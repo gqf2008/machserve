@@ -532,13 +532,26 @@ extern "C" __global__ void attn_decode_batched_f16(
     }
     float ssum = red[0];
 
-    for (int dd = threadIdx.x; dd < head_dim; dd += blockDim.x) {
-        float acc = 0.0f;
-        for (int p = 0; p <= pos; p++) {
-            const unsigned short* vp = vc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
-            acc += __expf(scores[p] - m) * f16_to_f32(*vp);
-        }
-        out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
+    // Parallel weighted sum: all 256 threads participate (blockDim/head_dim
+    // threads per output dim partition the keys), so each key's exp is computed
+    // by exactly one thread per dim instead of head_dim times. The `per`
+    // partials of each output dim are reduced over all `per` threads.
+    const int ndd = head_dim;
+    const int per = blockDim.x / ndd;
+    const int dd = threadIdx.x % ndd;
+    const int c = threadIdx.x / ndd;
+    const int np = pos + 1;
+    float acc = 0.0f;
+    for (int p = c; p < np; p += per) {
+        const unsigned short* vp = vc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
+        acc += __expf(scores[p] - m) * f16_to_f32(*vp);
+    }
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    if (c == 0) {
+        float sum = 0.0f;
+        for (int cc = 0; cc < per; cc++) sum += red[dd + cc * ndd];
+        out[((long long)s * n_heads + h) * head_dim + dd] = sum / ssum;
     }
 }
 "#;
@@ -1507,7 +1520,7 @@ impl HipKernels {
             &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
         let grid = (batch * n_heads) as u32;
-        let shared = (2 * max_seq as u32 + 256) * 4;
+        let shared = (max_seq as u32 + 256) * 4;
         Ok(self
             .attn_f16
             .launch_shmem([grid, 1, 1], [256, 1, 1], &mut p, self.stream, shared)?)

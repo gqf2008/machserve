@@ -260,3 +260,17 @@
     无回归(B=512 19ms、B=64 ~5ms);
   - 结论:长 context decode 瓶颈是 KV 读取带宽,需内存访问模式优化的 attention
     (合并 K/V 读、GQA 复用);已留作后续专项。
+
+- **P3j 修正:decode attention 分区加权求和(2026-08-23,7900 XTX 真机)**:
+  - 前次 P3j 的 kernel 改动因脚本中断未落盘(只改了 launch 共享字节,2× 浪费且压
+    context 能力);本次真正实现:加权求和改为 **256 线程分区**(blockDim/head_dim
+    线程/输出维,每 key 的 exp 只算一次),共享字节回落 `max_seq+256`(context 上限
+    恢复 ~16k);
+  - **踩坑并修复**:初版分区归约假设 `per=4`(head_dim=64),tiny 模型 head_dim=32 →
+    per=8 只加了 4 个部分和,漏掉一半 V 贡献 → F16 多行 forward logits 错 2.05
+    (F32/F16 对拍发现);归约改为遍历全部 `per` 部分和后,F32-BATCHED vs
+    F16-BATCHED 回到 0.0019(fp16 舍入),argmax 一致;
+  - **性能(修复后,Qwen2.5-0.5B fp16, capacity 64)**:2048-token prefill TTFT
+    **373ms(-33%)**、长 context(2048)decode **8.27 ms/token(-56%)**——此前误判为
+    "带宽受限中性",实际旧 64 线程加权循环是并行度受限;
+  - 正确性:fp16/continuous/real_model 全绿,`chat_check` 正确回答;clippy/fmt 干净。
