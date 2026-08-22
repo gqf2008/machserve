@@ -143,3 +143,13 @@
   - **正确性(真机)**:引擎生成 == 单序列贪婪参考逐 token 一致(多 prompt)、序列完成释放
     槽位且新序列 KV 隔离、EOS 精确停止;
   - 测试:默认 + HIP 31 全绿(新增 continuous 3、batched 2),clippy/default+hip 0 告警。
+
+- **P2d OpenAI 兼容服务器完成(2026-08-22,7900 XTX 真机)**:
+  - `mach-server` crate(axum + tokio):后台引擎线程(持有 ContinuousModel,仅该线程碰 GPU)+
+    channel 通信;`ServerEngine::submit` 提交请求,引擎循环按容量 admit + step + 完成回传;
+  - 路由:`GET /healthz`、`POST /v1/completions`、`POST /v1/chat/completions`;
+    prompt 接受 token id 数组或 ASCII 字符串(朴素 byte→token 映射,真 tokenizer 留待后续);
+  - **端到端(真机, Qwen2.5-0.5B)**:`/healthz` ok;`/v1/completions` 生成 8 个真实 BPE token;
+    2 个并发请求同时完成(连续批处理);chat 接口正常;
+  - 集成测试:HTTP 响应 == 直接引擎调用逐 token 一致、healthz + text prompt;
+  - 测试:默认 + HIP 33 全绿(新增 server 2),clippy(default+hip)0 告警,fmt 干净。

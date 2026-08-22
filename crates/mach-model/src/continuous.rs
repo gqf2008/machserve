@@ -49,6 +49,8 @@ pub struct ContinuousModel {
     next_id: SeqId,
 }
 
+unsafe impl Send for ContinuousModel {}
+
 impl ContinuousModel {
     /// Builds an engine with `capacity` concurrent sequence slots.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights, capacity: usize) -> Result<Self, Error> {

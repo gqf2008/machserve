@@ -6,6 +6,7 @@ members = [
     "crates/mach-kernel-sys",
     "crates/mach-bench",
     "crates/mach-model",
+    "crates/mach-server",
 ]
 
 [workspace.package]
@@ -23,6 +24,9 @@ all = "warn"
 mach-engine = { path = "crates/mach-engine", version = "0.1.0" }
 mach-kernel = { path = "crates/mach-kernel", version = "0.1.0" }
 mach-kernel-sys = { path = "crates/mach-kernel-sys", version = "0.1.0" }
+mach-model = { path = "crates/mach-model", version = "0.1.0" }
+
+
 
 
 

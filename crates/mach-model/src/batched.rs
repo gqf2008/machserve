@@ -461,6 +461,10 @@ impl BatchedModel {
     }
 }
 
+// SAFETY: BatchedModel is confined to one engine thread; its raw device
+// pointers are only dereferenced there, and the loaded HIP runtime is Send.
+unsafe impl Send for BatchedModel {}
+
 impl Drop for BatchedModel {
     fn drop(&mut self) {
         let hip = self.k.hip();
