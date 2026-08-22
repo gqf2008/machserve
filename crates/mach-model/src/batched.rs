@@ -271,17 +271,17 @@ impl BatchedModel {
                 self.k.stream,
             )?;
         }
-        self.run_kernels()?;
-        let next = self.sample()?;
+        self.run_kernels(self.batch as i32)?;
+        let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
             *l += 1;
         }
         Ok(next)
     }
 
-    fn run_kernels(&self) -> Result<(), Error> {
+    fn run_kernels(&self, count: i32) -> Result<(), Error> {
         let c = self.cfg;
-        let b = self.batch as i32;
+        let b = count;
         let d = c.d_model as i32;
         let nq = (c.n_heads * c.head_dim) as i32;
         let nkv = (c.n_kv_heads * c.head_dim) as i32;
@@ -359,8 +359,8 @@ impl BatchedModel {
     }
 
     /// Batched greedy sampling: argmax per row, read back only `batch` tokens.
-    fn sample(&self) -> Result<Vec<u32>, Error> {
-        let b = self.batch as i32;
+    fn sample(&self, n: usize) -> Result<Vec<u32>, Error> {
+        let b = n as i32;
         self.k.launch_argmax_batched(
             self.logits,
             self.out_tok_dev,
@@ -376,17 +376,82 @@ impl BatchedModel {
                 self.k.hip(),
                 self.out_tok_host as *mut core::ffi::c_void,
                 self.out_tok_dev as *const core::ffi::c_void,
-                self.batch * 4,
+                n * 4,
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
             )?;
         }
-        let mut out = Vec::with_capacity(self.batch);
+        let mut out = Vec::with_capacity(n);
         unsafe {
-            for i in 0..self.batch {
+            for i in 0..n {
                 out.push(*self.out_tok_host.add(i) as u32);
             }
         }
         Ok(out)
+    }
+
+    /// Batched decode with explicit per-sequence lengths and a variable active
+    /// count (`tokens.len()` may be <= capacity). The engine owns `lens`; this
+    /// method does not touch the internal lens used by [`decode_step`](Self::decode_step).
+    pub fn decode_step_explicit(
+        &mut self,
+        tokens: &[u32],
+        lens: &[u32],
+    ) -> Result<Vec<u32>, Error> {
+        let n = tokens.len();
+        assert_eq!(n, lens.len(), "tokens and lens must be equal length");
+        assert!(n <= self.batch, "active count exceeds capacity");
+        unsafe {
+            for i in 0..n {
+                *self.tokens_host.add(i) = tokens[i] as i32;
+                *self.pos_host.add(i) = lens[i] as i32;
+            }
+            hip::memcpy_async(
+                self.k.hip(),
+                self.tokens_dev as *mut core::ffi::c_void,
+                self.tokens_host as *const core::ffi::c_void,
+                n * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
+            hip::memcpy_async(
+                self.k.hip(),
+                self.pos_dev as *mut core::ffi::c_void,
+                self.pos_host as *const core::ffi::c_void,
+                n * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
+        }
+        self.run_kernels(n as i32)?;
+        self.sample(n)
+    }
+
+    /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the
+    /// first `len` positions are copied.
+    pub fn copy_seq_kv(&self, from: usize, to: usize, len: usize) -> Result<(), Error> {
+        let row_bytes = self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
+        let copy_bytes = len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
+        for (kc, vc) in &self.kv_cache {
+            let src_k = (*kc as usize + from * row_bytes) as *const core::ffi::c_void;
+            let dst_k = (*kc as usize + to * row_bytes) as *mut core::ffi::c_void;
+            let src_v = (*vc as usize + from * row_bytes) as *const core::ffi::c_void;
+            let dst_v = (*vc as usize + to * row_bytes) as *mut core::ffi::c_void;
+            hip::memcpy(
+                self.k.hip(),
+                dst_k,
+                src_k,
+                copy_bytes,
+                hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )?;
+            hip::memcpy(
+                self.k.hip(),
+                dst_v,
+                src_v,
+                copy_bytes,
+                hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )?;
+        }
+        Ok(())
     }
 
     /// The configured batch size.

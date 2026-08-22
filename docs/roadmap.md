@@ -133,3 +133,13 @@
     B=1: 11.9ms | B=8: 1.60ms | B=16: 0.84ms | B=32: 0.47ms | **B=64: 0.216ms(4640 tok/s)**;
     对比 llama.cpp Vulkan 1.55ms(643 tok/s):**B=64 时快 7.2x**;
   - 这证实 P2 的判断:瓶颈是 m=1 GEMM,批量(m=B)直接修复,且连续批处理本身就是引擎模型。
+
+- **P2c 连续批处理引擎完成(2026-08-22,7900 XTX 真机)**:
+  - `continuous.rs`:`ContinuousModel`——序列生命周期管理:add(带 prompt)/step(每步推进
+    prefill 或 decode 一个 token)/finish(EOS 或 max_new);**prefill 与 decode 在同一 batch
+    step 中混合**(生产连续批处理语义);稳定 `SeqId` 与 KV 槽位解耦,序列完成后槽位压缩复用;
+  - `BatchedModel` 增加 `decode_step_explicit`(显式 lens/活跃数)+ `copy_seq_kv`(槽位搬运);
+    修复 `sample()` 按实际活跃数返回(此前按容量返回,导致引擎在活跃<容量时出错);
+  - **正确性(真机)**:引擎生成 == 单序列贪婪参考逐 token 一致(多 prompt)、序列完成释放
+    槽位且新序列 KV 隔离、EOS 精确停止;
+  - 测试:默认 + HIP 31 全绿(新增 continuous 3、batched 2),clippy/default+hip 0 告警。

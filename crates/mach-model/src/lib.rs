@@ -10,6 +10,8 @@
 #[cfg(feature = "hip")]
 pub mod batched;
 pub mod config;
+#[cfg(feature = "hip")]
+pub mod continuous;
 pub mod loader;
 pub mod ref_model;
 #[cfg(feature = "hip")]
