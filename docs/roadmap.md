@@ -274,3 +274,16 @@
     **373ms(-33%)**、长 context(2048)decode **8.27 ms/token(-56%)**——此前误判为
     "带宽受限中性",实际旧 64 线程加权循环是并行度受限;
   - 正确性:fp16/continuous/real_model 全绿,`chat_check` 正确回答;clippy/fmt 干净。
+
+- **P3k fp16 转换改硬件原生指令(2026-08-23,7900 XTX 真机)**:
+  - 手写分支式 `f16_to_f32`/`f32_to_f16`(每元素 ~8-10 指令)替换为 **`_Float16`
+    原生 cvt 指令 + union 位重解释**(每元素 1-2 指令),覆盖 attention/KV store/
+    cast/embed 全部 fp16 kernel;
+  - **踩坑**:初版直接 `(float)((_Float16)u16)`/`(unsigned short)((_Float16)f32)`
+    是**数值转换不是位重解释**(u16 0x3C00→15360.0),logits 错 1.6——改为 union
+    位重解释后回到 0.0019;
+  - **性能(Qwen2.5-0.5B fp16,7900 XTX)**:B=512 **35251 tok/s(+35%,= llama.cpp
+    Vulkan 的 55x)**;B=64/128/256:13070/21066/29273 tok/s;2048-token prefill
+    TTFT 325ms;长 context(2048)decode **6.99 ms/token**(自 P3j 起 18.78→6.99,
+    累计 -63%);
+  - 正确性:fp16/continuous/real_model 全绿,clippy/fmt 干净。

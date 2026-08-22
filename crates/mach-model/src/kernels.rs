@@ -350,31 +350,10 @@ extern "C" __global__ void argmax_batched(const float* logits, int* out_tok,
 
 /// f32 -> fp16 cast (device conversion matches `crate::fp16::f32_to_f16`).
 const CAST_F32_F16: &str = r#"
-__device__ unsigned short f32_to_f16(float x) {
-    unsigned int b = __float_as_uint(x);
-    unsigned int sign = (b >> 16) & 0x8000u;
-    int e = (int)((b >> 23) & 0xffu);
-    unsigned int m = b & 0x7fffffu;
-    if (e == 255) return (unsigned short)(sign | 0x7c00u | (m ? 0x200u : 0u));
-    int ne = e - 127 + 15;
-    if (ne >= 31) return (unsigned short)(sign | 0x7c00u);
-    if (ne <= 0) {
-        if (ne < -10) return (unsigned short)sign;
-        unsigned int mm = m | 0x800000u;
-        int shift = 14 - ne;
-        unsigned int half = 1u << (shift - 1);
-        unsigned int m16 = mm >> shift;
-        unsigned int rem = mm & ((1u << shift) - 1u);
-        if (rem > half || (rem == half && (m16 & 1u))) m16++;
-        return (unsigned short)(sign | m16);
-    }
-    unsigned int m16 = m >> 13;
-    unsigned int rem = m & 0x1fffu;
-    if (rem > 0x1000u || (rem == 0x1000u && (m16 & 1u))) {
-        m16++;
-        if (m16 == 0x400u) { m16 = 0u; ne++; if (ne >= 31) return (unsigned short)(sign | 0x7c00u); }
-    }
-    return (unsigned short)(sign | ((unsigned int)ne << 10) | m16);
+__device__ inline unsigned short f32_to_f16(float x) {
+    union { _Float16 h; unsigned short u; } c;
+    c.h = (_Float16)x;
+    return c.u;
 }
 
 extern "C" __global__ void cast_f32_f16(const float* x, unsigned short* y, int n) {
@@ -385,25 +364,10 @@ extern "C" __global__ void cast_f32_f16(const float* x, unsigned short* y, int n
 
 /// fp16 -> f32 cast (device conversion matches `crate::fp16::f16_to_f32`).
 const CAST_F16_F32: &str = r#"
-__device__ float f16_to_f32(unsigned short h) {
-    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
-    unsigned int e = (h >> 10) & 0x1fu;
-    unsigned int m = h & 0x3ffu;
-    unsigned int b;
-    if (e == 0u) {
-        if (m == 0u) b = sign;
-        else {
-            unsigned int m2 = m;
-            unsigned int e2 = 127u + 1u - 15u;
-            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
-            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
-        }
-    } else if (e == 0x1fu) {
-        b = sign | 0x7f800000u | (m << 13);
-    } else {
-        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
-    }
-    return __uint_as_float(b);
+__device__ inline float f16_to_f32(unsigned short h) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = h;
+    return (float)c.h;
 }
 
 extern "C" __global__ void cast_f16_f32(const unsigned short* x, float* y, int n) {
@@ -415,52 +379,17 @@ extern "C" __global__ void cast_f16_f32(const unsigned short* x, float* y, int n
 /// fp16 KV cache: store f32 K/V rows as fp16, attention reads fp16 K/V
 /// (half the cache memory and bandwidth of the f32 path).
 const KV_F16: &str = r#"
-__device__ unsigned short f32_to_f16(float x) {
-    unsigned int b = __float_as_uint(x);
-    unsigned int sign = (b >> 16) & 0x8000u;
-    int e = (int)((b >> 23) & 0xffu);
-    unsigned int m = b & 0x7fffffu;
-    if (e == 255) return (unsigned short)(sign | 0x7c00u | (m ? 0x200u : 0u));
-    int ne = e - 127 + 15;
-    if (ne >= 31) return (unsigned short)(sign | 0x7c00u);
-    if (ne <= 0) {
-        if (ne < -10) return (unsigned short)sign;
-        unsigned int mm = m | 0x800000u;
-        int shift = 14 - ne;
-        unsigned int half = 1u << (shift - 1);
-        unsigned int m16 = mm >> shift;
-        unsigned int rem = mm & ((1u << shift) - 1u);
-        if (rem > half || (rem == half && (m16 & 1u))) m16++;
-        return (unsigned short)(sign | m16);
-    }
-    unsigned int m16 = m >> 13;
-    unsigned int rem = m & 0x1fffu;
-    if (rem > 0x1000u || (rem == 0x1000u && (m16 & 1u))) {
-        m16++;
-        if (m16 == 0x400u) { m16 = 0u; ne++; if (ne >= 31) return (unsigned short)(sign | 0x7c00u); }
-    }
-    return (unsigned short)(sign | ((unsigned int)ne << 10) | m16);
+__device__ inline unsigned short f32_to_f16_bits(float x) {
+    _Float16 h = (_Float16)x;
+    union { _Float16 h; unsigned short u; } c;
+    c.h = h;
+    return c.u;
 }
 
-__device__ float f16_to_f32(unsigned short h) {
-    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
-    unsigned int e = (h >> 10) & 0x1fu;
-    unsigned int m = h & 0x3ffu;
-    unsigned int b;
-    if (e == 0u) {
-        if (m == 0u) b = sign;
-        else {
-            unsigned int m2 = m;
-            unsigned int e2 = 127u + 1u - 15u;
-            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
-            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
-        }
-    } else if (e == 0x1fu) {
-        b = sign | 0x7f800000u | (m << 13);
-    } else {
-        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
-    }
-    return __uint_as_float(b);
+__device__ inline float f16_bits_to_f32(unsigned short u) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = u;
+    return (float)c.h;
 }
 
 extern "C" __global__ void kv_store_batched_f16(const float* kv,
@@ -475,7 +404,7 @@ extern "C" __global__ void kv_store_batched_f16(const float* kv,
         int i = idx % (kv_heads * head_dim);
         int p = pos_buf[s];
         cache[((long long)slots[s] * max_seq + p) * kv_heads * head_dim + i] =
-            f32_to_f16(kv[(long long)s * kv_heads * head_dim + i]);
+            f32_to_f16_bits(kv[(long long)s * kv_heads * head_dim + i]);
     }
 }
 
@@ -507,7 +436,7 @@ extern "C" __global__ void attn_decode_batched_f16(
     for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
         const unsigned short* kp = kc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim;
         float sc = 0.0f;
-        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * f16_to_f32(kp[dd]);
+        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * f16_bits_to_f32(kp[dd]);
         scores[p] = sc * scale;
     }
     __syncthreads();
@@ -544,7 +473,7 @@ extern "C" __global__ void attn_decode_batched_f16(
     float acc = 0.0f;
     for (int p = c; p < np; p += per) {
         const unsigned short* vp = vc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
-        acc += __expf(scores[p] - m) * f16_to_f32(*vp);
+        acc += __expf(scores[p] - m) * f16_bits_to_f32(*vp);
     }
     red[threadIdx.x] = acc;
     __syncthreads();
@@ -676,25 +605,10 @@ extern "C" __global__ void attn_prefill_f16(
 
 /// fp16 embedding gather -> f32 activations (matches `crate::fp16::f16_to_f32`).
 const EMBED_GATHER_F16: &str = r#" 
-__device__ float f16_to_f32(unsigned short h) {
-    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
-    unsigned int e = (h >> 10) & 0x1fu;
-    unsigned int m = h & 0x3ffu;
-    unsigned int b;
-    if (e == 0u) {
-        if (m == 0u) b = sign;
-        else {
-            unsigned int m2 = m;
-            unsigned int e2 = 127u + 1u - 15u;
-            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
-            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
-        }
-    } else if (e == 0x1fu) {
-        b = sign | 0x7f800000u | (m << 13);
-    } else {
-        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
-    }
-    return __uint_as_float(b);
+__device__ inline float f16_to_f32(unsigned short h) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = h;
+    return (float)c.h;
 }
 
 extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short* emb,
