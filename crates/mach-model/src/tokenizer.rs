@@ -150,6 +150,16 @@ impl Tokenizer {
         self.vocab.len() + self.added.len()
     }
 
+    /// Token id for an added/special token by exact content (e.g.
+    /// `<|im_end|>`), or `None` when it is not an added token.
+    #[must_use]
+    pub fn special_token_id(&self, content: &str) -> Option<u32> {
+        self.added
+            .iter()
+            .find(|(c, _)| c == content)
+            .map(|(_, id)| *id)
+    }
+
     /// Encodes `text` to token ids (added tokens matched literally first).
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {

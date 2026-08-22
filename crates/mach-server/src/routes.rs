@@ -141,6 +141,20 @@ fn decode_text(tok: &Option<Arc<Tokenizer>>, tokens: &[u32]) -> String {
     }
 }
 
+/// Formats chat messages with the Qwen chat template
+/// (`<|im_start|>role\ncontent<|im_end|>\n...<|im_start|>assistant\n`).
+fn qwen_chat_text(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        out.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            m.role, m.content
+        ));
+    }
+    out.push_str("<|im_start|>assistant\n");
+    out
+}
+
 /// Builds sampling params from optional request fields (greedy by default).
 fn sampling_params(
     temperature: Option<f32>,
@@ -303,15 +317,16 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let text: String = req
-        .messages
-        .iter()
-        .map(|m| format!("{}: {}\n", m.role, m.content))
-        .collect();
+    let text = qwen_chat_text(&req.messages);
     let tokens = match &state.tok {
         Some(t) => t.encode(&text),
         None => naive_encode(&text),
     };
+    // Stop at the chat end token when the real tokenizer is configured.
+    let eos = state
+        .tok
+        .as_ref()
+        .and_then(|t| t.special_token_id("<|im_end|>"));
     let params = sampling_params(req.temperature, req.top_k, req.top_p, req.seed);
     let id = format!("chatcmpl-{}", now());
     let created = now();
@@ -319,7 +334,7 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
-            .submit_stream(tokens, req.max_tokens, None, params)
+            .submit_stream(tokens, req.max_tokens, eos, params)
             .await
         {
             Ok(x) => x,
@@ -337,7 +352,7 @@ pub async fn chat_completions(
 
     let output = match state
         .engine
-        .submit(tokens, req.max_tokens, None, params)
+        .submit(tokens, req.max_tokens, eos, params)
         .await
     {
         Ok(o) => o,
@@ -371,4 +386,34 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn qwen_chat_template_format() {
+        let text = qwen_chat_text(&[msg("system", "You are helpful."), msg("user", "hi")]);
+        assert_eq!(
+            text,
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen_chat_template_no_system() {
+        let text = qwen_chat_text(&[msg("user", "hello")]);
+        assert_eq!(
+            text,
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
 }

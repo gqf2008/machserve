@@ -59,10 +59,11 @@ def rope(x, n_heads, head_dim, pos, theta):
     c = np.cos(ang)
     s = np.sin(ang)
     x = x.reshape(n_heads, head_dim)
-    a = x[:, 0::2].copy()
-    b = x[:, 1::2].copy()
-    x[:, 0::2] = a * c - b * s
-    x[:, 1::2] = a * s + b * c
+    # GPT-NeoX rotary: pairs (d, d + half), matching HF rotate_half.
+    a = x[:, :half].copy()
+    b = x[:, half:].copy()
+    x[:, :half] = a * c - b * s
+    x[:, half:] = a * s + b * c
     return x.reshape(-1)
 
 
@@ -100,6 +101,17 @@ def forward(w, cfg, tokens):
             q = matvec_t(xn, w[p("self_attn.q_proj.weight")], nq)
             k = matvec_t(xn, w[p("self_attn.k_proj.weight")], nkv)
             v = matvec_t(xn, w[p("self_attn.v_proj.weight")], nkv)
+            # Qwen2 checkpoints ship q/k/v biases even when the config says
+            # `attention_bias: false`; add them when present.
+            bq = w.get(p("self_attn.q_proj.bias"), None)
+            bk = w.get(p("self_attn.k_proj.bias"), None)
+            bv = w.get(p("self_attn.v_proj.bias"), None)
+            if bq is not None:
+                q = q + bq
+            if bk is not None:
+                k = k + bk
+            if bv is not None:
+                v = v + bv
             q = rope(q, cfg["heads"], cfg["head_dim"], pos, cfg["theta"])
             k = rope(k, cfg["kv_heads"], cfg["head_dim"], pos, cfg["theta"])
             kcache[li][pos] = k.reshape(cfg["kv_heads"], cfg["head_dim"])
@@ -109,7 +121,7 @@ def forward(w, cfg, tokens):
             xn = rms_norm(x, w[p("post_attention_layernorm.weight")], cfg["eps"])
             gate = matvec_t(xn, w[p("mlp.gate_proj.weight")], cfg["intermediate"])
             up = matvec_t(xn, w[p("mlp.up_proj.weight")], cfg["intermediate"])
-            h = gate * (up / (1.0 + np.exp(-up)))
+            h = (gate / (1.0 + np.exp(-gate))) * up
             x = x + matvec_t(h, w[p("mlp.down_proj.weight")], d)
         xf = rms_norm(x, w["model.norm.weight"], cfg["eps"])
         logits = matvec_t(xf, lm, cfg["vocab"])

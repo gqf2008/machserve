@@ -229,7 +229,7 @@ fn main() {
         let mut cfg16 = cfg;
         cfg16.dtype = ModelDType::F16;
         println!("\n=== chunked prefill TTFT (Qwen2.5-0.5B, capacity 64) ===");
-        let prompt_len = 512usize;
+        let prompt_len = 2048usize;
         let prompt: Vec<u32> = (0..prompt_len).map(|i| (i % 977) as u32).collect();
         let mut eng = ContinuousModel::new(hip::hip().unwrap(), cfg16, &w, 64).unwrap();
         let id = eng

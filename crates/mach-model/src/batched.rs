@@ -26,6 +26,10 @@ struct LayerDev {
     wu: *mut f32,
     wd: *mut f32,
     rms_mlp: *mut f32,
+    /// Attention projection biases (null when the checkpoint has none).
+    bq: *mut f32,
+    bk: *mut f32,
+    bv: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -270,6 +274,27 @@ impl BatchedModel {
                 wu: self.dalloc(lw.wu.len() * 4)?,
                 wd: self.dalloc(lw.wd.len() * 4)?,
                 rms_mlp: self.dalloc(lw.rms_mlp.len() * 4)?,
+                bq: if lw.bq.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.bq.len() * 4)?;
+                    self.upload(p, &lw.bq)?;
+                    p
+                },
+                bk: if lw.bk.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.bk.len() * 4)?;
+                    self.upload(p, &lw.bk)?;
+                    p
+                },
+                bv: if lw.bv.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.bv.len() * 4)?;
+                    self.upload(p, &lw.bv)?;
+                    p
+                },
             };
             self.upload(l.wq, &lw.wq)?;
             self.upload(l.wk, &lw.wk)?;
@@ -452,6 +477,16 @@ impl BatchedModel {
                 nkv,
                 d,
             )?;
+            // Qwen2 checkpoints ship q/k/v biases.
+            if !lw.bq.is_null() {
+                k.launch_add_bias(self.q, lw.bq, b, nq)?;
+            }
+            if !lw.bk.is_null() {
+                k.launch_add_bias(self.k_buf, lw.bk, b, nkv)?;
+            }
+            if !lw.bv.is_null() {
+                k.launch_add_bias(self.v_buf, lw.bv, b, nkv)?;
+            }
             k.launch_rope_batched(
                 self.q,
                 self.k_buf,
@@ -560,7 +595,8 @@ impl BatchedModel {
                 inter,
                 d,
             )?;
-            k.launch_silu_mul(self.gate, self.up, self.h, b * inter)?;
+            // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
+            k.launch_silu_mul(self.up, self.gate, self.h, b * inter)?;
             gemm(
                 self.proj,
                 self.h,

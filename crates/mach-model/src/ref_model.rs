@@ -73,7 +73,8 @@ impl RefModel {
             let up = matvec_t(&xn2, &lw.wu, inter);
             let mut h = vec![0.0; inter];
             for i in 0..inter {
-                h[i] = gate[i] * silu(up[i]);
+                // SwiGLU: h = silu(gate) * up.
+                h[i] = silu(gate[i]) * up[i];
             }
             let down = matvec_t(&h, &lw.wd, d);
             for i in 0..d {
@@ -95,11 +96,12 @@ fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta:
             let ang = pos as f32 * freq;
             let c = ang.cos();
             let sn = ang.sin();
-            let idx = h * head_dim + 2 * d;
+            // GPT-NeoX rotary: pairs (d, d + half), matching HF rotate_half.
+            let idx = h * head_dim + d;
             let a = x[idx];
-            let b = x[idx + 1];
+            let b = x[idx + half];
             x[idx] = a * c - b * sn;
-            x[idx + 1] = a * sn + b * c;
+            x[idx + half] = a * sn + b * c;
         }
     }
 }

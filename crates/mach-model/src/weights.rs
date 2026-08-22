@@ -27,6 +27,11 @@ pub struct LayerWeights {
     pub wd: Vec<f32>,
     /// `[d_model]`
     pub rms_mlp: Vec<f32>,
+    /// Attention projection biases (Qwen2 checkpoints ship them despite
+    /// `attention_bias: false` in some configs). Empty when absent.
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
 }
 
 /// All model weights.
@@ -73,6 +78,9 @@ impl Weights {
                 wu: mat(&mut rng, cfg.intermediate_size, d, scale),
                 wd: mat(&mut rng, d, cfg.intermediate_size, scale),
                 rms_mlp: vec1(&mut rng, d),
+                bq: Vec::new(),
+                bk: Vec::new(),
+                bv: Vec::new(),
             });
         }
 

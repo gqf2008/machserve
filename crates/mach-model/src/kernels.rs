@@ -57,8 +57,20 @@ extern "C" __global__ void add(float* x, const float* y, int n) {
 }
 "#;
 
+/// Broadcast-add a bias vector to every row: `x[row][col] += bias[col]`.
+const ADD_BIAS: &str = r#"
+extern "C" __global__ void add_bias(float* x, const float* bias, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx < total) {
+        int c = idx % cols;
+        x[idx] += bias[c];
+    }
+}
+"#;
+
 /// Store a K/V row into the cache at position `*pos`.
-const KV_STORE: &str = r#"
+const KV_STORE: &str = r#" 
 extern "C" __global__ void kv_store(const float* kv, float* cache, const int* pos_buf,
                                     int kv_heads, int head_dim, int max_seq) {
     int p = *pos_buf;
@@ -78,6 +90,7 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
     int half = head_dim / 2;
     int total_q = n_heads * head_dim;
     int total_k = n_kv_heads * head_dim;
+    // GPT-NeoX rotary: pairs (d, d + half), matching HF rotate_half.
     if (i < total_q) {
         int h = i / head_dim;
         int d = i % head_dim;
@@ -85,10 +98,10 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
             float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
             float ang = (float)pos * freq;
             float c = cosf(ang), sn = sinf(ang);
-            float* p = q + h * head_dim + 2 * d;
-            float a = p[0], b = p[1];
-            p[0] = a * c - b * sn;
-            p[1] = a * sn + b * c;
+            float* p = q + h * head_dim;
+            float a = p[d], b = p[d + half];
+            p[d] = a * c - b * sn;
+            p[d + half] = a * sn + b * c;
         }
     }
     if (i < total_k) {
@@ -98,10 +111,10 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
             float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
             float ang = (float)pos * freq;
             float c = cosf(ang), sn = sinf(ang);
-            float* p = k + h * head_dim + 2 * d;
-            float a = p[0], b = p[1];
-            p[0] = a * c - b * sn;
-            p[1] = a * sn + b * c;
+            float* p = k + h * head_dim;
+            float a = p[d], b = p[d + half];
+            p[d] = a * c - b * sn;
+            p[d + half] = a * sn + b * c;
         }
     }
 }
@@ -195,10 +208,10 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
             float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
             float ang = (float)pos * freq;
             float c = cosf(ang), sn = sinf(ang);
-            float* p = q + (long long)s * n_heads * head_dim + h * head_dim + 2 * d;
-            float a = p[0], b = p[1];
-            p[0] = a * c - b * sn;
-            p[1] = a * sn + b * c;
+            float* p = q + (long long)s * n_heads * head_dim + h * head_dim;
+            float a = p[d], b = p[d + half];
+            p[d] = a * c - b * sn;
+            p[d + half] = a * sn + b * c;
         }
     }
     if (idx < total_k) {
@@ -211,10 +224,10 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
             float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
             float ang = (float)pos * freq;
             float c = cosf(ang), sn = sinf(ang);
-            float* p = k + (long long)s * n_kv_heads * head_dim + h * head_dim + 2 * d;
-            float a = p[0], b = p[1];
-            p[0] = a * c - b * sn;
-            p[1] = a * sn + b * c;
+            float* p = k + (long long)s * n_kv_heads * head_dim + h * head_dim;
+            float a = p[d], b = p[d + half];
+            p[d] = a * c - b * sn;
+            p[d + half] = a * sn + b * c;
         }
     }
 }
@@ -567,6 +580,7 @@ pub struct HipKernels {
     rms_norm: HipKernelModule,
     silu_mul: HipKernelModule,
     add: HipKernelModule,
+    add_bias: HipKernelModule,
     kv_store: HipKernelModule,
     attn_decode: HipKernelModule,
     rope: HipKernelModule,
@@ -605,6 +619,7 @@ impl HipKernels {
             rms_norm: HipKernelModule::compile(&arch, RMS_NORM, "rms_norm")?,
             silu_mul: HipKernelModule::compile(&arch, SILU_MUL, "silu_mul")?,
             add: HipKernelModule::compile(&arch, ADD, "add")?,
+            add_bias: HipKernelModule::compile(&arch, ADD_BIAS, "add_bias")?,
             kv_store: HipKernelModule::compile(&arch, KV_STORE, "kv_store")?,
             attn_decode: HipKernelModule::compile(&arch, ATTN_DECODE, "attn_decode")?,
             rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
@@ -716,6 +731,29 @@ impl HipKernels {
         let blocks = (n as u32).div_ceil(256);
         Ok(self
             .add
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Broadcast-adds `bias` (length `cols`) to every row of `x`.
+    pub fn launch_add_bias(
+        &self,
+        x: *mut f32,
+        bias: *const f32,
+        rows: i32,
+        cols: i32,
+    ) -> Result<(), Error> {
+        let xp = x;
+        let bp = bias;
+        let mut p = vec![
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &bp as *const *const f32 as *mut core::ffi::c_void,
+            &rows as *const i32 as *mut core::ffi::c_void,
+            &cols as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (rows * cols) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .add_bias
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 

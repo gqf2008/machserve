@@ -33,6 +33,10 @@ struct LayerDev {
     wu: *mut f32,
     wd: *mut f32,
     rms_mlp: *mut f32,
+    /// Attention projection biases (null when the checkpoint has none).
+    bq: *mut f32,
+    bk: *mut f32,
+    bv: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -254,6 +258,27 @@ impl GpuModel {
                 wu: self.dalloc(lw.wu.len() * 4)?,
                 wd: self.dalloc(lw.wd.len() * 4)?,
                 rms_mlp: self.dalloc(lw.rms_mlp.len() * 4)?,
+                bq: if lw.bq.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.bq.len() * 4)?;
+                    self.upload(p, &lw.bq)?;
+                    p
+                },
+                bk: if lw.bk.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.bk.len() * 4)?;
+                    self.upload(p, &lw.bk)?;
+                    p
+                },
+                bv: if lw.bv.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.bv.len() * 4)?;
+                    self.upload(p, &lw.bv)?;
+                    p
+                },
             };
             self.upload(l.wq, &lw.wq)?;
             self.upload(l.wk, &lw.wk)?;
@@ -372,6 +397,16 @@ impl GpuModel {
                 nkv,
                 d,
             )?;
+            // Qwen2 checkpoints ship q/k/v biases.
+            if !lw.bq.is_null() {
+                k.launch_add_bias(self.q, lw.bq, 1, nq)?;
+            }
+            if !lw.bk.is_null() {
+                k.launch_add_bias(self.k_buf, lw.bk, 1, nkv)?;
+            }
+            if !lw.bv.is_null() {
+                k.launch_add_bias(self.v_buf, lw.bv, 1, nkv)?;
+            }
             k.launch_rope(
                 self.q,
                 self.k_buf,
@@ -439,7 +474,8 @@ impl GpuModel {
                 inter,
                 d,
             )?;
-            k.launch_silu_mul(self.gate, self.up, self.h, inter)?;
+            // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
+            k.launch_silu_mul(self.up, self.gate, self.h, inter)?;
             gemm(
                 self.proj,
                 self.h,

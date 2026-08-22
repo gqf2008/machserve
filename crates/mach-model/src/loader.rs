@@ -163,6 +163,14 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
     let nq = cfg.n_heads * cfg.head_dim;
     let nkv = cfg.n_kv_heads * cfg.head_dim;
 
+    // Like `get`, but returns an empty vector when the tensor is absent
+    // (optional biases).
+    let get_opt = |name: &str, expected: usize| -> Result<Vec<f32>, Error> {
+        if !tensors.contains_key(name) {
+            return Ok(Vec::new());
+        }
+        tensor_f32(&data, &tensors[name], expected, name)
+    };
     let get = |name: &str, expected: usize| -> Result<Vec<f32>, Error> {
         let t = tensors
             .get(name)
@@ -195,6 +203,11 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
             wu: get(&p("mlp.up_proj.weight"), cfg.intermediate_size * d)?,
             wd: get(&p("mlp.down_proj.weight"), d * cfg.intermediate_size)?,
             rms_mlp: get(&p("post_attention_layernorm.weight"), d)?,
+            // Qwen2 checkpoints ship q/k/v biases (even with
+            // `attention_bias: false`); default to empty (no bias) when absent.
+            bq: get_opt(&p("self_attn.q_proj.bias"), nq)?,
+            bk: get_opt(&p("self_attn.k_proj.bias"), nkv)?,
+            bv: get_opt(&p("self_attn.v_proj.bias"), nkv)?,
         };
         layers.push(lw);
     }
