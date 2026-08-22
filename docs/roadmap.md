@@ -247,3 +247,16 @@
     分块 prefill 正确性测试(`fp16_prefill_attention_matches_single_token`);
   - 长期 target:长 prompt/长 context 的 attention 仍是下一个优化方向,需要
     多 block 共享 KV + 减少每 key 开销的 flash 式设计。
+
+- **P3j decode attention 优化 + 长 context 基准(2026-08-22/23,7900 XTX 真机)**:
+  - `attn_decode_batched_f16` 加权求和重写:softmax 指数一次性缓存到共享(`sexp`,
+    消除 64x 冗余 `__expf`)+ 全部 256 线程参与(blockDim/head_dim=4 线程/输出维,
+    分区键后共享归约),不再只有 head_dim=64 个线程串行;
+  - **长 context 实测**:Qwen2.5-0.5B fp16、capacity 64、context 2048 时
+    **decode 18.78 ms/token**——分析为 **KV 带宽受限**(896 blocks × 2048 keys ×
+    64 dims × 2B × 2(K+V)× 24 层 ≈ 11.3GB/步 @ ~600GB/s);exp 缓存/线程并行是
+    计算侧优化,墙钟受内存带宽主导;
+  - 正确性:fp16/连续/real_model 全绿,`chat_check` 仍正确回答;短 context decode
+    无回归(B=512 19ms、B=64 ~5ms);
+  - 结论:长 context decode 瓶颈是 KV 读取带宽,需内存访问模式优化的 attention
+    (合并 K/V 读、GQA 复用);已留作后续专项。

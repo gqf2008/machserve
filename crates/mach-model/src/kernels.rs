@@ -1507,7 +1507,7 @@ impl HipKernels {
             &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
         let grid = (batch * n_heads) as u32;
-        let shared = (max_seq as u32 + 256) * 4;
+        let shared = (2 * max_seq as u32 + 256) * 4;
         Ok(self
             .attn_f16
             .launch_shmem([grid, 1, 1], [256, 1, 1], &mut p, self.stream, shared)?)

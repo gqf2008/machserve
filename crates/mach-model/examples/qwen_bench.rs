@@ -235,14 +235,14 @@ fn main() {
         let id = eng
             .add(
                 &prompt,
-                1,
+                15,
                 None,
                 mach_model::sampling::SamplingParams::default(),
             )
             .unwrap();
         let mut steps = 0usize;
         let t = Instant::now();
-        while !eng.is_done(id) {
+        while eng.generated(id).is_empty() {
             eng.step().unwrap();
             steps += 1;
         }
@@ -252,6 +252,13 @@ fn main() {
             "prompt {prompt_len} tokens: {steps} steps, TTFT {ttft_ms:.1} ms, prefill {prefill_tps:.0} tok/s (single-token prefill would be ~{} ms)",
             prompt_len as f64 * 5.0
         );
+        // Decode at long context: 10 tokens after the 2048-token prompt.
+        let t = Instant::now();
+        for _ in 0..10 {
+            eng.step().unwrap();
+        }
+        let decode_ms = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
+        println!("decode at context {prompt_len}: {decode_ms:.2} ms/token");
     }
 }
 
