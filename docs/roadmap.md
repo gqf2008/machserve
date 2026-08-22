@@ -97,3 +97,8 @@
     `examples/qwen_bench.rs`、`examples/kernel_probe.rs`(逐 kernel 隔离验证)、
     `examples/ref_cpu.rs`(Rust f32/f64 参考);
   - 验证:默认 16 + HIP 24 测试全绿,clippy(default+hip)0 告警,fmt 干净。
+
+- **P1 收尾状态(2026-08-22)**:TPOT 与 TokenSpeed 同场景对标所需的运行环境暂不可用——
+  WSL2 Ubuntu-24.04 反复启动失败(0x800705aa 系统资源不足),且 WSL 内未装 ROCm/PyTorch;
+  已产出 `docs/benchmark-protocol.md`(对标协议 + 模板 + MachServe 侧实测数据),
+  环境就绪后按协议填 TokenSpeed 数字即可完成对标。
