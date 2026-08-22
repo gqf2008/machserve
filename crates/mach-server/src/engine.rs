@@ -16,11 +16,15 @@ struct Request {
     prompt: Vec<u32>,
     max_new: usize,
     eos: Option<u32>,
+    stop_seqs: Vec<Vec<u32>>,
     params: SamplingParams,
-    done: oneshot::Sender<Vec<u32>>,
+    done: oneshot::Sender<(Vec<u32>, &'static str)>,
     /// Streaming: per-token channel (None for non-streaming requests).
     tokens_tx: Option<tokio::sync::mpsc::Sender<u32>>,
 }
+
+/// Completion delivery: generated tokens plus the OpenAI finish reason.
+type DoneSender = oneshot::Sender<(Vec<u32>, &'static str)>;
 
 /// Shared engine handle (channel side only; the model stays on the engine
 /// thread).
@@ -28,7 +32,7 @@ pub struct ServerEngine {
     capacity: usize,
     pending: Mutex<VecDeque<Request>>,
     cond: Condvar,
-    txs: Mutex<HashMap<SeqId, oneshot::Sender<Vec<u32>>>>,
+    txs: Mutex<HashMap<SeqId, DoneSender>>,
     /// Streaming token channels per active sequence.
     streams: Mutex<HashMap<SeqId, tokio::sync::mpsc::Sender<u32>>>,
     _requests: AtomicU64,
@@ -63,8 +67,9 @@ impl ServerEngine {
         prompt: Vec<u32>,
         max_new: usize,
         eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
         params: SamplingParams,
-    ) -> Result<Vec<u32>, EngineError> {
+    ) -> Result<(Vec<u32>, &'static str), EngineError> {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
@@ -75,6 +80,7 @@ impl ServerEngine {
                 prompt,
                 max_new,
                 eos,
+                stop_seqs,
                 params,
                 done: tx,
                 tokens_tx: None,
@@ -92,10 +98,11 @@ impl ServerEngine {
         prompt: Vec<u32>,
         max_new: usize,
         eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
         params: SamplingParams,
     ) -> Result<
         (
-            oneshot::Receiver<Vec<u32>>,
+            oneshot::Receiver<(Vec<u32>, &'static str)>,
             tokio::sync::mpsc::Receiver<u32>,
         ),
         EngineError,
@@ -111,6 +118,7 @@ impl ServerEngine {
                 prompt,
                 max_new,
                 eos,
+                stop_seqs,
                 params,
                 done: tx,
                 tokens_tx: Some(tokens_tx),
@@ -144,7 +152,7 @@ impl ServerEngine {
                 while !pending.is_empty() && model.active() < self.capacity {
                     let r = pending.pop_front().expect("checked non-empty");
                     let id = model
-                        .add(&r.prompt, r.max_new, r.eos, r.params)
+                        .add(&r.prompt, r.max_new, r.eos, r.stop_seqs, r.params)
                         .expect("capacity guaranteed");
                     txs.insert(id, r.done);
                     if let Some(stx) = r.tokens_tx {
@@ -165,9 +173,10 @@ impl ServerEngine {
                             let _ = stx.try_send(tok);
                         }
                         let output = model.generated(id);
+                        let reason = model.finish_reason(id);
                         model.ack(id);
                         if let Some(tx) = txs.remove(&id) {
-                            let _ = tx.send(output);
+                            let _ = tx.send((output, reason));
                         }
                         // Closing the stream sender signals end-of-stream.
                         streams.remove(&id);

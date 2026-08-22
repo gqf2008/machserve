@@ -237,6 +237,7 @@ fn main() {
                 &prompt,
                 15,
                 None,
+                Vec::new(),
                 mach_model::sampling::SamplingParams::default(),
             )
             .unwrap();

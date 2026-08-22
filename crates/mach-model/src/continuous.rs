@@ -20,6 +20,14 @@ use std::sync::Arc;
 /// Stable sequence identifier.
 pub type SeqId = u64;
 
+/// True when `generated` ends with any of `seqs` (OpenAI stop sequences).
+#[must_use]
+fn ends_with_stop(generated: &[u32], seqs: &[Vec<u32>]) -> bool {
+    seqs.iter().any(|s| {
+        !s.is_empty() && generated.len() >= s.len() && &generated[generated.len() - s.len()..] == s
+    })
+}
+
 /// Per-sequence state in the engine.
 #[derive(Debug)]
 struct SeqState {
@@ -34,6 +42,9 @@ struct SeqState {
     params: SamplingParams,
     /// EOS token id (None disables early stopping).
     eos: Option<u32>,
+    /// Stop sequences: generation finishes as soon as `generated` ends with
+    /// any of these token sequences (OpenAI `stop`).
+    stop_seqs: Vec<Vec<u32>>,
     /// Number of KV positions consumed (prompt + generated).
     len: usize,
     /// The token to feed next (first generated token after prefill, then each
@@ -48,7 +59,7 @@ pub struct ContinuousModel {
     seqs: Vec<Option<SeqState>>,
     active: usize,
     /// Finished sequences' outputs, keyed by stable id.
-    finished: Vec<(SeqId, Vec<u32>)>,
+    finished: Vec<(SeqId, Vec<u32>, bool)>,
     next_id: SeqId,
 }
 
@@ -85,6 +96,7 @@ impl ContinuousModel {
         prompt: &[u32],
         max_new: usize,
         eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
         mut params: SamplingParams,
     ) -> Result<SeqId, Error> {
         if prompt.is_empty() {
@@ -107,6 +119,7 @@ impl ContinuousModel {
             generated: Vec::new(),
             max_new,
             eos,
+            stop_seqs,
             params,
             len: 0,
             first_decode: None,
@@ -193,7 +206,10 @@ impl ContinuousModel {
                 if s.prompt.is_empty() {
                     s.generated.push(last_out);
                     s.first_decode = Some(last_out);
-                    if s.eos.is_some_and(|e| last_out == e) || s.generated.len() >= s.max_new {
+                    if s.eos.is_some_and(|e| last_out == e)
+                        || ends_with_stop(&s.generated, &s.stop_seqs)
+                        || s.generated.len() >= s.max_new
+                    {
                         done_slots.push(i);
                     }
                     outputs.push((s.id, last_out));
@@ -203,7 +219,10 @@ impl ContinuousModel {
                 s.generated.push(out);
                 s.len += 1;
                 s.first_decode = Some(out);
-                if s.eos.is_some_and(|e| out == e) || s.generated.len() >= s.max_new {
+                if s.eos.is_some_and(|e| out == e)
+                    || ends_with_stop(&s.generated, &s.stop_seqs)
+                    || s.generated.len() >= s.max_new
+                {
                     done_slots.push(i);
                 }
                 outputs.push((s.id, out));
@@ -224,7 +243,7 @@ impl ContinuousModel {
     /// Whether the sequence with `id` has finished (or is unknown).
     #[must_use]
     pub fn is_done(&self, id: SeqId) -> bool {
-        if self.finished.iter().any(|(fid, _)| *fid == id) {
+        if self.finished.iter().any(|(fid, _, _)| *fid == id) {
             return true;
         }
         self.seqs.iter().flatten().find(|s| s.id == id).is_none()
@@ -233,7 +252,7 @@ impl ContinuousModel {
     /// Generated tokens of the sequence with `id` (empty if unknown).
     #[must_use]
     pub fn generated(&self, id: SeqId) -> Vec<u32> {
-        if let Some((_, g)) = self.finished.iter().find(|(fid, _)| *fid == id) {
+        if let Some((_, g, _)) = self.finished.iter().find(|(fid, _, _)| *fid == id) {
             return g.clone();
         }
         self.seqs
@@ -244,18 +263,36 @@ impl ContinuousModel {
             .unwrap_or_default()
     }
 
+    /// OpenAI finish reason for a finished sequence: `"stop"` when the last
+    /// token was the EOS or a stop sequence, `"length"` otherwise. Unknown ids
+    /// (or still-active sequences) report `"length"`.
+    #[must_use]
+    pub fn finish_reason(&self, id: SeqId) -> &'static str {
+        if self
+            .finished
+            .iter()
+            .any(|(fid, _, stopped)| *fid == id && *stopped)
+        {
+            "stop"
+        } else {
+            "length"
+        }
+    }
+
     /// Removes a finished sequence from the finished list (freeing bookkeeping).
     pub fn ack(&mut self, id: SeqId) {
-        self.finished.retain(|(fid, _)| *fid != id);
+        self.finished.retain(|(fid, _, _)| *fid != id);
     }
 
     fn finish(&mut self, slot: usize) {
         assert!(slot < self.active, "finish out of range");
-        let (id, generated) = {
+        let (id, generated, stopped) = {
             let s = self.seqs[slot].as_ref().expect("active slot");
-            (s.id, s.generated.clone())
+            let stopped = s.generated.last().is_some_and(|&t| s.eos == Some(t))
+                || ends_with_stop(&s.generated, &s.stop_seqs);
+            (s.id, s.generated.clone(), stopped)
         };
-        self.finished.push((id, generated));
+        self.finished.push((id, generated, stopped));
         // Compact: move every sequence above `slot` down by one, copying KV.
         for i in (slot + 1)..self.active {
             let from = i;

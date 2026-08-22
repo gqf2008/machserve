@@ -58,8 +58,14 @@ fn run_engine(
     let mut ids = Vec::new();
     for (prompt, max_new, eos) in jobs {
         ids.push(
-            eng.add(prompt, *max_new, *eos, SamplingParams::default())
-                .unwrap(),
+            eng.add(
+                prompt,
+                *max_new,
+                *eos,
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap(),
         );
     }
     while !eng.all_done() {
@@ -95,7 +101,9 @@ fn slots_reuse_after_finish() {
     let w = Weights::random(&cfg, 53).unwrap();
     // A short sequence finishes quickly, freeing its slot for a new one.
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
-    let a = eng.add(&[3], 2, None, SamplingParams::default()).unwrap();
+    let a = eng
+        .add(&[3], 2, None, Vec::new(), SamplingParams::default())
+        .unwrap();
     while !eng.is_done(a) {
         eng.step().unwrap();
     }
@@ -104,7 +112,7 @@ fn slots_reuse_after_finish() {
 
     // Slot is freed: a new sequence can join at the compacted slot.
     let b = eng
-        .add(&[9, 7, 42], 4, None, SamplingParams::default())
+        .add(&[9, 7, 42], 4, None, Vec::new(), SamplingParams::default())
         .unwrap();
     assert_ne!(b, a, "stable ids differ");
     while !eng.all_done() {
@@ -137,7 +145,13 @@ fn eos_stops_generation() {
 
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
     let s = eng
-        .add(&[2, 5], 20, Some(eos_tok), SamplingParams::default())
+        .add(
+            &[2, 5],
+            20,
+            Some(eos_tok),
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     while !eng.is_done(s) {
         eng.step().unwrap();
@@ -162,7 +176,7 @@ fn sampling_is_deterministic_per_seed() {
         let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
         let mut p = base;
         p.seed = seed;
-        let id = eng.add(&[3, 9, 27], 12, None, p).unwrap();
+        let id = eng.add(&[3, 9, 27], 12, None, Vec::new(), p).unwrap();
         while !eng.is_done(id) {
             eng.step().unwrap();
         }
@@ -191,7 +205,13 @@ fn chunked_prefill_matches_single_token() {
 
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
     let id = eng
-        .add(&prompt, max_new, None, SamplingParams::default())
+        .add(
+            &prompt,
+            max_new,
+            None,
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     while !eng.is_done(id) {
         eng.step().unwrap();
@@ -212,7 +232,7 @@ fn chunked_prefill_finishes_with_fewer_steps() {
     let capacity = 16usize;
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
     let id = eng
-        .add(&prompt, 4, None, SamplingParams::default())
+        .add(&prompt, 4, None, Vec::new(), SamplingParams::default())
         .unwrap();
     let mut steps = 0usize;
     while !eng.is_done(id) {
@@ -247,7 +267,13 @@ fn fp16_prefill_attention_matches_single_token() {
 
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
     let id = eng
-        .add(&prompt, max_new, None, SamplingParams::default())
+        .add(
+            &prompt,
+            max_new,
+            None,
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     while !eng.is_done(id) {
         eng.step().unwrap();
@@ -257,4 +283,62 @@ fn fp16_prefill_attention_matches_single_token() {
         want,
         "fp16 prefill attention must match single-token greedy"
     );
+}
+
+#[test]
+fn stop_sequence_terminates_generation() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 61).unwrap();
+    let prompt = vec![5u32, 9, 3];
+
+    // Find the greedy first token T; then stop=[[T]] must finish immediately.
+    let want = gen_ref(&hip, cfg, &w, &prompt, 6);
+    let stop_tok = want[0];
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
+    let id = eng
+        .add(
+            &prompt,
+            6,
+            None,
+            vec![vec![stop_tok]],
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.is_done(id) {
+        eng.step().unwrap();
+    }
+    let g = eng.generated(id);
+    assert_eq!(
+        g,
+        vec![stop_tok],
+        "stop sequence must terminate right after it is generated, got {g:?}"
+    );
+    assert_eq!(eng.finish_reason(id), "stop");
+
+    // A longer stop sequence (first two generated tokens) must also stop.
+    let stop2 = want[..2].to_vec();
+    let mut eng2 = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
+    let id2 = eng2
+        .add(&prompt, 6, None, vec![stop2], SamplingParams::default())
+        .unwrap();
+    while !eng2.is_done(id2) {
+        eng2.step().unwrap();
+    }
+    assert_eq!(
+        eng2.generated(id2),
+        want[..2],
+        "two-token stop sequence must stop at the pair"
+    );
+    assert_eq!(eng2.finish_reason(id2), "stop");
+
+    // A run to max_new without stop/EOS reports "length".
+    let mut eng3 = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
+    let id3 = eng3
+        .add(&prompt, 6, None, Vec::new(), SamplingParams::default())
+        .unwrap();
+    while !eng3.is_done(id3) {
+        eng3.step().unwrap();
+    }
+    assert_eq!(eng3.finish_reason(id3), "length");
 }

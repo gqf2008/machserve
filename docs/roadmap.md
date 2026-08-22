@@ -287,3 +287,11 @@
     TTFT 325ms;长 context(2048)decode **6.99 ms/token**(自 P3j 起 18.78→6.99,
     累计 -63%);
   - 正确性:fp16/continuous/real_model 全绿,clippy/fmt 干净。
+
+- **P3m OpenAI `stop` 序列 + 完成原因(2026-08-23,7900 XTX 真机)**:
+  - `/v1/completions`、`/v1/chat/completions` 支持 OpenAI `stop`(字符串或数组):
+    tokenizer 编码成 token 序列,引擎在生成落到任一 stop 序列时终止(等价 EOS);
+  - **finish_reason 区分** `stop`/`length`(此前恒为 length):引擎记录每序列是否
+    因 EOS/stop 结束,服务器响应与 SSE 末块透传;
+  - 确定性单测:stop=[首个贪心 token] 立即终止、两 token stop 序列精确停止、
+    max_new 结束报 length;默认 + HIP 全绿,clippy/fmt 干净。

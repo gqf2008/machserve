@@ -36,6 +36,14 @@ pub enum Prompt {
     Tokens(Vec<u32>),
 }
 
+/// OpenAI `stop`: a single string or an array of strings.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StopSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
     pub prompt: Prompt,
@@ -56,6 +64,9 @@ pub struct CompletionRequest {
     /// Stream tokens over SSE as they are generated.
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Stop generation when the output ends with any of these strings.
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +90,8 @@ pub struct ChatRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +135,23 @@ fn naive_decode(tokens: &[u32]) -> String {
 /// Naive ASCII fallback: byte -> token id.
 fn naive_encode(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
+}
+
+/// Encodes OpenAI `stop` strings into token sequences.
+fn stop_seqs(tok: &Option<Arc<Tokenizer>>, stop: &Option<StopSpec>) -> Vec<Vec<u32>> {
+    let Some(spec) = stop else {
+        return Vec::new();
+    };
+    let strs: Vec<&String> = match spec {
+        StopSpec::One(s) => vec![s],
+        StopSpec::Many(v) => v.iter().collect(),
+    };
+    strs.into_iter()
+        .map(|s| match tok {
+            Some(t) => t.encode(s),
+            None => naive_encode(s),
+        })
+        .collect()
 }
 
 fn prompt_tokens(tok: &Option<Arc<Tokenizer>>, prompt: &Prompt) -> Vec<u32> {
@@ -224,6 +254,7 @@ async fn stream_tokens(
     id: String,
     object: &'static str,
     created: u64,
+    reason: &'static str,
     mut rx: tokio::sync::mpsc::Receiver<u32>,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
@@ -247,7 +278,7 @@ async fn stream_tokens(
         let ev = sse_chunk(&id, object, &state.model, created, &tail, None);
         let _ = tx.send(Ok(Bytes::from(ev))).await;
     }
-    let ev = sse_chunk(&id, object, &state.model, created, "", Some("stop"));
+    let ev = sse_chunk(&id, object, &state.model, created, "", Some(reason));
     let _ = tx.send(Ok(Bytes::from(ev))).await;
     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
 }
@@ -266,6 +297,7 @@ pub async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> Response {
     let tokens = prompt_tokens(&state.tok, &req.prompt);
+    let stop = stop_seqs(&state.tok, &req.stop);
     let params = sampling_params(req.temperature, req.top_k, req.top_p, req.seed);
     let id = format!("cmpl-{}", now());
     let created = now();
@@ -273,7 +305,7 @@ pub async fn completions(
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
-            .submit_stream(tokens, req.max_tokens, None, params)
+            .submit_stream(tokens, req.max_tokens, None, stop, params)
             .await
         {
             Ok(x) => x,
@@ -283,15 +315,15 @@ pub async fn completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let _ = rx_final.await; // keep the request alive until completion
-            stream_tokens(st, id2, "text_completion", created, rx_tokens, tx).await;
+            let reason = rx_final.await.map(|(_, r)| r).unwrap_or("length");
+            stream_tokens(st, id2, "text_completion", created, reason, rx_tokens, tx).await;
         });
         return sse_response(rx);
     }
 
-    let output = match state
+    let (output, reason) = match state
         .engine
-        .submit(tokens, req.max_tokens, None, params)
+        .submit(tokens, req.max_tokens, None, stop, params)
         .await
     {
         Ok(o) => o,
@@ -306,7 +338,7 @@ pub async fn completions(
             index: 0,
             text: decode_text(&state.tok, &output),
             tokens: output,
-            finish_reason: "length".into(),
+            finish_reason: reason.into(),
         }],
     })
     .into_response()
@@ -327,6 +359,7 @@ pub async fn chat_completions(
         .tok
         .as_ref()
         .and_then(|t| t.special_token_id("<|im_end|>"));
+    let stop = stop_seqs(&state.tok, &req.stop);
     let params = sampling_params(req.temperature, req.top_k, req.top_p, req.seed);
     let id = format!("chatcmpl-{}", now());
     let created = now();
@@ -334,7 +367,7 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
-            .submit_stream(tokens, req.max_tokens, eos, params)
+            .submit_stream(tokens, req.max_tokens, eos, stop, params)
             .await
         {
             Ok(x) => x,
@@ -344,15 +377,24 @@ pub async fn chat_completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let _ = rx_final.await;
-            stream_tokens(st, id2, "chat.completion.chunk", created, rx_tokens, tx).await;
+            let reason = rx_final.await.map(|(_, r)| r).unwrap_or("length");
+            stream_tokens(
+                st,
+                id2,
+                "chat.completion.chunk",
+                created,
+                reason,
+                rx_tokens,
+                tx,
+            )
+            .await;
         });
         return sse_response(rx);
     }
 
-    let output = match state
+    let (output, reason) = match state
         .engine
-        .submit(tokens, req.max_tokens, eos, params)
+        .submit(tokens, req.max_tokens, eos, stop, params)
         .await
     {
         Ok(o) => o,
@@ -367,7 +409,7 @@ pub async fn chat_completions(
             index: 0,
             text: decode_text(&state.tok, &output),
             tokens: output,
-            finish_reason: "length".into(),
+            finish_reason: reason.into(),
         }],
     })
     .into_response()
