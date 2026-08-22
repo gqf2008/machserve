@@ -70,6 +70,9 @@ pub struct CompletionRequest {
     /// Number of independent completions to generate (default 1).
     #[serde(default)]
     pub n: Option<usize>,
+    /// Include per-token log-probabilities in the response.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +100,8 @@ pub struct ChatRequest {
     pub stop: Option<StopSpec>,
     #[serde(default)]
     pub n: Option<usize>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,7 +109,17 @@ pub struct CompletionChoice {
     pub index: usize,
     pub text: String,
     pub tokens: Vec<u32>,
+    /// OpenAI logprobs (present when requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Logprobs>,
     pub finish_reason: String,
+}
+
+/// OpenAI `logprobs` payload (tokens + per-token log-probabilities).
+#[derive(Debug, Serialize)]
+pub struct Logprobs {
+    pub tokens: Vec<String>,
+    pub token_logprobs: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -320,7 +335,7 @@ pub async fn completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let reason = rx_final.await.map(|(_, r)| r).unwrap_or("length");
+            let reason = rx_final.await.map(|(_, _, r)| r).unwrap_or("length");
             stream_tokens(st, id2, "text_completion", created, reason, rx_tokens, tx).await;
         });
         return sse_response(rx);
@@ -337,7 +352,7 @@ pub async fn completions(
             req.seed
         };
         let params = sampling_params(req.temperature, req.top_k, req.top_p, seed);
-        let (output, reason) = match state
+        let (output, lps, reason) = match state
             .engine
             .submit(tokens.clone(), req.max_tokens, None, stop.clone(), params)
             .await
@@ -345,10 +360,22 @@ pub async fn completions(
             Ok(o) => o,
             Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
+        let logprobs = if req.logprobs.unwrap_or(false) {
+            Some(Logprobs {
+                tokens: output
+                    .iter()
+                    .map(|&t| decode_text(&state.tok, &[t]))
+                    .collect(),
+                token_logprobs: lps.clone(),
+            })
+        } else {
+            None
+        };
         choices.push(CompletionChoice {
             index: i,
             text: decode_text(&state.tok, &output),
             tokens: output,
+            logprobs,
             finish_reason: reason.into(),
         });
     }
@@ -395,7 +422,7 @@ pub async fn chat_completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let reason = rx_final.await.map(|(_, r)| r).unwrap_or("length");
+            let reason = rx_final.await.map(|(_, _, r)| r).unwrap_or("length");
             stream_tokens(
                 st,
                 id2,
@@ -419,7 +446,7 @@ pub async fn chat_completions(
             req.seed
         };
         let params = sampling_params(req.temperature, req.top_k, req.top_p, seed);
-        let (output, reason) = match state
+        let (output, lps, reason) = match state
             .engine
             .submit(tokens.clone(), req.max_tokens, eos, stop.clone(), params)
             .await
@@ -427,10 +454,22 @@ pub async fn chat_completions(
             Ok(o) => o,
             Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
+        let logprobs = if req.logprobs.unwrap_or(false) {
+            Some(Logprobs {
+                tokens: output
+                    .iter()
+                    .map(|&t| decode_text(&state.tok, &[t]))
+                    .collect(),
+                token_logprobs: lps.clone(),
+            })
+        } else {
+            None
+        };
         choices.push(CompletionChoice {
             index: i,
             text: decode_text(&state.tok, &output),
             tokens: output,
+            logprobs,
             finish_reason: reason.into(),
         });
     }

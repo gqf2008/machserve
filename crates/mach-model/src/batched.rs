@@ -734,7 +734,7 @@ impl BatchedModel {
         lens: &[u32],
         slots: &[u32],
         params: &mut [SamplingParams],
-    ) -> Result<Vec<u32>, Error> {
+    ) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");

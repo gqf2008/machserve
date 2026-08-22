@@ -45,6 +45,8 @@ struct SeqState {
     /// Stop sequences: generation finishes as soon as `generated` ends with
     /// any of these token sequences (OpenAI `stop`).
     stop_seqs: Vec<Vec<u32>>,
+    /// Per-token log-probabilities of `generated` (OpenAI `logprobs`).
+    logprobs: Vec<f32>,
     /// Number of KV positions consumed (prompt + generated).
     len: usize,
     /// The token to feed next (first generated token after prefill, then each
@@ -59,7 +61,7 @@ pub struct ContinuousModel {
     seqs: Vec<Option<SeqState>>,
     active: usize,
     /// Finished sequences' outputs, keyed by stable id.
-    finished: Vec<(SeqId, Vec<u32>, bool)>,
+    finished: Vec<(SeqId, Vec<u32>, Vec<f32>, bool)>,
     next_id: SeqId,
 }
 
@@ -120,6 +122,7 @@ impl ContinuousModel {
             max_new,
             eos,
             stop_seqs,
+            logprobs: Vec::new(),
             params,
             len: 0,
             first_decode: None,
@@ -177,9 +180,9 @@ impl ContinuousModel {
             }
         }
 
-        let sampled = self
-            .model
-            .decode_step_explicit(&tokens, &lens, &slots, &mut params)?;
+        let (sampled, logprobs) =
+            self.model
+                .decode_step_explicit(&tokens, &lens, &slots, &mut params)?;
         // The sampler advanced each row's seed one RNG step (rows of one
         // sequence start from the same seed); the last row's value is the
         // sequence's authoritative next seed.
@@ -205,6 +208,7 @@ impl ContinuousModel {
                 s.len += count;
                 if s.prompt.is_empty() {
                     s.generated.push(last_out);
+                    s.logprobs.push(logprobs[start + count - 1]);
                     s.first_decode = Some(last_out);
                     if s.eos.is_some_and(|e| last_out == e)
                         || ends_with_stop(&s.generated, &s.stop_seqs)
@@ -217,6 +221,7 @@ impl ContinuousModel {
             } else {
                 let out = sampled[start];
                 s.generated.push(out);
+                s.logprobs.push(logprobs[start]);
                 s.len += 1;
                 s.first_decode = Some(out);
                 if s.eos.is_some_and(|e| out == e)
@@ -243,7 +248,7 @@ impl ContinuousModel {
     /// Whether the sequence with `id` has finished (or is unknown).
     #[must_use]
     pub fn is_done(&self, id: SeqId) -> bool {
-        if self.finished.iter().any(|(fid, _, _)| *fid == id) {
+        if self.finished.iter().any(|(fid, _, _, _)| *fid == id) {
             return true;
         }
         self.seqs.iter().flatten().find(|s| s.id == id).is_none()
@@ -252,7 +257,7 @@ impl ContinuousModel {
     /// Generated tokens of the sequence with `id` (empty if unknown).
     #[must_use]
     pub fn generated(&self, id: SeqId) -> Vec<u32> {
-        if let Some((_, g, _)) = self.finished.iter().find(|(fid, _, _)| *fid == id) {
+        if let Some((_, g, _, _)) = self.finished.iter().find(|(fid, _, _, _)| *fid == id) {
             return g.clone();
         }
         self.seqs
@@ -260,6 +265,21 @@ impl ContinuousModel {
             .flatten()
             .find(|s| s.id == id)
             .map(|s| s.generated.clone())
+            .unwrap_or_default()
+    }
+
+    /// Per-token log-probabilities of the generated output (OpenAI
+    /// `logprobs`), empty when unknown.
+    #[must_use]
+    pub fn generated_logprobs(&self, id: SeqId) -> Vec<f32> {
+        if let Some((_, _, lp, _)) = self.finished.iter().find(|(fid, _, _, _)| *fid == id) {
+            return lp.clone();
+        }
+        self.seqs
+            .iter()
+            .flatten()
+            .find(|s| s.id == id)
+            .map(|s| s.logprobs.clone())
             .unwrap_or_default()
     }
 
@@ -271,7 +291,7 @@ impl ContinuousModel {
         if self
             .finished
             .iter()
-            .any(|(fid, _, stopped)| *fid == id && *stopped)
+            .any(|(fid, _, _, stopped)| *fid == id && *stopped)
         {
             "stop"
         } else {
@@ -281,18 +301,18 @@ impl ContinuousModel {
 
     /// Removes a finished sequence from the finished list (freeing bookkeeping).
     pub fn ack(&mut self, id: SeqId) {
-        self.finished.retain(|(fid, _, _)| *fid != id);
+        self.finished.retain(|(fid, _, _, _)| *fid != id);
     }
 
     fn finish(&mut self, slot: usize) {
         assert!(slot < self.active, "finish out of range");
-        let (id, generated, stopped) = {
+        let (id, generated, logprobs, stopped) = {
             let s = self.seqs[slot].as_ref().expect("active slot");
             let stopped = s.generated.last().is_some_and(|&t| s.eos == Some(t))
                 || ends_with_stop(&s.generated, &s.stop_seqs);
-            (s.id, s.generated.clone(), stopped)
+            (s.id, s.generated.clone(), s.logprobs.clone(), stopped)
         };
-        self.finished.push((id, generated, stopped));
+        self.finished.push((id, generated, logprobs, stopped));
         // Compact: move every sequence above `slot` down by one, copying KV.
         for i in (slot + 1)..self.active {
             let from = i;

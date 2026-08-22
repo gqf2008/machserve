@@ -301,3 +301,12 @@
     用不同 seed 提交独立序列(引擎连续批处理并发跑),响应返回 n 个 choice;
     n=1 行为不变(透传调用方 seed);
   - 服务器测试:n=2 返回 2 个独立 sample 且不同;默认 + HIP 全绿,clippy/fmt 干净。
+
+- **P3o OpenAI `logprobs`(2026-08-23,7900 XTX 真机)**:
+  - 采样 kernel 在选中 token 时同步输出其 **log 概率**(`(logit-max)*inv_t - log(total)`),
+    贪心为 0;`sample_batched` 返回 (tokens, logprobs);引擎按序列累计
+    `generated_logprobs(id)`;
+  - `/v1/completions`、`/v1/chat/completions` 支持 `logprobs: true`,响应
+    `choices[].logprobs` 返回 `tokens` + `token_logprobs`;
+  - 测试:采样层(贪心=0、采样有限且<=0)+ 服务器(返回字段);默认 + HIP 全绿,
+    clippy/fmt 干净。

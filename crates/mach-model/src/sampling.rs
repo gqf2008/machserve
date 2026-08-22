@@ -107,6 +107,7 @@ extern "C" __global__ void sample_batched(
     const float* __restrict__ top_p,
     ull* __restrict__ seed,
     int* __restrict__ out_tok,
+    float* __restrict__ logprobs,
     int vocab, int batch)
 {
     const int s = blockIdx.x;
@@ -162,7 +163,10 @@ extern "C" __global__ void sample_batched(
             }
             __syncthreads();
         }
-        if (tid == 0) out_tok[s] = s_idx[0];
+        if (tid == 0) {
+            out_tok[s] = s_idx[0];
+            logprobs[s] = 0.0f; // greedy: probability 1 -> log 0
+        }
         return;
     }
 
@@ -311,7 +315,11 @@ extern "C" __global__ void sample_batched(
             if (use_topp && !(pr >= cut)) ok = false;
             if (ok) {
                 acc += pr;
-                if (acc > target) { out_tok[s] = i; break; }
+                if (acc > target) {
+                    out_tok[s] = i;
+                    logprobs[s] = (row[i] - maxv) * inv_t - logf(tot);
+                    break;
+                }
             }
         }
     }
@@ -334,6 +342,7 @@ extern "C" __global__ void sample_batched(
             found = idx;
         }
         out_tok[s] = found;
+        logprobs[s] = (row[found] - maxv) * inv_t - logf(tot);
     }
 }
 "#;
@@ -348,11 +357,13 @@ pub struct BatchedSampler {
     topp_dev: *mut f32,
     seed_dev: *mut u64,
     out_dev: *mut i32,
+    logprobs_dev: *mut f32,
     temp_host: *mut f32,
     topk_host: *mut i32,
     topp_host: *mut f32,
     seed_host: *mut u64,
     out_host: *mut i32,
+    logprobs_host: *mut f32,
     capacity: usize,
     allocs: Vec<*mut core::ffi::c_void>,
     pins: Vec<*mut core::ffi::c_void>,
@@ -385,11 +396,13 @@ impl BatchedSampler {
         let topp_dev = dalloc(capacity * 4)? as *mut f32;
         let seed_dev = dalloc(capacity * 8)? as *mut u64;
         let out_dev = dalloc(capacity * 4)? as *mut i32;
+        let logprobs_dev = dalloc(capacity * 4)? as *mut f32;
         let temp_host = pall(capacity * 4)? as *mut f32;
         let topk_host = pall(capacity * 4)? as *mut i32;
         let topp_host = pall(capacity * 4)? as *mut f32;
         let seed_host = pall(capacity * 8)? as *mut u64;
         let out_host = pall(capacity * 4)? as *mut i32;
+        let logprobs_host = pall(capacity * 4)? as *mut f32;
         Ok(Self {
             hip,
             stream,
@@ -399,11 +412,13 @@ impl BatchedSampler {
             topp_dev,
             seed_dev,
             out_dev,
+            logprobs_dev,
             temp_host,
             topk_host,
             topp_host,
             seed_host,
             out_host,
+            logprobs_host,
             capacity,
             allocs,
             pins,
@@ -419,7 +434,7 @@ impl BatchedSampler {
         logits: *const f32,
         params: &mut [SamplingParams],
         vocab: usize,
-    ) -> Result<Vec<u32>, Error> {
+    ) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let n = params.len();
         assert!(n <= self.capacity, "sampler capacity exceeded");
         #[allow(clippy::needless_range_loop)] // raw pinned-host writes by slot
@@ -470,6 +485,7 @@ impl BatchedSampler {
         let pp = self.topp_dev;
         let sp = self.seed_dev;
         let op = self.out_dev;
+        let lgp = self.logprobs_dev;
         let vocab_i = vocab as i32;
         let n_i = n as i32;
         let mut args: Vec<*mut core::ffi::c_void> = vec![
@@ -479,6 +495,7 @@ impl BatchedSampler {
             &pp as *const *mut f32 as *mut core::ffi::c_void,
             &sp as *const *mut u64 as *mut core::ffi::c_void,
             &op as *const *mut i32 as *mut core::ffi::c_void,
+            &lgp as *const *mut f32 as *mut core::ffi::c_void,
             &vocab_i as *const i32 as *mut core::ffi::c_void,
             &n_i as *const i32 as *mut core::ffi::c_void,
         ];
@@ -497,6 +514,13 @@ impl BatchedSampler {
                 n * 4,
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
             )?;
+            hip::memcpy(
+                &self.hip,
+                self.logprobs_host as *mut core::ffi::c_void,
+                self.logprobs_dev as *const core::ffi::c_void,
+                n * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
         }
         // Advance the authoritative host-side seeds one step (kernel does the
         // same on its device copy, which is re-uploaded next call anyway).
@@ -504,12 +528,14 @@ impl BatchedSampler {
             p.seed = advance_seed(p.seed);
         }
         let mut out = Vec::with_capacity(n);
+        let mut lps = Vec::with_capacity(n);
         unsafe {
             for i in 0..n {
                 out.push(*self.out_host.add(i) as u32);
+                lps.push(*self.logprobs_host.add(i));
             }
         }
-        Ok(out)
+        Ok((out, lps))
     }
 }
 
@@ -942,7 +968,7 @@ mod tests {
         let stream = make_stream(h);
         let dlogits = upload_logits(h, logits);
         let s = BatchedSampler::new(Arc::clone(h), stream, params.len()).unwrap();
-        let got = s.sample_batched(dlogits, params, vocab).unwrap();
+        let (got, _) = s.sample_batched(dlogits, params, vocab).unwrap();
         hip::free(h, dlogits as *mut _).unwrap();
         unsafe { hip::check(h, (h.api.hip_stream_destroy)(stream)).unwrap() };
         got
@@ -1049,5 +1075,56 @@ mod tests {
             "expected a varied distribution, got {} distinct tokens",
             seen.len()
         );
+    }
+    #[test]
+    fn sample_returns_logprobs() {
+        let Some(h) = have_gpu() else { return };
+        let vocab = 4096usize;
+        let logits = lcg_logits(vocab * 4, 17);
+        let n = 4usize;
+        // Greedy -> logprob 0 (probability 1).
+        let mut gp: Vec<SamplingParams> = (0..n)
+            .map(|i| SamplingParams::greedy(10 + i as u64))
+            .collect();
+        let (toks, lps) = {
+            let stream = make_stream(&h);
+            let d = upload_logits(&h, &logits);
+            let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
+            let r = s.sample_batched(d, &mut gp, vocab).unwrap();
+            hip::free(&h, d as *mut _).unwrap();
+            unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+            r
+        };
+        assert_eq!(toks.len(), n);
+        assert_eq!(lps.len(), n);
+        assert!(
+            lps.iter().all(|&v| v == 0.0),
+            "greedy logprobs must be 0, got {lps:?}"
+        );
+
+        // Sampling -> logprob must be finite, <= 0 (log of a probability).
+        let mut sp: Vec<SamplingParams> = (0..n)
+            .map(|i| SamplingParams {
+                temperature: 0.9,
+                top_k: 0,
+                top_p: 0.95,
+                seed: 500 + i as u64,
+            })
+            .collect();
+        let (_, lps2) = {
+            let stream = make_stream(&h);
+            let d = upload_logits(&h, &logits);
+            let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
+            let r = s.sample_batched(d, &mut sp, vocab).unwrap();
+            hip::free(&h, d as *mut _).unwrap();
+            unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+            r
+        };
+        for &v in &lps2 {
+            assert!(
+                v.is_finite() && v <= 0.0,
+                "sampled logprob must be <= 0, got {v}"
+            );
+        }
     }
 }

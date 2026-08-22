@@ -459,3 +459,49 @@ async fn n_returns_multiple_distinct_choices() {
         "n>1 choices must use distinct seeds -> distinct samples"
     );
 }
+
+#[tokio::test]
+async fn logprobs_are_returned_when_requested() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 91).unwrap();
+    let prompt = vec![5u32, 9, 3];
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": 4,
+        "temperature": 0,
+        "logprobs": true,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let lp = &json["choices"][0]["logprobs"];
+    let tokens = lp["tokens"].as_array().expect("logprobs tokens");
+    let tlog = lp["token_logprobs"].as_array().expect("token_logprobs");
+    assert_eq!(tokens.len(), 4);
+    assert_eq!(tlog.len(), 4);
+    // Greedy -> each token logprob is 0.
+    assert!(tlog.iter().all(|v| v.as_f64().unwrap() == 0.0));
+}

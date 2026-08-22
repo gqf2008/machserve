@@ -18,13 +18,13 @@ struct Request {
     eos: Option<u32>,
     stop_seqs: Vec<Vec<u32>>,
     params: SamplingParams,
-    done: oneshot::Sender<(Vec<u32>, &'static str)>,
+    done: oneshot::Sender<(Vec<u32>, Vec<f32>, &'static str)>,
     /// Streaming: per-token channel (None for non-streaming requests).
     tokens_tx: Option<tokio::sync::mpsc::Sender<u32>>,
 }
 
 /// Completion delivery: generated tokens plus the OpenAI finish reason.
-type DoneSender = oneshot::Sender<(Vec<u32>, &'static str)>;
+type DoneSender = oneshot::Sender<(Vec<u32>, Vec<f32>, &'static str)>;
 
 /// Shared engine handle (channel side only; the model stays on the engine
 /// thread).
@@ -69,7 +69,7 @@ impl ServerEngine {
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
         params: SamplingParams,
-    ) -> Result<(Vec<u32>, &'static str), EngineError> {
+    ) -> Result<(Vec<u32>, Vec<f32>, &'static str), EngineError> {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
@@ -102,7 +102,7 @@ impl ServerEngine {
         params: SamplingParams,
     ) -> Result<
         (
-            oneshot::Receiver<(Vec<u32>, &'static str)>,
+            oneshot::Receiver<(Vec<u32>, Vec<f32>, &'static str)>,
             tokio::sync::mpsc::Receiver<u32>,
         ),
         EngineError,
@@ -173,10 +173,11 @@ impl ServerEngine {
                             let _ = stx.try_send(tok);
                         }
                         let output = model.generated(id);
+                        let lps = model.generated_logprobs(id);
                         let reason = model.finish_reason(id);
                         model.ack(id);
                         if let Some(tx) = txs.remove(&id) {
-                            let _ = tx.send((output, reason));
+                            let _ = tx.send((output, lps, reason));
                         }
                         // Closing the stream sender signals end-of-stream.
                         streams.remove(&id);
