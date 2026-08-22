@@ -200,11 +200,14 @@ impl BatchedModel {
         self.up = self.dalloc(b * inter * 4)?;
         self.h = self.dalloc(b * inter * 4)?;
         self.logits = self.dalloc(b * c.vocab_size * 4)?;
-        // fp16 GEMM scratch (only used in F16 mode): A operand + hidden output.
+        // fp16 GEMM scratch (only used in F16 mode): A operand + fp16 output
+        // (yh must cover the lm_head output = batch * vocab for the c16 logits
+        // path, which is then cast back to fp32 for the sampler).
         let max_n = c
             .d_model
             .max(c.intermediate_size)
-            .max(c.n_heads * c.head_dim);
+            .max(c.n_heads * c.head_dim)
+            .max(c.vocab_size);
         let xh_bytes = b * c.d_model.max(c.intermediate_size) * 2;
         let xh = hip::malloc(self.k.hip(), xh_bytes)?;
         self.xh = xh as *mut u16;
@@ -503,7 +506,7 @@ impl BatchedModel {
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
         if f16 {
-            k.gemm_batched_f16_logits(
+            k.gemm_batched_f16(
                 self.logits,
                 self.xn,
                 self.lm_head_f16,
@@ -511,6 +514,7 @@ impl BatchedModel {
                 c.vocab_size as i32,
                 d,
                 self.xh,
+                self.yh,
             )?;
         } else {
             k.gemm_batched(

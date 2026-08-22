@@ -172,11 +172,13 @@ impl GpuModel {
         self.up = self.dalloc(inter * 4)?;
         self.h = self.dalloc(inter * 4)?;
         self.logits = self.dalloc(c.vocab_size * 4)?;
-        // fp16 GEMM scratch (only used in F16 mode): A operand + hidden output.
+        // fp16 GEMM scratch (only used in F16 mode): A operand + fp16 output
+        // (yh must cover the lm_head output = vocab for the c16 logits path).
         let max_n = c
             .d_model
             .max(c.intermediate_size)
-            .max(c.n_heads * c.head_dim);
+            .max(c.n_heads * c.head_dim)
+            .max(c.vocab_size);
         let xh_bytes = c.d_model.max(c.intermediate_size) * 2;
         let xh = hip::malloc(self.k.hip(), xh_bytes)?;
         self.xh = xh as *mut u16;
@@ -450,13 +452,14 @@ impl GpuModel {
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, 1, d, c.rms_eps)?;
         if f16 {
-            k.gemm_f16_logits(
+            k.gemm_f16(
                 self.logits,
                 self.xn,
                 self.lm_head_f16,
                 c.vocab_size as i32,
                 d,
                 self.xh,
+                self.yh,
             )?;
         } else {
             k.gemm(

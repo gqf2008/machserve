@@ -196,3 +196,14 @@
   - **真机端到端(Qwen2.5-0.5B + fp16 + 真实 tokenizer)**:SSE 流式返回中文/多语言
     delta 正常拼接,`finish_reason` + `[DONE]` 收尾;非流式文本解码正确;
   - 测试:默认 + HIP 全绿(新增 tokenizer 2、server 2),clippy 0 告警,fmt 干净。
+
+- **P3d lm_head c16 + cast 完成(2026-08-22,7900 XTX 真机)**:
+  - lm_head 改用 fp16 输出(c16)+ cast 回 fp32(采样仍需 fp32 logits):rocBLAS 在
+    m=151936 瘦长形状 c16 比 c32 快 **3.35x**(0.43 vs 1.43ms);直接复用隐藏层
+    `gemm_batched_f16` 路径,`_logits` 变体删除,`yh` 缓冲扩到 batch×vocab;
+  - **性能(Qwen2.5-0.5B fp16)**:B=64 每步 5.78 → **4.97ms**,每序列 0.078ms =
+    **12885 tok/s**,较上一轮 +16%,是 llama.cpp Vulkan(643 tok/s)的 **20x**;
+  - **自研 GEMM 调研(暂缓)**:共享内存分块 fp16 GEMM(向量化 float4 加载)在关键
+    形状上仍比 rocBLAS 慢 2-3x(标量 fp16→fp32 累加无法打包成 RDNA3 的 packed FMA,
+    需 `v_dot2_f32_f16` 类内建指令);rocBLAS solution-index 调优 API 在 ROCm 6.2
+    Windows 未导出;已记录,留待后续内核专项。

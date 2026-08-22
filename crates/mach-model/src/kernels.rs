@@ -992,43 +992,6 @@ impl HipKernels {
         self.launch_cast_f16_f32(yh, out, n as usize)
     }
 
-    /// fp16 GEMM for m = 1 with fp32 output (lm_head: keeps fp32 logits for
-    /// the sampler). `xh` is fp16 scratch of `k` elements.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_f16_logits(
-        &self,
-        out: *mut f32,
-        x: *const f32,
-        w16: *const u16,
-        n: i32,
-        k: i32,
-        xh: *mut u16,
-    ) -> Result<(), Error> {
-        use mach_kernel_sys::hipblas::{
-            HIPBLAS_COMPUTE_32F, HIPBLAS_OP_N, HIPBLAS_R_16F, HIPBLAS_R_32F,
-        };
-        self.launch_cast_f32_f16(x, xh, k as usize)?;
-        self.blas
-            .gemm_ex(
-                HIPBLAS_OP_N,
-                HIPBLAS_OP_N,
-                1,
-                n,
-                k,
-                HIPBLAS_R_16F,
-                xh as *const core::ffi::c_void,
-                1,
-                HIPBLAS_R_16F,
-                w16 as *const core::ffi::c_void,
-                k,
-                HIPBLAS_R_32F,
-                out as *mut core::ffi::c_void,
-                1,
-                HIPBLAS_COMPUTE_32F,
-            )
-            .map_err(|e| Error::Model(format!("hipblas gemm_ex m=1 n={n} k={k}: {e}")))
-    }
-
     /// Batched fp16 GEMM: `out[B, n] = x[B, k] @ w16^T`. Hidden layers output
     /// fp16 (`yh` scratch) then cast to f32 (rocBLAS fp16 C is much faster for
     /// the tall-skinny MLP shapes). `w16` is row-major `[n, k]`; `xh`/`yh` are
