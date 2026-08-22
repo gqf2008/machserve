@@ -12,9 +12,13 @@ default = []
 # Marks the CUDA paths as active. P0 keeps them as documented placeholders;
 # P1 wires cudarc (requires a local CUDA toolkit) behind this flag.
 cuda = []
+# ROCm/HIP backend: memory pool, streams and graph capture on AMD GPUs.
+hip = ["dep:mach-kernel-sys", "mach-kernel-sys/hip"]
 
 [dependencies]
+mach-kernel-sys = { workspace = true, optional = true }
 thiserror = "2"
 
 [lints]
 workspace = true
+

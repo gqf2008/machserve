@@ -77,6 +77,7 @@ impl MemoryPool for CpuMemoryPool {
                 pool_id: self.pool_id,
                 offset: aligned,
                 bytes,
+                ptr: 0,
             });
         }
 
@@ -93,6 +94,7 @@ impl MemoryPool for CpuMemoryPool {
             pool_id: self.pool_id,
             offset: aligned,
             bytes,
+            ptr: 0,
         })
     }
 
@@ -189,6 +191,7 @@ mod tests {
             pool_id: 999,
             offset: 0,
             bytes: 8,
+            ptr: 0,
         };
         assert!(pool.free(bad).is_err());
     }

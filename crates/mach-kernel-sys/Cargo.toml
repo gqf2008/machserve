@@ -14,6 +14,12 @@ default = []
 flashinfer = []
 # Compile the cutlass FFI declarations (requires thirdparty/cutlass built).
 cutlass = []
+# HIP runtime FFI (ROCm). Loads amdhip64_6.dll / hiprtc0602.dll dynamically.
+hip = ["dep:libloading"]
+
+[dependencies]
+libloading = { version = "0.8", optional = true }
+thiserror = "2"
 
 [lints]
 workspace = true

@@ -15,10 +15,12 @@ use core::fmt;
 pub struct Allocation {
     /// Unique id of the owning pool (or allocator).
     pub pool_id: u64,
-    /// Byte offset within the pool's backing store.
+    /// Byte offset within the pool's backing store (CPU pools) or 0.
     pub offset: usize,
     /// Requested byte size.
     pub bytes: usize,
+    /// Backend device address (HIP/CUDA) or 0 for CPU pools.
+    pub ptr: usize,
 }
 
 impl fmt::Display for Allocation {

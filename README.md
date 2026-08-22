@@ -13,7 +13,7 @@ host 侧(调度/采样/内存/图捕获)用 Rust 做到零 Python 开销,GPU 侧
 - **内核边界唯一化**:`mach-kernel` 是运行时唯一内核入口,`mach-kernel-sys` 是唯一 FFI 入口;
   第三方内核代码只存在于 `thirdparty/`,通过 `ops/<family>/<solution>` 引入并注册。
 - **不依赖 libtorch / tch-rs / burn 运行时**;burn 仅作为设计参考。
-- 目标硬件:NVIDIA(CUDA)优先,AMD(ROCm / gluon)次之,CPU 仅作参考/开发后端。
+- 目标硬件:**AMD(ROCm / HIP)优先**(当前:7900 XTX / gfx1100),CPU 作参考/开发后端。
 
 ## 架构
 
@@ -31,8 +31,9 @@ thirdparty/      flashinfer / cutlass / trtllm / gluon / candle-kernels(全部 p
 
 ## 当前状态
 
-- **P0(进行中)**:工作区骨架、mach-engine 核心抽象(CPU 可测)、mach-kernel 边界、
-  mach-kernel-sys FFI 骨架、mach-bench 基准骨架。
+- **P0 + P0.5(已完成)**:工作区骨架、mach-engine 核心抽象(CPU 可测)、mach-kernel 边界、
+  mach-kernel-sys **HIP FFI + hiprtc kernel 运行时**、mach-bench 基准;
+  7900 XTX 上 HIP kernel 编译/启动与 **HIP graph 捕获/重放**已实测通过。
 - 详细路线图见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 构建
@@ -54,3 +55,4 @@ cargo build -p mach-engine --features cuda
 ## License
 
 MIT OR Apache-2.0
+

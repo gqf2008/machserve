@@ -34,3 +34,23 @@
 
 - 契约测试:参考实现输出固化为 golden 文件,每阶段全量跑。
 - 数值:FP8 场景有界误差,用 tolerance 断言。
+
+## 平台调整(2026-08-22,已确认)
+
+- **目标 GPU = AMD Radeon RX 7900 XTX(gfx1100,24G,Windows 原生 ROCm 6.2)**。
+- 路线改为 **AMD/HIP 优先**:`mach-kernel-sys` 提供 HIP FFI(动态加载 amdhip64_6.dll + hiprtc0602.dll),
+  `mach-engine` 提供 `HipMemoryPool` / `HipGraphCapture`(HIP graph 捕获 = AMD 版 CUDA Graph)。
+- tokenspeed-kernel-amd 目前只有 gfx950/gfx1250;7900 XTX 的 kernel 走自有 HIP/hiprtc 路径,
+  后续可参考 Gluon(gfx1100 支持)补充。
+- P1 验收改为:小模型 decode 链路在 7900 XTX 上跑通,TPOT 对标 TokenSpeed(同 kernel 场景)。
+
+## 进度日志
+
+- **P0 完成(2026-08-22)**:workspace 骨架、mach-engine 核心抽象、mach-kernel 内核边界、
+  mach-kernel-sys FFI 骨架、mach-bench 基准(host 派发 ~86-90 ns/op)。
+- **P0.5 AMD/HIP 地基完成(2026-08-22,真机验证)**:
+  - HIP 运行时 FFI(纯 Rust 动态加载,无链接期依赖);
+  - hiprtc 运行时编译 HIP kernel + hipModule 加载/启动;
+  - `HipMemoryPool`(malloc/free/pin)与 `HipGraphCapture`(严格生命周期 + 捕获/重放);
+  - 7900 XTX 实测:`hiprtc_saxpy_runs_on_gpu` / `hip_graph_capture_records_and_replays`
+    等 4 个 GPU 测试全部通过。

@@ -15,5 +15,8 @@
 
 pub mod ffi;
 
+#[cfg(feature = "hip")]
+pub mod hip;
+
 /// Version of the FFI contract (bump on breaking ABI changes).
 pub const FFI_VERSION: u32 = 1;

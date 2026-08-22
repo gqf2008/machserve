@@ -59,6 +59,7 @@ fn main() {
         pool_id: 0,
         offset: 0,
         bytes: 4096,
+        ptr: 0,
     };
     bench_ns("buffer metadata construction", n, || {
         std::hint::black_box(Buffer::new(

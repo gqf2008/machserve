@@ -21,6 +21,9 @@ pub mod stream;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "hip")]
+pub mod hip;
+
 pub use device::Device;
 pub use dtype::DType;
 pub use graph::{CaptureState, GraphCapture, GraphError, GraphHandle, SoftwareGraphCapture};
@@ -37,6 +40,10 @@ pub enum Error {
     BackendUnavailable(String),
     #[error("graph error: {0}")]
     Graph(#[from] graph::GraphError),
+
+    #[cfg(feature = "hip")]
+    #[error("hip error: {0}")]
+    Hip(#[from] mach_kernel_sys::hip::HipError),
     #[error("memory error: {0}")]
     Memory(String),
 }
