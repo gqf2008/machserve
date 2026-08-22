@@ -50,9 +50,11 @@ impl RefModel {
 
         for (li, lw) in self.w.layers.iter().enumerate() {
             let xn = rms_norm(&x, &lw.rms_attn, cfg.rms_eps);
-            let q = matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
-            let k = matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
+            let mut q = matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
+            let mut k = matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
             let v = matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
+            apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
+            apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
 
             // Store into KV cache.
             store_row(&mut self.kv[li].0, &k, pos, cfg);
@@ -65,11 +67,12 @@ impl RefModel {
                 x[i] += attn_proj[i];
             }
 
+            let inter = cfg.intermediate_size;
             let xn2 = rms_norm(&x, &lw.rms_mlp, cfg.rms_eps);
-            let gate = matvec_t(&xn2, &lw.wg, d);
-            let up = matvec_t(&xn2, &lw.wu, d);
-            let mut h = vec![0.0; d];
-            for i in 0..d {
+            let gate = matvec_t(&xn2, &lw.wg, inter);
+            let up = matvec_t(&xn2, &lw.wu, inter);
+            let mut h = vec![0.0; inter];
+            for i in 0..inter {
                 h[i] = gate[i] * silu(up[i]);
             }
             let down = matvec_t(&h, &lw.wd, d);
@@ -81,6 +84,23 @@ impl RefModel {
         let xf = rms_norm(&x, &self.w.rms_final, cfg.rms_eps);
         self.pos += 1;
         matvec_t(&xf, &self.w.lm_head, cfg.vocab_size)
+    }
+}
+
+fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
+    let half = head_dim / 2;
+    for h in 0..n_heads {
+        for d in 0..half {
+            let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+            let ang = pos as f32 * freq;
+            let c = ang.cos();
+            let sn = ang.sin();
+            let idx = h * head_dim + 2 * d;
+            let a = x[idx];
+            let b = x[idx + 1];
+            x[idx] = a * c - b * sn;
+            x[idx + 1] = a * sn + b * c;
+        }
     }
 }
 

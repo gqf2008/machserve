@@ -70,6 +70,44 @@ extern "C" __global__ void kv_store(const float* kv, float* cache, const int* po
 }
 "#;
 
+/// Rotary position embeddings applied in place to q and k.
+const ROPE: &str = r#"
+extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
+                                int n_heads, int n_kv_heads, int head_dim, float theta) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int pos = *pos_buf;
+    int half = head_dim / 2;
+    int total_q = n_heads * head_dim;
+    int total_k = n_kv_heads * head_dim;
+    if (i < total_q) {
+        int h = i / head_dim;
+        int d = i % head_dim;
+        if (d < half) {
+            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float ang = (float)pos * freq;
+            float c = cosf(ang), sn = sinf(ang);
+            float* p = q + h * head_dim + 2 * d;
+            float a = p[0], b = p[1];
+            p[0] = a * c - b * sn;
+            p[1] = a * sn + b * c;
+        }
+    }
+    if (i < total_k) {
+        int h = i / head_dim;
+        int d = i % head_dim;
+        if (d < half) {
+            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float ang = (float)pos * freq;
+            float c = cosf(ang), sn = sinf(ang);
+            float* p = k + h * head_dim + 2 * d;
+            float a = p[0], b = p[1];
+            p[0] = a * c - b * sn;
+            p[1] = a * sn + b * c;
+        }
+    }
+}
+"#;
+
 /// Decode attention (GQA) over positions `0..=*pos`, two-pass softmax.
 const ATTN_DECODE: &str = r#"
 extern "C" __global__ void attn_decode(
@@ -142,6 +180,7 @@ pub struct HipKernels {
     add: HipKernelModule,
     kv_store: HipKernelModule,
     attn_decode: HipKernelModule,
+    rope: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -169,6 +208,7 @@ impl HipKernels {
             add: HipKernelModule::compile(&arch, ADD, "add")?,
             kv_store: HipKernelModule::compile(&arch, KV_STORE, "kv_store")?,
             attn_decode: HipKernelModule::compile(&arch, ATTN_DECODE, "attn_decode")?,
+            rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
         })
     }
 
@@ -323,6 +363,37 @@ impl HipKernels {
             self.stream,
             SHARED_FLOATS * 4,
         )?)
+    }
+
+    /// Applies rotary position embeddings to q and k in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_rope(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        pos: *const i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        theta: f32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k;
+        let pp = pos;
+        let mut p = vec![
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &kp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &theta as *const f32 as *mut core::ffi::c_void,
+        ];
+        let total = (n_heads.max(n_kv_heads) * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .rope
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
     /// `out[1, n] = x[1, k] @ W^T` where `w` is `[n, k]` row-major.

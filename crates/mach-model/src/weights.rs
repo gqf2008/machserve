@@ -19,11 +19,11 @@ pub struct LayerWeights {
     pub wo: Vec<f32>,
     /// `[d_model]`
     pub rms_attn: Vec<f32>,
-    /// `[d_model, d_model]`
+    /// `[intermediate_size, d_model]`
     pub wg: Vec<f32>,
-    /// `[d_model, d_model]`
+    /// `[intermediate_size, d_model]`
     pub wu: Vec<f32>,
-    /// `[d_model, d_model]`
+    /// `[d_model, intermediate_size]`
     pub wd: Vec<f32>,
     /// `[d_model]`
     pub rms_mlp: Vec<f32>,
@@ -69,9 +69,9 @@ impl Weights {
                 wv: mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale),
                 wo: mat(&mut rng, cfg.n_heads * cfg.head_dim, d, scale),
                 rms_attn: vec1(&mut rng, d),
-                wg: mat(&mut rng, d, d, scale),
-                wu: mat(&mut rng, d, d, scale),
-                wd: mat(&mut rng, d, d, scale),
+                wg: mat(&mut rng, cfg.intermediate_size, d, scale),
+                wu: mat(&mut rng, cfg.intermediate_size, d, scale),
+                wd: mat(&mut rng, d, cfg.intermediate_size, scale),
                 rms_mlp: vec1(&mut rng, d),
             });
         }

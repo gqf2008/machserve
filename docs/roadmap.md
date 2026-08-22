@@ -67,3 +67,17 @@
     ~2-5x(本次实测 48.5 vs 94.4 us/token);完整步(含 logits 读回)~1.15x。
   - 踩坑记录:hipblas 列主序 leading dimension、kernel 指针参数传法、
     动态共享内存大小、graph capture 的 stream 所有权——均已修复并有回归测试。
+
+- **P1b 真实权重加载完成(2026-08-22,7900 XTX 真机验证)**:
+  - `loader.rs`:纯 Rust safetensors 解析(F32/F16/BF16→f32)+ Llama/Qwen 权重名映射
+    (embed/q/k/v/o_proj/gate/up/down + RMSNorm),支持 `tie_word_embeddings`;
+  - 模型新增 **RoPE**(真实 Llama 必需,GPU kernel + CPU 参考同步实现)与
+    **intermediate_size**(真实 MLP 宽度,不再硬编码 = d_model);
+  - **真实模型验证**:加载 `hf-internal-testing/tiny-random-LlamaForCausalLM`
+    (4.1MB safetensors),GPU 解码 5 token,与独立 **fp64 Python 参考**
+    (`tools/ref_llama.py`)逐元素对比,**相对误差 1.8e-7**(此前 5.9% 的"误差"
+    是 Python 参考的 bug——MLP 宽度写错,已修);Rust GPU==Rust CPU f32==f64
+    全部自洽;
+  - 新增测试:合成 safetensors roundtrip(CPU)、加载权重 GPU 解码对拍 CPU(真机)、
+    真实模型有限/确定性 smoke(真机,模型缺失则跳过);
+  - 验证:默认 16 + HIP 23 测试全绿,clippy(default+hip)0 告警,fmt 干净。

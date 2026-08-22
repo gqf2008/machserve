@@ -15,10 +15,14 @@ pub struct Config {
     pub n_kv_heads: usize,
     /// Head dimension (d_model / n_heads).
     pub head_dim: usize,
+    /// MLP intermediate size (gate/up width).
+    pub intermediate_size: usize,
     /// Maximum sequence length (static KV cache size).
     pub max_seq_len: usize,
     /// RMSNorm epsilon.
     pub rms_eps: f32,
+    /// Rotary embedding theta.
+    pub rope_theta: f32,
 }
 
 impl Config {
@@ -32,8 +36,34 @@ impl Config {
             n_heads: 4,
             n_kv_heads: 2,
             head_dim: 32,
+            intermediate_size: 512,
             max_seq_len: 256,
             rms_eps: 1e-6,
+            rope_theta: 10000.0,
+        }
+    }
+
+    /// Llama/Qwen-style config from raw hyperparameters.
+    #[must_use]
+    pub fn llama(
+        hidden_size: usize,
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+    ) -> Self {
+        Self {
+            vocab_size,
+            d_model: hidden_size,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim: hidden_size / n_heads,
+            intermediate_size: 4 * hidden_size,
+            max_seq_len,
+            rms_eps: 1e-6,
+            rope_theta: 10000.0,
         }
     }
 
@@ -47,8 +77,10 @@ impl Config {
             n_heads: 8,
             n_kv_heads: 4,
             head_dim: 64,
+            intermediate_size: 2048,
             max_seq_len: 1024,
             rms_eps: 1e-6,
+            rope_theta: 10000.0,
         }
     }
 }

@@ -7,11 +7,12 @@
 //! used by TokenSpeed on CUDA.
 
 pub mod config;
+pub mod loader;
 pub mod ref_model;
 pub mod weights;
 
 pub use config::Config;
-pub use weights::Weights;
+pub use weights::{LayerWeights, Weights};
 
 /// Errors from the model layer.
 #[derive(Debug, thiserror::Error)]

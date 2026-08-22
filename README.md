@@ -31,11 +31,12 @@ thirdparty/      flashinfer / cutlass / trtllm / gluon / candle-kernels(全部 p
 
 ## 当前状态
 
-- **P0 + P0.5 + P1a(已完成)**:工作区骨架、mach-engine 核心抽象、mach-kernel 边界、
+- **P0 + P0.5 + P1(已完成)**:工作区骨架、mach-engine 核心抽象、mach-kernel 边界、
   mach-kernel-sys **HIP FFI + hiprtc kernel 运行时 + hipBLAS**、mach-bench 基准、
-  **mach-model decode 切片**(GQA 小 transformer + 静态 KV + HIP graph 捕获重放)。
-  7900 XTX 真机验收:GPU 解码与 CPU 参考逐 token 一致、graph 重放与 eager 一致,
-  launch-only 路径 graph 每 token 快 ~2-5x。
+  **mach-model 完整 decode 链路**(GQA + RoPE + SwiGLU + 静态 KV + HIP graph 捕获重放
+  + **safetensors 真实权重加载**)。
+  7900 XTX 真机验收:GPU 解码 == CPU 参考 == 独立 fp64 Python 参考(相对误差 ~2e-7);
+  真实 tiny-random-Llama checkpoint 加载并解码;graph 重放 == eager,launch-only 快 2-5x。
 - 详细路线图见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 构建
@@ -57,5 +58,6 @@ cargo build -p mach-engine --features cuda
 ## License
 
 MIT OR Apache-2.0
+
 
 

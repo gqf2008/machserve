@@ -136,9 +136,10 @@ impl GpuModel {
         self.v_buf = self.dalloc(nkv * 4)?;
         self.attn = self.dalloc(nq * 4)?;
         self.proj = self.dalloc(d * 4)?;
-        self.gate = self.dalloc(d * 4)?;
-        self.up = self.dalloc(d * 4)?;
-        self.h = self.dalloc(d * 4)?;
+        let inter = c.intermediate_size;
+        self.gate = self.dalloc(inter * 4)?;
+        self.up = self.dalloc(inter * 4)?;
+        self.h = self.dalloc(inter * 4)?;
         self.logits = self.dalloc(c.vocab_size * 4)?;
 
         let kv_bytes = c.max_seq_len * c.n_kv_heads * c.head_dim * 4;
@@ -242,6 +243,15 @@ impl GpuModel {
             k.gemm(self.q, self.xn, lw.wq, nq, d)?;
             k.gemm(self.k_buf, self.xn, lw.wk, nkv, d)?;
             k.gemm(self.v_buf, self.xn, lw.wv, nkv, d)?;
+            k.launch_rope(
+                self.q,
+                self.k_buf,
+                self.dev_pos,
+                c.n_heads as i32,
+                c.n_kv_heads as i32,
+                c.head_dim as i32,
+                c.rope_theta,
+            )?;
 
             let (kc, vc) = self.kv_cache[li];
             k.launch_kv_store(
@@ -275,11 +285,12 @@ impl GpuModel {
             k.gemm(self.proj, self.attn, lw.wo, d, nq)?;
             k.launch_add(self.x, self.proj, d)?;
 
+            let inter = c.intermediate_size as i32;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, 1, d, c.rms_eps)?;
-            k.gemm(self.gate, self.xn2, lw.wg, d, d)?;
-            k.gemm(self.up, self.xn2, lw.wu, d, d)?;
-            k.launch_silu_mul(self.gate, self.up, self.h, d)?;
-            k.gemm(self.proj, self.h, lw.wd, d, d)?;
+            k.gemm(self.gate, self.xn2, lw.wg, inter, d)?;
+            k.gemm(self.up, self.xn2, lw.wu, inter, d)?;
+            k.launch_silu_mul(self.gate, self.up, self.h, inter)?;
+            k.gemm(self.proj, self.h, lw.wd, d, inter)?;
             k.launch_add(self.x, self.proj, d)?;
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, 1, d, c.rms_eps)?;
