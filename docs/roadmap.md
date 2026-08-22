@@ -54,3 +54,16 @@
   - `HipMemoryPool`(malloc/free/pin)与 `HipGraphCapture`(严格生命周期 + 捕获/重放);
   - 7900 XTX 实测:`hiprtc_saxpy_runs_on_gpu` / `hip_graph_capture_records_and_replays`
     等 4 个 GPU 测试全部通过。
+
+- **P1a decode 切片完成(2026-08-22,7900 XTX 真机验证)**:
+  - `mach-model` crate:小 transformer(GQA attention + RMSNorm + SwiGLU MLP)、静态 KV cache、
+    CPU f32 参考实现、HIP 解码路径(embed gather / rms_norm / silu_mul / add / kv_store /
+    attn_decode 手写 HIP kernel + hipBLAS GEMM,hiprtc 运行时编译);
+  - decode 步拆分为 update_inputs / run_kernels / read_logits,`run_kernels` 可整体捕获为
+    HIP graph 并重放(位置/token 通过设备缓冲更新,一张图服务所有位置);
+  - **验收测试全绿(真机)**:gpu_matches_cpu_reference(GPU==CPU 对拍)、
+    graph_replay_matches_eager(graph 重放==eager)、kv_cache_is_positional;
+  - **基准(小模型 512 维/2 层)**:launch-only 路径 graph 重放比 eager 每 token 快
+    ~2-5x(本次实测 48.5 vs 94.4 us/token);完整步(含 logits 读回)~1.15x。
+  - 踩坑记录:hipblas 列主序 leading dimension、kernel 指针参数传法、
+    动态共享内存大小、graph capture 的 stream 所有权——均已修复并有回归测试。

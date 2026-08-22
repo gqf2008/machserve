@@ -1,0 +1,20 @@
+[package]
+name = "mach-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MachServe model layer: transformer config, weights, CPU reference and HIP decode path."
+
+[features]
+default = []
+hip = ["mach-engine/hip", "mach-kernel-sys/hip"]
+
+[dependencies]
+mach-engine = { workspace = true }
+mach-kernel-sys = { workspace = true }
+thiserror = "2"
+
+[lints]
+workspace = true

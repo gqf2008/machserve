@@ -1,14 +1,17 @@
-//! HIP runtime FFI for the ROCm backend (Windows amdhip64_6.dll + hiprtc0602.dll).
+//! HIP runtime FFI for the ROCm backend (amdhip64_6.dll + hiprtc0602.dll).
 //!
-//! The DLLs are loaded **dynamically** at runtime (no link-time dependency), so
-//! the crate builds with any toolchain (including GNU) and only fails when the
-//! `hip` feature is used on a machine without ROCm. This is the only place the
-//! runtime talks to the HIP driver/runtime.
+//! DLLs are loaded **dynamically** at runtime (no link-time dependency). The
+//! HIP runtime is resolved from the ROCm install (`MACH_HIP_PATH` or
+//! `C:\Program Files\AMD\ROCm\<ver>\bin`) and falls back to bare DLL names
+//! (e.g. copies in System32). This is the only place the runtime talks to the
+//! HIP driver/runtime.
 //!
-//! ABI constants were verified against `C:\Program Files\AMD\ROCm\6.2\include\hip\`
-//! (hip_runtime_api.h / driver_types.h / hiprtc.h).
+//! Symbol names are the exported **camelCase** forms (verified via
+//! GetProcAddress against ROCm 6.2): `hipGetDeviceCount`, `hipMalloc`, ...
+//! ABI constants were verified against `hip_runtime_api.h` / `driver_types.h`.
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 /// HIP success code.
@@ -58,7 +61,11 @@ pub struct HipApi {
     pub hip_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int,
     pub hip_free: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub hip_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int,
+    pub hip_memcpy_async:
+        unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, HipStream) -> c_int,
     pub hip_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
+    pub hip_host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> c_int,
+    pub hip_host_free: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub hip_stream_create: unsafe extern "C" fn(*mut HipStream) -> c_int,
     pub hip_stream_destroy: unsafe extern "C" fn(HipStream) -> c_int,
     pub hip_stream_synchronize: unsafe extern "C" fn(HipStream) -> c_int,
@@ -116,228 +123,130 @@ pub struct Hip {
     pub api: HipApi,
 }
 
-/// Loads a symbol from `lib`, returning it as the fn-pointer type `$ty`.
-macro_rules! get {
-    ($lib:expr, $name:ident, $ty:ty) => {
-        *(unsafe { $lib.get::<$ty>(concat!(stringify!($name), "\0").as_bytes()) }
-            .map_err(|e| HipError::Symbol(format!("{}({e})", stringify!($name))))?)
+// SAFETY: the DLL handles are kept alive by this struct and never unloaded
+// while in use; all HIP driver calls we issue are thread-safe, so sharing the
+// loaded runtime across threads is sound.
+unsafe impl Send for Hip {}
+unsafe impl Sync for Hip {}
+
+/// Resolves the ROCm bin directory: `MACH_HIP_PATH`, else the newest
+/// `C:\Program Files\AMD\ROCm\<ver>\bin` found on disk.
+pub(crate) fn rocm_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MACH_HIP_PATH") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let base = PathBuf::from(r"C:\Program Files\AMD\ROCm");
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return None;
     };
+    let mut vers: Vec<(u64, PathBuf)> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let v: u64 = name.trim_start_matches("6.").parse().ok()?;
+            Some((v, e.path()))
+        })
+        .collect();
+    vers.sort();
+    vers.last().map(|(_, p)| p.join("bin"))
+}
+
+/// Loads the first library that succeeds from a list of names/paths.
+fn load_first(candidates: &[String]) -> Result<libloading::Library, HipError> {
+    let mut last_err = None;
+    for c in candidates {
+        match unsafe { libloading::Library::new(c.as_str()) } {
+            Ok(l) => return Ok(l),
+            Err(e) => last_err = Some(format!("{c}: {e}")),
+        }
+    }
+    Err(HipError::Library(
+        last_err.unwrap_or_else(|| "no candidates".into()),
+    ))
+}
+
+/// Loads a symbol `$sym` (exported name) into field `$field` of `$api`.
+/// Loads a symbol by its exported name; `T` is inferred from the field type.
+fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T, HipError> {
+    unsafe { lib.get::<T>(name.as_bytes()) }
+        .map(|s| *s)
+        .map_err(|e| HipError::Symbol(format!("{name}({e})")))
+}
+
+/// Prepends the ROCm bin directory to `PATH` so `LoadLibrary` can resolve
+/// the HIP/hipBLAS DLLs and their dependencies (rocblas, etc.).
+pub(crate) fn ensure_rocm_on_path() {
+    if let Some(bin) = rocm_bin() {
+        let bin_s = bin.to_string_lossy().into_owned();
+        let path = std::env::var("PATH").unwrap_or_default();
+        if !path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
+            // SAFETY: single-threaded at first DLL load; no other env reads race.
+            unsafe { std::env::set_var("PATH", format!("{bin_s};{path}")) };
+        }
+    }
 }
 
 fn load() -> Result<Arc<Hip>, HipError> {
-    let mut hip_lib = None;
-    for n in ["amdhip64_6.dll", "amdhip64.dll"] {
-        if let Ok(l) = unsafe { libloading::Library::new(n) } {
-            hip_lib = Some(l);
-            break;
-        }
+    ensure_rocm_on_path();
+    let bin = rocm_bin();
+    let mut hip_candidates: Vec<String> = Vec::new();
+    if let Some(b) = &bin {
+        hip_candidates.push(b.join("amdhip64_6.dll").to_string_lossy().into_owned());
+        hip_candidates.push(b.join("amdhip64.dll").to_string_lossy().into_owned());
     }
-    let hip_lib = hip_lib.ok_or_else(|| {
-        HipError::Library("amdhip64_6.dll / amdhip64.dll not found (ROCm not installed?)".into())
-    })?;
+    hip_candidates.push("amdhip64_6.dll".into());
+    hip_candidates.push("amdhip64.dll".into());
+    let hip_lib = load_first(&hip_candidates)?;
+
+    let mut rtc_candidates: Vec<String> = Vec::new();
+    if let Some(b) = &bin {
+        rtc_candidates.push(b.join("hiprtc0602.dll").to_string_lossy().into_owned());
+    }
+    rtc_candidates.push("hiprtc0602.dll".into());
+    let rtc_lib = load_first(&rtc_candidates)?;
 
     let api = HipApi {
-        hip_get_device_count: get!(
-            hip_lib,
-            hip_get_device_count,
-            unsafe extern "C" fn(*mut c_int) -> c_int
-        ),
-        hip_set_device: get!(
-            hip_lib,
-            hip_set_device,
-            unsafe extern "C" fn(c_int) -> c_int
-        ),
-        hip_get_device_name: get!(
-            hip_lib,
-            hip_get_device_name,
-            unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int
-        ),
-        hip_device_synchronize: get!(
-            hip_lib,
-            hip_device_synchronize,
-            unsafe extern "C" fn() -> c_int
-        ),
-        hip_get_last_error: get!(hip_lib, hip_get_last_error, unsafe extern "C" fn() -> c_int),
-        hip_get_error_string: get!(
-            hip_lib,
-            hip_get_error_string,
-            unsafe extern "C" fn(c_int) -> *const c_char
-        ),
-        hip_malloc: get!(
-            hip_lib,
-            hip_malloc,
-            unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int
-        ),
-        hip_free: get!(
-            hip_lib,
-            hip_free,
-            unsafe extern "C" fn(*mut c_void) -> c_int
-        ),
-        hip_memcpy: get!(
-            hip_lib,
-            hip_memcpy,
-            unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int
-        ),
-        hip_memset: get!(
-            hip_lib,
-            hip_memset,
-            unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int
-        ),
-        hip_stream_create: get!(
-            hip_lib,
-            hip_stream_create,
-            unsafe extern "C" fn(*mut HipStream) -> c_int
-        ),
-        hip_stream_destroy: get!(
-            hip_lib,
-            hip_stream_destroy,
-            unsafe extern "C" fn(HipStream) -> c_int
-        ),
-        hip_stream_synchronize: get!(
-            hip_lib,
-            hip_stream_synchronize,
-            unsafe extern "C" fn(HipStream) -> c_int
-        ),
-        hip_event_create: get!(
-            hip_lib,
-            hip_event_create,
-            unsafe extern "C" fn(*mut HipEvent) -> c_int
-        ),
-        hip_event_destroy: get!(
-            hip_lib,
-            hip_event_destroy,
-            unsafe extern "C" fn(HipEvent) -> c_int
-        ),
-        hip_event_record: get!(
-            hip_lib,
-            hip_event_record,
-            unsafe extern "C" fn(HipEvent, HipStream) -> c_int
-        ),
-        hip_event_synchronize: get!(
-            hip_lib,
-            hip_event_synchronize,
-            unsafe extern "C" fn(HipEvent) -> c_int
-        ),
-        hip_stream_begin_capture: get!(
-            hip_lib,
-            hip_stream_begin_capture,
-            unsafe extern "C" fn(HipStream, c_int) -> c_int
-        ),
-        hip_stream_end_capture: get!(
-            hip_lib,
-            hip_stream_end_capture,
-            unsafe extern "C" fn(HipStream, *mut HipGraph) -> c_int
-        ),
-        hip_graph_instantiate: get!(
-            hip_lib,
-            hip_graph_instantiate,
-            unsafe extern "C" fn(
-                *mut HipGraphExec,
-                HipGraph,
-                *mut c_void,
-                *mut c_char,
-                usize,
-            ) -> c_int
-        ),
-        hip_graph_launch: get!(
-            hip_lib,
-            hip_graph_launch,
-            unsafe extern "C" fn(HipGraphExec, HipStream) -> c_int
-        ),
-        hip_graph_exec_destroy: get!(
-            hip_lib,
-            hip_graph_exec_destroy,
-            unsafe extern "C" fn(HipGraphExec) -> c_int
-        ),
-        hip_graph_destroy: get!(
-            hip_lib,
-            hip_graph_destroy,
-            unsafe extern "C" fn(HipGraph) -> c_int
-        ),
-        hip_module_load_data: get!(
-            hip_lib,
-            hip_module_load_data,
-            unsafe extern "C" fn(*mut HipModule, *const c_void) -> c_int
-        ),
-        hip_module_get_function: get!(
-            hip_lib,
-            hip_module_get_function,
-            unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> c_int
-        ),
-        hip_module_unload: get!(
-            hip_lib,
-            hip_module_unload,
-            unsafe extern "C" fn(HipModule) -> c_int
-        ),
-        hip_module_launch_kernel: get!(
-            hip_lib,
-            hip_module_launch_kernel,
-            unsafe extern "C" fn(
-                HipFunction,
-                c_uint,
-                c_uint,
-                c_uint,
-                c_uint,
-                c_uint,
-                c_uint,
-                c_uint,
-                HipStream,
-                *mut *mut c_void,
-                *mut *mut c_void,
-            ) -> c_int
-        ),
-        hip_rtc_create_program: get!(
-            hip_lib,
-            hip_rtc_create_program,
-            unsafe extern "C" fn(
-                *mut HipRtcProgram,
-                *const c_char,
-                *const c_char,
-                c_int,
-                *const *const c_char,
-                *const *const c_char,
-            ) -> c_int
-        ),
-        hip_rtc_compile_program: get!(
-            hip_lib,
-            hip_rtc_compile_program,
-            unsafe extern "C" fn(HipRtcProgram, c_int, *const *const c_char) -> c_int
-        ),
-        hip_rtc_get_code_size: get!(
-            hip_lib,
-            hip_rtc_get_code_size,
-            unsafe extern "C" fn(HipRtcProgram, *mut usize) -> c_int
-        ),
-        hip_rtc_get_code: get!(
-            hip_lib,
-            hip_rtc_get_code,
-            unsafe extern "C" fn(HipRtcProgram, *mut c_char) -> c_int
-        ),
-        hip_rtc_get_program_log_size: get!(
-            hip_lib,
-            hip_rtc_get_program_log_size,
-            unsafe extern "C" fn(HipRtcProgram, *mut usize) -> c_int
-        ),
-        hip_rtc_get_program_log: get!(
-            hip_lib,
-            hip_rtc_get_program_log,
-            unsafe extern "C" fn(HipRtcProgram, *mut c_char) -> c_int
-        ),
-        hip_rtc_destroy_program: get!(
-            hip_lib,
-            hip_rtc_destroy_program,
-            unsafe extern "C" fn(*mut HipRtcProgram) -> c_int
-        ),
-        hip_rtc_get_error_string: get!(
-            hip_lib,
-            hip_rtc_get_error_string,
-            unsafe extern "C" fn(c_int) -> *const c_char
-        ),
-    };
-
-    let rtc_lib = unsafe {
-        libloading::Library::new("hiprtc0602.dll")
-            .map_err(|e| HipError::Library(format!("hiprtc0602.dll not found ({e})")))?
+        hip_get_device_count: sym(&hip_lib, "hipGetDeviceCount")?,
+        hip_set_device: sym(&hip_lib, "hipSetDevice")?,
+        hip_get_device_name: sym(&hip_lib, "hipDeviceGetName")?,
+        hip_device_synchronize: sym(&hip_lib, "hipDeviceSynchronize")?,
+        hip_get_last_error: sym(&hip_lib, "hipGetLastError")?,
+        hip_get_error_string: sym(&hip_lib, "hipGetErrorString")?,
+        hip_malloc: sym(&hip_lib, "hipMalloc")?,
+        hip_free: sym(&hip_lib, "hipFree")?,
+        hip_memcpy: sym(&hip_lib, "hipMemcpy")?,
+        hip_memcpy_async: sym(&hip_lib, "hipMemcpyAsync")?,
+        hip_memset: sym(&hip_lib, "hipMemset")?,
+        hip_host_malloc: sym(&hip_lib, "hipHostMalloc")?,
+        hip_host_free: sym(&hip_lib, "hipHostFree")?,
+        hip_stream_create: sym(&hip_lib, "hipStreamCreate")?,
+        hip_stream_destroy: sym(&hip_lib, "hipStreamDestroy")?,
+        hip_stream_synchronize: sym(&hip_lib, "hipStreamSynchronize")?,
+        hip_event_create: sym(&hip_lib, "hipEventCreate")?,
+        hip_event_destroy: sym(&hip_lib, "hipEventDestroy")?,
+        hip_event_record: sym(&hip_lib, "hipEventRecord")?,
+        hip_event_synchronize: sym(&hip_lib, "hipEventSynchronize")?,
+        hip_stream_begin_capture: sym(&hip_lib, "hipStreamBeginCapture")?,
+        hip_stream_end_capture: sym(&hip_lib, "hipStreamEndCapture")?,
+        hip_graph_instantiate: sym(&hip_lib, "hipGraphInstantiate")?,
+        hip_graph_launch: sym(&hip_lib, "hipGraphLaunch")?,
+        hip_graph_exec_destroy: sym(&hip_lib, "hipGraphExecDestroy")?,
+        hip_graph_destroy: sym(&hip_lib, "hipGraphDestroy")?,
+        hip_module_load_data: sym(&hip_lib, "hipModuleLoadData")?,
+        hip_module_get_function: sym(&hip_lib, "hipModuleGetFunction")?,
+        hip_module_unload: sym(&hip_lib, "hipModuleUnload")?,
+        hip_module_launch_kernel: sym(&hip_lib, "hipModuleLaunchKernel")?,
+        hip_rtc_create_program: sym(&rtc_lib, "hiprtcCreateProgram")?,
+        hip_rtc_compile_program: sym(&rtc_lib, "hiprtcCompileProgram")?,
+        hip_rtc_get_code_size: sym(&rtc_lib, "hiprtcGetCodeSize")?,
+        hip_rtc_get_code: sym(&rtc_lib, "hiprtcGetCode")?,
+        hip_rtc_get_program_log_size: sym(&rtc_lib, "hiprtcGetProgramLogSize")?,
+        hip_rtc_get_program_log: sym(&rtc_lib, "hiprtcGetProgramLog")?,
+        hip_rtc_destroy_program: sym(&rtc_lib, "hiprtcDestroyProgram")?,
+        hip_rtc_get_error_string: sym(&rtc_lib, "hiprtcGetErrorString")?,
     };
 
     Ok(Arc::new(Hip {
@@ -417,6 +326,33 @@ pub fn malloc(h: &Hip, bytes: usize) -> Result<*mut c_void, HipError> {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn free(h: &Hip, ptr: *mut c_void) -> Result<(), HipError> {
     unsafe { check(h, (h.api.hip_free)(ptr)) }
+}
+
+/// Copies `bytes` between host/device according to `kind`, enqueued on `stream`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn memcpy_async(
+    h: &Hip,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+    kind: c_int,
+    stream: HipStream,
+) -> Result<(), HipError> {
+    unsafe { check(h, (h.api.hip_memcpy_async)(dst, src, bytes, kind, stream)) }
+}
+
+/// Allocates pinned host memory (for async H2D/D2H).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn host_malloc(h: &Hip, bytes: usize) -> Result<*mut c_void, HipError> {
+    let mut ptr = std::ptr::null_mut();
+    unsafe { check(h, (h.api.hip_host_malloc)(&mut ptr, bytes, 0))? };
+    Ok(ptr)
+}
+
+/// Frees pinned host memory allocated by [`host_malloc`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn host_free(h: &Hip, ptr: *mut c_void) -> Result<(), HipError> {
+    unsafe { check(h, (h.api.hip_host_free)(ptr)) }
 }
 
 /// Copies `bytes` between host/device according to `kind`.
@@ -530,12 +466,13 @@ impl HipKernelModule {
     /// Launches the kernel. `params` holds one pointer per kernel argument,
     /// each pointing at the argument value (HIP convention).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn launch(
+    pub fn launch_shmem(
         &self,
         grid: [u32; 3],
         block: [u32; 3],
         params: &mut [*mut c_void],
         stream: HipStream,
+        shared_bytes: u32,
     ) -> Result<(), HipError> {
         let h = &self._hip;
         unsafe {
@@ -549,13 +486,25 @@ impl HipKernelModule {
                     block[0],
                     block[1],
                     block[2],
-                    0,
+                    shared_bytes,
                     stream,
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
             )
         }
+    }
+
+    /// Launches the kernel with no dynamic shared memory.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn launch(
+        &self,
+        grid: [u32; 3],
+        block: [u32; 3],
+        params: &mut [*mut c_void],
+        stream: HipStream,
+    ) -> Result<(), HipError> {
+        self.launch_shmem(grid, block, params, stream, 0)
     }
 }
 

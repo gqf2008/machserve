@@ -153,6 +153,8 @@ pub struct HipGraphCapture {
     hip: std::sync::Arc<Hip>,
     stream: HipHandle,
     state: Mutex<CaptureState>,
+    /// Whether this instance created the stream (and must destroy it).
+    owns_stream: bool,
 }
 
 impl core::fmt::Debug for HipGraphCapture {
@@ -166,10 +168,28 @@ impl HipGraphCapture {
     pub fn new(hip: std::sync::Arc<Hip>) -> Result<Self, Error> {
         let mut stream = std::ptr::null_mut();
         unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut stream))? };
+        Self::with_owned_stream(hip, stream)
+    }
+
+    /// Creates a capture backend over an existing stream. The stream must be
+    /// the one kernels are launched on; otherwise capture records nothing.
+    /// The caller owns the stream's lifetime.
+    pub fn with_stream(hip: std::sync::Arc<Hip>, stream: HipStream) -> Result<Self, Error> {
         Ok(Self {
             hip,
             stream: HipHandle(stream),
             state: Mutex::new(CaptureState::NoCapture),
+            owns_stream: false,
+        })
+    }
+
+    /// Internal constructor for the owning case.
+    fn with_owned_stream(hip: std::sync::Arc<Hip>, stream: HipStream) -> Result<Self, Error> {
+        Ok(Self {
+            hip,
+            stream: HipHandle(stream),
+            state: Mutex::new(CaptureState::NoCapture),
+            owns_stream: true,
         })
     }
 
@@ -182,7 +202,7 @@ impl HipGraphCapture {
 
 impl Drop for HipGraphCapture {
     fn drop(&mut self) {
-        if !self.stream.0.is_null() {
+        if self.owns_stream && !self.stream.0.is_null() {
             unsafe {
                 let _ = (self.hip.api.hip_stream_destroy)(self.stream.0);
             }
@@ -213,7 +233,10 @@ impl GraphCapture for HipGraphCapture {
         };
         if r != hip::HIP_SUCCESS {
             *state = state.abort();
-            return Err(GraphError::Unsupported);
+            return Err(GraphError::Driver(format!(
+                "hipStreamBeginCapture: {r} {}",
+                hip::error_string(&self.hip, r)
+            )));
         }
         Ok(())
     }
@@ -225,7 +248,10 @@ impl GraphCapture for HipGraphCapture {
         let mut graph = std::ptr::null_mut();
         let r = unsafe { (self.hip.api.hip_stream_end_capture)(self.stream.0, &mut graph) };
         if r != hip::HIP_SUCCESS {
-            return Err(GraphError::Unsupported);
+            return Err(GraphError::Driver(format!(
+                "hipStreamEndCapture: {r} {}",
+                hip::error_string(&self.hip, r)
+            )));
         }
         let mut exec: HipGraphExec = std::ptr::null_mut();
         let r = unsafe {
@@ -243,7 +269,10 @@ impl GraphCapture for HipGraphCapture {
             }
         }
         if r != hip::HIP_SUCCESS {
-            return Err(GraphError::Unsupported);
+            return Err(GraphError::Driver(format!(
+                "hipGraphInstantiate: {r} {}",
+                hip::error_string(&self.hip, r)
+            )));
         }
         Ok(Box::new(HipGraph {
             hip: std::sync::Arc::clone(&self.hip),
@@ -276,7 +305,8 @@ impl GraphHandle for HipGraph {
     unsafe fn replay(&self) -> Result<(), GraphError> {
         let r = unsafe { (self.hip.api.hip_graph_launch)(self.exec.0, self.stream.0) };
         if r != hip::HIP_SUCCESS {
-            return Err(GraphError::Unsupported);
+            let msg = hip::error_string(&self.hip, r);
+            return Err(GraphError::Driver(format!("hipGraphLaunch: {r} {msg}")));
         }
         Ok(())
     }
@@ -355,10 +385,12 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let module =
             hip::HipKernelModule::compile(&hip_arch(), SAXPY_SRC, "saxpy").expect("hiprtc compile");
         let a: f32 = 2.0;
+        let xp = x.ptr as *mut core::ffi::c_void;
+        let yp = y.ptr as *mut core::ffi::c_void;
         let mut params: Vec<*mut core::ffi::c_void> = vec![
             &a as *const f32 as *mut core::ffi::c_void,
-            x.ptr as *mut core::ffi::c_void,
-            y.ptr as *mut core::ffi::c_void,
+            &xp as *const *mut core::ffi::c_void as *mut core::ffi::c_void,
+            &yp as *const *mut core::ffi::c_void as *mut core::ffi::c_void,
             &n as *const i32 as *mut core::ffi::c_void,
         ];
         module
@@ -420,6 +452,8 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let module =
             hip::HipKernelModule::compile(&hip_arch(), SAXPY_SRC, "saxpy").expect("hiprtc compile");
         let a: f32 = 2.0;
+        let xp = x.ptr as *mut core::ffi::c_void;
+        let yp = y.ptr as *mut core::ffi::c_void;
 
         let cap = HipGraphCapture::new(std::sync::Arc::clone(h)).unwrap();
         cap.prepare().unwrap();
@@ -427,8 +461,8 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         {
             let mut params: Vec<*mut core::ffi::c_void> = vec![
                 &a as *const f32 as *mut core::ffi::c_void,
-                x.ptr as *mut core::ffi::c_void,
-                y.ptr as *mut core::ffi::c_void,
+                &xp as *const *mut core::ffi::c_void as *mut core::ffi::c_void,
+                &yp as *const *mut core::ffi::c_void as *mut core::ffi::c_void,
                 &n as *const i32 as *mut core::ffi::c_void,
             ];
             // Recorded into the graph instead of executed.
@@ -458,9 +492,10 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
             HIP_MEMCPY_DEVICE_TO_HOST,
         )
         .unwrap();
+        // y starts at 0; two replays: 0 -> 2 -> 4.
         assert!(
-            hy.iter().all(|&v| v == 3.0),
-            "graph replay expected 3.0, got {:?}",
+            hy.iter().all(|&v| v == 4.0),
+            "graph replay expected 4.0 after two replays, got {:?}",
             &hy[..4]
         );
     }

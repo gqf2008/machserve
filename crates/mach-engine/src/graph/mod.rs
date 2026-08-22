@@ -30,6 +30,8 @@ pub enum GraphError {
     AllocatedDuringCapture(String),
     #[error("backend does not support hardware graph capture")]
     Unsupported,
+    #[error("driver error during graph capture/replay: {0}")]
+    Driver(String),
 }
 
 /// Where a stream sits in the graph-capture lifecycle.
