@@ -175,3 +175,55 @@ fn sampling_is_deterministic_per_seed() {
         "different seeds must (overwhelmingly likely) diverge"
     );
 }
+
+#[test]
+fn chunked_prefill_matches_single_token() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 83).unwrap();
+    // Prompt longer than the engine capacity forces multiple prefill chunks.
+    let prompt: Vec<u32> = (0..80u32).map(|i| (i % 977) + 1).collect();
+    let capacity = 16usize;
+    let max_new = 8usize;
+
+    // Reference: single-token prefill + greedy decode via the single-seq model.
+    let want = gen_ref(&hip, cfg, &w, &prompt, max_new);
+
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
+    let id = eng
+        .add(&prompt, max_new, None, SamplingParams::default())
+        .unwrap();
+    while !eng.is_done(id) {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(id),
+        want,
+        "chunked prefill must match single-token greedy generation"
+    );
+}
+
+#[test]
+fn chunked_prefill_finishes_with_fewer_steps() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 91).unwrap();
+    let prompt: Vec<u32> = (0..80u32).map(|i| (i % 977) + 1).collect();
+    let capacity = 16usize;
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
+    let id = eng
+        .add(&prompt, 4, None, SamplingParams::default())
+        .unwrap();
+    let mut steps = 0usize;
+    while !eng.is_done(id) {
+        eng.step().unwrap();
+        steps += 1;
+    }
+    // 80 prompt tokens at capacity 16 -> >= ceil(80/16) = 5 prefill steps,
+    // plus 4 decode steps. Far fewer than the 80+ steps of single-token prefill.
+    assert!(
+        steps < 20,
+        "chunked prefill should finish in few steps, took {steps}"
+    );
+    assert_eq!(eng.generated(id).len(), 4);
+}

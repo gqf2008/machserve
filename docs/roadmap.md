@@ -207,3 +207,17 @@
     形状上仍比 rocBLAS 慢 2-3x(标量 fp16→fp32 累加无法打包成 RDNA3 的 packed FMA,
     需 `v_dot2_f32_f16` 类内建指令);rocBLAS solution-index 调优 API 在 ROCm 6.2
     Windows 未导出;已记录,留待后续内核专项。
+
+- **P3e 分块 prefill 完成(2026-08-22,7900 XTX 真机)**:
+  - `ContinuousModel::step` 改为**分块 prefill**:每步消费最多 `capacity` 个 prompt tokens
+    (按序列顺序填满行预算,prefill 与 decode 混合在同一 batched forward),彻底摆脱
+    "每步每序列 1 个 token"的逐 token prefill(TTFT 灾难);
+  - **关键修复**:batched KV 写入/attention 原假定"行号==槽位";分块 prefill 下同一
+    序列多行须写同一 KV 槽位,给 `kv_store_batched`/`attn_decode_batched` 增加
+    `slots` 数组(每行→槽位),`decode_step_explicit` 透传;
+  - **正确性(真机)**:分块 prefill 贪心输出与单 token prefill 逐 token 一致(长 prompt),
+    80-token prompt 在 capacity=16 下 <20 步完成;server 流式在引擎简化(去掉
+    prefill_left,step 只返回真实 token)后 SSE 与非流式仍精确一致;
+  - **性能(Qwen2.5-0.5B fp16, capacity 64)**:512-token prompt **TTFT 61.7ms(8 步)**,
+    prefill **8292 tok/s**,较单 token prefill(~3.6s)**~58x**;
+  - 测试:默认 + HIP 全绿(新增 continuous 2),clippy 0 告警,fmt 干净。

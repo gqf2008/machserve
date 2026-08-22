@@ -115,66 +115,100 @@ impl ContinuousModel {
         Ok(id)
     }
 
-    /// Advances all active sequences by one token (prefill or decode).
-    /// Returns `(seq_id, sampled_token)` for each sequence that ran.
+    /// Advances the engine by one batched step (chunked prefill + decode).
+    ///
+    /// Each step consumes up to `capacity` rows: a sequence still prefilling
+    /// contributes up to the remaining budget of its pending prompt tokens
+    /// (chunked prefill — one forward position per prompt token), a sequence
+    /// already decoding contributes its next token (one row). Prefill and
+    /// decode mix in the same batched forward.
+    ///
+    /// Returns `(seq_id, token)` for each sequence that produced a *real*
+    /// token this step: the first generated token when prefill completes, or a
+    /// decode token. Sequences still prefilling produce no entry (their
+    /// per-position predictions are internal).
     pub fn step(&mut self) -> Result<Vec<(SeqId, u32)>, Error> {
         if self.active == 0 {
             return Ok(Vec::new());
         }
-        let mut tokens = Vec::with_capacity(self.active);
-        let mut lens = Vec::with_capacity(self.active);
+        let mut tokens = Vec::new();
+        let mut lens = Vec::new();
+        let mut slots = Vec::new();
+        let mut params = Vec::new();
+        // (row_start, row_count, was_prefill) per active slot.
+        let mut rows: Vec<(usize, usize, bool)> = Vec::with_capacity(self.active);
+        let mut budget = self.capacity();
         for i in 0..self.active {
             let s = self.seqs[i].as_ref().expect("active slot");
-            let tok = if !s.prompt.is_empty() {
-                s.prompt[0]
+            if budget == 0 {
+                rows.push((tokens.len(), 0, false));
+                continue;
+            }
+            if !s.prompt.is_empty() {
+                let take = s.prompt.len().min(budget);
+                for j in 0..take {
+                    tokens.push(s.prompt[j]);
+                    lens.push((s.len + j) as u32);
+                    slots.push(i as u32); // all rows of seq i live in slot i
+                    params.push(s.params);
+                }
+                rows.push((tokens.len() - take, take, true));
+                budget -= take;
             } else {
-                s.first_decode.expect("decode requires a prior token")
-            };
-            tokens.push(tok);
-            lens.push(s.len as u32);
+                tokens.push(s.first_decode.expect("decode requires a prior token"));
+                lens.push(s.len as u32);
+                slots.push(i as u32);
+                params.push(s.params);
+                rows.push((tokens.len() - 1, 1, false));
+                budget -= 1;
+            }
         }
 
-        let mut params: Vec<SamplingParams> = (0..self.active)
-            .map(|i| self.seqs[i].as_ref().expect("active slot").params)
-            .collect();
         let sampled = self
             .model
-            .decode_step_explicit(&tokens, &lens, &mut params)?;
-        // The sampler advanced each seed by one RNG step; keep the authoritative
-        // host-side copy in sync so later steps and CPU references agree.
-        for (i, p) in params.iter().copied().enumerate() {
-            self.seqs[i].as_mut().expect("active slot").params = p;
+            .decode_step_explicit(&tokens, &lens, &slots, &mut params)?;
+        // The sampler advanced each row's seed one RNG step (rows of one
+        // sequence start from the same seed); the last row's value is the
+        // sequence's authoritative next seed.
+        for (i, &(start, count, _)) in rows.iter().enumerate() {
+            if count > 0 {
+                let p = params[start + count - 1];
+                self.seqs[i].as_mut().expect("active slot").params = p;
+            }
         }
 
-        // Update per-sequence state; track finished slots (by slot index).
         let mut done_slots = Vec::new();
-        for (i, &out) in sampled.iter().enumerate() {
+        let mut outputs = Vec::new();
+        for (i, &(start, count, was_prefill)) in rows.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
             let s = self.seqs[i].as_mut().expect("active slot");
-            if !s.prompt.is_empty() {
-                // This step consumed a prompt token (prefill). The sampled
-                // token predicts the next position; it becomes the first
-                // generated token only when prefill is complete.
-                s.prompt.pop_front();
-                s.len += 1;
+            if was_prefill {
+                let last_out = sampled[start + count - 1];
+                for _ in 0..count {
+                    s.prompt.pop_front();
+                }
+                s.len += count;
                 if s.prompt.is_empty() {
-                    s.generated.push(out);
-                    s.first_decode = Some(out);
-                    if s.eos.is_some_and(|e| out == e) || s.generated.len() >= s.max_new {
+                    s.generated.push(last_out);
+                    s.first_decode = Some(last_out);
+                    if s.eos.is_some_and(|e| last_out == e) || s.generated.len() >= s.max_new {
                         done_slots.push(i);
                     }
+                    outputs.push((s.id, last_out));
                 }
             } else {
+                let out = sampled[start];
                 s.generated.push(out);
                 s.len += 1;
                 s.first_decode = Some(out);
                 if s.eos.is_some_and(|e| out == e) || s.generated.len() >= s.max_new {
                     done_slots.push(i);
                 }
+                outputs.push((s.id, out));
             }
         }
-        let outputs: Vec<(SeqId, u32)> = (0..self.active)
-            .map(|i| (self.seqs[i].as_ref().expect("active slot").id, sampled[i]))
-            .collect();
         for &slot in done_slots.iter().rev() {
             self.finish(slot);
         }

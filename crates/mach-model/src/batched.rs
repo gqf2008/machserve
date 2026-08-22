@@ -53,6 +53,9 @@ pub struct BatchedModel {
     // pinned host inputs
     tokens_host: *mut i32,
     pos_host: *mut i32,
+    /// Per-row KV cache slot (row index != slot during chunked prefill).
+    slots_host: *mut i32,
+    slots_dev: *mut i32,
     // activations
     x: *mut f32,
     xn: *mut f32,
@@ -103,6 +106,8 @@ impl BatchedModel {
             pos_dev: std::ptr::null_mut(),
             tokens_host: std::ptr::null_mut(),
             pos_host: std::ptr::null_mut(),
+            slots_host: std::ptr::null_mut(),
+            slots_dev: std::ptr::null_mut(),
             x: std::ptr::null_mut(),
             xn: std::ptr::null_mut(),
             xn2: std::ptr::null_mut(),
@@ -181,12 +186,16 @@ impl BatchedModel {
 
         self.tokens_dev = self.dalloc(b * 4)? as *mut i32;
         self.pos_dev = self.dalloc(b * 4)? as *mut i32;
+        self.slots_dev = self.dalloc(b * 4)? as *mut i32;
         let th = hip::host_malloc(self.k.hip(), b * 4)?;
         let ph = hip::host_malloc(self.k.hip(), b * 4)?;
+        let sh = hip::host_malloc(self.k.hip(), b * 4)?;
         self.tokens_host = th as *mut i32;
         self.pos_host = ph as *mut i32;
+        self.slots_host = sh as *mut i32;
         self.host_pins.push(th);
         self.host_pins.push(ph);
+        self.host_pins.push(sh);
 
         self.x = self.dalloc(b * d * 4)?;
         self.xn = self.dalloc(b * d * 4)?;
@@ -341,6 +350,7 @@ impl BatchedModel {
             for (i, (&t, &l)) in tokens.iter().zip(&self.lens).enumerate() {
                 *self.tokens_host.add(i) = t as i32;
                 *self.pos_host.add(i) = l as i32;
+                *self.slots_host.add(i) = i as i32; // row == slot for decode
             }
             hip::memcpy_async(
                 self.k.hip(),
@@ -358,8 +368,16 @@ impl BatchedModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 self.k.stream,
             )?;
+            hip::memcpy_async(
+                self.k.hip(),
+                self.slots_dev as *mut core::ffi::c_void,
+                self.slots_host as *const core::ffi::c_void,
+                self.batch * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
         }
-        self.run_kernels(self.batch as i32)?;
+        self.run_kernels(self.batch as i32, self.slots_dev)?;
         let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
             *l += 1;
@@ -367,7 +385,7 @@ impl BatchedModel {
         Ok(next)
     }
 
-    fn run_kernels(&self, count: i32) -> Result<(), Error> {
+    fn run_kernels(&self, count: i32, slots: *const i32) -> Result<(), Error> {
         let c = self.cfg;
         let b = count;
         let d = c.d_model as i32;
@@ -440,6 +458,7 @@ impl BatchedModel {
                 self.k_buf,
                 kc,
                 self.pos_dev,
+                slots,
                 b,
                 c.n_kv_heads as i32,
                 c.head_dim as i32,
@@ -449,6 +468,7 @@ impl BatchedModel {
                 self.v_buf,
                 vc,
                 self.pos_dev,
+                slots,
                 b,
                 c.n_kv_heads as i32,
                 c.head_dim as i32,
@@ -460,6 +480,7 @@ impl BatchedModel {
                 vc,
                 self.attn,
                 self.pos_dev,
+                slots,
                 b,
                 c.n_heads as i32,
                 c.n_kv_heads as i32,
@@ -567,15 +588,18 @@ impl BatchedModel {
         &mut self,
         tokens: &[u32],
         lens: &[u32],
+        slots: &[u32],
         params: &mut [SamplingParams],
     ) -> Result<Vec<u32>, Error> {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
+        assert_eq!(n, slots.len(), "tokens and slots must be equal length");
         assert!(n <= self.batch, "active count exceeds capacity");
         unsafe {
             for i in 0..n {
                 *self.tokens_host.add(i) = tokens[i] as i32;
                 *self.pos_host.add(i) = lens[i] as i32;
+                *self.slots_host.add(i) = slots[i] as i32;
             }
             hip::memcpy_async(
                 self.k.hip(),
@@ -593,8 +617,16 @@ impl BatchedModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 self.k.stream,
             )?;
+            hip::memcpy_async(
+                self.k.hip(),
+                self.slots_dev as *mut core::ffi::c_void,
+                self.slots_host as *const core::ffi::c_void,
+                n * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
         }
-        self.run_kernels(n as i32)?;
+        self.run_kernels(n as i32, self.slots_dev)?;
         self.sampler
             .sample_batched(self.logits, params, self.cfg.vocab_size)
     }

@@ -223,15 +223,16 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
 /// Batched KV store: each sequence writes its k/v row at its own position.
 const KV_STORE_BATCHED: &str = r#"
 extern "C" __global__ void kv_store_batched(const float* kv, float* cache,
-                                            const int* pos_buf, int batch,
-                                            int kv_heads, int head_dim, int max_seq) {
+                                            const int* pos_buf, const int* slots,
+                                            int batch, int kv_heads, int head_dim,
+                                            int max_seq) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * kv_heads * head_dim;
     if (idx < total) {
         int s = idx / (kv_heads * head_dim);
         int i = idx % (kv_heads * head_dim);
         int p = pos_buf[s];
-        cache[((long long)s * max_seq + p) * kv_heads * head_dim + i] =
+        cache[((long long)slots[s] * max_seq + p) * kv_heads * head_dim + i] =
             kv[(long long)s * kv_heads * head_dim + i];
     }
 }
@@ -245,6 +246,7 @@ extern "C" __global__ void attn_decode_batched(
     const float* __restrict__ vc,
     float* __restrict__ out,
     const int* __restrict__ pos_buf,
+    const int* __restrict__ slots,
     int batch, int n_heads, int n_kv_heads, int head_dim, float scale, int max_seq) {
     extern __shared__ float smem[];
     float* scores = smem;
@@ -254,11 +256,12 @@ extern "C" __global__ void attn_decode_batched(
     int h = blockIdx.x % n_heads;
     int groups = n_heads / n_kv_heads;
     int kv = h / groups;
+    int slot = slots[s];
     int pos = pos_buf[s];
     const float* qh = q + ((long long)s * n_heads + h) * head_dim;
 
     for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
-        const float* kp = kc + ((long long)s * max_seq + p) * n_kv_heads * head_dim + kv * head_dim;
+        const float* kp = kc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim;
         float sc = 0.0f;
         for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * kp[dd];
         scores[p] = sc * scale;
@@ -288,7 +291,7 @@ extern "C" __global__ void attn_decode_batched(
     for (int dd = threadIdx.x; dd < head_dim; dd += blockDim.x) {
         float acc = 0.0f;
         for (int p = 0; p <= pos; p++) {
-            const float* vp = vc + ((long long)s * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
+            const float* vp = vc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
             acc += __expf(scores[p] - m) * (*vp);
         }
         out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
@@ -808,6 +811,7 @@ impl HipKernels {
         kv: *const f32,
         cache: *mut f32,
         pos: *const i32,
+        slots: *const i32,
         batch: i32,
         kv_heads: i32,
         head_dim: i32,
@@ -816,10 +820,12 @@ impl HipKernels {
         let kvp = kv;
         let cp = cache;
         let pp = pos;
+        let sp = slots;
         let mut p = vec![
             &kvp as *const *const f32 as *mut core::ffi::c_void,
             &cp as *const *mut f32 as *mut core::ffi::c_void,
             &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
             &kv_heads as *const i32 as *mut core::ffi::c_void,
             &head_dim as *const i32 as *mut core::ffi::c_void,
@@ -840,6 +846,7 @@ impl HipKernels {
         vc: *const f32,
         out: *mut f32,
         pos: *const i32,
+        slots: *const i32,
         batch: i32,
         n_heads: i32,
         n_kv_heads: i32,
@@ -852,12 +859,14 @@ impl HipKernels {
         let vp = vc;
         let op = out;
         let pp = pos;
+        let sp = slots;
         let mut p = vec![
             &qp as *const *const f32 as *mut core::ffi::c_void,
             &kp as *const *const f32 as *mut core::ffi::c_void,
             &vp as *const *const f32 as *mut core::ffi::c_void,
             &op as *const *mut f32 as *mut core::ffi::c_void,
             &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
             &n_heads as *const i32 as *mut core::ffi::c_void,
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,

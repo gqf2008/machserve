@@ -221,6 +221,38 @@ fn main() {
             println!("{b:>4} | {step_ms:>8.2} ms | {per:>11.3} ms/seq-tok | {tps:>13.0} tok/s");
         }
     }
+
+    // --- chunked prefill: TTFT for a long prompt (continuous engine) ---
+    {
+        use mach_model::config::ModelDType;
+        use mach_model::continuous::ContinuousModel;
+        let mut cfg16 = cfg;
+        cfg16.dtype = ModelDType::F16;
+        println!("\n=== chunked prefill TTFT (Qwen2.5-0.5B, capacity 64) ===");
+        let prompt_len = 512usize;
+        let prompt: Vec<u32> = (0..prompt_len).map(|i| (i % 977) as u32).collect();
+        let mut eng = ContinuousModel::new(hip::hip().unwrap(), cfg16, &w, 64).unwrap();
+        let id = eng
+            .add(
+                &prompt,
+                1,
+                None,
+                mach_model::sampling::SamplingParams::default(),
+            )
+            .unwrap();
+        let mut steps = 0usize;
+        let t = Instant::now();
+        while !eng.is_done(id) {
+            eng.step().unwrap();
+            steps += 1;
+        }
+        let ttft_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let prefill_tps = prompt_len as f64 / (ttft_ms / 1000.0);
+        println!(
+            "prompt {prompt_len} tokens: {steps} steps, TTFT {ttft_ms:.1} ms, prefill {prefill_tps:.0} tok/s (single-token prefill would be ~{} ms)",
+            prompt_len as f64 * 5.0
+        );
+    }
 }
 
 #[cfg(not(feature = "hip"))]
