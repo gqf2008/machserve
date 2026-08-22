@@ -1,0 +1,19 @@
+[package]
+name = "mach-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MachServe micro-benchmarks (host-side dispatch overhead floor)."
+
+[[bin]]
+name = "mach-bench"
+path = "src/main.rs"
+
+[dependencies]
+mach-engine = { workspace = true }
+mach-kernel = { workspace = true }
+
+[lints]
+workspace = true

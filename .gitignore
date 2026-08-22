@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+# third-party kernel build artifacts
+/thirdparty/**/build
+/thirdparty/**/cmake-build*
+*.o
+*.a
+*.so
+*.dylib
+*.dll

@@ -1,0 +1,19 @@
+[package]
+name = "mach-kernel-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MachServe FFI boundary: bindings to thirdparty/ C/CUDA kernel libraries."
+build = "build.rs"
+
+[features]
+default = []
+# Compile the flashinfer FFI declarations (requires thirdparty/flashinfer built).
+flashinfer = []
+# Compile the cutlass FFI declarations (requires thirdparty/cutlass built).
+cutlass = []
+
+[lints]
+workspace = true

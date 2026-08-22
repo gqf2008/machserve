@@ -1,0 +1,20 @@
+[package]
+name = "mach-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MachServe core: device, dtype, shape, memory pools, streams and CUDA-graph lifecycle."
+
+[features]
+default = []
+# Marks the CUDA paths as active. P0 keeps them as documented placeholders;
+# P1 wires cudarc (requires a local CUDA toolkit) behind this flag.
+cuda = []
+
+[dependencies]
+thiserror = "2"
+
+[lints]
+workspace = true
