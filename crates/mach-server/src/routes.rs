@@ -7,6 +7,7 @@
 use crate::engine::ServerEngine;
 use axum::Json;
 use axum::extract::State;
+use mach_model::sampling::SamplingParams;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,18 @@ pub struct CompletionRequest {
     pub prompt: Prompt,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// Temperature; omitted or 0 means greedy. OpenAI-shaped.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Top-p (nucleus); omitted means disabled (1.0).
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Top-k; omitted means disabled. Nonstandard extension field.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    /// RNG seed for deterministic sampling (OpenAI-shaped).
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 fn default_max_tokens() -> usize {
@@ -49,6 +62,14 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +112,16 @@ fn naive_encode(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
 }
 
+/// Builds sampling params from optional request fields (greedy by default).
+fn sampling_params(req: &CompletionRequest) -> SamplingParams {
+    SamplingParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_k: req.top_k.unwrap_or(0),
+        top_p: req.top_p.unwrap_or(1.0),
+        seed: req.seed.unwrap_or(0),
+    }
+}
+
 fn prompt_tokens(prompt: &Prompt) -> Vec<u32> {
     match prompt {
         Prompt::Text(s) => naive_encode(s),
@@ -106,7 +137,7 @@ pub async fn completions(
     let tokens = prompt_tokens(&req.prompt);
     let output = state
         .engine
-        .submit(tokens, req.max_tokens, None)
+        .submit(tokens, req.max_tokens, None, sampling_params(&req))
         .await
         .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(Json(CompletionResponse {
@@ -139,9 +170,22 @@ pub async fn chat_completions(
             )
         })
         .collect();
+    let synth = CompletionRequest {
+        prompt: Prompt::Tokens(naive_encode(&text)),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+    };
     let output = state
         .engine
-        .submit(naive_encode(&text), req.max_tokens, None)
+        .submit(
+            naive_encode(&text),
+            req.max_tokens,
+            None,
+            sampling_params(&synth),
+        )
         .await
         .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(Json(CompletionResponse {

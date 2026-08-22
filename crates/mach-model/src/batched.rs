@@ -7,6 +7,7 @@
 //! per-sequence position).
 
 use crate::kernels::HipKernels;
+use crate::sampling::{BatchedSampler, SamplingParams};
 use crate::{Config, Error, Weights};
 use mach_kernel_sys::hip::{self, Hip};
 use std::sync::Arc;
@@ -31,6 +32,7 @@ pub struct BatchedModel {
     /// Max sequences per step.
     batch: usize,
     k: Arc<HipKernels>,
+    sampler: BatchedSampler,
     // device inputs
     tokens_dev: *mut i32,
     pos_dev: *mut i32,
@@ -70,10 +72,12 @@ impl BatchedModel {
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights, batch: usize) -> Result<Self, Error> {
         assert!(batch >= 1, "batch must be >= 1");
         let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
+        let sampler = BatchedSampler::new(Arc::clone(&hip), k.stream, batch)?;
         let mut m = Self {
             cfg,
             batch,
             k,
+            sampler,
             tokens_dev: std::ptr::null_mut(),
             pos_dev: std::ptr::null_mut(),
             tokens_host: std::ptr::null_mut(),
@@ -396,6 +400,7 @@ impl BatchedModel {
         &mut self,
         tokens: &[u32],
         lens: &[u32],
+        params: &mut [SamplingParams],
     ) -> Result<Vec<u32>, Error> {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
@@ -423,7 +428,8 @@ impl BatchedModel {
             )?;
         }
         self.run_kernels(n as i32)?;
-        self.sample(n)
+        self.sampler
+            .sample_batched(self.logits, params, self.cfg.vocab_size)
     }
 
     /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the

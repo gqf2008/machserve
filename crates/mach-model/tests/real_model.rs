@@ -13,8 +13,10 @@
 #![cfg(feature = "hip")]
 
 use mach_kernel_sys::hip;
+use mach_model::continuous::ContinuousModel;
 use mach_model::loader::load_safetensors;
 use mach_model::model::GpuModel;
+use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
@@ -65,4 +67,58 @@ fn real_model_decodes_finite_and_deterministic() {
         a.len(),
         a.iter().fold(0.0f32, |m, v| m.max(v.abs()))
     );
+}
+
+#[test]
+fn real_model_samples_with_seed_deterministically() {
+    let candidates = [
+        PathBuf::from("../../.models").join("tiny-llama.safetensors"),
+        PathBuf::from(".models").join("tiny-llama.safetensors"),
+    ];
+    let Some(model_path) = candidates.into_iter().find(|p| p.exists()) else {
+        eprintln!("skipping real_model sampling: model not present (see doc comment)");
+        return;
+    };
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping real_model sampling: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping real_model sampling: {e}");
+            return;
+        }
+    };
+
+    let cfg = Config::llama(16, 2, 4, 4, 32000, 2048);
+    let w: Weights = load_safetensors(&model_path, &cfg, false).expect("load weights");
+    let params = SamplingParams {
+        temperature: 0.8,
+        top_k: 0,
+        top_p: 0.9,
+        seed: 99,
+    };
+    let run = || -> Vec<u32> {
+        let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).expect("engine");
+        let id = eng.add(&[1, 2, 3], 10, None, params).expect("add");
+        while !eng.is_done(id) {
+            eng.step().expect("step");
+        }
+        eng.generated(id)
+    };
+    let a = run();
+    assert!(!a.is_empty(), "sampling must generate tokens");
+    assert!(
+        a.iter().all(|&t| t < cfg.vocab_size as u32),
+        "sampled tokens must be in vocabulary"
+    );
+    let b = run();
+    assert_eq!(
+        a, b,
+        "same seed must reproduce the same sample on the real model"
+    );
+    eprintln!("real_model sampling OK: {a:?}");
 }

@@ -153,3 +153,18 @@
     2 个并发请求同时完成(连续批处理);chat 接口正常;
   - 集成测试:HTTP 响应 == 直接引擎调用逐 token 一致、healthz + text prompt;
   - 测试:默认 + HIP 33 全绿(新增 server 2),clippy(default+hip)0 告警,fmt 干净。
+
+- **P3a GPU 采样完成(2026-08-22,7900 XTX 真机)**:
+  - `sampling.rs` 新增 **`BatchedSampler`**:单个 HIP kernel(每序列一行一个 block)实现
+    temperature 缩放 + top-k(k-th largest logit 阈值,二分搜索,含边界并列)+ top-p
+    (累计概率阈值,边界整层纳入)+ 单次均匀抽样;**确定性 RNG = SplitMix64**,每序列
+    每步恰好推进一次 seed,host 侧保有权威 seed(CPU 参考可精确复现同一 draw);
+  - **`SamplingParams`**(temperature/top_k/top_p/seed,默认 greedy)贯穿全链路:
+    `BatchedModel::decode_step_explicit` 按序列采样 → `ContinuousModel::add/step`
+    维护每序列参数与 seed 推进 → `/v1/completions`、`/v1/chat/completions` 透传
+    `temperature`/`top_p`/`top_k`/`seed`(OpenAI 形状,缺省 greedy);
+  - **正确性(真机)**:GPU vs CPU 同种子逐 token 一致(峰态分布)、greedy==argmax、
+    同 seed 确定、不同 seed 发散、真实 tiny-llama 采样冒烟(同 seed 跨引擎复现)、
+    HTTP 采样请求 == 直接引擎同参数同 seed 输出;
+  - 测试:默认 + HIP 40 全绿(新增 sampling 4、continuous 1、server 1、real_model 1),
+    clippy(default+hip)0 告警,fmt 干净。

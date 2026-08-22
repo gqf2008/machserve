@@ -6,6 +6,7 @@
 use mach_kernel_sys::hip;
 use mach_model::continuous::ContinuousModel;
 use mach_model::model::GpuModel;
+use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
@@ -56,7 +57,10 @@ fn run_engine(
     let mut eng = ContinuousModel::new(hip.clone(), cfg, w, capacity).unwrap();
     let mut ids = Vec::new();
     for (prompt, max_new, eos) in jobs {
-        ids.push(eng.add(prompt, *max_new, *eos).unwrap());
+        ids.push(
+            eng.add(prompt, *max_new, *eos, SamplingParams::default())
+                .unwrap(),
+        );
     }
     while !eng.all_done() {
         eng.step().unwrap();
@@ -91,7 +95,7 @@ fn slots_reuse_after_finish() {
     let w = Weights::random(&cfg, 53).unwrap();
     // A short sequence finishes quickly, freeing its slot for a new one.
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
-    let a = eng.add(&[3], 2, None).unwrap();
+    let a = eng.add(&[3], 2, None, SamplingParams::default()).unwrap();
     while !eng.is_done(a) {
         eng.step().unwrap();
     }
@@ -99,7 +103,9 @@ fn slots_reuse_after_finish() {
     let a_out = eng.generated(a);
 
     // Slot is freed: a new sequence can join at the compacted slot.
-    let b = eng.add(&[9, 7, 42], 4, None).unwrap();
+    let b = eng
+        .add(&[9, 7, 42], 4, None, SamplingParams::default())
+        .unwrap();
     assert_ne!(b, a, "stable ids differ");
     while !eng.all_done() {
         eng.step().unwrap();
@@ -130,11 +136,42 @@ fn eos_stops_generation() {
     let idx = ref_g.iter().position(|&t| t == eos_tok).unwrap();
 
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
-    let s = eng.add(&[2, 5], 20, Some(eos_tok)).unwrap();
+    let s = eng
+        .add(&[2, 5], 20, Some(eos_tok), SamplingParams::default())
+        .unwrap();
     while !eng.is_done(s) {
         eng.step().unwrap();
     }
     let gens = eng.generated(s);
     assert_eq!(gens, &ref_g[..=idx], "must stop exactly at the EOS token");
     assert!(gens.len() < 20, "must stop before max_new");
+}
+
+#[test]
+fn sampling_is_deterministic_per_seed() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 29).unwrap();
+    let base = SamplingParams {
+        temperature: 0.9,
+        top_k: 0,
+        top_p: 0.95,
+        seed: 0,
+    };
+    let run = |seed: u64| -> Vec<u32> {
+        let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
+        let mut p = base;
+        p.seed = seed;
+        let id = eng.add(&[3, 9, 27], 12, None, p).unwrap();
+        while !eng.is_done(id) {
+            eng.step().unwrap();
+        }
+        eng.generated(id)
+    };
+    assert_eq!(run(42), run(42), "same seed must reproduce the same sample");
+    assert_ne!(
+        run(1),
+        run(2),
+        "different seeds must (overwhelmingly likely) diverge"
+    );
 }

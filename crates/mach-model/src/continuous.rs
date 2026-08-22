@@ -11,6 +11,7 @@
 //! slot, so callers can track outputs across compaction.
 
 use crate::batched::BatchedModel;
+use crate::sampling::SamplingParams;
 use crate::{Config, Error, Weights};
 use mach_kernel_sys::hip::Hip;
 use std::collections::VecDeque;
@@ -29,6 +30,8 @@ struct SeqState {
     generated: Vec<u32>,
     /// Maximum generated tokens.
     max_new: usize,
+    /// Per-sequence sampling configuration (seed advances every step).
+    params: SamplingParams,
     /// EOS token id (None disables early stopping).
     eos: Option<u32>,
     /// Number of KV positions consumed (prompt + generated).
@@ -82,12 +85,18 @@ impl ContinuousModel {
         prompt: &[u32],
         max_new: usize,
         eos: Option<u32>,
+        mut params: SamplingParams,
     ) -> Result<SeqId, Error> {
         if prompt.is_empty() {
             return Err(Error::Model("prompt must not be empty".into()));
         }
         if self.active >= self.capacity() {
             return Err(Error::Model("engine at capacity".into()));
+        }
+        // A zero seed means 'unspecified': derive a unique per-sequence seed
+        // so independent sequences do not share a draw schedule.
+        if params.seed == 0 {
+            params.seed = self.next_id;
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -98,6 +107,7 @@ impl ContinuousModel {
             generated: Vec::new(),
             max_new,
             eos,
+            params,
             len: 0,
             first_decode: None,
         });
@@ -124,7 +134,17 @@ impl ContinuousModel {
             lens.push(s.len as u32);
         }
 
-        let sampled = self.model.decode_step_explicit(&tokens, &lens)?;
+        let mut params: Vec<SamplingParams> = (0..self.active)
+            .map(|i| self.seqs[i].as_ref().expect("active slot").params)
+            .collect();
+        let sampled = self
+            .model
+            .decode_step_explicit(&tokens, &lens, &mut params)?;
+        // The sampler advanced each seed by one RNG step; keep the authoritative
+        // host-side copy in sync so later steps and CPU references agree.
+        for (i, p) in params.iter().copied().enumerate() {
+            self.seqs[i].as_mut().expect("active slot").params = p;
+        }
 
         // Update per-sequence state; track finished slots (by slot index).
         let mut done_slots = Vec::new();

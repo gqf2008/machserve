@@ -4,6 +4,7 @@
 
 use mach_kernel_sys::hip::Hip;
 use mach_model::continuous::{ContinuousModel, SeqId};
+use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
@@ -15,6 +16,7 @@ struct Request {
     prompt: Vec<u32>,
     max_new: usize,
     eos: Option<u32>,
+    params: SamplingParams,
     done: oneshot::Sender<Vec<u32>>,
 }
 
@@ -56,6 +58,7 @@ impl ServerEngine {
         prompt: Vec<u32>,
         max_new: usize,
         eos: Option<u32>,
+        params: SamplingParams,
     ) -> Result<Vec<u32>, EngineError> {
         let (tx, rx) = oneshot::channel();
         {
@@ -67,6 +70,7 @@ impl ServerEngine {
                 prompt,
                 max_new,
                 eos,
+                params,
                 done: tx,
             });
         }
@@ -97,7 +101,7 @@ impl ServerEngine {
                 while !pending.is_empty() && model.active() < self.capacity {
                     let r = pending.pop_front().expect("checked non-empty");
                     let id = model
-                        .add(&r.prompt, r.max_new, r.eos)
+                        .add(&r.prompt, r.max_new, r.eos, r.params)
                         .expect("capacity guaranteed");
                     txs.insert(id, r.done);
                 }
