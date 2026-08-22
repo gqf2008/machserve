@@ -200,7 +200,7 @@ fn main() {
         let mut cfg16 = cfg;
         cfg16.dtype = ModelDType::F16;
         println!("batch |  ms/step | ms/seq-tok |   tok/s");
-        for &b in &[16usize, 32, 64] {
+        for &b in &[16usize, 64, 128, 256, 384, 512] {
             let mut bm =
                 BatchedModel::new(hip::hip().unwrap(), cfg16, &w, b).expect("batched fp16");
             bm.reset_state().expect("reset");

@@ -399,6 +399,132 @@ extern "C" __global__ void cast_f16_f32(const unsigned short* x, float* y, int n
 }
 "#;
 
+/// fp16 KV cache: store f32 K/V rows as fp16, attention reads fp16 K/V
+/// (half the cache memory and bandwidth of the f32 path).
+const KV_F16: &str = r#"
+__device__ unsigned short f32_to_f16(float x) {
+    unsigned int b = __float_as_uint(x);
+    unsigned int sign = (b >> 16) & 0x8000u;
+    int e = (int)((b >> 23) & 0xffu);
+    unsigned int m = b & 0x7fffffu;
+    if (e == 255) return (unsigned short)(sign | 0x7c00u | (m ? 0x200u : 0u));
+    int ne = e - 127 + 15;
+    if (ne >= 31) return (unsigned short)(sign | 0x7c00u);
+    if (ne <= 0) {
+        if (ne < -10) return (unsigned short)sign;
+        unsigned int mm = m | 0x800000u;
+        int shift = 14 - ne;
+        unsigned int half = 1u << (shift - 1);
+        unsigned int m16 = mm >> shift;
+        unsigned int rem = mm & ((1u << shift) - 1u);
+        if (rem > half || (rem == half && (m16 & 1u))) m16++;
+        return (unsigned short)(sign | m16);
+    }
+    unsigned int m16 = m >> 13;
+    unsigned int rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (m16 & 1u))) {
+        m16++;
+        if (m16 == 0x400u) { m16 = 0u; ne++; if (ne >= 31) return (unsigned short)(sign | 0x7c00u); }
+    }
+    return (unsigned short)(sign | ((unsigned int)ne << 10) | m16);
+}
+
+__device__ float f16_to_f32(unsigned short h) {
+    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
+    unsigned int e = (h >> 10) & 0x1fu;
+    unsigned int m = h & 0x3ffu;
+    unsigned int b;
+    if (e == 0u) {
+        if (m == 0u) b = sign;
+        else {
+            unsigned int m2 = m;
+            unsigned int e2 = 127u + 1u - 15u;
+            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
+            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
+        }
+    } else if (e == 0x1fu) {
+        b = sign | 0x7f800000u | (m << 13);
+    } else {
+        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
+    }
+    return __uint_as_float(b);
+}
+
+extern "C" __global__ void kv_store_batched_f16(const float* kv,
+                                                unsigned short* cache,
+                                                const int* pos_buf, const int* slots,
+                                                int batch, int kv_heads, int head_dim,
+                                                int max_seq) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * kv_heads * head_dim;
+    if (idx < total) {
+        int s = idx / (kv_heads * head_dim);
+        int i = idx % (kv_heads * head_dim);
+        int p = pos_buf[s];
+        cache[((long long)slots[s] * max_seq + p) * kv_heads * head_dim + i] =
+            f32_to_f16(kv[(long long)s * kv_heads * head_dim + i]);
+    }
+}
+
+extern "C" __global__ void attn_decode_batched_f16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ kc,
+    const unsigned short* __restrict__ vc,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ slots,
+    int batch, int n_heads, int n_kv_heads, int head_dim, float scale, int max_seq) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_seq;
+
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int groups = n_heads / n_kv_heads;
+    int kv = h / groups;
+    int slot = slots[s];
+    int pos = pos_buf[s];
+    const float* qh = q + ((long long)s * n_heads + h) * head_dim;
+
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        const unsigned short* kp = kc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim;
+        float sc = 0.0f;
+        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * f16_to_f32(kp[dd]);
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+
+    for (int dd = threadIdx.x; dd < head_dim; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            const unsigned short* vp = vc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
+            acc += __expf(scores[p] - m) * f16_to_f32(*vp);
+        }
+        out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// fp16 embedding gather -> f32 activations (matches `crate::fp16::f16_to_f32`).
 const EMBED_GATHER_F16: &str = r#"
 __device__ float f16_to_f32(unsigned short h) {
@@ -452,6 +578,8 @@ pub struct HipKernels {
     cast_f32_f16: HipKernelModule,
     cast_f16_f32: HipKernelModule,
     embed_f16: HipKernelModule,
+    kv_store_f16: HipKernelModule,
+    attn_f16: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -496,6 +624,8 @@ impl HipKernels {
             cast_f32_f16: HipKernelModule::compile(&arch, CAST_F32_F16, "cast_f32_f16")?,
             cast_f16_f32: HipKernelModule::compile(&arch, CAST_F16_F32, "cast_f16_f32")?,
             embed_f16: HipKernelModule::compile(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
+            kv_store_f16: HipKernelModule::compile(&arch, KV_F16, "kv_store_batched_f16")?,
+            attn_f16: HipKernelModule::compile(&arch, KV_F16, "attn_decode_batched_f16")?,
         })
     }
 
@@ -1087,6 +1217,84 @@ impl HipKernels {
                     "hipblas gemm_ex batched m={n} n={batch} k={k}: {e}"
                 ))
             })
+    }
+
+    /// Stores f32 K/V rows into an fp16 cache at per-row positions (slots).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_batched_f16(
+        &self,
+        kv: *const f32,
+        cache: *mut u16,
+        pos: *const i32,
+        slots: *const i32,
+        batch: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let cp = cache;
+        let pp = pos;
+        let sp = slots;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &cp as *const *mut u16 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_heads * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .kv_store_f16
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Decode attention over an fp16 KV cache (f32 q, fp32 output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_batched_f16(
+        &self,
+        q: *const f32,
+        kc: *const u16,
+        vc: *const u16,
+        out: *mut f32,
+        pos: *const i32,
+        slots: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        max_seq: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = kc;
+        let vp = vc;
+        let op = out;
+        let pp = pos;
+        let sp = slots;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+        ];
+        let grid = (batch * n_heads) as u32;
+        let shared = (max_seq as u32 + 256) * 4;
+        Ok(self
+            .attn_f16
+            .launch_shmem([grid, 1, 1], [256, 1, 1], &mut p, self.stream, shared)?)
     }
 
     /// Synchronizes the execution stream.

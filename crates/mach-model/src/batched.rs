@@ -84,7 +84,9 @@ pub struct BatchedModel {
     /// fp16 scratch for hidden GEMM outputs (batch * max hidden n).
     yh: *mut u16,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
-    kv_cache: Vec<(*mut f32, *mut f32)>,
+    /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
+    /// `[batch, max_seq, kv_heads, head_dim]`.
+    kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
     /// Per-sequence lengths (host).
     lens: Vec<u32>,
     allocs: Vec<*mut core::ffi::c_void>,
@@ -229,11 +231,13 @@ impl BatchedModel {
         self.out_tok_host = oh as *mut i32;
         self.host_pins.push(oh);
 
-        let kv_bytes = b * c.max_seq_len * c.n_kv_heads * c.head_dim * 4;
+        let kv_elem = if c.dtype == ModelDType::F16 { 2 } else { 4 };
+        let kv_bytes = b * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
         for _ in 0..c.n_layers {
             let kk = self.dalloc(kv_bytes)?;
             let vv = self.dalloc(kv_bytes)?;
-            self.kv_cache.push((kk, vv));
+            self.kv_cache
+                .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
         }
         Ok(())
     }
@@ -303,8 +307,13 @@ impl BatchedModel {
 
     /// Zeroes KV caches and resets all sequence lengths.
     pub fn reset_state(&mut self) -> Result<(), Error> {
+        let kv_elem = if self.cfg.dtype == ModelDType::F16 {
+            2
+        } else {
+            4
+        };
         let kv_bytes =
-            self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
+            self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * kv_elem;
         for (kc, vc) in &self.kv_cache {
             unsafe {
                 hip::check(
@@ -454,40 +463,77 @@ impl BatchedModel {
                 c.rope_theta,
             )?;
             let (kc, vc) = self.kv_cache[li];
-            k.launch_kv_store_batched(
-                self.k_buf,
-                kc,
-                self.pos_dev,
-                slots,
-                b,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                c.max_seq_len as i32,
-            )?;
-            k.launch_kv_store_batched(
-                self.v_buf,
-                vc,
-                self.pos_dev,
-                slots,
-                b,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                c.max_seq_len as i32,
-            )?;
-            k.launch_attn_decode_batched(
-                self.q,
-                kc,
-                vc,
-                self.attn,
-                self.pos_dev,
-                slots,
-                b,
-                c.n_heads as i32,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                scale,
-                c.max_seq_len as i32,
-            )?;
+            if f16 {
+                k.launch_kv_store_batched_f16(
+                    self.k_buf,
+                    kc as *mut u16,
+                    self.pos_dev,
+                    slots,
+                    b,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.max_seq_len as i32,
+                )?;
+                k.launch_kv_store_batched_f16(
+                    self.v_buf,
+                    vc as *mut u16,
+                    self.pos_dev,
+                    slots,
+                    b,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.max_seq_len as i32,
+                )?;
+                k.launch_attn_decode_batched_f16(
+                    self.q,
+                    kc as *const u16,
+                    vc as *const u16,
+                    self.attn,
+                    self.pos_dev,
+                    slots,
+                    b,
+                    c.n_heads as i32,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    scale,
+                    c.max_seq_len as i32,
+                )?;
+            } else {
+                k.launch_kv_store_batched(
+                    self.k_buf,
+                    kc as *mut f32,
+                    self.pos_dev,
+                    slots,
+                    b,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.max_seq_len as i32,
+                )?;
+                k.launch_kv_store_batched(
+                    self.v_buf,
+                    vc as *mut f32,
+                    self.pos_dev,
+                    slots,
+                    b,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.max_seq_len as i32,
+                )?;
+                k.launch_attn_decode_batched(
+                    self.q,
+                    kc as *const f32,
+                    vc as *const f32,
+                    self.attn,
+                    self.pos_dev,
+                    slots,
+                    b,
+                    c.n_heads as i32,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    scale,
+                    c.max_seq_len as i32,
+                )?;
+            }
             gemm(
                 self.proj,
                 self.attn,
@@ -634,8 +680,13 @@ impl BatchedModel {
     /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the
     /// first `len` positions are copied.
     pub fn copy_seq_kv(&self, from: usize, to: usize, len: usize) -> Result<(), Error> {
-        let row_bytes = self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
-        let copy_bytes = len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
+        let kv_elem = if self.cfg.dtype == ModelDType::F16 {
+            2
+        } else {
+            4
+        };
+        let row_bytes = self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * kv_elem;
+        let copy_bytes = len * self.cfg.n_kv_heads * self.cfg.head_dim * kv_elem;
         for (kc, vc) in &self.kv_cache {
             let src_k = (*kc as usize + from * row_bytes) as *const core::ffi::c_void;
             let dst_k = (*kc as usize + to * row_bytes) as *mut core::ffi::c_void;

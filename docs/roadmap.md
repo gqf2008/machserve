@@ -221,3 +221,16 @@
   - **性能(Qwen2.5-0.5B fp16, capacity 64)**:512-token prompt **TTFT 61.7ms(8 步)**,
     prefill **8292 tok/s**,较单 token prefill(~3.6s)**~58x**;
   - 测试:默认 + HIP 全绿(新增 continuous 2),clippy 0 告警,fmt 干净。
+
+- **P3f fp16 KV cache + attention 完成(2026-08-22,7900 XTX 真机)**:
+  - KV cache 从 f32 改为 **fp16**(最后一块 f32 大缓冲):新增 `kv_store_batched_f16`
+    (存 f32→fp16)与 `attn_decode_batched_f16`(读 fp16 K/V,f32 q/输出)两个 kernel,
+    `kv_cache` 按 dtype 选择元素宽度;rope/GEMM/采样不动;
+  - **效果**:KV 内存减半(B=512 的 KV 12.8GB→6.4GB,总显存 ~10GB 可容纳);attention
+    读 KV 带宽减半(长 context 直接受益);
+  - **性能(Qwen2.5-0.5B fp16)**:fp16 KV 释放内存后 **B=512 可跑**:step 19.56ms、
+    每序列 0.038ms、**26173 tok/s ≈ llama.cpp Vulkan(643 tok/s)的 41x**;
+    B=128/256:0.057/0.044 ms/seq-tok(17692/22747 tok/s);
+  - **正确性(真机)**:batched fp16 vs fp32 最大 logit 差 0.0024(fp16 KV 舍入,仍极小),
+    连续/采样/分块 prefill 测试全绿;
+  - 测试:默认 + HIP 全绿,clippy 0 告警,fmt 干净。
