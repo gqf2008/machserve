@@ -14,7 +14,7 @@ use crate::batched::BatchedModel;
 use crate::sampling::SamplingParams;
 use crate::{Config, Error, Weights};
 use mach_kernel_sys::hip::Hip;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// Stable sequence identifier.
@@ -47,6 +47,8 @@ struct SeqState {
     stop_seqs: Vec<Vec<u32>>,
     /// Per-token log-probabilities of `generated` (OpenAI `logprobs`).
     logprobs: Vec<f32>,
+    /// Token occurrence counts of `generated` (presence/frequency penalties).
+    counts: HashMap<u32, u32>,
     /// Number of KV positions consumed (prompt + generated).
     len: usize,
     /// The token to feed next (first generated token after prefill, then each
@@ -123,6 +125,7 @@ impl ContinuousModel {
             eos,
             stop_seqs,
             logprobs: Vec::new(),
+            counts: HashMap::new(),
             params,
             len: 0,
             first_decode: None,
@@ -151,6 +154,7 @@ impl ContinuousModel {
         let mut lens = Vec::new();
         let mut slots = Vec::new();
         let mut params = Vec::new();
+        let mut row_counts: Vec<Vec<(u32, u32)>> = Vec::new();
         // (row_start, row_count, was_prefill) per active slot.
         let mut rows: Vec<(usize, usize, bool)> = Vec::with_capacity(self.active);
         let mut budget = self.capacity();
@@ -167,6 +171,7 @@ impl ContinuousModel {
                     lens.push((s.len + j) as u32);
                     slots.push(i as u32); // all rows of seq i live in slot i
                     params.push(s.params);
+                    row_counts.push(Vec::new()); // no generated history during prefill
                 }
                 rows.push((tokens.len() - take, take, true));
                 budget -= take;
@@ -175,6 +180,7 @@ impl ContinuousModel {
                 lens.push(s.len as u32);
                 slots.push(i as u32);
                 params.push(s.params);
+                row_counts.push(s.counts.iter().map(|(&t, &c)| (t, c)).collect());
                 rows.push((tokens.len() - 1, 1, false));
                 budget -= 1;
             }
@@ -182,7 +188,7 @@ impl ContinuousModel {
 
         let (sampled, logprobs) =
             self.model
-                .decode_step_explicit(&tokens, &lens, &slots, &mut params)?;
+                .decode_step_explicit(&tokens, &lens, &slots, &mut params, &row_counts)?;
         // The sampler advanced each row's seed one RNG step (rows of one
         // sequence start from the same seed); the last row's value is the
         // sequence's authoritative next seed.
@@ -209,6 +215,7 @@ impl ContinuousModel {
                 if s.prompt.is_empty() {
                     s.generated.push(last_out);
                     s.logprobs.push(logprobs[start + count - 1]);
+                    *s.counts.entry(last_out).or_insert(0) += 1;
                     s.first_decode = Some(last_out);
                     if s.eos.is_some_and(|e| last_out == e)
                         || ends_with_stop(&s.generated, &s.stop_seqs)
@@ -222,6 +229,7 @@ impl ContinuousModel {
                 let out = sampled[start];
                 s.generated.push(out);
                 s.logprobs.push(logprobs[start]);
+                *s.counts.entry(out).or_insert(0) += 1;
                 s.len += 1;
                 s.first_decode = Some(out);
                 if s.eos.is_some_and(|e| out == e)

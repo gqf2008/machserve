@@ -310,3 +310,12 @@
     `choices[].logprobs` 返回 `tokens` + `token_logprobs`;
   - 测试:采样层(贪心=0、采样有限且<=0)+ 服务器(返回字段);默认 + HIP 全绿,
     clippy/fmt 干净。
+
+- **P3p OpenAI presence/frequency penalty(2026-08-23,7900 XTX 真机)**:
+  - `SamplingParams` 增加 `presence_penalty`/`frequency_penalty`;采样 kernel 在
+    softmax 前**预扫描惩罚列表就地改 logits**(host 维护每序列 token 计数,每步上传
+    (token,count) 对);CPU 参考 `sample_cpu` 同步实现(可对拍);
+  - 引擎按序列累计计数(prefill 不惩罚,decode 起生效),`/v1/completions`、
+    `/v1/chat/completions` 解析透传;
+  - **对拍**:GPU vs CPU 同 seed 逐 token 一致(含贪心+采样);默认 + HIP 全绿,
+    clippy/fmt 干净。

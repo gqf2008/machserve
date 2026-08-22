@@ -150,6 +150,8 @@ async fn sampling_params_flow_through_http() {
         top_k: 50,
         top_p: 0.92,
         seed: 1234,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
     };
 
     // Direct engine reference with the same params + seed.

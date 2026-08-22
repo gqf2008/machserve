@@ -48,14 +48,26 @@ fn main() {
     let slots = vec![0u32; ids.len()];
     let mut params = vec![SamplingParams::greedy(0); ids.len()];
     let (sampled, _) = model
-        .decode_step_explicit(&ids, &lens, &slots, &mut params)
+        .decode_step_explicit(
+            &ids,
+            &lens,
+            &slots,
+            &mut params,
+            &vec![Vec::new(); ids.len()],
+        )
         .expect("prefill");
     let mut tok_id = sampled[ids.len() - 1];
     let mut out = vec![tok_id];
     for _ in 0..40 {
         let mut p = [SamplingParams::greedy(0)];
         tok_id = model
-            .decode_step_explicit(&[tok_id], &[ids.len() as u32], &[0], &mut p)
+            .decode_step_explicit(
+                &[tok_id],
+                &[ids.len() as u32],
+                &[0],
+                &mut p,
+                &vec![Vec::new(); 1],
+            )
             .expect("gen")
             .0[0];
         if tok_id == 151645 {

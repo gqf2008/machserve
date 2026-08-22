@@ -734,6 +734,7 @@ impl BatchedModel {
         lens: &[u32],
         slots: &[u32],
         params: &mut [SamplingParams],
+        counts: &[Vec<(u32, u32)>],
     ) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
@@ -800,7 +801,7 @@ impl BatchedModel {
         }
         self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
         self.sampler
-            .sample_batched(self.logits, params, self.cfg.vocab_size)
+            .sample_batched(self.logits, params, counts, self.cfg.vocab_size)
     }
 
     /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the

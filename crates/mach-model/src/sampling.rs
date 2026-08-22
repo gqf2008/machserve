@@ -54,6 +54,12 @@ pub struct SamplingParams {
     pub top_p: f32,
     /// RNG seed; advanced once per sampled step.
     pub seed: u64,
+    /// Presence penalty: subtract `presence_penalty` from a token's logit
+    /// whenever it has appeared (OpenAI `presence_penalty`).
+    pub presence_penalty: f32,
+    /// Frequency penalty: subtract `frequency_penalty * count` from a token's
+    /// logit for each prior occurrence (OpenAI `frequency_penalty`).
+    pub frequency_penalty: f32,
 }
 
 impl Default for SamplingParams {
@@ -64,6 +70,8 @@ impl Default for SamplingParams {
             top_k: 0,
             top_p: 1.0,
             seed: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -78,6 +86,8 @@ impl SamplingParams {
             top_k: 0,
             top_p: 1.0,
             seed,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }
@@ -101,17 +111,22 @@ __device__ ull mix64(ull z) {
 }
 
 extern "C" __global__ void sample_batched(
-    const float* __restrict__ logits,
+    float* __restrict__ logits,
     const float* __restrict__ temp,
     const int* __restrict__ top_k,
     const float* __restrict__ top_p,
     ull* __restrict__ seed,
     int* __restrict__ out_tok,
     float* __restrict__ logprobs,
-    int vocab, int batch)
+    const float* __restrict__ presence_pen,
+    const float* __restrict__ freq_pen,
+    const int* __restrict__ pen_tokens,
+    const int* __restrict__ pen_counts,
+    const int* __restrict__ pen_count,
+    int max_pen, int vocab, int batch)
 {
     const int s = blockIdx.x;
-    const float* row = logits + (long long)s * vocab;
+    float* row = logits + (long long)s * vocab; // penalties modify in place
     const int T = blockDim.x;
     const int tid = threadIdx.x;
 
@@ -131,6 +146,22 @@ extern "C" __global__ void sample_batched(
     const float t = temp[s];
     const int k = top_k[s];
     const float p = top_p[s];
+
+    // Apply presence/frequency penalties in place (before softmax).
+    {
+        const float pp = presence_pen[s];
+        const float fp = freq_pen[s];
+        if (pp != 0.0f || fp != 0.0f) {
+            for (int j = tid; j < pen_count[s]; j += T) {
+                int tok = pen_tokens[(long long)s * max_pen + j];
+                int cnt = pen_counts[(long long)s * max_pen + j];
+                if (cnt > 0 && tok < vocab) {
+                    row[tok] -= pp + fp * (float)cnt;
+                }
+            }
+            __syncthreads();
+        }
+    }
 
     // One RNG draw + advance per row per call (even for greedy, so the draw
     // schedule stays identical between greedy and sampling runs).
@@ -358,12 +389,22 @@ pub struct BatchedSampler {
     seed_dev: *mut u64,
     out_dev: *mut i32,
     logprobs_dev: *mut f32,
+    presence_dev: *mut f32,
+    freq_dev: *mut f32,
+    pen_tokens_dev: *mut i32,
+    pen_counts_dev: *mut i32,
+    pen_count_dev: *mut i32,
     temp_host: *mut f32,
     topk_host: *mut i32,
     topp_host: *mut f32,
     seed_host: *mut u64,
     out_host: *mut i32,
     logprobs_host: *mut f32,
+    presence_host: *mut f32,
+    freq_host: *mut f32,
+    pen_tokens_host: *mut i32,
+    pen_counts_host: *mut i32,
+    pen_count_host: *mut i32,
     capacity: usize,
     allocs: Vec<*mut core::ffi::c_void>,
     pins: Vec<*mut core::ffi::c_void>,
@@ -397,12 +438,22 @@ impl BatchedSampler {
         let seed_dev = dalloc(capacity * 8)? as *mut u64;
         let out_dev = dalloc(capacity * 4)? as *mut i32;
         let logprobs_dev = dalloc(capacity * 4)? as *mut f32;
+        let presence_dev = dalloc(capacity * 4)? as *mut f32;
+        let freq_dev = dalloc(capacity * 4)? as *mut f32;
+        let pen_tokens_dev = dalloc(capacity * MAX_PEN * 4)? as *mut i32;
+        let pen_counts_dev = dalloc(capacity * MAX_PEN * 4)? as *mut i32;
+        let pen_count_dev = dalloc(capacity * 4)? as *mut i32;
         let temp_host = pall(capacity * 4)? as *mut f32;
         let topk_host = pall(capacity * 4)? as *mut i32;
         let topp_host = pall(capacity * 4)? as *mut f32;
         let seed_host = pall(capacity * 8)? as *mut u64;
         let out_host = pall(capacity * 4)? as *mut i32;
         let logprobs_host = pall(capacity * 4)? as *mut f32;
+        let presence_host = pall(capacity * 4)? as *mut f32;
+        let freq_host = pall(capacity * 4)? as *mut f32;
+        let pen_tokens_host = pall(capacity * MAX_PEN * 4)? as *mut i32;
+        let pen_counts_host = pall(capacity * MAX_PEN * 4)? as *mut i32;
+        let pen_count_host = pall(capacity * 4)? as *mut i32;
         Ok(Self {
             hip,
             stream,
@@ -413,12 +464,22 @@ impl BatchedSampler {
             seed_dev,
             out_dev,
             logprobs_dev,
+            presence_dev,
+            freq_dev,
+            pen_tokens_dev,
+            pen_counts_dev,
+            pen_count_dev,
             temp_host,
             topk_host,
             topp_host,
             seed_host,
             out_host,
             logprobs_host,
+            presence_host,
+            freq_host,
+            pen_tokens_host,
+            pen_counts_host,
+            pen_count_host,
             capacity,
             allocs,
             pins,
@@ -433,17 +494,30 @@ impl BatchedSampler {
         &self,
         logits: *const f32,
         params: &mut [SamplingParams],
+        counts: &[Vec<(u32, u32)>],
         vocab: usize,
     ) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let n = params.len();
         assert!(n <= self.capacity, "sampler capacity exceeded");
+        assert_eq!(counts.len(), n, "counts must be per-row");
         #[allow(clippy::needless_range_loop)] // raw pinned-host writes by slot
         for i in 0..n {
+            assert!(
+                counts[i].len() <= MAX_PEN,
+                "too many distinct tokens for penalty scratch"
+            );
             unsafe {
                 *self.temp_host.add(i) = params[i].temperature;
                 *self.topk_host.add(i) = params[i].top_k as i32;
                 *self.topp_host.add(i) = params[i].top_p;
                 *self.seed_host.add(i) = params[i].seed;
+                *self.presence_host.add(i) = params[i].presence_penalty;
+                *self.freq_host.add(i) = params[i].frequency_penalty;
+                *self.pen_count_host.add(i) = counts[i].len() as i32;
+                for (j, &(t, c)) in counts[i].iter().enumerate() {
+                    *self.pen_tokens_host.add(i * MAX_PEN + j) = t as i32;
+                    *self.pen_counts_host.add(i * MAX_PEN + j) = c as i32;
+                }
             }
         }
         hip::memcpy_async(
@@ -478,24 +552,76 @@ impl BatchedSampler {
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.stream,
         )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.presence_dev as *mut core::ffi::c_void,
+            self.presence_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.freq_dev as *mut core::ffi::c_void,
+            self.freq_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.pen_tokens_dev as *mut core::ffi::c_void,
+            self.pen_tokens_host as *const core::ffi::c_void,
+            n * MAX_PEN * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.pen_counts_dev as *mut core::ffi::c_void,
+            self.pen_counts_host as *const core::ffi::c_void,
+            n * MAX_PEN * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.pen_count_dev as *mut core::ffi::c_void,
+            self.pen_count_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
 
-        let lp = logits;
+        let lp = logits as *mut f32; // kernel applies penalties in place
         let tp = self.temp_dev;
         let kp = self.topk_dev;
         let pp = self.topp_dev;
         let sp = self.seed_dev;
         let op = self.out_dev;
         let lgp = self.logprobs_dev;
+        let psp = self.presence_dev;
+        let fsp = self.freq_dev;
+        let ptp = self.pen_tokens_dev;
+        let pcp = self.pen_counts_dev;
+        let pnp = self.pen_count_dev;
         let vocab_i = vocab as i32;
         let n_i = n as i32;
+        let max_pen = MAX_PEN as i32;
         let mut args: Vec<*mut core::ffi::c_void> = vec![
-            &lp as *const *const f32 as *mut core::ffi::c_void,
+            &lp as *const *mut f32 as *mut core::ffi::c_void,
             &tp as *const *mut f32 as *mut core::ffi::c_void,
             &kp as *const *mut i32 as *mut core::ffi::c_void,
             &pp as *const *mut f32 as *mut core::ffi::c_void,
             &sp as *const *mut u64 as *mut core::ffi::c_void,
             &op as *const *mut i32 as *mut core::ffi::c_void,
             &lgp as *const *mut f32 as *mut core::ffi::c_void,
+            &psp as *const *mut f32 as *mut core::ffi::c_void,
+            &fsp as *const *mut f32 as *mut core::ffi::c_void,
+            &ptp as *const *mut i32 as *mut core::ffi::c_void,
+            &pcp as *const *mut i32 as *mut core::ffi::c_void,
+            &pnp as *const *mut i32 as *mut core::ffi::c_void,
+            &max_pen as *const i32 as *mut core::ffi::c_void,
             &vocab_i as *const i32 as *mut core::ffi::c_void,
             &n_i as *const i32 as *mut core::ffi::c_void,
         ];
@@ -568,9 +694,28 @@ fn argmax_first(logits: &[f32]) -> u32 {
 /// cumulative threshold, then one SplitMix64 draw and a cumulative walk over
 /// the allowed set. `state` is advanced by exactly one step per call.
 #[must_use]
-pub fn sample_cpu(logits: &[f32], p: &SamplingParams, state: &mut u64) -> u32 {
+pub fn sample_cpu(
+    logits: &[f32],
+    p: &SamplingParams,
+    counts: &[(u32, u32)],
+    state: &mut u64,
+) -> u32 {
     let vocab = logits.len();
     let u = next_f32(state);
+    // Apply presence/frequency penalties to a copy of the logits.
+    let penalized: Vec<f32> = if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+        let mut v = logits.to_vec();
+        for &(t, c) in counts {
+            if t < vocab as u32 && c > 0 {
+                v[t as usize] -= p.presence_penalty + p.frequency_penalty * c as f32;
+            }
+        }
+        v
+    } else {
+        logits.to_vec()
+    };
+    let logits = &penalized;
+    let vocab = logits.len();
     if p.temperature <= 0.0 {
         return argmax_first(logits);
     }
@@ -648,6 +793,9 @@ pub fn sample_cpu(logits: &[f32], p: &SamplingParams, state: &mut u64) -> u32 {
     }
     chosen.unwrap_or_else(|| argmax_first(logits))
 }
+
+/// Maximum penalty (token, count) pairs per row (OpenAI frequency/presence).
+const MAX_PEN: usize = 4096;
 
 /// Block-local argmax: each block reduces a contiguous 256-element slice.
 const ARGMAX_SLICE: &str = r#"
@@ -968,7 +1116,8 @@ mod tests {
         let stream = make_stream(h);
         let dlogits = upload_logits(h, logits);
         let s = BatchedSampler::new(Arc::clone(h), stream, params.len()).unwrap();
-        let (got, _) = s.sample_batched(dlogits, params, vocab).unwrap();
+        let empty: Vec<Vec<(u32, u32)>> = (0..params.len()).map(|_| Vec::new()).collect();
+        let (got, _) = s.sample_batched(dlogits, params, &empty, vocab).unwrap();
         hip::free(h, dlogits as *mut _).unwrap();
         unsafe { hip::check(h, (h.api.hip_stream_destroy)(stream)).unwrap() };
         got
@@ -1001,6 +1150,8 @@ mod tests {
                 top_k: 0,
                 top_p: 0.95,
                 seed: 500 + i as u64,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
             })
             .collect();
         let mut b = a.clone();
@@ -1035,13 +1186,15 @@ mod tests {
                 top_k: [0usize, 0, 40, 10][i % 4],
                 top_p: [0.95f32, 1.0, 0.9, 0.8][i % 4],
                 seed: 7000 + i as u64,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
             })
             .collect();
         let mut params = cases.clone();
         let got = gpu_sample(&h, &logits, &mut params, vocab);
         for (i, p) in cases.iter().enumerate() {
             let mut state = p.seed;
-            let want = sample_cpu(&logits[i * vocab..(i + 1) * vocab], p, &mut state);
+            let want = sample_cpu(&logits[i * vocab..(i + 1) * vocab], p, &[], &mut state);
             assert_eq!(
                 got[i], want,
                 "seq {i} params={p:?}: gpu={} cpu={}",
@@ -1064,11 +1217,13 @@ mod tests {
             top_k: 0,
             top_p: 0.9,
             seed: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         };
         let mut seen = std::collections::BTreeSet::new();
         for k in 0..200u64 {
             let mut state = p.seed.wrapping_add(k * 7919);
-            seen.insert(sample_cpu(&logits, &p, &mut state));
+            seen.insert(sample_cpu(&logits, &p, &[], &mut state));
         }
         assert!(
             seen.len() >= 8,
@@ -1090,7 +1245,8 @@ mod tests {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
-            let r = s.sample_batched(d, &mut gp, vocab).unwrap();
+            let empty: Vec<Vec<(u32, u32)>> = (0..gp.len()).map(|_| Vec::new()).collect();
+            let r = s.sample_batched(d, &mut gp, &empty, vocab).unwrap();
             hip::free(&h, d as *mut _).unwrap();
             unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
             r
@@ -1109,13 +1265,16 @@ mod tests {
                 top_k: 0,
                 top_p: 0.95,
                 seed: 500 + i as u64,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
             })
             .collect();
         let (_, lps2) = {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
-            let r = s.sample_batched(d, &mut sp, vocab).unwrap();
+            let empty: Vec<Vec<(u32, u32)>> = (0..sp.len()).map(|_| Vec::new()).collect();
+            let r = s.sample_batched(d, &mut sp, &empty, vocab).unwrap();
             hip::free(&h, d as *mut _).unwrap();
             unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
             r
@@ -1124,6 +1283,59 @@ mod tests {
             assert!(
                 v.is_finite() && v <= 0.0,
                 "sampled logprob must be <= 0, got {v}"
+            );
+        }
+    }
+    #[test]
+    fn penalties_match_cpu_reference() {
+        let Some(h) = have_gpu() else { return };
+        let vocab = 2048usize;
+        let n = 6usize;
+        // Peaked logits; penalties target some top tokens so the distribution
+        // shifts but stays well-separated (exact GPU==CPU match expected).
+        let mut logits = vec![0.0f32; vocab * n];
+        for s in 0..n {
+            let row = &mut logits[s * vocab..(s + 1) * vocab];
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = 0.5 - 1.2 * (i as f32) * 0.25;
+            }
+        }
+        let mut params: Vec<SamplingParams> = (0..n)
+            .map(|i| SamplingParams {
+                temperature: if i == 0 { 0.0 } else { 0.9 },
+                top_k: 0,
+                top_p: 0.95,
+                seed: 9000 + i as u64,
+                presence_penalty: 0.5,
+                frequency_penalty: 0.3,
+            })
+            .collect();
+        // Counts: token 0 has appeared 3x, token 1 x1, token 10 x2.
+        let counts: Vec<Vec<(u32, u32)>> = (0..n)
+            .map(|_| vec![(0u32, 3u32), (1, 1), (10, 2)])
+            .collect();
+        let cases = params.clone();
+        let (got, _) = {
+            let stream = make_stream(&h);
+            let d = upload_logits(&h, &logits);
+            let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
+            let r = s.sample_batched(d, &mut params, &counts, vocab).unwrap();
+            hip::free(&h, d as *mut _).unwrap();
+            unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+            r
+        };
+        for (i, p) in cases.iter().enumerate() {
+            let mut state = p.seed;
+            let want = sample_cpu(
+                &logits[i * vocab..(i + 1) * vocab],
+                p,
+                &counts[i],
+                &mut state,
+            );
+            assert_eq!(
+                got[i], want,
+                "seq {i} penalty sample mismatch: gpu={} cpu={}",
+                got[i], want
             );
         }
     }

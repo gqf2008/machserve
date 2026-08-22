@@ -73,6 +73,12 @@ pub struct CompletionRequest {
     /// Include per-token log-probabilities in the response.
     #[serde(default)]
     pub logprobs: Option<bool>,
+    /// Penalize tokens that have appeared (OpenAI presence_penalty).
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// Penalize tokens by occurrence count (OpenAI frequency_penalty).
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +108,10 @@ pub struct ChatRequest {
     pub n: Option<usize>,
     #[serde(default)]
     pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,12 +221,16 @@ fn sampling_params(
     top_k: Option<usize>,
     top_p: Option<f32>,
     seed: Option<u64>,
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
 ) -> SamplingParams {
     SamplingParams {
         temperature: temperature.unwrap_or(0.0),
         top_k: top_k.unwrap_or(0),
         top_p: top_p.unwrap_or(1.0),
         seed: seed.unwrap_or(0),
+        presence_penalty: presence_penalty.unwrap_or(0.0),
+        frequency_penalty: frequency_penalty.unwrap_or(0.0),
     }
 }
 
@@ -318,7 +332,14 @@ pub async fn completions(
 ) -> Response {
     let tokens = prompt_tokens(&state.tok, &req.prompt);
     let stop = stop_seqs(&state.tok, &req.stop);
-    let params = sampling_params(req.temperature, req.top_k, req.top_p, req.seed);
+    let params = sampling_params(
+        req.temperature,
+        req.top_k,
+        req.top_p,
+        req.seed,
+        req.presence_penalty,
+        req.frequency_penalty,
+    );
     let id = format!("cmpl-{}", now());
     let created = now();
 
@@ -351,7 +372,14 @@ pub async fn completions(
         } else {
             req.seed
         };
-        let params = sampling_params(req.temperature, req.top_k, req.top_p, seed);
+        let params = sampling_params(
+            req.temperature,
+            req.top_k,
+            req.top_p,
+            seed,
+            req.presence_penalty,
+            req.frequency_penalty,
+        );
         let (output, lps, reason) = match state
             .engine
             .submit(tokens.clone(), req.max_tokens, None, stop.clone(), params)
@@ -405,7 +433,14 @@ pub async fn chat_completions(
         .as_ref()
         .and_then(|t| t.special_token_id("<|im_end|>"));
     let stop = stop_seqs(&state.tok, &req.stop);
-    let params = sampling_params(req.temperature, req.top_k, req.top_p, req.seed);
+    let params = sampling_params(
+        req.temperature,
+        req.top_k,
+        req.top_p,
+        req.seed,
+        req.presence_penalty,
+        req.frequency_penalty,
+    );
     let id = format!("chatcmpl-{}", now());
     let created = now();
 
@@ -445,7 +480,14 @@ pub async fn chat_completions(
         } else {
             req.seed
         };
-        let params = sampling_params(req.temperature, req.top_k, req.top_p, seed);
+        let params = sampling_params(
+            req.temperature,
+            req.top_k,
+            req.top_p,
+            seed,
+            req.presence_penalty,
+            req.frequency_penalty,
+        );
         let (output, lps, reason) = match state
             .engine
             .submit(tokens.clone(), req.max_tokens, eos, stop.clone(), params)
