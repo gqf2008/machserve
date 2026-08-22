@@ -102,3 +102,14 @@
   WSL2 Ubuntu-24.04 反复启动失败(0x800705aa 系统资源不足),且 WSL 内未装 ROCm/PyTorch;
   已产出 `docs/benchmark-protocol.md`(对标协议 + 模板 + MachServe 侧实测数据),
   环境就绪后按协议填 TokenSpeed 数字即可完成对标。
+
+- **Windows 原生对标可行性实测(2026-08-22)**:
+  - MachServe 全程跑在 Windows 原生(ROCm 6.2 HIP SDK),从未依赖 WSL;
+  - **TokenSpeed 无法在 Windows 原生运行**(已核实):(a) PyTorch ROCm 官方 wheel
+    (rocm6.2/6.3)只有 manylinux,无 win_amd64;(b) TokenSpeed 整个 AMD kernel 栈依赖
+    `tokenspeed-triton`(Triton fork),其 PyPI wheel 全部 manylinux,无 Windows 版;
+  - llama.cpp HIP 构建实测:Windows+ROCm 6.2 下踩到 perl 缺失(已装)、HIP_PLATFORM、
+    MSVC 误编 .cu、ROCm 6.2 缺 `__hip_fp8_e4m3`(已补 fnuz 别名)等,最终 HIP kernel
+    未正确链入(ggml-hip.lib 仅 4KB)——Windows HIP 构建的已知痛点;
+  - 可选替代:llama.cpp **Vulkan 后端**(Windows 上成熟,7900 XTX 驱动好),但需先装
+    Vulkan SDK;未获用户确认前不擅自安装。
