@@ -162,6 +162,35 @@ fn main() {
         "\nend-to-end TPOT: host-readback {gen_host_ms:.2} ms | GPU-sampled {gen_gpu_ms:.2} ms | speedup {:.2}x | llama.cpp Vulkan reference 1.55 ms",
         gen_host_ms / gen_gpu_ms
     );
+
+    // --- batched decode (continuous batching): B sequences share one forward ---
+    {
+        use mach_model::batched::BatchedModel;
+        println!("\n=== batched decode scaling (Qwen2.5-0.5B, 7900 XTX) ===");
+        println!("batch |  ms/step | ms/seq-tok |   tok/s");
+        for &b in &[1usize, 2, 4, 8, 16, 32, 64] {
+            let mut bm = BatchedModel::new(hip::hip().unwrap(), cfg, &w, b).expect("batched model");
+            bm.reset_state().expect("reset");
+            let mut tokens: Vec<u32> = (0..b).map(|i| (i % 977) as u32).collect();
+            for _ in 0..5 {
+                tokens = bm.decode_step(&tokens).expect("warmup");
+            }
+            bm.reset_state().expect("reset");
+            tokens = (0..b).map(|i| (i % 977) as u32).collect();
+            let steps = 50usize;
+            let t7 = Instant::now();
+            for _ in 0..steps {
+                tokens = bm.decode_step(&tokens).expect("batched step");
+            }
+            let step_ms = t7.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+            let per = step_ms / b as f64;
+            let tps = 1000.0 / per;
+            println!("{b:>4} | {step_ms:>8.2} ms | {per:>11.3} ms/seq-tok | {tps:>13.0} tok/s");
+        }
+        println!(
+            "  reference: llama.cpp Vulkan 1.55 ms/seq-tok (643 tok/s), single-seq MachServe ~7 ms"
+        );
+    }
 }
 
 #[cfg(not(feature = "hip"))]

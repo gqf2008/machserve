@@ -123,3 +123,13 @@
     llama.cpp 在 GPU 侧采样;已列为下一步优化(GPU 侧 sampling kernel);
   - 完整对比表见 `docs/benchmark-protocol.md`;Windows HIP 构建 llama.cpp 的坑
     (MSVC-vs-hipcc/空 HIP lib)已记录,不重复踩。
+
+- **P2b 批量 decode 完成(2026-08-22,7900 XTX 真机)**:
+  - `batched.rs`:`BatchedModel`——B 序列共享一次前向:批量投影 GEMM(m=B,替换 m=1,
+    hipBLAS `OP_T/OP_N` 形式,任意 in/out 维度都满足 leading-dim 约束)、批量
+    embed/rope(每序列独立 pos)/kv_store/attention(逐序列 mask)/批量 argmax 采样;
+  - **正确性**:batched step 与逐序列单模型逐 token 一致(3 步 × 4 序列)、序列间独立、确定性;
+  - **性能(关键)**:批量缩放曲线——step 时间几乎与 B 无关(~12-15ms),每序列 TPOT 按 1/B 线性下降:
+    B=1: 11.9ms | B=8: 1.60ms | B=16: 0.84ms | B=32: 0.47ms | **B=64: 0.216ms(4640 tok/s)**;
+    对比 llama.cpp Vulkan 1.55ms(643 tok/s):**B=64 时快 7.2x**;
+  - 这证实 P2 的判断:瓶颈是 m=1 GEMM,批量(m=B)直接修复,且连续批处理本身就是引擎模型。

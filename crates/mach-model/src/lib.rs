@@ -6,9 +6,13 @@
 //! once into a HIP graph and replayed for every token — the serving pattern
 //! used by TokenSpeed on CUDA.
 
+#[cfg(feature = "hip")]
+#[cfg(feature = "hip")]
+pub mod batched;
 pub mod config;
 pub mod loader;
 pub mod ref_model;
+#[cfg(feature = "hip")]
 pub mod sampling;
 pub mod weights;
 

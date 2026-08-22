@@ -166,6 +166,172 @@ extern "C" __global__ void attn_decode(
 }
 "#;
 
+/// Batched embedding: `x[s, :] = emb[tok[s], :]`.
+const EMBED_BATCHED: &str = r#"
+extern "C" __global__ void embed_batched(const int* tok, const float* emb, float* x,
+                                         int cols, int batch) {
+    int s = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < cols) x[(long long)s * cols + i] = emb[(long long)tok[s] * cols + i];
+}
+"#;
+
+/// Batched rotary embeddings with per-sequence positions.
+const ROPE_BATCHED: &str = r#"
+extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
+                                        int batch, int n_heads, int n_kv_heads,
+                                        int head_dim, float theta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = head_dim / 2;
+    int total_q = batch * n_heads * head_dim;
+    int total_k = batch * n_kv_heads * head_dim;
+    if (idx < total_q) {
+        int s = idx / (n_heads * head_dim);
+        int rem = idx % (n_heads * head_dim);
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+        if (d < half) {
+            int pos = pos_buf[s];
+            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float ang = (float)pos * freq;
+            float c = cosf(ang), sn = sinf(ang);
+            float* p = q + (long long)s * n_heads * head_dim + h * head_dim + 2 * d;
+            float a = p[0], b = p[1];
+            p[0] = a * c - b * sn;
+            p[1] = a * sn + b * c;
+        }
+    }
+    if (idx < total_k) {
+        int s = idx / (n_kv_heads * head_dim);
+        int rem = idx % (n_kv_heads * head_dim);
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+        if (d < half) {
+            int pos = pos_buf[s];
+            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float ang = (float)pos * freq;
+            float c = cosf(ang), sn = sinf(ang);
+            float* p = k + (long long)s * n_kv_heads * head_dim + h * head_dim + 2 * d;
+            float a = p[0], b = p[1];
+            p[0] = a * c - b * sn;
+            p[1] = a * sn + b * c;
+        }
+    }
+}
+"#;
+
+/// Batched KV store: each sequence writes its k/v row at its own position.
+const KV_STORE_BATCHED: &str = r#"
+extern "C" __global__ void kv_store_batched(const float* kv, float* cache,
+                                            const int* pos_buf, int batch,
+                                            int kv_heads, int head_dim, int max_seq) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * kv_heads * head_dim;
+    if (idx < total) {
+        int s = idx / (kv_heads * head_dim);
+        int i = idx % (kv_heads * head_dim);
+        int p = pos_buf[s];
+        cache[((long long)s * max_seq + p) * kv_heads * head_dim + i] =
+            kv[(long long)s * kv_heads * head_dim + i];
+    }
+}
+"#;
+
+/// Batched decode attention (GQA), one block per (sequence, head).
+const ATTN_DECODE_BATCHED: &str = r#"
+extern "C" __global__ void attn_decode_batched(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int batch, int n_heads, int n_kv_heads, int head_dim, float scale, int max_seq) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_seq;
+
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int groups = n_heads / n_kv_heads;
+    int kv = h / groups;
+    int pos = pos_buf[s];
+    const float* qh = q + ((long long)s * n_heads + h) * head_dim;
+
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        const float* kp = kc + ((long long)s * max_seq + p) * n_kv_heads * head_dim + kv * head_dim;
+        float sc = 0.0f;
+        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * kp[dd];
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+
+    for (int dd = threadIdx.x; dd < head_dim; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            const float* vp = vc + ((long long)s * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
+            acc += __expf(scores[p] - m) * (*vp);
+        }
+        out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
+    }
+}
+"#;
+
+/// Per-row argmax over a [batch, vocab] logits matrix.
+const ARGMAX_BATCHED: &str = r#"
+extern "C" __global__ void argmax_batched(const float* logits, int* out_tok,
+                                          int vocab, int batch) {
+    int s = blockIdx.x;
+    const float* row = logits + (long long)s * vocab;
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    float v = -1e30f;
+    int idx = -1;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        if (row[i] > v || (row[i] == v && i < idx)) {
+            v = row[i];
+            idx = i;
+        }
+    }
+    s_val[threadIdx.x] = v;
+    s_idx[threadIdx.x] = idx;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            float a = s_val[threadIdx.x + st];
+            float b = s_val[threadIdx.x];
+            int ai = s_idx[threadIdx.x + st];
+            int bi = s_idx[threadIdx.x];
+            if (a > b || (a == b && ai < bi)) {
+                s_val[threadIdx.x] = a;
+                s_idx[threadIdx.x] = ai;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_tok[s] = s_idx[0];
+}
+"#;
+
 /// Compiled kernels plus the hipBLAS handle, bound to one stream.
 pub struct HipKernels {
     hip: std::sync::Arc<Hip>,
@@ -180,6 +346,11 @@ pub struct HipKernels {
     kv_store: HipKernelModule,
     attn_decode: HipKernelModule,
     rope: HipKernelModule,
+    embed_batched: HipKernelModule,
+    rope_batched: HipKernelModule,
+    kv_store_batched: HipKernelModule,
+    attn_decode_batched: HipKernelModule,
+    argmax_batched: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -208,6 +379,19 @@ impl HipKernels {
             kv_store: HipKernelModule::compile(&arch, KV_STORE, "kv_store")?,
             attn_decode: HipKernelModule::compile(&arch, ATTN_DECODE, "attn_decode")?,
             rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
+            embed_batched: HipKernelModule::compile(&arch, EMBED_BATCHED, "embed_batched")?,
+            rope_batched: HipKernelModule::compile(&arch, ROPE_BATCHED, "rope_batched")?,
+            kv_store_batched: HipKernelModule::compile(
+                &arch,
+                KV_STORE_BATCHED,
+                "kv_store_batched",
+            )?,
+            attn_decode_batched: HipKernelModule::compile(
+                &arch,
+                ATTN_DECODE_BATCHED,
+                "attn_decode_batched",
+            )?,
+            argmax_batched: HipKernelModule::compile(&arch, ARGMAX_BATCHED, "argmax_batched")?,
         })
     }
 
@@ -426,6 +610,189 @@ impl HipKernels {
                 1,
             )
             .map_err(|e| Error::Model(format!("hipblas sgemm m=1 n={n} k={k}: {e}")))
+    }
+
+    /// Batched GEMM: `out[B, n] = x[B, k] @ W^T`, `w` is `[n, k]` row-major.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched(
+        &self,
+        out: *mut f32,
+        x: *const f32,
+        w: *const f32,
+        batch: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), Error> {
+        self.blas
+            .sgemm(
+                mach_kernel_sys::hipblas::HIPBLAS_OP_T,
+                mach_kernel_sys::hipblas::HIPBLAS_OP_N,
+                n,
+                batch,
+                k,
+                1.0,
+                w,
+                k,
+                x,
+                k,
+                0.0,
+                out,
+                n,
+            )
+            .map_err(|e| Error::Model(format!("hipblas batched sgemm m={n} n={batch} k={k}: {e}")))
+    }
+
+    pub fn launch_embed_batched(
+        &self,
+        tok: *const i32,
+        emb: *const f32,
+        x: *mut f32,
+        cols: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        let tp = tok;
+        let ep = emb;
+        let xp = x;
+        let mut p = vec![
+            &tp as *const *const i32 as *mut core::ffi::c_void,
+            &ep as *const *const f32 as *mut core::ffi::c_void,
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &cols as *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (cols as u32).div_ceil(256);
+        Ok(self.embed_batched.launch(
+            [blocks, batch as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_rope_batched(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        pos: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        theta: f32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k;
+        let pp = pos;
+        let mut p = vec![
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &kp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &theta as *const f32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads.max(n_kv_heads) * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .rope_batched
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_batched(
+        &self,
+        kv: *const f32,
+        cache: *mut f32,
+        pos: *const i32,
+        batch: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        max_seq: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let cp = cache;
+        let pp = pos;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &cp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_heads * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .kv_store_batched
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_batched(
+        &self,
+        q: *const f32,
+        kc: *const f32,
+        vc: *const f32,
+        out: *mut f32,
+        pos: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        max_seq: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = kc;
+        let vp = vc;
+        let op = out;
+        let pp = pos;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+        ];
+        let grid = (batch * n_heads) as u32;
+        let shared = (max_seq as u32 + 256) * 4;
+        Ok(self.attn_decode_batched.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
+    pub fn launch_argmax_batched(
+        &self,
+        logits: *const f32,
+        out_tok: *mut i32,
+        vocab: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        let lp = logits;
+        let op = out_tok;
+        let mut p = vec![
+            &lp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut i32 as *mut core::ffi::c_void,
+            &vocab as *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self
+            .argmax_batched
+            .launch([batch as u32, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
     /// Synchronizes the execution stream.
