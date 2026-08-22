@@ -181,3 +181,18 @@
   - **正确性(真机)**:fp16 vs fp32 最大 logit 差 5e-5(tiny-llama 真实权重)/2e-3(随机),
     贪心 argmax 一致;新增 fp16 集成测试(single/batched/真实模型)+ hipblas GemmEx 探针;
   - 服务默认 dtype=f16(`MACH_DTYPE=f32` 关闭);测试默认 + HIP 全绿,clippy 0 告警。
+
+- **P3c 真实 tokenizer + SSE 流式完成(2026-08-22,7900 XTX 真机)**:
+  - `tokenizer.rs`:纯 Rust 字节级 BPE(Qwen2.5/Llama 风格)——NFC 归一化 + GPT-2 预切分
+    正则(fancy-regex)+ ByteLevel(byte↔unicode)+ BPE merge + added/special tokens;
+    解析 HuggingFace `tokenizer.json`;**与 HF tokenizers 0.23.1 golden 逐 token 对拍一致**
+    (16 组文本 + decode + special token,`tests/data/tok_golden.json` 由
+    `tools/_gen_golden.py` 生成);round-trip 中文/emoji/重音全过;
+  - `mach-server`:prompt 文本用真实 tokenizer 编码、生成结果用真实 tokenizer 解码
+    (naive byte 映射仅作无 tokenizer 时的回退);`/v1/completions`、`/v1/chat/completions`
+    支持 `stream: true` → **SSE**(`text/event-stream`,逐 token delta + `[DONE]`);
+    增量 UTF-8 解码保证多字节字符跨 token 不分裂;引擎逐 token 推送(跳过 prefill 预测,
+    完成时先推最后 token 再关闭流);
+  - **真机端到端(Qwen2.5-0.5B + fp16 + 真实 tokenizer)**:SSE 流式返回中文/多语言
+    delta 正常拼接,`finish_reason` + `[DONE]` 收尾;非流式文本解码正确;
+  - 测试:默认 + HIP 全绿(新增 tokenizer 2、server 2),clippy 0 告警,fmt 干净。

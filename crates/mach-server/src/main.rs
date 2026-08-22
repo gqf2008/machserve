@@ -15,6 +15,8 @@ use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
 use mach_model::loader::load_safetensors;
 #[cfg(feature = "hip")]
+use mach_model::tokenizer::Tokenizer;
+#[cfg(feature = "hip")]
 use mach_model::{Config, Weights};
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ServerEngine, router};
@@ -51,6 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
     let model_name = std::env::var("MACH_MODEL").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
     let config_name = std::env::var("MACH_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
+    let tokenizer_name =
+        std::env::var("MACH_TOKENIZER").unwrap_or_else(|_| "tokenizer.json".into());
     let capacity = std::env::var("MACH_CAPACITY")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -76,11 +80,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hip = hip::hip().expect("HIP runtime");
     assert!(hip::device_count().expect("devices") > 0, "no HIP device");
 
+    // Load the real tokenizer when available; fall back to naive bytes.
+    let tok_path = root.join(&tokenizer_name);
+    let tok = if tok_path.exists() {
+        let t = Tokenizer::from_path(&tok_path).expect("load tokenizer");
+        println!(
+            "tokenizer: {} (vocab {})",
+            tok_path.display(),
+            t.vocab_size()
+        );
+        Some(std::sync::Arc::new(t))
+    } else {
+        println!("tokenizer {tok_path:?} not found; using naive byte mapping");
+        None
+    };
+
     let engine = ServerEngine::new(capacity);
     engine.clone().spawn(hip, cfg, w)?;
     let state = AppState {
         engine,
         model: model_name,
+        tok,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

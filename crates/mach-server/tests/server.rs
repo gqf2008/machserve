@@ -7,6 +7,7 @@ use axum::http::{Request, StatusCode};
 use mach_kernel_sys::hip;
 use mach_model::continuous::ContinuousModel;
 use mach_model::sampling::SamplingParams;
+use mach_model::tokenizer::Tokenizer;
 use mach_model::{Config, Weights};
 use mach_server::{AppState, ServerEngine, router};
 use tower::ServiceExt;
@@ -51,6 +52,7 @@ async fn completions_endpoint_matches_direct_engine() {
     let state = AppState {
         engine,
         model: "tiny".into(),
+        tok: None,
     };
     let app = router(state);
 
@@ -91,6 +93,7 @@ async fn healthz_and_text_prompt() {
     let state = AppState {
         engine,
         model: "tiny".into(),
+        tok: None,
     };
     let app = router(state);
 
@@ -157,6 +160,7 @@ async fn sampling_params_flow_through_http() {
     let state = AppState {
         engine,
         model: "tiny".into(),
+        tok: None,
     };
     let app = router(state);
     let body = serde_json::json!({
@@ -193,5 +197,199 @@ async fn sampling_params_flow_through_http() {
     assert_eq!(
         got, want,
         "HTTP sampling must equal a direct engine run with the same params+seed"
+    );
+}
+
+/// Collects the `content`/`text` deltas from an SSE response body.
+async fn collect_sse_deltas(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 << 20)
+        .await
+        .expect("read sse body");
+    let text = String::from_utf8_lossy(&bytes);
+    let mut out = String::new();
+    for line in text.lines() {
+        if let Some(payload) = line.strip_prefix("data: ") {
+            if payload == "[DONE]" {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(payload).expect("sse json");
+            if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                out.push_str(delta);
+            } else if let Some(t) = v["choices"][0]["text"].as_str() {
+                out.push_str(t);
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn streaming_matches_non_streaming_with_same_seed() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 89).unwrap();
+    let prompt = vec![5u32, 9, 3];
+    let max_new = 6usize;
+
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    // Non-streaming with a fixed seed.
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": max_new,
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "seed": 4321,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let want = json["choices"][0]["text"].as_str().unwrap().to_string();
+
+    // Streaming with the same seed: concatenated deltas must equal `want`.
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": max_new,
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "seed": 4321,
+        "stream": true,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "text/event-stream",
+        "stream must be served as SSE"
+    );
+    let got = collect_sse_deltas(resp).await;
+    assert_eq!(got, want, "SSE deltas must reconstruct the non-stream text");
+}
+
+#[tokio::test]
+async fn text_prompt_uses_real_tokenizer_when_available() {
+    let Some(hip) = hip_ctx() else { return };
+    // tokenizer.json at the repo root .models (skips when absent).
+    let candidates = [
+        std::path::PathBuf::from("../../.models").join("tokenizer.json"),
+        std::path::PathBuf::from(".models").join("tokenizer.json"),
+    ];
+    let Some(tok_path) = candidates.into_iter().find(|p| p.exists()) else {
+        eprintln!("skipping tokenizer test: tokenizer.json missing");
+        return;
+    };
+    let tok = std::sync::Arc::new(Tokenizer::from_path(&tok_path).expect("load tokenizer"));
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 97).unwrap();
+
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: Some(tok.clone()),
+    };
+    let app = router(state);
+
+    // Text prompt with a fixed seed must equal the same prompt sent as raw
+    // token ids produced by the tokenizer.
+    let text = "Hello, world!";
+    let body_text = serde_json::json!({
+        "prompt": text,
+        "max_tokens": 5,
+        "temperature": 0.9,
+        "top_p": 0.9,
+        "seed": 777,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body_text.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let text_tokens: Vec<u32> = json["choices"][0]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+
+    let ids = tok.encode(text);
+    let body_ids = serde_json::json!({
+        "prompt": ids,
+        "max_tokens": 5,
+        "temperature": 0.9,
+        "top_p": 0.9,
+        "seed": 777,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body_ids.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id_tokens: Vec<u32> = json["choices"][0]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert_eq!(
+        text_tokens, id_tokens,
+        "text prompt must encode to the same ids as the tokenizer"
     );
 }
