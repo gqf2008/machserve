@@ -293,7 +293,7 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let max_seq = v["max_position_embeddings"]
         .as_u64()
         .unwrap_or(2048)
-        .min(2048) as usize;
+        .min(8192) as usize;
     let eps = v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
     let theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
     let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);

@@ -6,7 +6,7 @@
 //!
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
-//! MACH_CAPACITY (default 32), MACH_ADDR (default "127.0.0.1:8080").
+//! MACH_CAPACITY (default 64), MACH_ADDR (default "127.0.0.1:8080").
 
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
@@ -37,7 +37,7 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let max_seq = v["max_position_embeddings"]
         .as_u64()
         .unwrap_or(2048)
-        .min(2048) as usize;
+        .min(8192) as usize;
     let eps = v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
     let theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
     let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capacity = std::env::var("MACH_CAPACITY")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(64);
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
