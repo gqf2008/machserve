@@ -9,6 +9,7 @@
 pub mod config;
 pub mod loader;
 pub mod ref_model;
+pub mod sampling;
 pub mod weights;
 
 pub use config::Config;

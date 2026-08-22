@@ -120,7 +120,7 @@ fn main() {
         eager_launch_ms / graph_launch_ms
     );
 
-    // --- real generation demo: 8 tokens, argmax sampling ---
+    // --- real generation demo: 8 tokens, host argmax (full logits readback) ---
     model.reset_state().expect("reset");
     let mut token = 151643u32; // <|im_start|>
     let mut out = Vec::new();
@@ -130,8 +130,38 @@ fn main() {
         token = argmax(&logits) as u32;
         out.push(token);
     }
-    let gen_ms = t4.elapsed().as_secs_f64() * 1000.0 / 8.0;
-    println!("\ngeneration (argmax): {gen_ms:.2} ms/token, tokens {out:?}");
+    let gen_host_ms = t4.elapsed().as_secs_f64() * 1000.0 / 8.0;
+    println!(
+        "\ngeneration (host argmax, full logits readback): {gen_host_ms:.2} ms/token, tokens {out:?}"
+    );
+
+    // --- Verify launch-only is submission rate: 50 eager steps + ONE final sync ---
+    model.reset_state().expect("reset");
+    let m = 50usize;
+    let t6 = Instant::now();
+    for i in 0..m {
+        model.step_eager((i % 977) as u32).expect("eager");
+    }
+    model.sync().expect("sync");
+    let batch_ms = t6.elapsed().as_secs_f64() * 1000.0 / m as f64;
+    println!("eager 50 steps + 1 sync: {batch_ms:.2} ms/token (GPU completion rate)");
+
+    // --- GPU-sampled generation: only 4 bytes read back per token ---
+    let n_gen = 200usize;
+    model.reset_state().expect("reset");
+    let mut token = 151643u32;
+    let mut out2 = Vec::new();
+    let t5 = Instant::now();
+    for _ in 0..n_gen {
+        token = model.decode_step_sampled(token).expect("gen-gpu");
+        out2.push(token);
+    }
+    let gen_gpu_ms = t5.elapsed().as_secs_f64() * 1000.0 / n_gen as f64;
+    println!("generation (GPU argmax, 4B readback): {gen_gpu_ms:.2} ms/token, tokens {out2:?}");
+    println!(
+        "\nend-to-end TPOT: host-readback {gen_host_ms:.2} ms | GPU-sampled {gen_gpu_ms:.2} ms | speedup {:.2}x | llama.cpp Vulkan reference 1.55 ms",
+        gen_host_ms / gen_gpu_ms
+    );
 }
 
 #[cfg(not(feature = "hip"))]

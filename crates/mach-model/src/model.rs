@@ -12,6 +12,7 @@
 //! replays, then replay.
 
 use crate::kernels::HipKernels;
+use crate::sampling::HipSampler;
 use crate::{Config, Error, Weights};
 use mach_engine::graph::{GraphCapture, GraphHandle};
 use mach_engine::hip::HipGraphCapture;
@@ -67,12 +68,15 @@ pub struct GpuModel {
     /// Number of tokens stored so far.
     pos: usize,
     host_pins: Vec<*mut core::ffi::c_void>,
+    /// GPU-side greedy sampler (reads only the sampled token).
+    sampler: HipSampler,
 }
 
 impl GpuModel {
     /// Builds a GPU model and uploads `w` to device memory.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights) -> Result<Self, Error> {
         let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
+        let sampler = HipSampler::new(Arc::clone(&hip), k.stream)?;
         let mut m = Self {
             cfg,
             k,
@@ -100,6 +104,7 @@ impl GpuModel {
             allocs: Vec::new(),
             pos: 0,
             host_pins: Vec::new(),
+            sampler,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -354,6 +359,24 @@ impl GpuModel {
         let out = self.read_logits()?;
         self.pos += 1;
         Ok(out)
+    }
+
+    /// Syncs the model stream (debug/measurement).
+    pub fn sync(&self) -> Result<(), Error> {
+        self.k.sync()
+    }
+
+    /// One decode step returning the greedy-sampled next token, reading back
+    /// only 4 bytes instead of the full logits vector.
+    pub fn decode_step_sampled(&mut self, token: u32) -> Result<u32, Error> {
+        if self.pos >= self.cfg.max_seq_len {
+            return Err(Error::Model("sequence length exceeded".into()));
+        }
+        self.update_inputs(token)?;
+        self.run_kernels()?;
+        let next = self.sampler.argmax(self.logits, self.cfg.vocab_size)?;
+        self.pos += 1;
+        Ok(next)
     }
 
     /// Runs `tokens` one by one and returns logits of the final token.
