@@ -9,16 +9,25 @@ use std::path::PathBuf;
 
 fn main() {
     let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
-    let model_path = PathBuf::from(&root).join("tiny-llama.safetensors");
-    let cfg = Config::llama(16, 2, 4, 4, 32000, 2048);
-    let w: Weights = load_safetensors(&model_path, &cfg, false).expect("load weights");
+    let model = std::env::var("MACH_MODEL").unwrap_or_else(|_| "tiny-llama.safetensors".into());
+    let model_path = PathBuf::from(&root).join(&model);
+    let cfg = if model.starts_with("qwen") {
+        let mut c = Config::llama(896, 24, 14, 2, 151936, 2048);
+        c.intermediate_size = 4864;
+        c.rope_theta = 1_000_000.0;
+        c
+    } else {
+        Config::llama(16, 2, 4, 4, 32000, 2048)
+    };
+    let tie = model.starts_with("qwen");
+    let w: Weights = load_safetensors(&model_path, &cfg, tie).expect("load weights");
 
     let tokens: Vec<u32> = std::env::args()
         .skip(1)
         .map(|a| a.parse().unwrap())
         .collect();
     let tokens = if tokens.is_empty() {
-        vec![1, 2, 3, 4, 5]
+        vec![1, 2, 3]
     } else {
         tokens
     };
@@ -39,9 +48,27 @@ fn main() {
         serde_json::to_string(&l64).unwrap(),
     )
     .unwrap();
+    if model.starts_with("qwen") {
+        std::fs::write(
+            PathBuf::from(&root).join("qwen_rust_cpu_f64_logits.json"),
+            serde_json::to_string(&l64).unwrap(),
+        )
+        .unwrap();
+    }
 
     let d32 = max_diff(&l32, &l64);
     println!("f32 vs f64 max abs diff: {d32:.3e}");
+
+    if std::env::var("MACH_LAYER0").is_ok() {
+        let layer0 = forward_f64_layer0(&w, &cfg, tokens[0]);
+        std::fs::write(
+            PathBuf::from(&root).join("qwen_f64_layer0.json"),
+            serde_json::to_string(&layer0).unwrap(),
+        )
+        .unwrap();
+        println!("f64 layer0 dumped (xn/q/k/x)");
+        return;
+    }
     println!(
         "f64[0..8] = {:?}",
         l64[..8]
@@ -132,6 +159,13 @@ fn forward_f64(w: &Weights, cfg: &Config, tokens: &[u32]) -> Vec<f64> {
     let nkv = cfg.n_kv_heads * cfg.head_dim;
     let inter = cfg.intermediate_size;
     let mut logits = vec![0.0; cfg.vocab_size];
+    // Persistent per-layer KV caches.
+    let mut kcaches: Vec<Vec<f64>> = (0..cfg.n_layers)
+        .map(|_| vec![0.0; cfg.max_seq_len * nkv])
+        .collect();
+    let mut vcaches: Vec<Vec<f64>> = (0..cfg.n_layers)
+        .map(|_| vec![0.0; cfg.max_seq_len * nkv])
+        .collect();
     for (pos, &tok) in tokens.iter().enumerate() {
         let emb: Vec<f64> = w.tok_emb[tok as usize * d..(tok as usize + 1) * d]
             .iter()
@@ -174,11 +208,17 @@ fn forward_f64(w: &Weights, cfg: &Config, tokens: &[u32]) -> Vec<f64> {
                 cfg.rope_theta as f64,
             );
             let _ = li;
-            let mut kc = vec![0.0; cfg.max_seq_len * nkv];
-            let mut vc = vec![0.0; cfg.max_seq_len * nkv];
-            kc[pos * nkv..(pos + 1) * nkv].copy_from_slice(&k);
-            vc[pos * nkv..(pos + 1) * nkv].copy_from_slice(&v);
-            let attn = attention(&q, &kc, &vc, pos, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+            kcaches[li][pos * nkv..(pos + 1) * nkv].copy_from_slice(&k);
+            vcaches[li][pos * nkv..(pos + 1) * nkv].copy_from_slice(&v);
+            let attn = attention(
+                &q,
+                &kcaches[li],
+                &vcaches[li],
+                pos,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+            );
             let proj = matvec_t(
                 &attn,
                 &lw.wo.iter().map(|v| *v as f64).collect::<Vec<_>>(),
@@ -222,4 +262,82 @@ fn forward_f64(w: &Weights, cfg: &Config, tokens: &[u32]) -> Vec<f64> {
         );
     }
     logits
+}
+
+/// Single-layer f64 forward for one token, returning (xn, q, k, x after layer 0).
+fn forward_f64_layer0(w: &Weights, cfg: &Config, token: u32) -> Vec<Vec<f64>> {
+    let d = cfg.d_model;
+    let nq = cfg.n_heads * cfg.head_dim;
+    let nkv = cfg.n_kv_heads * cfg.head_dim;
+    let inter = cfg.intermediate_size;
+    let lw = &w.layers[0];
+    let emb: Vec<f64> = w.tok_emb[token as usize * d..(token as usize + 1) * d]
+        .iter()
+        .map(|v| *v as f64)
+        .collect();
+    let mut x = emb;
+    let xn = rms_norm(
+        &x,
+        &lw.rms_attn.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        cfg.rms_eps as f64,
+    );
+    let mut q = matvec_t(
+        &xn,
+        &lw.wq.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        nq,
+    );
+    let mut k = matvec_t(
+        &xn,
+        &lw.wk.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        nkv,
+    );
+    let v = matvec_t(
+        &xn,
+        &lw.wv.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        nkv,
+    );
+    rope(&mut q, cfg.n_heads, cfg.head_dim, 0, cfg.rope_theta as f64);
+    rope(
+        &mut k,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        0,
+        cfg.rope_theta as f64,
+    );
+    let mut kc = vec![0.0; cfg.max_seq_len * nkv];
+    let mut vc = vec![0.0; cfg.max_seq_len * nkv];
+    kc[..nkv].copy_from_slice(&k);
+    vc[..nkv].copy_from_slice(&v);
+    let attn = attention(&q, &kc, &vc, 0, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    let proj = matvec_t(
+        &attn,
+        &lw.wo.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        d,
+    );
+    for i in 0..d {
+        x[i] += proj[i];
+    }
+    let xn2 = rms_norm(
+        &x,
+        &lw.rms_mlp.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        cfg.rms_eps as f64,
+    );
+    let gate = matvec_t(
+        &xn2,
+        &lw.wg.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        inter,
+    );
+    let up = matvec_t(
+        &xn2,
+        &lw.wu.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        inter,
+    );
+    let h: Vec<f64> = (0..inter)
+        .map(|i| gate[i] * (up[i] / (1.0 + (-up[i]).exp())))
+        .collect();
+    let down = matvec_t(&h, &lw.wd.iter().map(|v| *v as f64).collect::<Vec<_>>(), d);
+    for i in 0..d {
+        x[i] += down[i];
+    }
+    vec![xn, q, k, x]
 }

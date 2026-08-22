@@ -35,8 +35,9 @@ thirdparty/      flashinfer / cutlass / trtllm / gluon / candle-kernels(全部 p
   mach-kernel-sys **HIP FFI + hiprtc kernel 运行时 + hipBLAS**、mach-bench 基准、
   **mach-model 完整 decode 链路**(GQA + RoPE + SwiGLU + 静态 KV + HIP graph 捕获重放
   + **safetensors 真实权重加载**)。
-  7900 XTX 真机验收:GPU 解码 == CPU 参考 == 独立 fp64 Python 参考(相对误差 ~2e-7);
-  真实 tiny-random-Llama checkpoint 加载并解码;graph 重放 == eager,launch-only 快 2-5x。
+  7900 XTX 真机验收:GPU 解码 == CPU 参考 == 独立 fp64 numpy 参考;真实
+  **Qwen2.5-0.5B** 加载解码相对误差 **4.4e-6**;graph 重放 == eager,
+  launch-only 快 2.3-5.3x(0.5B 模型 GPU 解码实耗 ~0.3-0.5 ms/token)。
 - 详细路线图见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## 构建
@@ -58,6 +59,7 @@ cargo build -p mach-engine --features cuda
 ## License
 
 MIT OR Apache-2.0
+
 
 
 

@@ -78,6 +78,29 @@ fn gpu_matches_cpu_reference() {
 }
 
 #[test]
+fn gpu_matches_cpu_reference_large_dmodel() {
+    // d_model 512 > one block (256 threads): catches kernels that only cover a
+    // single block (e.g. embed_gather with a fixed [1,1,1] grid).
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::llama(512, 2, 8, 2, 4096, 256);
+    let w = Weights::random(&cfg, 21).unwrap();
+    let tokens: Vec<u32> = vec![3, 9, 77, 5, 300, 12];
+
+    let mut gpu = GpuModel::new(hip, cfg, &w).unwrap();
+    let gpu_logits = gpu.forward(&tokens).unwrap();
+    let mut cpu = RefModel::new(cfg, w);
+    let cpu_logits = cpu.forward(&tokens);
+
+    assert_close(
+        &gpu_logits,
+        &cpu_logits,
+        2e-3,
+        2e-3,
+        "large-d_model gpu vs cpu",
+    );
+}
+
+#[test]
 fn graph_replay_matches_eager() {
     let Some(hip) = hip_ctx() else { return };
     let cfg = Config::tiny();

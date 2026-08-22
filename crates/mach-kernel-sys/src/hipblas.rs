@@ -197,6 +197,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_cast)]
     fn sgemm_probe() {
         if !have_gpu() {
             eprintln!("skipping: no device");
@@ -312,6 +313,81 @@ mod tests {
             }
             eprintln!("random gemm maxerr={}", maxerr);
             assert!(maxerr < 1e-3, "random gemm mismatch {maxerr}");
+
+            // Qwen-scale shapes: m=1, k=896, n up to 151936.
+            {
+                let kk = 896i32;
+                for &nn in &[896i32, 4864i32, 151936i32] {
+                    let wx2: Vec<f32> = (0..(nn as usize * kk as usize))
+                        .map(|i| ((i % 7919) as f32 - 3959.0) / 100000.0)
+                        .collect();
+                    let xin2: Vec<f32> = (0..kk as usize)
+                        .map(|i| ((i % 104729) as f32 - 50000.0) / 1000000.0)
+                        .collect();
+                    let dw2 = hip::malloc(&h, (nn as usize * kk as usize * 4) as usize).unwrap();
+                    let dx2 = hip::malloc(&h, (kk as usize * 4) as usize).unwrap();
+                    let dco2 = hip::malloc(&h, (nn as usize * 4) as usize).unwrap();
+                    hip::memcpy(
+                        &h,
+                        dw2,
+                        wx2.as_ptr() as *const _,
+                        (nn as usize * kk as usize * 4) as usize,
+                        hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                    )
+                    .unwrap();
+                    hip::memcpy(
+                        &h,
+                        dx2,
+                        xin2.as_ptr() as *const _,
+                        (kk as usize * 4) as usize,
+                        hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                    )
+                    .unwrap();
+                    blas.sgemm(
+                        HIPBLAS_OP_N,
+                        HIPBLAS_OP_N,
+                        1,
+                        nn,
+                        kk,
+                        1.0,
+                        dx2 as *const f32,
+                        1,
+                        dw2 as *const f32,
+                        kk,
+                        0.0,
+                        dco2 as *mut f32,
+                        1,
+                    )
+                    .expect("qwen gemm");
+                    let mut cout2 = vec![0.0f32; nn as usize];
+                    hip::memcpy(
+                        &h,
+                        cout2.as_mut_ptr() as *mut _,
+                        dco2 as *const _,
+                        (nn as usize * 4) as usize,
+                        hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                    )
+                    .unwrap();
+                    // sample 64 outputs
+                    let mut maxerr = 0.0f32;
+                    for &j in &[0usize, 1, 17, 100, 999, 5000, 9999, 12345] {
+                        if j >= nn as usize {
+                            continue;
+                        }
+                        let mut want = 0.0f32;
+                        for i in 0..kk as usize {
+                            want += xin2[i] * wx2[j * kk as usize + i];
+                        }
+                        maxerr = maxerr.max((cout2[j] - want).abs());
+                    }
+                    eprintln!("qwen-shape gemm m=1 k={kk} n={nn} maxerr={maxerr}");
+                    assert!(maxerr < 1e-2, "qwen-shape gemm n={nn} mismatch {maxerr}");
+                    hip::free(&h, dw2).unwrap();
+                    hip::free(&h, dx2).unwrap();
+                    hip::free(&h, dco2).unwrap();
+                }
+            }
+
             hip::free(&h, dw2).unwrap();
             hip::free(&h, dx2).unwrap();
             hip::free(&h, dco2).unwrap();

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Independent fp64 reference for the tiny Llama decode, used to validate the
-Rust GPU path numerically. Mirrors mach_model::ref_model (rmsnorm, rope,
+"""Independent fp64 (numpy) reference for Llama/Qwen decode, used to validate
+the Rust GPU path numerically. Mirrors mach_model's forward (rmsnorm, rope,
 GQA attention, swiglu MLP, lm_head) reading a real safetensors checkpoint.
 
 Usage:
-  python tools/ref_llama.py <model.safetensors> [rust_logits.json] [tokens...]
-Prints the reference logits (and, when rust_logits.json is given, the max
-absolute difference vs the Rust output).
+  python tools/ref_llama.py <model.safetensors> [config.json] [rust_logits.json] [tokens...]
 """
 import json
 import struct
 import sys
+
+import numpy as np
 
 
 def load_safetensors(path):
@@ -26,66 +26,60 @@ def load_safetensors(path):
         shape = meta["shape"]
         start, end = meta["data_offsets"]
         raw = data[start:end]
-        n = 1
-        for d in shape:
-            n *= d
+        n = int(np.prod(shape))
         if dtype == "F32":
-            vals = struct.unpack("<%df" % n, raw)
+            vals = np.frombuffer(raw, dtype="<f4").astype(np.float64)
         elif dtype == "F16":
-            vals = [struct.unpack("<e", raw[i * 2 : i * 2 + 2])[0] for i in range(n)]
+            vals = np.frombuffer(raw, dtype="<f2").astype(np.float64)
         elif dtype == "BF16":
-            vals = [
-                struct.unpack("<f", struct.pack("<I", struct.unpack("<H", raw[i * 2 : i * 2 + 2])[0] << 16))[0]
-                for i in range(n)
-            ]
+            u = np.frombuffer(raw, dtype="<u2").astype(np.uint32)
+            vals = (u << 16).view(np.float32).astype(np.float64)
         else:
             raise ValueError("unsupported dtype " + dtype)
-        out[name] = list(vals)
+        out[name] = vals.reshape(shape)
     return out
 
 
 def rms_norm(x, w, eps):
-    n = len(x)
-    mean = sum(v * v for v in x) / n
-    inv = 1.0 / (mean + eps) ** 0.5
-    return [x[i] * inv * w[i] for i in range(n)]
+    mean = np.mean(x * x)
+    inv = 1.0 / np.sqrt(mean + eps)
+    return x * inv * w
 
 
 def matvec_t(x, w, out_dim):
-    k = len(x)
-    return [sum(w[o * k + i] * x[i] for i in range(k)) for o in range(out_dim)]
+    # w is [out, in] row-major; out = w @ x
+    return w @ x
 
 
 def rope(x, n_heads, head_dim, pos, theta):
     half = head_dim // 2
-    for h in range(n_heads):
-        for d in range(half):
-            freq = 1.0 / theta ** (2.0 * d / head_dim)
-            ang = pos * freq
-            c, sn = math.cos(ang), math.sin(ang)
-            idx = h * head_dim + 2 * d
-            a, b = x[idx], x[idx + 1]
-            x[idx] = a * c - b * sn
-            x[idx + 1] = a * sn + b * c
+    d = np.arange(half, dtype=np.float64)
+    freq = 1.0 / (theta ** (2.0 * d / head_dim))
+    ang = pos * freq
+    c = np.cos(ang)
+    s = np.sin(ang)
+    x = x.reshape(n_heads, head_dim)
+    a = x[:, 0::2].copy()
+    b = x[:, 1::2].copy()
+    x[:, 0::2] = a * c - b * s
+    x[:, 1::2] = a * s + b * c
+    return x.reshape(-1)
 
 
 def attention_decode(q, kc, vc, pos, n_heads, n_kv_heads, head_dim):
+    # kc/vc are [max_seq, n_kv_heads, head_dim]; only rows 0..=pos are valid.
     scale = head_dim ** -0.5
     groups = n_heads // n_kv_heads
-    out = [0.0] * (n_heads * head_dim)
+    out = np.zeros(n_heads * head_dim, dtype=np.float64)
+    q = q.reshape(n_heads, head_dim)
     for h in range(n_heads):
         kv = h // groups
-        qh = q[h * head_dim : (h + 1) * head_dim]
-        scores = []
-        for p in range(pos + 1):
-            kp = kc[(p * n_kv_heads + kv) * head_dim : (p * n_kv_heads + kv + 1) * head_dim]
-            scores.append(sum(qh[d] * kp[d] for d in range(head_dim)) * scale)
-        m = max(scores)
-        ex = [math.exp(s - m) for s in scores]
-        tot = sum(ex)
-        for d in range(head_dim):
-            acc = sum(ex[p] * vc[(p * n_kv_heads + kv) * head_dim + d] for p in range(pos + 1))
-            out[h * head_dim + d] = acc / tot
+        kp = kc[: pos + 1, kv, :]  # [pos+1, head_dim]
+        vp = vc[: pos + 1, kv, :]
+        scores = (kp @ q[h]) * scale
+        m = scores.max()
+        ex = np.exp(scores - m)
+        out[h * head_dim : (h + 1) * head_dim] = (ex @ vp) / ex.sum()
     return out
 
 
@@ -93,65 +87,74 @@ def forward(w, cfg, tokens):
     d = cfg["hidden"]
     nq = cfg["heads"] * cfg["head_dim"]
     nkv = cfg["kv_heads"] * cfg["head_dim"]
-    kv = [([0.0] * (cfg["max_seq"] * nkv), [0.0] * (cfg["max_seq"] * nkv)) for _ in range(cfg["layers"])]
+    lm = w.get("lm_head.weight", w["model.embed_tokens.weight"])
+    # Persistent per-layer KV caches (rows 0..=pos valid).
+    kcache = [np.zeros((cfg["max_seq"], cfg["kv_heads"], cfg["head_dim"]), dtype=np.float64) for _ in range(cfg["layers"])]
+    vcache = [np.zeros((cfg["max_seq"], cfg["kv_heads"], cfg["head_dim"]), dtype=np.float64) for _ in range(cfg["layers"])]
     logits = None
     for pos, tok in enumerate(tokens):
-        x = w["model.embed_tokens.weight"][tok * d : (tok + 1) * d]
+        x = w["model.embed_tokens.weight"][tok].copy()
         for li in range(cfg["layers"]):
             p = lambda s: "model.layers.%d.%s" % (li, s)
             xn = rms_norm(x, w[p("input_layernorm.weight")], cfg["eps"])
             q = matvec_t(xn, w[p("self_attn.q_proj.weight")], nq)
             k = matvec_t(xn, w[p("self_attn.k_proj.weight")], nkv)
             v = matvec_t(xn, w[p("self_attn.v_proj.weight")], nkv)
-            rope(q, cfg["heads"], cfg["head_dim"], pos, cfg["theta"])
-            rope(k, cfg["kv_heads"], cfg["head_dim"], pos, cfg["theta"])
-            kv[li][0][pos * nkv : (pos + 1) * nkv] = k
-            kv[li][1][pos * nkv : (pos + 1) * nkv] = v
-            attn = attention_decode(q, kv[li][0], kv[li][1], pos, cfg["heads"], cfg["kv_heads"], cfg["head_dim"])
-            proj = matvec_t(attn, w[p("self_attn.o_proj.weight")], d)
-            x = [x[i] + proj[i] for i in range(d)]
+            q = rope(q, cfg["heads"], cfg["head_dim"], pos, cfg["theta"])
+            k = rope(k, cfg["kv_heads"], cfg["head_dim"], pos, cfg["theta"])
+            kcache[li][pos] = k.reshape(cfg["kv_heads"], cfg["head_dim"])
+            vcache[li][pos] = v.reshape(cfg["kv_heads"], cfg["head_dim"])
+            attn = attention_decode(q, kcache[li], vcache[li], pos, cfg["heads"], cfg["kv_heads"], cfg["head_dim"])
+            x = x + matvec_t(attn, w[p("self_attn.o_proj.weight")], d)
             xn = rms_norm(x, w[p("post_attention_layernorm.weight")], cfg["eps"])
             gate = matvec_t(xn, w[p("mlp.gate_proj.weight")], cfg["intermediate"])
             up = matvec_t(xn, w[p("mlp.up_proj.weight")], cfg["intermediate"])
-            h = [gate[i] * (up[i] / (1.0 + math.exp(-up[i]))) for i in range(cfg["intermediate"])]
-            down = matvec_t(h, w[p("mlp.down_proj.weight")], d)
-            x = [x[i] + down[i] for i in range(d)]
+            h = gate * (up / (1.0 + np.exp(-up)))
+            x = x + matvec_t(h, w[p("mlp.down_proj.weight")], d)
         xf = rms_norm(x, w["model.norm.weight"], cfg["eps"])
-        logits = matvec_t(xf, w["lm_head.weight"], cfg["vocab"])
+        logits = matvec_t(xf, lm, cfg["vocab"])
     return logits
 
 
 def main():
-    import math  # noqa: F401 (used in closures via module globals)
-
-    global math
-    import math
-
     path = sys.argv[1]
-    rust_json = sys.argv[2] if len(sys.argv) > 2 else None
-    tokens = [int(t) for t in sys.argv[3:]] or [1, 2, 3, 4, 5]
+    cfg_path = sys.argv[2] if len(sys.argv) > 2 else None
+    rust_json = sys.argv[3] if len(sys.argv) > 3 else None
+    tokens = [int(t) for t in sys.argv[4:]] or [1, 2, 3, 4, 5]
 
     w = load_safetensors(path)
-    cfg = {
-        "hidden": 16,
-        "layers": 2,
-        "heads": 4,
-        "kv_heads": 4,
-        "head_dim": 4,
-        "intermediate": 64,
-        "vocab": 32000,
-        "max_seq": 2048,
-        "eps": 1e-6,
-        "theta": 10000.0,
-    }
+    if cfg_path:
+        c = json.load(open(cfg_path))
+        hidden = c.get("hidden_size", 16)
+        n_heads = c.get("num_attention_heads", 4)
+        kv = c.get("num_key_value_heads", n_heads)
+        head_dim = c.get("head_dim", hidden // n_heads)
+        cfg = {
+            "hidden": hidden,
+            "layers": c.get("num_hidden_layers", 2),
+            "heads": n_heads,
+            "kv_heads": kv,
+            "head_dim": head_dim,
+            "intermediate": c.get("intermediate_size", 4 * hidden),
+            "vocab": c.get("vocab_size", 32000),
+            "eps": c.get("rms_norm_eps", 1e-6),
+            "theta": c.get("rope_theta", 10000.0),
+            "max_seq": min(c.get("max_position_embeddings", 2048), 2048),
+        }
+    else:
+        cfg = {
+            "hidden": 16, "layers": 2, "heads": 4, "kv_heads": 4, "head_dim": 4,
+            "intermediate": 64, "vocab": 32000, "eps": 1e-6, "theta": 10000.0,
+            "max_seq": 2048,
+        }
     ref = forward(w, cfg, tokens)
-    print("ref logits[0..8] =", [round(v, 6) for v in ref[:8]])
-    print("ref max |x| =", max(abs(v) for v in ref))
+    print("ref logits[0..8] =", [round(float(v), 6) for v in ref[:8]])
+    print("ref max |x| =", float(np.max(np.abs(ref))))
 
     if rust_json:
         rust = json.load(open(rust_json))
-        diff = max(abs(a - b) for a, b in zip(rust, ref))
-        scale = max(abs(v) for v in ref)
+        diff = float(np.max(np.abs(np.asarray(rust) - ref)))
+        scale = float(np.max(np.abs(ref)))
         print("RUST vs REF: max abs diff = %.6e  (scale %.3f, rel %.3e)" % (diff, scale, diff / scale))
 
 

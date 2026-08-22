@@ -81,3 +81,19 @@
   - 新增测试:合成 safetensors roundtrip(CPU)、加载权重 GPU 解码对拍 CPU(真机)、
     真实模型有限/确定性 smoke(真机,模型缺失则跳过);
   - 验证:默认 16 + HIP 23 测试全绿,clippy(default+hip)0 告警,fmt 干净。
+
+- **P1c 真实模型验证完成(2026-08-22,7900 XTX 真机)**:
+  - 加载真实 **Qwen2.5-0.5B-Instruct**(942MB BF16 safetensors,24 层/896 维/GQA 14:2/
+    intermediate 4864/rope_theta 1e6/tie_embeddings),GPU 解码并与**独立 fp64 numpy 参考**
+    逐元素对拍,**相对误差 4.4e-6**;
+  - 过程中发现并修复一个真 bug:**`embed_gather` kernel 的 grid 固定 [1,1,1]**(只有 256 线程),
+    当 d_model > 256(如 Qwen 896)时只写前 256 维,其余是未初始化内存 → 整模型数值错乱、
+    且随运行变化(曾误判为 1.949x/0.0028 等假象)。修复为 `ceil(cols/256)` 分块;
+    `kv_store` 同样改为 grid-stride 防御;
+  - **基准(Qwen2.5-0.5B,7900 XTX)**:launch-only 路径 graph 重放 **0.30-0.47 ms/token**
+    vs eager 1.06-1.59 ms/token(**2.3-5.3x**);完整步(含 607KB logits 读回)~7.2-9.8 ms;
+  - 新增回归测试:`gpu_matches_cpu_reference_large_dmodel`(d_model=512>256,直接抓 embed grid bug);
+  - 工具:`tools/ref_llama.py`(numpy fp64 参考,支持任意 Llama/Qwen config)、
+    `examples/qwen_bench.rs`、`examples/kernel_probe.rs`(逐 kernel 隔离验证)、
+    `examples/ref_cpu.rs`(Rust f32/f64 参考);
+  - 验证:默认 16 + HIP 24 测试全绿,clippy(default+hip)0 告警,fmt 干净。

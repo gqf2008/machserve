@@ -61,10 +61,9 @@ extern "C" __global__ void add(float* x, const float* y, int n) {
 const KV_STORE: &str = r#"
 extern "C" __global__ void kv_store(const float* kv, float* cache, const int* pos_buf,
                                     int kv_heads, int head_dim, int max_seq) {
-    int i = threadIdx.x;
     int p = *pos_buf;
     int total = kv_heads * head_dim;
-    if (i < total) {
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
         cache[((long long)p * kv_heads * head_dim) + i] = kv[i];
     }
 }
@@ -235,9 +234,11 @@ impl HipKernels {
             &xp as *const *mut f32 as *mut core::ffi::c_void,
             &cols as *const i32 as *mut core::ffi::c_void,
         ];
+        // cols can exceed one block (256 threads), so grid over blocks.
+        let blocks = (cols as u32).div_ceil(256);
         Ok(self
             .embed
-            .launch([1, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
     pub fn launch_rms_norm(

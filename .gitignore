@@ -11,3 +11,5 @@ Cargo.lock
 
 # downloaded test models (fetch with the commands in tests/real_model.rs)
 /.models
+
+__pycache__/
