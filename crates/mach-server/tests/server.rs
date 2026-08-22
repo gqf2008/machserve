@@ -399,3 +399,63 @@ async fn text_prompt_uses_real_tokenizer_when_available() {
         "text prompt must encode to the same ids as the tokenizer"
     );
 }
+
+#[tokio::test]
+async fn n_returns_multiple_distinct_choices() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 79).unwrap();
+    let prompt = vec![5u32, 9, 3];
+    let engine = ServerEngine::new(8);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": 4,
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "seed": 42,
+        "n": 2,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let choices = json["choices"].as_array().expect("choices array");
+    assert_eq!(choices.len(), 2, "n=2 must return two choices");
+    let t0: Vec<u32> = choices[0]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let t1: Vec<u32> = choices[1]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert!(!t0.is_empty() && !t1.is_empty());
+    assert_ne!(
+        t0, t1,
+        "n>1 choices must use distinct seeds -> distinct samples"
+    );
+}

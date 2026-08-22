@@ -67,6 +67,9 @@ pub struct CompletionRequest {
     /// Stop generation when the output ends with any of these strings.
     #[serde(default)]
     pub stop: Option<StopSpec>,
+    /// Number of independent completions to generate (default 1).
+    #[serde(default)]
+    pub n: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +95,8 @@ pub struct ChatRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub stop: Option<StopSpec>,
+    #[serde(default)]
+    pub n: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -321,25 +326,38 @@ pub async fn completions(
         return sse_response(rx);
     }
 
-    let (output, reason) = match state
-        .engine
-        .submit(tokens, req.max_tokens, None, stop, params)
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let n = req.n.unwrap_or(1).max(1);
+    let mut choices = Vec::with_capacity(n);
+    for i in 0..n {
+        // Distinct seeds per choice so n > 1 produces independent samples
+        // (n = 1 keeps the caller seed unchanged).
+        let seed = if n > 1 {
+            Some(req.seed.unwrap_or(1_000_000).wrapping_add(i as u64))
+        } else {
+            req.seed
+        };
+        let params = sampling_params(req.temperature, req.top_k, req.top_p, seed);
+        let (output, reason) = match state
+            .engine
+            .submit(tokens.clone(), req.max_tokens, None, stop.clone(), params)
+            .await
+        {
+            Ok(o) => o,
+            Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        choices.push(CompletionChoice {
+            index: i,
+            text: decode_text(&state.tok, &output),
+            tokens: output,
+            finish_reason: reason.into(),
+        });
+    }
     Json(CompletionResponse {
         id,
         object: "text_completion".into(),
         created,
         model: state.model.clone(),
-        choices: vec![CompletionChoice {
-            index: 0,
-            text: decode_text(&state.tok, &output),
-            tokens: output,
-            finish_reason: reason.into(),
-        }],
+        choices,
     })
     .into_response()
 }
@@ -392,25 +410,36 @@ pub async fn chat_completions(
         return sse_response(rx);
     }
 
-    let (output, reason) = match state
-        .engine
-        .submit(tokens, req.max_tokens, eos, stop, params)
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let n = req.n.unwrap_or(1).max(1);
+    let mut choices = Vec::with_capacity(n);
+    for i in 0..n {
+        let seed = if n > 1 {
+            Some(req.seed.unwrap_or(1_000_000).wrapping_add(i as u64))
+        } else {
+            req.seed
+        };
+        let params = sampling_params(req.temperature, req.top_k, req.top_p, seed);
+        let (output, reason) = match state
+            .engine
+            .submit(tokens.clone(), req.max_tokens, eos, stop.clone(), params)
+            .await
+        {
+            Ok(o) => o,
+            Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        choices.push(CompletionChoice {
+            index: i,
+            text: decode_text(&state.tok, &output),
+            tokens: output,
+            finish_reason: reason.into(),
+        });
+    }
     Json(CompletionResponse {
         id,
         object: "chat.completion".into(),
         created,
         model: state.model.clone(),
-        choices: vec![CompletionChoice {
-            index: 0,
-            text: decode_text(&state.tok, &output),
-            tokens: output,
-            finish_reason: reason.into(),
-        }],
+        choices,
     })
     .into_response()
 }

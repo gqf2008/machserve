@@ -295,3 +295,9 @@
     因 EOS/stop 结束,服务器响应与 SSE 末块透传;
   - 确定性单测:stop=[首个贪心 token] 立即终止、两 token stop 序列精确停止、
     max_new 结束报 length;默认 + HIP 全绿,clippy/fmt 干净。
+
+- **P3n OpenAI `n` 多生成(2026-08-23,7900 XTX 真机)**:
+  - `/v1/completions`、`/v1/chat/completions` 支持 `n`(默认 1):n>1 时每个 choice
+    用不同 seed 提交独立序列(引擎连续批处理并发跑),响应返回 n 个 choice;
+    n=1 行为不变(透传调用方 seed);
+  - 服务器测试:n=2 返回 2 个独立 sample 且不同;默认 + HIP 全绿,clippy/fmt 干净。
