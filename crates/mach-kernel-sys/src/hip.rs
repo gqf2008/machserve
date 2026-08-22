@@ -275,6 +275,76 @@ pub fn error_string(h: &Hip, code: c_int) -> String {
     }
 }
 
+/// Converts an f32 to fp16 bits (round-to-nearest-even). Host-side mirror of
+/// the device cast; kept here so kernel-sys tests can prepare fp16 operands.
+#[must_use]
+pub fn fp32_to_f16_host(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let mut e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = 14 - e;
+        let half = 1u32 << (shift - 1);
+        let mut m16 = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        if rem > half || (rem == half && (m16 & 1) == 1) {
+            m16 += 1;
+        }
+        return sign | m16 as u16;
+    }
+    let mut m16 = mant >> 13;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m16 & 1) == 1) {
+        m16 += 1;
+        if m16 == 0x400 {
+            m16 = 0;
+            e += 1;
+            if e >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | (((e as u16) & 0x1f) << 10) | (m16 as u16)
+}
+
+/// Expands fp16 bits to f32 (exact).
+#[must_use]
+pub fn fp16_to_f32_host(h: u16) -> f32 {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let e = ((h >> 10) & 0x1f) as u32;
+    let m = (h & 0x03ff) as u32;
+    let b = if e == 0 {
+        if m == 0 {
+            sign
+        } else {
+            let mut m2 = m;
+            let mut e2 = 127u32 - 15 + 1;
+            while (m2 & 0x0400) == 0 {
+                m2 <<= 1;
+                e2 -= 1;
+            }
+            sign | (e2 << 23) | ((m2 & 0x03ff) << 13)
+        }
+    } else if e == 0x1f {
+        sign | 0x7f80_0000 | (m << 13)
+    } else {
+        sign | (((e as i32 - 15 + 127) as u32) << 23) | (m << 13)
+    };
+    f32::from_bits(b)
+}
+
 /// Converts a HIP/hiprtc return code into `Ok`/`Err` with a message.
 pub fn check(h: &Hip, code: c_int) -> Result<(), HipError> {
     if code == HIP_SUCCESS {

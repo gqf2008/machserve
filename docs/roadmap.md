@@ -168,3 +168,16 @@
     HTTP 采样请求 == 直接引擎同参数同 seed 输出;
   - 测试:默认 + HIP 40 全绿(新增 sampling 4、continuous 1、server 1、real_model 1),
     clippy(default+hip)0 告警,fmt 干净。
+
+- **P3b fp16 计算完成(2026-08-22,7900 XTX 真机)**:
+  - `ModelDType::{F32, F16}` 贯穿 Config/BatchedModel/GpuModel;权重与 GEMM 输入 fp16、
+    **fp32 累加**(hipBLAS `GemmEx_v2`,A/B=16F、C=32F 或 16F,compute=32F);
+  - **关键性能发现**:rocBLAS 瘦长形状(m>>n)fp16 GEMM 输出 fp16 比 fp32 快 3-4x,
+    而输出 fp32 反而比 f32 慢——隐藏层 GEMM 输出 fp16 + cast 回 f32,lm_head 保持 fp32
+    (采样精度);第一版(c32 输出)在 B=64 无提升,改 c16 后拿到 2.4x;
+  - **性能(Qwen2.5-0.5B)**:B=16/32/64 每步 4.84/4.45/5.78ms vs f32 14.18/14.84/13.78ms
+    (2.9x/3.3x/2.4x);B=64 每序列 0.090ms = **11074 tok/s**,llama.cpp Vulkan 643 tok/s
+    的 **17x**;
+  - **正确性(真机)**:fp16 vs fp32 最大 logit 差 5e-5(tiny-llama 真实权重)/2e-3(随机),
+    贪心 argmax 一致;新增 fp16 集成测试(single/batched/真实模型)+ hipblas GemmEx 探针;
+  - 服务默认 dtype=f16(`MACH_DTYPE=f32` 关闭);测试默认 + HIP 全绿,clippy 0 告警。

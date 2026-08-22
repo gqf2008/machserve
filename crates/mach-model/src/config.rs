@@ -1,8 +1,20 @@
 //! Transformer configuration for the P1 decode slice.
 
+/// Device compute dtype for weights + GEMM operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelDType {
+    /// Full fp32 path (default; reference behavior).
+    #[default]
+    F32,
+    /// fp16 weights + fp16 GEMM inputs with fp32 accumulation (2x GEMM rate).
+    F16,
+}
+
 /// Configuration of the small transformer used in the P1 slice.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
+    /// Compute dtype for device weights and GEMM operands.
+    pub dtype: ModelDType,
     /// Vocabulary size.
     pub vocab_size: usize,
     /// Hidden (model) dimension.
@@ -30,6 +42,7 @@ impl Config {
     #[must_use]
     pub fn tiny() -> Self {
         Self {
+            dtype: ModelDType::F32,
             vocab_size: 1024,
             d_model: 128,
             n_layers: 2,
@@ -54,6 +67,7 @@ impl Config {
         max_seq_len: usize,
     ) -> Self {
         Self {
+            dtype: ModelDType::F32,
             vocab_size,
             d_model: hidden_size,
             n_layers,
@@ -71,6 +85,7 @@ impl Config {
     #[must_use]
     pub fn small() -> Self {
         Self {
+            dtype: ModelDType::F32,
             vocab_size: 32000,
             d_model: 512,
             n_layers: 2,

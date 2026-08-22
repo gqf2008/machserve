@@ -122,3 +122,66 @@ fn real_model_samples_with_seed_deterministically() {
     );
     eprintln!("real_model sampling OK: {a:?}");
 }
+
+#[test]
+fn real_model_fp16_matches_fp32() {
+    let candidates = [
+        PathBuf::from("../../.models").join("tiny-llama.safetensors"),
+        PathBuf::from(".models").join("tiny-llama.safetensors"),
+    ];
+    let Some(model_path) = candidates.into_iter().find(|p| p.exists()) else {
+        eprintln!("skipping real_model fp16: model not present (see doc comment)");
+        return;
+    };
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping real_model fp16: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping real_model fp16: {e}");
+            return;
+        }
+    };
+    let cfg = Config::llama(16, 2, 4, 4, 32000, 2048);
+    let w: Weights = load_safetensors(&model_path, &cfg, false).expect("load weights");
+    let tokens = [1u32, 2, 3, 4, 5];
+
+    let mut m32 = GpuModel::new(hip.clone(), cfg, &w).expect("f32 model");
+    let l32 = m32.forward(&tokens).expect("f32 decode");
+    let mut cfg16 = cfg;
+    cfg16.dtype = mach_model::config::ModelDType::F16;
+    let mut m16 = GpuModel::new(hip.clone(), cfg16, &w).expect("f16 model");
+    let l16 = m16.forward(&tokens).expect("f16 decode");
+
+    assert_eq!(l32.len(), l16.len());
+    let max_abs = l32
+        .iter()
+        .zip(&l16)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("real_model fp16 vs fp32: max |logit diff| = {max_abs:.6}");
+    assert!(
+        max_abs < 0.1,
+        "fp16 vs fp32 logit diff too large on real weights: {max_abs}"
+    );
+    let arg32 = l32
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+    let arg16 = l16
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap();
+    assert_eq!(
+        arg32, arg16,
+        "fp16 greedy argmax must match fp32 on real weights"
+    );
+}

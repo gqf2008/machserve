@@ -11,6 +11,8 @@
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
+use mach_model::config::ModelDType;
+#[cfg(feature = "hip")]
 use mach_model::loader::load_safetensors;
 #[cfg(feature = "hip")]
 use mach_model::{Config, Weights};
@@ -54,13 +56,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
+    // opts out. bf16 is not wired yet.
+    let dtype = std::env::var("MACH_DTYPE").unwrap_or_else(|_| "f16".into());
 
     let root = PathBuf::from(root);
-    let cfg = config_from_json(&root.join(&config_name));
+    let mut cfg = config_from_json(&root.join(&config_name));
+    match dtype.as_str() {
+        "f32" => cfg.dtype = ModelDType::F32,
+        "f16" => cfg.dtype = ModelDType::F16,
+        other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
+    }
     let w: Weights = load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
     println!(
-        "model {model_name}: d_model={} layers={} heads={} kv={} vocab={}",
-        cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size
+        "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
+        cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
     );
 
     let hip = hip::hip().expect("HIP runtime");

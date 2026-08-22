@@ -6,6 +6,8 @@
 //! sequences at different positions are processed together (attention masks by
 //! per-sequence position).
 
+use crate::config::ModelDType;
+use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
 use crate::sampling::{BatchedSampler, SamplingParams};
 use crate::{Config, Error, Weights};
@@ -24,6 +26,18 @@ struct LayerDev {
     wu: *mut f32,
     wd: *mut f32,
     rms_mlp: *mut f32,
+}
+
+/// Per-layer fp16 device weight pointers (dtype = F16 only).
+#[derive(Clone, Copy)]
+struct LayerDevF16 {
+    wq: *mut u16,
+    wk: *mut u16,
+    wv: *mut u16,
+    wo: *mut u16,
+    wg: *mut u16,
+    wu: *mut u16,
+    wd: *mut u16,
 }
 
 /// Multi-sequence transformer on the GPU.
@@ -54,11 +68,18 @@ pub struct BatchedModel {
     logits: *mut f32,
     out_tok_dev: *mut i32,
     out_tok_host: *mut i32,
-    // weights
+    // weights (f32; fp16 copies when cfg.dtype == F16)
     emb_dev: *mut f32,
     rms_final_dev: *mut f32,
     lm_head_dev: *mut f32,
     layers_dev: Vec<LayerDev>,
+    emb_f16: *mut u16,
+    lm_head_f16: *mut u16,
+    layers_f16: Vec<LayerDevF16>,
+    /// fp16 scratch for GEMM A operands (batch * max(d_model, intermediate)).
+    xh: *mut u16,
+    /// fp16 scratch for hidden GEMM outputs (batch * max hidden n).
+    yh: *mut u16,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     kv_cache: Vec<(*mut f32, *mut f32)>,
     /// Per-sequence lengths (host).
@@ -100,6 +121,11 @@ impl BatchedModel {
             rms_final_dev: std::ptr::null_mut(),
             lm_head_dev: std::ptr::null_mut(),
             layers_dev: Vec::new(),
+            emb_f16: std::ptr::null_mut(),
+            lm_head_f16: std::ptr::null_mut(),
+            layers_f16: Vec::new(),
+            xh: std::ptr::null_mut(),
+            yh: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             lens: vec![0; batch],
             allocs: Vec::new(),
@@ -125,6 +151,24 @@ impl BatchedModel {
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
         )?;
         Ok(())
+    }
+
+    fn upload_f16(&self, dst: *mut u16, src: &[f32]) -> Result<(), Error> {
+        let buf: Vec<u16> = src.iter().map(|&v| f32_to_f16(v)).collect();
+        hip::memcpy(
+            self.k.hip(),
+            dst as *mut core::ffi::c_void,
+            buf.as_ptr() as *const core::ffi::c_void,
+            buf.len() * 2,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )?;
+        Ok(())
+    }
+
+    fn alloc_f16(&mut self, n: usize) -> Result<*mut u16, Error> {
+        let p = hip::malloc(self.k.hip(), n * 2)?;
+        self.allocs.push(p);
+        Ok(p as *mut u16)
     }
 
     fn alloc_buffers(&mut self) -> Result<(), Error> {
@@ -156,6 +200,18 @@ impl BatchedModel {
         self.up = self.dalloc(b * inter * 4)?;
         self.h = self.dalloc(b * inter * 4)?;
         self.logits = self.dalloc(b * c.vocab_size * 4)?;
+        // fp16 GEMM scratch (only used in F16 mode): A operand + hidden output.
+        let max_n = c
+            .d_model
+            .max(c.intermediate_size)
+            .max(c.n_heads * c.head_dim);
+        let xh_bytes = b * c.d_model.max(c.intermediate_size) * 2;
+        let xh = hip::malloc(self.k.hip(), xh_bytes)?;
+        self.xh = xh as *mut u16;
+        self.allocs.push(xh);
+        let yh = hip::malloc(self.k.hip(), b * max_n * 2)?;
+        self.yh = yh as *mut u16;
+        self.allocs.push(yh);
         self.out_tok_dev = self.dalloc(b * 4)? as *mut i32;
         let oh = hip::host_malloc(self.k.hip(), b * 4)?;
         self.out_tok_host = oh as *mut i32;
@@ -181,6 +237,12 @@ impl BatchedModel {
         self.upload(self.emb_dev, &w.tok_emb)?;
         self.upload(self.rms_final_dev, &w.rms_final)?;
         self.upload(self.lm_head_dev, &w.lm_head)?;
+        if c.dtype == ModelDType::F16 {
+            self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
+            self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
+            self.upload_f16(self.emb_f16, &w.tok_emb)?;
+            self.upload_f16(self.lm_head_f16, &w.lm_head)?;
+        }
         for lw in &w.layers {
             let l = LayerDev {
                 wq: self.dalloc(lw.wq.len() * 4)?,
@@ -204,6 +266,25 @@ impl BatchedModel {
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
             let _ = (d, nq, nkv);
             self.layers_dev.push(l);
+            if c.dtype == ModelDType::F16 {
+                let l16 = LayerDevF16 {
+                    wq: self.alloc_f16(lw.wq.len())?,
+                    wk: self.alloc_f16(lw.wk.len())?,
+                    wv: self.alloc_f16(lw.wv.len())?,
+                    wo: self.alloc_f16(lw.wo.len())?,
+                    wg: self.alloc_f16(lw.wg.len())?,
+                    wu: self.alloc_f16(lw.wu.len())?,
+                    wd: self.alloc_f16(lw.wd.len())?,
+                };
+                self.upload_f16(l16.wq, &lw.wq)?;
+                self.upload_f16(l16.wk, &lw.wk)?;
+                self.upload_f16(l16.wv, &lw.wv)?;
+                self.upload_f16(l16.wo, &lw.wo)?;
+                self.upload_f16(l16.wg, &lw.wg)?;
+                self.upload_f16(l16.wu, &lw.wu)?;
+                self.upload_f16(l16.wd, &lw.wd)?;
+                self.layers_f16.push(l16);
+            }
         }
         Ok(())
     }
@@ -292,13 +373,55 @@ impl BatchedModel {
         let inter = c.intermediate_size as i32;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
         let k = &self.k;
+        let f16 = c.dtype == ModelDType::F16;
 
-        k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
+        // Selects fp16 (cast activations + fp16 weights, fp32 output) or f32.
+        let gemm = |out: *mut f32,
+                    x: *const f32,
+                    w32: *mut f32,
+                    w16: *mut u16,
+                    n: i32,
+                    kk: i32|
+         -> Result<(), Error> {
+            if f16 {
+                k.gemm_batched_f16(out, x, w16, b, n, kk, self.xh, self.yh)
+            } else {
+                k.gemm_batched(out, x, w32, b, n, kk)
+            }
+        };
+
+        if f16 {
+            k.launch_embed_f16(self.tokens_dev, self.emb_f16, self.x, d, b)?;
+        } else {
+            k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
+        }
         for (li, lw) in self.layers_dev.iter().enumerate() {
+            let l16 = if f16 { Some(self.layers_f16[li]) } else { None };
             k.launch_rms_norm(self.x, lw.rms_attn, self.xn, b, d, c.rms_eps)?;
-            k.gemm_batched(self.q, self.xn, lw.wq, b, nq, d)?;
-            k.gemm_batched(self.k_buf, self.xn, lw.wk, b, nkv, d)?;
-            k.gemm_batched(self.v_buf, self.xn, lw.wv, b, nkv, d)?;
+            gemm(
+                self.q,
+                self.xn,
+                lw.wq,
+                l16.map_or(std::ptr::null_mut(), |l| l.wq),
+                nq,
+                d,
+            )?;
+            gemm(
+                self.k_buf,
+                self.xn,
+                lw.wk,
+                l16.map_or(std::ptr::null_mut(), |l| l.wk),
+                nkv,
+                d,
+            )?;
+            gemm(
+                self.v_buf,
+                self.xn,
+                lw.wv,
+                l16.map_or(std::ptr::null_mut(), |l| l.wv),
+                nkv,
+                d,
+            )?;
             k.launch_rope_batched(
                 self.q,
                 self.k_buf,
@@ -341,24 +464,64 @@ impl BatchedModel {
                 scale,
                 c.max_seq_len as i32,
             )?;
-            k.gemm_batched(self.proj, self.attn, lw.wo, b, d, nq)?;
+            gemm(
+                self.proj,
+                self.attn,
+                lw.wo,
+                l16.map_or(std::ptr::null_mut(), |l| l.wo),
+                d,
+                nq,
+            )?;
             k.launch_add(self.x, self.proj, b * d)?;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
-            k.gemm_batched(self.gate, self.xn2, lw.wg, b, inter, d)?;
-            k.gemm_batched(self.up, self.xn2, lw.wu, b, inter, d)?;
+            gemm(
+                self.gate,
+                self.xn2,
+                lw.wg,
+                l16.map_or(std::ptr::null_mut(), |l| l.wg),
+                inter,
+                d,
+            )?;
+            gemm(
+                self.up,
+                self.xn2,
+                lw.wu,
+                l16.map_or(std::ptr::null_mut(), |l| l.wu),
+                inter,
+                d,
+            )?;
             k.launch_silu_mul(self.gate, self.up, self.h, b * inter)?;
-            k.gemm_batched(self.proj, self.h, lw.wd, b, d, inter)?;
+            gemm(
+                self.proj,
+                self.h,
+                lw.wd,
+                l16.map_or(std::ptr::null_mut(), |l| l.wd),
+                d,
+                inter,
+            )?;
             k.launch_add(self.x, self.proj, b * d)?;
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
-        k.gemm_batched(
-            self.logits,
-            self.xn,
-            self.lm_head_dev,
-            b,
-            c.vocab_size as i32,
-            d,
-        )?;
+        if f16 {
+            k.gemm_batched_f16_logits(
+                self.logits,
+                self.xn,
+                self.lm_head_f16,
+                b,
+                c.vocab_size as i32,
+                d,
+                self.xh,
+            )?;
+        } else {
+            k.gemm_batched(
+                self.logits,
+                self.xn,
+                self.lm_head_dev,
+                b,
+                c.vocab_size as i32,
+                d,
+            )?;
+        }
         Ok(())
     }
 
@@ -464,6 +627,22 @@ impl BatchedModel {
     #[must_use]
     pub const fn batch(&self) -> usize {
         self.batch
+    }
+
+    /// Syncs the stream and copies the last step's logits (`[batch, vocab]`)
+    /// back to host (debug / numeric validation).
+    pub fn read_logits(&self) -> Result<Vec<f32>, Error> {
+        self.k.sync()?;
+        let n = self.batch * self.cfg.vocab_size;
+        let mut out = vec![0.0f32; n];
+        hip::memcpy(
+            self.k.hip(),
+            out.as_mut_ptr() as *mut core::ffi::c_void,
+            self.logits as *const core::ffi::c_void,
+            out.len() * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        Ok(out)
     }
 }
 

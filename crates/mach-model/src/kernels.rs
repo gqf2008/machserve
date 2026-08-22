@@ -332,6 +332,101 @@ extern "C" __global__ void argmax_batched(const float* logits, int* out_tok,
 }
 "#;
 
+/// f32 -> fp16 cast (device conversion matches `crate::fp16::f32_to_f16`).
+const CAST_F32_F16: &str = r#"
+__device__ unsigned short f32_to_f16(float x) {
+    unsigned int b = __float_as_uint(x);
+    unsigned int sign = (b >> 16) & 0x8000u;
+    int e = (int)((b >> 23) & 0xffu);
+    unsigned int m = b & 0x7fffffu;
+    if (e == 255) return (unsigned short)(sign | 0x7c00u | (m ? 0x200u : 0u));
+    int ne = e - 127 + 15;
+    if (ne >= 31) return (unsigned short)(sign | 0x7c00u);
+    if (ne <= 0) {
+        if (ne < -10) return (unsigned short)sign;
+        unsigned int mm = m | 0x800000u;
+        int shift = 14 - ne;
+        unsigned int half = 1u << (shift - 1);
+        unsigned int m16 = mm >> shift;
+        unsigned int rem = mm & ((1u << shift) - 1u);
+        if (rem > half || (rem == half && (m16 & 1u))) m16++;
+        return (unsigned short)(sign | m16);
+    }
+    unsigned int m16 = m >> 13;
+    unsigned int rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (m16 & 1u))) {
+        m16++;
+        if (m16 == 0x400u) { m16 = 0u; ne++; if (ne >= 31) return (unsigned short)(sign | 0x7c00u); }
+    }
+    return (unsigned short)(sign | ((unsigned int)ne << 10) | m16);
+}
+
+extern "C" __global__ void cast_f32_f16(const float* x, unsigned short* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = f32_to_f16(x[i]);
+}
+"#;
+
+/// fp16 -> f32 cast (device conversion matches `crate::fp16::f16_to_f32`).
+const CAST_F16_F32: &str = r#"
+__device__ float f16_to_f32(unsigned short h) {
+    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
+    unsigned int e = (h >> 10) & 0x1fu;
+    unsigned int m = h & 0x3ffu;
+    unsigned int b;
+    if (e == 0u) {
+        if (m == 0u) b = sign;
+        else {
+            unsigned int m2 = m;
+            unsigned int e2 = 127u + 1u - 15u;
+            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
+            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
+        }
+    } else if (e == 0x1fu) {
+        b = sign | 0x7f800000u | (m << 13);
+    } else {
+        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
+    }
+    return __uint_as_float(b);
+}
+
+extern "C" __global__ void cast_f16_f32(const unsigned short* x, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = f16_to_f32(x[i]);
+}
+"#;
+
+/// fp16 embedding gather -> f32 activations (matches `crate::fp16::f16_to_f32`).
+const EMBED_GATHER_F16: &str = r#"
+__device__ float f16_to_f32(unsigned short h) {
+    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
+    unsigned int e = (h >> 10) & 0x1fu;
+    unsigned int m = h & 0x3ffu;
+    unsigned int b;
+    if (e == 0u) {
+        if (m == 0u) b = sign;
+        else {
+            unsigned int m2 = m;
+            unsigned int e2 = 127u + 1u - 15u;
+            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
+            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
+        }
+    } else if (e == 0x1fu) {
+        b = sign | 0x7f800000u | (m << 13);
+    } else {
+        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
+    }
+    return __uint_as_float(b);
+}
+
+extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short* emb,
+                                            float* x, int cols, int batch) {
+    int s = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < cols) x[(long long)s * cols + i] = f16_to_f32(emb[(long long)tok[s] * cols + i]);
+}
+"#;
+
 /// Compiled kernels plus the hipBLAS handle, bound to one stream.
 pub struct HipKernels {
     hip: std::sync::Arc<Hip>,
@@ -351,6 +446,9 @@ pub struct HipKernels {
     kv_store_batched: HipKernelModule,
     attn_decode_batched: HipKernelModule,
     argmax_batched: HipKernelModule,
+    cast_f32_f16: HipKernelModule,
+    cast_f16_f32: HipKernelModule,
+    embed_f16: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -392,6 +490,9 @@ impl HipKernels {
                 "attn_decode_batched",
             )?,
             argmax_batched: HipKernelModule::compile(&arch, ARGMAX_BATCHED, "argmax_batched")?,
+            cast_f32_f16: HipKernelModule::compile(&arch, CAST_F32_F16, "cast_f32_f16")?,
+            cast_f16_f32: HipKernelModule::compile(&arch, CAST_F16_F32, "cast_f16_f32")?,
+            embed_f16: HipKernelModule::compile(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
         })
     }
 
@@ -793,6 +894,227 @@ impl HipKernels {
         Ok(self
             .argmax_batched
             .launch([batch as u32, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Casts `n` f32 values to fp16 (device-side, matches `crate::fp16`).
+    pub fn launch_cast_f32_f16(&self, x: *const f32, y: *mut u16, n: usize) -> Result<(), Error> {
+        let xp = x;
+        let yp = y;
+        let ni = n as i32;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &yp as *const *mut u16 as *mut core::ffi::c_void,
+            &ni as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (n as u32).div_ceil(256);
+        Ok(self
+            .cast_f32_f16
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Casts `n` fp16 values to f32 (device-side, matches `crate::fp16`).
+    pub fn launch_cast_f16_f32(&self, x: *const u16, y: *mut f32, n: usize) -> Result<(), Error> {
+        let xp = x;
+        let yp = y;
+        let ni = n as i32;
+        let mut p = vec![
+            &xp as *const *const u16 as *mut core::ffi::c_void,
+            &yp as *const *mut f32 as *mut core::ffi::c_void,
+            &ni as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (n as u32).div_ceil(256);
+        Ok(self
+            .cast_f16_f32
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Embedding gather from an fp16 table into f32 activations (2D grid:
+    /// `blockIdx.y` = sequence, `blockIdx.x` covers columns).
+    pub fn launch_embed_f16(
+        &self,
+        tok: *const i32,
+        emb: *const u16,
+        x: *mut f32,
+        cols: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        let tp = tok;
+        let ep = emb;
+        let xp = x;
+        let mut p = vec![
+            &tp as *const *const i32 as *mut core::ffi::c_void,
+            &ep as *const *const u16 as *mut core::ffi::c_void,
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &cols as *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (cols as u32).div_ceil(256);
+        Ok(self
+            .embed_f16
+            .launch([blocks, batch as u32, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// fp16 GEMM for m = 1: `out[1, n] = x[1, k] @ w16^T`. Hidden layers output
+    /// fp16 (`yh` scratch) then cast to f32: rocBLAS fp16 C is far faster than
+    /// fp32 C for the tall-skinny shapes. `xh`/`yh` are fp16 scratch of `k`/`n`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16(
+        &self,
+        out: *mut f32,
+        x: *const f32,
+        w16: *const u16,
+        n: i32,
+        k: i32,
+        xh: *mut u16,
+        yh: *mut u16,
+    ) -> Result<(), Error> {
+        use mach_kernel_sys::hipblas::{HIPBLAS_COMPUTE_32F, HIPBLAS_OP_N, HIPBLAS_R_16F};
+        self.launch_cast_f32_f16(x, xh, k as usize)?;
+        self.blas
+            .gemm_ex(
+                HIPBLAS_OP_N,
+                HIPBLAS_OP_N,
+                1,
+                n,
+                k,
+                HIPBLAS_R_16F,
+                xh as *const core::ffi::c_void,
+                1,
+                HIPBLAS_R_16F,
+                w16 as *const core::ffi::c_void,
+                k,
+                HIPBLAS_R_16F,
+                yh as *mut core::ffi::c_void,
+                1,
+                HIPBLAS_COMPUTE_32F,
+            )
+            .map_err(|e| Error::Model(format!("hipblas gemm_ex m=1 n={n} k={k}: {e}")))?;
+        self.launch_cast_f16_f32(yh, out, n as usize)
+    }
+
+    /// fp16 GEMM for m = 1 with fp32 output (lm_head: keeps fp32 logits for
+    /// the sampler). `xh` is fp16 scratch of `k` elements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_logits(
+        &self,
+        out: *mut f32,
+        x: *const f32,
+        w16: *const u16,
+        n: i32,
+        k: i32,
+        xh: *mut u16,
+    ) -> Result<(), Error> {
+        use mach_kernel_sys::hipblas::{
+            HIPBLAS_COMPUTE_32F, HIPBLAS_OP_N, HIPBLAS_R_16F, HIPBLAS_R_32F,
+        };
+        self.launch_cast_f32_f16(x, xh, k as usize)?;
+        self.blas
+            .gemm_ex(
+                HIPBLAS_OP_N,
+                HIPBLAS_OP_N,
+                1,
+                n,
+                k,
+                HIPBLAS_R_16F,
+                xh as *const core::ffi::c_void,
+                1,
+                HIPBLAS_R_16F,
+                w16 as *const core::ffi::c_void,
+                k,
+                HIPBLAS_R_32F,
+                out as *mut core::ffi::c_void,
+                1,
+                HIPBLAS_COMPUTE_32F,
+            )
+            .map_err(|e| Error::Model(format!("hipblas gemm_ex m=1 n={n} k={k}: {e}")))
+    }
+
+    /// Batched fp16 GEMM: `out[B, n] = x[B, k] @ w16^T`. Hidden layers output
+    /// fp16 (`yh` scratch) then cast to f32 (rocBLAS fp16 C is much faster for
+    /// the tall-skinny MLP shapes). `w16` is row-major `[n, k]`; `xh`/`yh` are
+    /// fp16 scratch of `batch*k` / `batch*n`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched_f16(
+        &self,
+        out: *mut f32,
+        x: *const f32,
+        w16: *const u16,
+        batch: i32,
+        n: i32,
+        k: i32,
+        xh: *mut u16,
+        yh: *mut u16,
+    ) -> Result<(), Error> {
+        use mach_kernel_sys::hipblas::{
+            HIPBLAS_COMPUTE_32F, HIPBLAS_OP_N, HIPBLAS_OP_T, HIPBLAS_R_16F,
+        };
+        self.launch_cast_f32_f16(x, xh, (batch * k) as usize)?;
+        self.blas
+            .gemm_ex(
+                HIPBLAS_OP_T,
+                HIPBLAS_OP_N,
+                n,
+                batch,
+                k,
+                HIPBLAS_R_16F,
+                w16 as *const core::ffi::c_void,
+                k,
+                HIPBLAS_R_16F,
+                xh as *const core::ffi::c_void,
+                k,
+                HIPBLAS_R_16F,
+                yh as *mut core::ffi::c_void,
+                n,
+                HIPBLAS_COMPUTE_32F,
+            )
+            .map_err(|e| {
+                Error::Model(format!(
+                    "hipblas gemm_ex batched m={n} n={batch} k={k}: {e}"
+                ))
+            })?;
+        self.launch_cast_f16_f32(yh, out, (batch * n) as usize)
+    }
+
+    /// Batched fp16 GEMM with fp32 output (lm_head: keeps fp32 logits for the
+    /// sampler). `xh` is fp16 scratch of `batch*k`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched_f16_logits(
+        &self,
+        out: *mut f32,
+        x: *const f32,
+        w16: *const u16,
+        batch: i32,
+        n: i32,
+        k: i32,
+        xh: *mut u16,
+    ) -> Result<(), Error> {
+        use mach_kernel_sys::hipblas::{
+            HIPBLAS_COMPUTE_32F, HIPBLAS_OP_N, HIPBLAS_OP_T, HIPBLAS_R_16F, HIPBLAS_R_32F,
+        };
+        self.launch_cast_f32_f16(x, xh, (batch * k) as usize)?;
+        self.blas
+            .gemm_ex(
+                HIPBLAS_OP_T,
+                HIPBLAS_OP_N,
+                n,
+                batch,
+                k,
+                HIPBLAS_R_16F,
+                w16 as *const core::ffi::c_void,
+                k,
+                HIPBLAS_R_16F,
+                xh as *const core::ffi::c_void,
+                k,
+                HIPBLAS_R_32F,
+                out as *mut core::ffi::c_void,
+                n,
+                HIPBLAS_COMPUTE_32F,
+            )
+            .map_err(|e| {
+                Error::Model(format!(
+                    "hipblas gemm_ex batched m={n} n={batch} k={k}: {e}"
+                ))
+            })
     }
 
     /// Synchronizes the execution stream.

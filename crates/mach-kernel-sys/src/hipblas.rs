@@ -11,6 +11,16 @@ pub const HIPBLAS_OP_N: i32 = 111;
 pub const HIPBLAS_OP_T: i32 = 112;
 pub const HIPBLAS_OP_C: i32 = 113;
 
+/// hipblasDatatype_t values (ROCm 6.2: `hipblasDatatype_t` is a typedef of
+/// `hipDataType`, so these are the hipDataType values).
+pub const HIPBLAS_R_32F: i32 = 0;
+pub const HIPBLAS_R_16F: i32 = 2;
+pub const HIPBLAS_R_16B: i32 = 14;
+/// hipblasComputeType_t: at least 32-bit precision.
+pub const HIPBLAS_COMPUTE_32F: i32 = 2;
+/// hipblasGemmAlgo_t: default.
+pub const HIPBLAS_GEMM_DEFAULT: i32 = 160;
+
 /// Opaque hipBLAS handle.
 pub type HipBlasHandle = *mut core::ffi::c_void;
 
@@ -34,6 +44,27 @@ pub struct HipBlasApi {
         i32,
         *const f32,
         *mut core::ffi::c_void,
+        i32,
+    ) -> i32,
+    pub hipblas_gemm_ex: unsafe extern "C" fn(
+        HipBlasHandle,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        *const core::ffi::c_void,
+        *const core::ffi::c_void,
+        i32,
+        i32,
+        *const core::ffi::c_void,
+        i32,
+        i32,
+        *const core::ffi::c_void,
+        *mut core::ffi::c_void,
+        i32,
+        i32,
+        i32,
         i32,
     ) -> i32,
 }
@@ -89,6 +120,10 @@ fn load() -> Result<Arc<HipBlasLib>, HipError> {
             .map_err(|e| HipError::Symbol(format!("hipblasSetStream({e})")))?,
         hipblas_sgemm: *(unsafe { lib.get(b"hipblasSgemm\0") })
             .map_err(|e| HipError::Symbol(format!("hipblasSgemm({e})")))?,
+        // ROCm 6.2: the plain `hipblasGemmEx` export is the legacy ABI and
+        // rejects every enum; `hipblasGemmEx_v2` (hipDataType values) works.
+        hipblas_gemm_ex: *(unsafe { lib.get(b"hipblasGemmEx_v2\0") })
+            .map_err(|e| HipError::Symbol(format!("hipblasGemmEx_v2({e})")))?,
     };
     Ok(Arc::new(HipBlasLib { _lib: lib, api }))
 }
@@ -166,6 +201,99 @@ impl HipBlas {
                     &beta,
                     c as *mut core::ffi::c_void,
                     ldc,
+                ),
+            )
+        }
+    }
+    /// `C = alpha * op(A) * op(B) + beta * C` with mixed dtypes via
+    /// `hipblasGemmEx` (e.g. fp16 inputs / fp32 output, fp32 accumulate).
+    /// `alpha`/`beta` are fp32 scalars matching `HIPBLAS_COMPUTE_32F`.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+    pub fn gemm_ex(
+        &self,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_type: i32,
+        a: *const core::ffi::c_void,
+        lda: i32,
+        b_type: i32,
+        b: *const core::ffi::c_void,
+        ldb: i32,
+        c_type: i32,
+        c: *mut core::ffi::c_void,
+        ldc: i32,
+        compute: i32,
+    ) -> Result<(), HipError> {
+        self.gemm_ex_algo(
+            trans_a,
+            trans_b,
+            m,
+            n,
+            k,
+            a_type,
+            a,
+            lda,
+            b_type,
+            b,
+            ldb,
+            c_type,
+            c,
+            ldc,
+            compute,
+            HIPBLAS_GEMM_DEFAULT,
+        )
+    }
+
+    /// [`Self::gemm_ex`] with an explicit rocBLAS algorithm/solution index
+    /// (probe/tuning only; production uses the default).
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+    pub fn gemm_ex_algo(
+        &self,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_type: i32,
+        a: *const core::ffi::c_void,
+        lda: i32,
+        b_type: i32,
+        b: *const core::ffi::c_void,
+        ldb: i32,
+        c_type: i32,
+        c: *mut core::ffi::c_void,
+        ldc: i32,
+        compute: i32,
+        algo: i32,
+    ) -> Result<(), HipError> {
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        unsafe {
+            check(
+                &self._hip,
+                (self.lib.api.hipblas_gemm_ex)(
+                    self.handle,
+                    trans_a,
+                    trans_b,
+                    m,
+                    n,
+                    k,
+                    &alpha as *const f32 as *const core::ffi::c_void,
+                    a,
+                    a_type,
+                    lda,
+                    b,
+                    b_type,
+                    ldb,
+                    &beta as *const f32 as *const core::ffi::c_void,
+                    c,
+                    c_type,
+                    ldc,
+                    compute,
+                    algo,
                 ),
             )
         }
@@ -410,5 +538,105 @@ mod tests {
         hip::free(&h, db).unwrap();
         hip::free(&h, dc).unwrap();
         eprintln!("4x4 sgemm OK");
+    }
+
+    /// fp16 inputs / fp32 output GEMM via `hipblasGemmEx` vs a CPU fp32 dot,
+    /// using the model's layout: weight row-major [n, k] = column-major B(k x n),
+    /// activation row-major [batch, k] = column-major (k x batch), transA=T.
+    #[test]
+    fn gemm_ex_fp16_probe() {
+        if !have_gpu() {
+            eprintln!("skipping: no device");
+            return;
+        }
+        let h = hip::hip().expect("hip runtime");
+        let blas = HipBlas::new(h.clone()).expect("hipblas handle");
+        let mut stream = std::ptr::null_mut();
+        unsafe { hip::check(&h, (h.api.hip_stream_create)(&mut stream)).unwrap() };
+        blas.set_stream(stream).unwrap();
+
+        let (n, batch, k) = (6i32, 4i32, 8i32);
+        let w: Vec<f32> = (0..(n * k) as usize)
+            .map(|i| ((i * 7) % 100) as f32 / 100.0 - 0.4)
+            .collect();
+        let x: Vec<f32> = (0..(batch * k) as usize)
+            .map(|i| ((i * 13) % 100) as f32 / 100.0 - 0.4)
+            .collect();
+        let w16: Vec<u16> = w.iter().map(|&v| crate::hip::fp32_to_f16_host(v)).collect();
+        let x16: Vec<u16> = x.iter().map(|&v| crate::hip::fp32_to_f16_host(v)).collect();
+
+        let dw = hip::malloc(&h, w16.len() * 2).unwrap();
+        let dx = hip::malloc(&h, x16.len() * 2).unwrap();
+        let dc = hip::malloc(&h, (batch * n) as usize * 4).unwrap();
+        hip::memcpy(
+            &h,
+            dw,
+            w16.as_ptr() as *const _,
+            w16.len() * 2,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            dx,
+            x16.as_ptr() as *const _,
+            x16.len() * 2,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+
+        blas.gemm_ex(
+            HIPBLAS_OP_T,
+            HIPBLAS_OP_N,
+            n,
+            batch,
+            k,
+            HIPBLAS_R_16F,
+            dw as *const core::ffi::c_void,
+            k,
+            HIPBLAS_R_16F,
+            dx as *const core::ffi::c_void,
+            k,
+            HIPBLAS_R_32F,
+            dc,
+            n,
+            HIPBLAS_COMPUTE_32F,
+        )
+        .expect("gemm_ex");
+
+        let mut c = vec![0.0f32; (batch * n) as usize];
+        hip::memcpy(
+            &h,
+            c.as_mut_ptr() as *mut _,
+            dc as *const _,
+            c.len() * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        let wf: Vec<f32> = w16
+            .iter()
+            .map(|&u| crate::hip::fp16_to_f32_host(u))
+            .collect();
+        let xf: Vec<f32> = x16
+            .iter()
+            .map(|&u| crate::hip::fp16_to_f32_host(u))
+            .collect();
+        let mut maxerr = 0.0f32;
+        for b in 0..batch as usize {
+            for j in 0..n as usize {
+                let mut want = 0.0f32;
+                for t in 0..k as usize {
+                    want += wf[j * k as usize + t] * xf[b * k as usize + t];
+                }
+                maxerr = maxerr.max((c[b * n as usize + j] - want).abs());
+            }
+        }
+        eprintln!("gemm_ex fp16 maxerr={maxerr}");
+        assert!(maxerr < 1e-3, "gemm_ex fp16 mismatch {maxerr}");
+        hip::free(&h, dw).unwrap();
+        hip::free(&h, dx).unwrap();
+        hip::free(&h, dc).unwrap();
+        unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+        eprintln!("gemm_ex fp16 probe OK");
     }
 }

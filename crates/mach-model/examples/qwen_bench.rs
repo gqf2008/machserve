@@ -191,6 +191,36 @@ fn main() {
             "  reference: llama.cpp Vulkan 1.55 ms/seq-tok (643 tok/s), single-seq MachServe ~7 ms"
         );
     }
+
+    // --- fp16 compute path: same batched decode, fp16 weights + fp32 accumulate ---
+    {
+        use mach_model::batched::BatchedModel;
+        use mach_model::config::ModelDType;
+        println!("\n=== batched decode scaling, fp16 compute (Qwen2.5-0.5B, 7900 XTX) ===");
+        let mut cfg16 = cfg;
+        cfg16.dtype = ModelDType::F16;
+        println!("batch |  ms/step | ms/seq-tok |   tok/s");
+        for &b in &[16usize, 32, 64] {
+            let mut bm =
+                BatchedModel::new(hip::hip().unwrap(), cfg16, &w, b).expect("batched fp16");
+            bm.reset_state().expect("reset");
+            let mut tokens: Vec<u32> = (0..b).map(|i| (i % 977) as u32).collect();
+            for _ in 0..5 {
+                tokens = bm.decode_step(&tokens).expect("warmup");
+            }
+            bm.reset_state().expect("reset");
+            tokens = (0..b).map(|i| (i % 977) as u32).collect();
+            let steps = 50usize;
+            let t = Instant::now();
+            for _ in 0..steps {
+                tokens = bm.decode_step(&tokens).expect("batched fp16 step");
+            }
+            let step_ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+            let per = step_ms / b as f64;
+            let tps = 1000.0 / per;
+            println!("{b:>4} | {step_ms:>8.2} ms | {per:>11.3} ms/seq-tok | {tps:>13.0} tok/s");
+        }
+    }
 }
 
 #[cfg(not(feature = "hip"))]

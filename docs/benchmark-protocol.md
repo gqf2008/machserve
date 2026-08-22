@@ -49,6 +49,25 @@
 对比 llama.cpp Vulkan:1.55 ms/seq-tok(643 tok/s)→ **batch=64 时 MachServe 快 7.2x**。
 结论:批量(m=B)GEMM 直接修复 m=1 瓶颈;连续批处理既是性能方案也是引擎模型。
 
+
+## fp16 计算路径(2026-08-22,P3b)
+
+权重与 GEMM 输入转 fp16(fp32 累加),隐藏层 GEMM 输出 fp16 后 cast 回 f32(lm_head 保持
+fp32 输出以保采样精度)。关键发现:**rocBLAS 对瘦长形状(m >> n)的 fp16 GEMM,输出类型
+用 fp16 比 fp32 快 3-4x**(c16 0.026ms vs c32 0.090ms for m=4864 n=64 k=896);用 fp32
+输出时 gate/up 形状反而比 f32 慢,这是第一版 fp16 没有提速的原因。
+
+| batch | fp32 ms/step | fp16 ms/step | ms/seq-tok(fp16) | tok/s(fp16) | 加速 |
+|---|---|---|---|---|---|
+| 16 | 14.18 | 4.84 | 0.302 | 3309 | 2.9x |
+| 32 | 14.84 | 4.45 | 0.139 | 7193 | 3.3x |
+| 64 | 13.78 | 5.78 | **0.090** | **11074** | **2.4x** |
+
+- batch=64:11074 tok/s,较 llama.cpp Vulkan(643 tok/s)**快 17x**;
+- 数值:fp16 vs fp32 真实权重最大 logit 差 5e-5(tiny-llama)/2e-3(随机权重),贪心 token 一致;
+- 服务默认 dtype=f16(`MACH_DTYPE=f32` 关闭)。
+
+## 复现
 ## 复现
 
 ```bash
