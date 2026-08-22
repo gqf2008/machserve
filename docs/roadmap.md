@@ -113,3 +113,13 @@
     未正确链入(ggml-hip.lib 仅 4KB)——Windows HIP 构建的已知痛点;
   - 可选替代:llama.cpp **Vulkan 后端**(Windows 上成熟,7900 XTX 驱动好),但需先装
     Vulkan SDK;未获用户确认前不擅自安装。
+
+- **P1 对标重定义 + Windows 原生 GPU 基线完成(2026-08-22)**:
+  - 按用户定位,**对标物从 TokenSpeed 改为本机可运行的 llama.cpp(Vulkan 后端)**;
+  - 在 Windows 原生构建 llama.cpp(ggml 2100e59, Vulkan SDK 1.4.357),下载
+    Qwen2.5-0.5B-Instruct Q8_0 GGUF,`llama-bench` 实测 **decode 643 tok/s(1.55 ms/tok)**;
+  - **MachServe(HIP graph 重放)GPU 解码计算 0.30-0.47 ms/tok,约为 llama.cpp 的 2-5x**;
+    但端到端 TPOT(7-10 ms/tok)落后——瓶颈是每 token 全量读回 151936 个 logits(607KB),
+    llama.cpp 在 GPU 侧采样;已列为下一步优化(GPU 侧 sampling kernel);
+  - 完整对比表见 `docs/benchmark-protocol.md`;Windows HIP 构建 llama.cpp 的坑
+    (MSVC-vs-hipcc/空 HIP lib)已记录,不重复踩。
