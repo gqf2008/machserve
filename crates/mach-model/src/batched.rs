@@ -60,6 +60,12 @@ pub struct BatchedModel {
     /// Per-row KV cache slot (row index != slot during chunked prefill).
     slots_host: *mut i32,
     slots_dev: *mut i32,
+    /// Prefill-attention run descriptors `[qoff, count, base, slot] x N` and
+    /// per-row mask (1 = row covered by a run -> prefill attention).
+    runs_host: *mut i32,
+    runs_dev: *mut i32,
+    run_mask_host: *mut i32,
+    run_mask_dev: *mut i32,
     // activations
     x: *mut f32,
     xn: *mut f32,
@@ -114,6 +120,10 @@ impl BatchedModel {
             pos_host: std::ptr::null_mut(),
             slots_host: std::ptr::null_mut(),
             slots_dev: std::ptr::null_mut(),
+            runs_host: std::ptr::null_mut(),
+            runs_dev: std::ptr::null_mut(),
+            run_mask_host: std::ptr::null_mut(),
+            run_mask_dev: std::ptr::null_mut(),
             x: std::ptr::null_mut(),
             xn: std::ptr::null_mut(),
             xn2: std::ptr::null_mut(),
@@ -193,15 +203,24 @@ impl BatchedModel {
         self.tokens_dev = self.dalloc(b * 4)? as *mut i32;
         self.pos_dev = self.dalloc(b * 4)? as *mut i32;
         self.slots_dev = self.dalloc(b * 4)? as *mut i32;
+        let max_runs = b.div_ceil(2);
+        self.runs_dev = self.dalloc(max_runs * 4 * 4)? as *mut i32;
+        self.run_mask_dev = self.dalloc(b * 4)? as *mut i32;
         let th = hip::host_malloc(self.k.hip(), b * 4)?;
         let ph = hip::host_malloc(self.k.hip(), b * 4)?;
         let sh = hip::host_malloc(self.k.hip(), b * 4)?;
+        let rh = hip::host_malloc(self.k.hip(), max_runs * 4 * 4)?;
+        let mh = hip::host_malloc(self.k.hip(), b * 4)?;
         self.tokens_host = th as *mut i32;
         self.pos_host = ph as *mut i32;
         self.slots_host = sh as *mut i32;
+        self.runs_host = rh as *mut i32;
+        self.run_mask_host = mh as *mut i32;
         self.host_pins.push(th);
         self.host_pins.push(ph);
         self.host_pins.push(sh);
+        self.host_pins.push(rh);
+        self.host_pins.push(mh);
 
         self.x = self.dalloc(b * d * 4)?;
         self.xn = self.dalloc(b * d * 4)?;
@@ -410,8 +429,20 @@ impl BatchedModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 self.k.stream,
             )?;
+            // Greedy decode: every row is a single decode position (no runs).
+            for i in 0..self.batch {
+                *self.run_mask_host.add(i) = 0;
+            }
+            hip::memcpy_async(
+                self.k.hip(),
+                self.run_mask_dev as *mut core::ffi::c_void,
+                self.run_mask_host as *const core::ffi::c_void,
+                self.batch * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
         }
-        self.run_kernels(self.batch as i32, self.slots_dev)?;
+        self.run_kernels(self.batch as i32, self.slots_dev, self.run_mask_dev, 0)?;
         let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
             *l += 1;
@@ -419,7 +450,13 @@ impl BatchedModel {
         Ok(next)
     }
 
-    fn run_kernels(&self, count: i32, slots: *const i32) -> Result<(), Error> {
+    fn run_kernels(
+        &self,
+        count: i32,
+        slots: *const i32,
+        run_mask: *const i32,
+        num_runs: i32,
+    ) -> Result<(), Error> {
         let c = self.cfg;
         let b = count;
         let d = c.d_model as i32;
@@ -526,6 +563,7 @@ impl BatchedModel {
                     self.attn,
                     self.pos_dev,
                     slots,
+                    run_mask,
                     b,
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
@@ -533,6 +571,30 @@ impl BatchedModel {
                     scale,
                     c.max_seq_len as i32,
                 )?;
+                // Shared-KV prefill attention for detected runs.
+                // Run descriptors are read from the pinned host copy.
+                let runs = self.runs_host;
+                for ri in 0..num_runs {
+                    let qoff = unsafe { *runs.add((ri * 4) as usize) };
+                    let cc = unsafe { *runs.add((ri * 4 + 1) as usize) };
+                    let base = unsafe { *runs.add((ri * 4 + 2) as usize) };
+                    let slot = unsafe { *runs.add((ri * 4 + 3) as usize) };
+                    k.launch_attn_prefill_f16(
+                        self.q,
+                        kc as *const u16,
+                        vc as *const u16,
+                        self.attn,
+                        qoff,
+                        cc,
+                        base,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        c.max_seq_len as i32,
+                        slot,
+                    )?;
+                }
             } else {
                 k.launch_kv_store_batched(
                     self.k_buf,
@@ -677,11 +739,21 @@ impl BatchedModel {
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
         assert!(n <= self.batch, "active count exceeds capacity");
+        // Prefill-attention runs are currently disabled: the naive shared-KV
+        // kernel is occupancy-bound and slower than decode attention on this
+        // GPU (see roadmap). All rows use decode attention (run_mask = 0).
+        let runs: Vec<i32> = Vec::new();
+        let run_mask = vec![0i32; n];
+        let num_runs = 0;
         unsafe {
             for i in 0..n {
                 *self.tokens_host.add(i) = tokens[i] as i32;
                 *self.pos_host.add(i) = lens[i] as i32;
                 *self.slots_host.add(i) = slots[i] as i32;
+                *self.run_mask_host.add(i) = run_mask[i];
+            }
+            for (k, &v) in runs.iter().enumerate() {
+                *self.runs_host.add(k) = v;
             }
             hip::memcpy_async(
                 self.k.hip(),
@@ -707,8 +779,26 @@ impl BatchedModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 self.k.stream,
             )?;
+            hip::memcpy_async(
+                self.k.hip(),
+                self.run_mask_dev as *mut core::ffi::c_void,
+                self.run_mask_host as *const core::ffi::c_void,
+                n * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
+            if num_runs > 0 {
+                hip::memcpy_async(
+                    self.k.hip(),
+                    self.runs_dev as *mut core::ffi::c_void,
+                    self.runs_host as *const core::ffi::c_void,
+                    num_runs * 4 * 4,
+                    hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                    self.k.stream,
+                )?;
+            }
         }
-        self.run_kernels(n as i32, self.slots_dev)?;
+        self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
         self.sampler
             .sample_batched(self.logits, params, self.cfg.vocab_size)
     }

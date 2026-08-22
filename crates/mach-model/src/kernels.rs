@@ -486,6 +486,7 @@ extern "C" __global__ void attn_decode_batched_f16(
     float* __restrict__ out,
     const int* __restrict__ pos_buf,
     const int* __restrict__ slots,
+    const int* __restrict__ run_mask,
     int batch, int n_heads, int n_kv_heads, int head_dim, float scale, int max_seq) {
     extern __shared__ float smem[];
     float* scores = smem;
@@ -497,6 +498,10 @@ extern "C" __global__ void attn_decode_batched_f16(
     int kv = h / groups;
     int slot = slots[s];
     int pos = pos_buf[s];
+    // Rows covered by a prefill-attention run are skipped here.
+    if (run_mask[s] != 0) {
+        return;
+    }
     const float* qh = q + ((long long)s * n_heads + h) * head_dim;
 
     for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
@@ -538,8 +543,126 @@ extern "C" __global__ void attn_decode_batched_f16(
 }
 "#;
 
+/// Prefill attention with shared K/V reads (one block per (run, head)).
+///
+/// A "run" is C consecutive query rows of one sequence at positions
+/// [base, base+C). Each key position is read once and reused for every row
+/// that causally attends to it, so attention K/V traffic drops from O(C * pos)
+/// (decode-style per-row attention) to O(pos).
+///
+/// Layout: 256 threads = 64 rows x 4 dim-groups (head_dim/4 each). A row's
+/// score dot is reduced across its quad with warp shuffles; the causal mask
+/// (`r >= p - base`) is value-based so warps stay uniform. Two passes: max
+/// scores (pass A) then exp-weighted V accumulation (pass B).
+const ATTN_PREFILL_F16: &str = r#"
+__device__ float f16_to_f32(unsigned short h) {
+    unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
+    unsigned int e = (h >> 10) & 0x1fu;
+    unsigned int m = h & 0x3ffu;
+    unsigned int b;
+    if (e == 0u) {
+        if (m == 0u) b = sign;
+        else {
+            unsigned int m2 = m;
+            unsigned int e2 = 127u + 1u - 15u;
+            while ((m2 & 0x400u) == 0u) { m2 <<= 1; e2--; }
+            b = sign | (e2 << 23) | ((m2 & 0x3ffu) << 13);
+        }
+    } else if (e == 0x1fu) {
+        b = sign | 0x7f800000u | (m << 13);
+    } else {
+        b = sign | ((e + 127u - 15u) << 23) | (m << 13);
+    }
+    return __uint_as_float(b);
+}
+
+extern "C" __global__ void attn_prefill_f16(
+    const float* __restrict__ q,          // [total_rows, n_heads, head_dim]
+    const unsigned short* __restrict__ kc, // [slot][max_seq][n_kv_heads][head_dim]
+    const unsigned short* __restrict__ vc,
+    float* __restrict__ out,              // [total_rows, n_heads, head_dim]
+    int qoff, int C, int base, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int max_seq, int slot)
+{
+    const int h = blockIdx.x;
+    const int kv = h / (n_heads / n_kv_heads);
+    const int tid = threadIdx.x;
+    const int r = tid / 4;        // 0..63 query row within the run
+    const int g = tid % 4;        // dim group (head_dim/4 each)
+    const int D = head_dim / 4;   // <= 16 for head_dim <= 64
+    const int P = base + C;       // key positions 0..P-1
+
+    __shared__ float s_max[64];
+    __shared__ float s_sum[64];
+    if (tid < 64) {
+        s_max[tid] = -1e30f;
+        s_sum[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float* qh = q + ((long long)(qoff + r) * n_heads + h) * head_dim;
+    float qreg[16];
+    #pragma unroll
+    for (int d = 0; d < D; d++) qreg[d] = qh[g * D + d];
+
+    const unsigned short* kbase = kc + ((long long)slot * max_seq) * n_kv_heads * head_dim + kv * head_dim;
+    const unsigned short* vbase = vc + ((long long)slot * max_seq) * n_kv_heads * head_dim + kv * head_dim;
+
+    // Pass A: per-row max score over causally-attended keys.
+    for (int p = 0; p < P; p++) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < D; d++) {
+            s += qreg[d] * f16_to_f32(kbase[(long long)p * n_kv_heads * head_dim + g * D + d]);
+        }
+        s += __shfl_down(s, 1);
+        s += __shfl_down(s, 2);
+        s = __shfl(s, (tid & ~3) & 31);
+        s *= scale;
+        float sm = (r >= p - base) ? s : -1e30f;
+        if (g == 0) {
+            s_max[r] = fmaxf(s_max[r], sm);
+        }
+    }
+    __syncthreads();
+
+    // Pass B: exp-weighted V accumulation (K read again, V read once).
+    float sumv = 0.0f;
+    float acc[16];
+    #pragma unroll
+    for (int d = 0; d < D; d++) acc[d] = 0.0f;
+    for (int p = 0; p < P; p++) {
+        float s = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < D; d++) {
+            s += qreg[d] * f16_to_f32(kbase[(long long)p * n_kv_heads * head_dim + g * D + d]);
+        }
+        s += __shfl_down(s, 1);
+        s += __shfl_down(s, 2);
+        s = __shfl(s, (tid & ~3) & 31);
+        s *= scale;
+        float e = (r >= p - base) ? __expf(s - s_max[r]) : 0.0f;
+        sumv += e;
+        const unsigned short* vp = vbase + (long long)p * n_kv_heads * head_dim + g * D;
+        #pragma unroll
+        for (int d = 0; d < D; d++) acc[d] += e * f16_to_f32(vp[d]);
+    }
+    if (g == 0) {
+        s_sum[r] = sumv;
+    }
+    __syncthreads();
+
+    float* oh = out + ((long long)(qoff + r) * n_heads + h) * head_dim;
+    if (r < C) {
+        float inv = 1.0f / s_sum[r];
+        #pragma unroll
+        for (int d = 0; d < D; d++) oh[g * D + d] = acc[d] * inv;
+    }
+}
+"#;
+
 /// fp16 embedding gather -> f32 activations (matches `crate::fp16::f16_to_f32`).
-const EMBED_GATHER_F16: &str = r#"
+const EMBED_GATHER_F16: &str = r#" 
 __device__ float f16_to_f32(unsigned short h) {
     unsigned int sign = ((unsigned int)h & 0x8000u) << 16;
     unsigned int e = (h >> 10) & 0x1fu;
@@ -594,6 +717,7 @@ pub struct HipKernels {
     embed_f16: HipKernelModule,
     kv_store_f16: HipKernelModule,
     attn_f16: HipKernelModule,
+    attn_prefill_f16: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -641,6 +765,11 @@ impl HipKernels {
             embed_f16: HipKernelModule::compile(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
             kv_store_f16: HipKernelModule::compile(&arch, KV_F16, "kv_store_batched_f16")?,
             attn_f16: HipKernelModule::compile(&arch, KV_F16, "attn_decode_batched_f16")?,
+            attn_prefill_f16: HipKernelModule::compile(
+                &arch,
+                ATTN_PREFILL_F16,
+                "attn_prefill_f16",
+            )?,
         })
     }
 
@@ -1257,6 +1386,52 @@ impl HipKernels {
             })
     }
 
+    /// Prefill attention for a run of `C` consecutive rows (same slot,
+    /// positions `[base, base+C)`) with shared K/V reads. One block per head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_prefill_f16(
+        &self,
+        q: *const f32,
+        kc: *const u16,
+        vc: *const u16,
+        out: *mut f32,
+        qoff: i32,
+        c: i32,
+        base: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        max_seq: i32,
+        slot: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = kc;
+        let vp = vc;
+        let op = out;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &qoff as *const i32 as *mut core::ffi::c_void,
+            &c as *const i32 as *mut core::ffi::c_void,
+            &base as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+            &slot as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.attn_prefill_f16.launch(
+            [n_heads as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
     /// Stores f32 K/V rows into an fp16 cache at per-row positions (slots).
     #[allow(clippy::too_many_arguments)]
     pub fn launch_kv_store_batched_f16(
@@ -1301,6 +1476,7 @@ impl HipKernels {
         out: *mut f32,
         pos: *const i32,
         slots: *const i32,
+        run_mask: *const i32,
         batch: i32,
         n_heads: i32,
         n_kv_heads: i32,
@@ -1314,6 +1490,7 @@ impl HipKernels {
         let op = out;
         let pp = pos;
         let sp = slots;
+        let mp = run_mask;
         let mut p = vec![
             &qp as *const *const f32 as *mut core::ffi::c_void,
             &kp as *const *const u16 as *mut core::ffi::c_void,
@@ -1321,6 +1498,7 @@ impl HipKernels {
             &op as *const *mut f32 as *mut core::ffi::c_void,
             &pp as *const *const i32 as *mut core::ffi::c_void,
             &sp as *const *const i32 as *mut core::ffi::c_void,
+            &mp as *const *const i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
             &n_heads as *const i32 as *mut core::ffi::c_void,
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,

@@ -227,3 +227,34 @@ fn chunked_prefill_finishes_with_fewer_steps() {
     );
     assert_eq!(eng.generated(id).len(), 4);
 }
+
+#[test]
+fn fp16_prefill_attention_matches_single_token() {
+    let Some(hip) = hip_ctx() else { return };
+    // F16 engine (fp16 KV + shared-KV prefill attention) vs an F32
+    // single-token greedy reference. Capacity < prompt length forces
+    // multi-chunk prefill, each chunk a detected run -> prefill attention.
+    let mut cfg = Config::tiny();
+    cfg.dtype = mach_model::config::ModelDType::F16;
+    let w = Weights::random(&cfg, 83).unwrap();
+    let prompt: Vec<u32> = (0..80u32).map(|i| (i % 977) + 1).collect();
+    let capacity = 16usize;
+    let max_new = 8usize;
+
+    let mut cfg32 = cfg;
+    cfg32.dtype = mach_model::config::ModelDType::F32;
+    let want = gen_ref(&hip, cfg32, &w, &prompt, max_new);
+
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
+    let id = eng
+        .add(&prompt, max_new, None, SamplingParams::default())
+        .unwrap();
+    while !eng.is_done(id) {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(id),
+        want,
+        "fp16 prefill attention must match single-token greedy"
+    );
+}

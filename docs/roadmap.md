@@ -234,3 +234,16 @@
   - **正确性(真机)**:batched fp16 vs fp32 最大 logit 差 0.0024(fp16 KV 舍入,仍极小),
     连续/采样/分块 prefill 测试全绿;
   - 测试:默认 + HIP 全绿,clippy 0 告警,fmt 干净。
+
+- **P3i flash-prefill attention 实验(2026-08-22,结论:暂缓)**:
+  - 实现共享 KV 的 `attn_prefill_f16` kernel(每 key 位置读一次、因果掩码复用给 C 行,
+    warp shuffle 归约 + 两遍 softmax),正确性通过(与单 token 参考一致);
+  - **结论:naive 版本比 decode attention 慢 5.7x**(2048-token prefill 553→3186ms):
+    每 chunk 只有 14 个 block(64 行 × 14 heads),GPU 96 CU 只用 15% 占用;且每 key 的
+    f16_to_f32(每元素 ~8 指令)与 3 次 warp shuffle 开销大;行分块会牺牲 KV 共享——
+    占用与共享存在本质权衡;
+  - **当前处置**:run 检测禁用(所有行走 decode attention,TTFT 回到 552ms);
+    正确 kernel + run 基础设施 + run_mask 保留供后续"占用感知"重设计;新增 F16
+    分块 prefill 正确性测试(`fp16_prefill_attention_matches_single_token`);
+  - 长期 target:长 prompt/长 context 的 attention 仍是下一个优化方向,需要
+    多 block 共享 KV + 减少每 key 开销的 flash 式设计。
