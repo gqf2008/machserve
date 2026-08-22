@@ -49,6 +49,8 @@ struct SeqState {
     logprobs: Vec<f32>,
     /// Token occurrence counts of `generated` (presence/frequency penalties).
     counts: HashMap<u32, u32>,
+    /// Static logit_bias (token, value) pairs applied to every sampled step.
+    logit_bias: Vec<(u32, f32)>,
     /// Number of KV positions consumed (prompt + generated).
     len: usize,
     /// The token to feed next (first generated token after prefill, then each
@@ -101,6 +103,7 @@ impl ContinuousModel {
         max_new: usize,
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
         mut params: SamplingParams,
     ) -> Result<SeqId, Error> {
         if prompt.is_empty() {
@@ -126,6 +129,7 @@ impl ContinuousModel {
             stop_seqs,
             logprobs: Vec::new(),
             counts: HashMap::new(),
+            logit_bias,
             params,
             len: 0,
             first_decode: None,
@@ -155,6 +159,7 @@ impl ContinuousModel {
         let mut slots = Vec::new();
         let mut params = Vec::new();
         let mut row_counts: Vec<Vec<(u32, u32)>> = Vec::new();
+        let mut row_bias: Vec<Vec<(u32, f32)>> = Vec::new();
         // (row_start, row_count, was_prefill) per active slot.
         let mut rows: Vec<(usize, usize, bool)> = Vec::with_capacity(self.active);
         let mut budget = self.capacity();
@@ -172,6 +177,7 @@ impl ContinuousModel {
                     slots.push(i as u32); // all rows of seq i live in slot i
                     params.push(s.params);
                     row_counts.push(Vec::new()); // no generated history during prefill
+                    row_bias.push(s.logit_bias.clone());
                 }
                 rows.push((tokens.len() - take, take, true));
                 budget -= take;
@@ -181,14 +187,20 @@ impl ContinuousModel {
                 slots.push(i as u32);
                 params.push(s.params);
                 row_counts.push(s.counts.iter().map(|(&t, &c)| (t, c)).collect());
+                row_bias.push(s.logit_bias.clone());
                 rows.push((tokens.len() - 1, 1, false));
                 budget -= 1;
             }
         }
 
-        let (sampled, logprobs) =
-            self.model
-                .decode_step_explicit(&tokens, &lens, &slots, &mut params, &row_counts)?;
+        let (sampled, logprobs) = self.model.decode_step_explicit(
+            &tokens,
+            &lens,
+            &slots,
+            &mut params,
+            &row_counts,
+            &row_bias,
+        )?;
         // The sampler advanced each row's seed one RNG step (rows of one
         // sequence start from the same seed); the last row's value is the
         // sequence's authoritative next seed.

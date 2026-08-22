@@ -106,7 +106,7 @@ fn real_model_samples_with_seed_deterministically() {
     let run = || -> Vec<u32> {
         let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).expect("engine");
         let id = eng
-            .add(&[1, 2, 3], 10, None, Vec::new(), params)
+            .add(&[1, 2, 3], 10, None, Vec::new(), Vec::new(), params)
             .expect("add");
         while !eng.is_done(id) {
             eng.step().expect("step");

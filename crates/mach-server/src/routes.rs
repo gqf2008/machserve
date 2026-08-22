@@ -79,6 +79,9 @@ pub struct CompletionRequest {
     /// Penalize tokens by occurrence count (OpenAI frequency_penalty).
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
+    /// Add bias to specific token logits (OpenAI logit_bias: {token_id: bias}).
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +115,8 @@ pub struct ChatRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,6 +170,16 @@ fn naive_decode(tokens: &[u32]) -> String {
 /// Naive ASCII fallback: byte -> token id.
 fn naive_encode(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
+}
+
+/// Converts an OpenAI logit_bias map ({token_id: bias}) into (token, bias) pairs.
+fn logit_bias_pairs(m: &Option<std::collections::HashMap<String, f32>>) -> Vec<(u32, f32)> {
+    let Some(map) = m else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|t| (t, v)))
+        .collect()
 }
 
 /// Encodes OpenAI `stop` strings into token sequences.
@@ -332,6 +347,7 @@ pub async fn completions(
 ) -> Response {
     let tokens = prompt_tokens(&state.tok, &req.prompt);
     let stop = stop_seqs(&state.tok, &req.stop);
+    let bias = logit_bias_pairs(&req.logit_bias);
     let params = sampling_params(
         req.temperature,
         req.top_k,
@@ -346,7 +362,7 @@ pub async fn completions(
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
-            .submit_stream(tokens, req.max_tokens, None, stop, params)
+            .submit_stream(tokens, req.max_tokens, None, stop, bias, params)
             .await
         {
             Ok(x) => x,
@@ -382,7 +398,14 @@ pub async fn completions(
         );
         let (output, lps, reason) = match state
             .engine
-            .submit(tokens.clone(), req.max_tokens, None, stop.clone(), params)
+            .submit(
+                tokens.clone(),
+                req.max_tokens,
+                None,
+                stop.clone(),
+                bias.clone(),
+                params,
+            )
             .await
         {
             Ok(o) => o,
@@ -433,6 +456,7 @@ pub async fn chat_completions(
         .as_ref()
         .and_then(|t| t.special_token_id("<|im_end|>"));
     let stop = stop_seqs(&state.tok, &req.stop);
+    let bias = logit_bias_pairs(&req.logit_bias);
     let params = sampling_params(
         req.temperature,
         req.top_k,
@@ -447,7 +471,7 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
-            .submit_stream(tokens, req.max_tokens, eos, stop, params)
+            .submit_stream(tokens, req.max_tokens, eos, stop, bias, params)
             .await
         {
             Ok(x) => x,
@@ -490,7 +514,14 @@ pub async fn chat_completions(
         );
         let (output, lps, reason) = match state
             .engine
-            .submit(tokens.clone(), req.max_tokens, eos, stop.clone(), params)
+            .submit(
+                tokens.clone(),
+                req.max_tokens,
+                eos,
+                stop.clone(),
+                bias.clone(),
+                params,
+            )
             .await
         {
             Ok(o) => o,

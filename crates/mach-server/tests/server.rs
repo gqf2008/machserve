@@ -44,6 +44,7 @@ async fn completions_endpoint_matches_direct_engine() {
             max_new,
             None,
             Vec::new(),
+            Vec::new(),
             SamplingParams::default(),
         )
         .unwrap();
@@ -156,7 +157,9 @@ async fn sampling_params_flow_through_http() {
 
     // Direct engine reference with the same params + seed.
     let mut cm = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
-    let id = cm.add(&prompt, max_new, None, Vec::new(), params).unwrap();
+    let id = cm
+        .add(&prompt, max_new, None, Vec::new(), Vec::new(), params)
+        .unwrap();
     while !cm.is_done(id) {
         cm.step().unwrap();
     }

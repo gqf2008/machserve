@@ -17,6 +17,7 @@ struct Request {
     max_new: usize,
     eos: Option<u32>,
     stop_seqs: Vec<Vec<u32>>,
+    logit_bias: Vec<(u32, f32)>,
     params: SamplingParams,
     done: oneshot::Sender<(Vec<u32>, Vec<f32>, &'static str)>,
     /// Streaming: per-token channel (None for non-streaming requests).
@@ -68,6 +69,7 @@ impl ServerEngine {
         max_new: usize,
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
         params: SamplingParams,
     ) -> Result<(Vec<u32>, Vec<f32>, &'static str), EngineError> {
         let (tx, rx) = oneshot::channel();
@@ -81,6 +83,7 @@ impl ServerEngine {
                 max_new,
                 eos,
                 stop_seqs,
+                logit_bias,
                 params,
                 done: tx,
                 tokens_tx: None,
@@ -99,6 +102,7 @@ impl ServerEngine {
         max_new: usize,
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
         params: SamplingParams,
     ) -> Result<
         (
@@ -119,6 +123,7 @@ impl ServerEngine {
                 max_new,
                 eos,
                 stop_seqs,
+                logit_bias,
                 params,
                 done: tx,
                 tokens_tx: Some(tokens_tx),
@@ -152,7 +157,14 @@ impl ServerEngine {
                 while !pending.is_empty() && model.active() < self.capacity {
                     let r = pending.pop_front().expect("checked non-empty");
                     let id = model
-                        .add(&r.prompt, r.max_new, r.eos, r.stop_seqs, r.params)
+                        .add(
+                            &r.prompt,
+                            r.max_new,
+                            r.eos,
+                            r.stop_seqs,
+                            r.logit_bias,
+                            r.params,
+                        )
                         .expect("capacity guaranteed");
                     txs.insert(id, r.done);
                     if let Some(stx) = r.tokens_tx {

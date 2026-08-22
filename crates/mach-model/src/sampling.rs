@@ -123,7 +123,10 @@ extern "C" __global__ void sample_batched(
     const int* __restrict__ pen_tokens,
     const int* __restrict__ pen_counts,
     const int* __restrict__ pen_count,
-    int max_pen, int vocab, int batch)
+    const int* __restrict__ bias_tokens,
+    const float* __restrict__ bias_vals,
+    const int* __restrict__ bias_count,
+    int max_pen, int max_bias, int vocab, int batch)
 {
     const int s = blockIdx.x;
     float* row = logits + (long long)s * vocab; // penalties modify in place
@@ -161,6 +164,17 @@ extern "C" __global__ void sample_batched(
             }
             __syncthreads();
         }
+    }
+
+    // Apply logit_bias in place (OpenAI logit_bias adds to logits).
+    {
+        for (int j = tid; j < bias_count[s]; j += T) {
+            int tok = bias_tokens[(long long)s * max_bias + j];
+            if (tok < vocab) {
+                row[tok] += bias_vals[(long long)s * max_bias + j];
+            }
+        }
+        __syncthreads();
     }
 
     // One RNG draw + advance per row per call (even for greedy, so the draw
@@ -394,6 +408,9 @@ pub struct BatchedSampler {
     pen_tokens_dev: *mut i32,
     pen_counts_dev: *mut i32,
     pen_count_dev: *mut i32,
+    bias_tokens_dev: *mut i32,
+    bias_vals_dev: *mut f32,
+    bias_count_dev: *mut i32,
     temp_host: *mut f32,
     topk_host: *mut i32,
     topp_host: *mut f32,
@@ -405,6 +422,9 @@ pub struct BatchedSampler {
     pen_tokens_host: *mut i32,
     pen_counts_host: *mut i32,
     pen_count_host: *mut i32,
+    bias_tokens_host: *mut i32,
+    bias_vals_host: *mut f32,
+    bias_count_host: *mut i32,
     capacity: usize,
     allocs: Vec<*mut core::ffi::c_void>,
     pins: Vec<*mut core::ffi::c_void>,
@@ -443,6 +463,9 @@ impl BatchedSampler {
         let pen_tokens_dev = dalloc(capacity * MAX_PEN * 4)? as *mut i32;
         let pen_counts_dev = dalloc(capacity * MAX_PEN * 4)? as *mut i32;
         let pen_count_dev = dalloc(capacity * 4)? as *mut i32;
+        let bias_tokens_dev = dalloc(capacity * MAX_BIAS * 4)? as *mut i32;
+        let bias_vals_dev = dalloc(capacity * MAX_BIAS * 4)? as *mut f32;
+        let bias_count_dev = dalloc(capacity * 4)? as *mut i32;
         let temp_host = pall(capacity * 4)? as *mut f32;
         let topk_host = pall(capacity * 4)? as *mut i32;
         let topp_host = pall(capacity * 4)? as *mut f32;
@@ -454,6 +477,9 @@ impl BatchedSampler {
         let pen_tokens_host = pall(capacity * MAX_PEN * 4)? as *mut i32;
         let pen_counts_host = pall(capacity * MAX_PEN * 4)? as *mut i32;
         let pen_count_host = pall(capacity * 4)? as *mut i32;
+        let bias_tokens_host = pall(capacity * MAX_BIAS * 4)? as *mut i32;
+        let bias_vals_host = pall(capacity * MAX_BIAS * 4)? as *mut f32;
+        let bias_count_host = pall(capacity * 4)? as *mut i32;
         Ok(Self {
             hip,
             stream,
@@ -469,6 +495,9 @@ impl BatchedSampler {
             pen_tokens_dev,
             pen_counts_dev,
             pen_count_dev,
+            bias_tokens_dev,
+            bias_vals_dev,
+            bias_count_dev,
             temp_host,
             topk_host,
             topp_host,
@@ -480,6 +509,9 @@ impl BatchedSampler {
             pen_tokens_host,
             pen_counts_host,
             pen_count_host,
+            bias_tokens_host,
+            bias_vals_host,
+            bias_count_host,
             capacity,
             allocs,
             pins,
@@ -495,17 +527,20 @@ impl BatchedSampler {
         logits: *const f32,
         params: &mut [SamplingParams],
         counts: &[Vec<(u32, u32)>],
+        bias: &[Vec<(u32, f32)>],
         vocab: usize,
     ) -> Result<(Vec<u32>, Vec<f32>), Error> {
         let n = params.len();
         assert!(n <= self.capacity, "sampler capacity exceeded");
         assert_eq!(counts.len(), n, "counts must be per-row");
+        assert_eq!(bias.len(), n, "bias must be per-row");
         #[allow(clippy::needless_range_loop)] // raw pinned-host writes by slot
         for i in 0..n {
             assert!(
                 counts[i].len() <= MAX_PEN,
                 "too many distinct tokens for penalty scratch"
             );
+            assert!(bias[i].len() <= MAX_BIAS, "too many logit_bias entries");
             unsafe {
                 *self.temp_host.add(i) = params[i].temperature;
                 *self.topk_host.add(i) = params[i].top_k as i32;
@@ -517,6 +552,11 @@ impl BatchedSampler {
                 for (j, &(t, c)) in counts[i].iter().enumerate() {
                     *self.pen_tokens_host.add(i * MAX_PEN + j) = t as i32;
                     *self.pen_counts_host.add(i * MAX_PEN + j) = c as i32;
+                }
+                *self.bias_count_host.add(i) = bias[i].len() as i32;
+                for (j, &(t, b)) in bias[i].iter().enumerate() {
+                    *self.bias_tokens_host.add(i * MAX_BIAS + j) = t as i32;
+                    *self.bias_vals_host.add(i * MAX_BIAS + j) = b;
                 }
             }
         }
@@ -592,6 +632,30 @@ impl BatchedSampler {
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.stream,
         )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.bias_tokens_dev as *mut core::ffi::c_void,
+            self.bias_tokens_host as *const core::ffi::c_void,
+            n * MAX_BIAS * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.bias_vals_dev as *mut core::ffi::c_void,
+            self.bias_vals_host as *const core::ffi::c_void,
+            n * MAX_BIAS * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.bias_count_dev as *mut core::ffi::c_void,
+            self.bias_count_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
 
         let lp = logits as *mut f32; // kernel applies penalties in place
         let tp = self.temp_dev;
@@ -605,9 +669,13 @@ impl BatchedSampler {
         let ptp = self.pen_tokens_dev;
         let pcp = self.pen_counts_dev;
         let pnp = self.pen_count_dev;
+        let btp = self.bias_tokens_dev;
+        let bvp = self.bias_vals_dev;
+        let bcp = self.bias_count_dev;
         let vocab_i = vocab as i32;
         let n_i = n as i32;
         let max_pen = MAX_PEN as i32;
+        let max_bias = MAX_BIAS as i32;
         let mut args: Vec<*mut core::ffi::c_void> = vec![
             &lp as *const *mut f32 as *mut core::ffi::c_void,
             &tp as *const *mut f32 as *mut core::ffi::c_void,
@@ -621,7 +689,11 @@ impl BatchedSampler {
             &ptp as *const *mut i32 as *mut core::ffi::c_void,
             &pcp as *const *mut i32 as *mut core::ffi::c_void,
             &pnp as *const *mut i32 as *mut core::ffi::c_void,
+            &btp as *const *mut i32 as *mut core::ffi::c_void,
+            &bvp as *const *mut f32 as *mut core::ffi::c_void,
+            &bcp as *const *mut i32 as *mut core::ffi::c_void,
             &max_pen as *const i32 as *mut core::ffi::c_void,
+            &max_bias as *const i32 as *mut core::ffi::c_void,
             &vocab_i as *const i32 as *mut core::ffi::c_void,
             &n_i as *const i32 as *mut core::ffi::c_void,
         ];
@@ -698,16 +770,23 @@ pub fn sample_cpu(
     logits: &[f32],
     p: &SamplingParams,
     counts: &[(u32, u32)],
+    bias: &[(u32, f32)],
     state: &mut u64,
 ) -> u32 {
     let vocab = logits.len();
     let u = next_f32(state);
-    // Apply presence/frequency penalties to a copy of the logits.
-    let penalized: Vec<f32> = if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+    // Apply presence/frequency penalties and logit_bias to a copy of logits.
+    let need_edit = p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 || !bias.is_empty();
+    let penalized: Vec<f32> = if need_edit {
         let mut v = logits.to_vec();
         for &(t, c) in counts {
             if t < vocab as u32 && c > 0 {
                 v[t as usize] -= p.presence_penalty + p.frequency_penalty * c as f32;
+            }
+        }
+        for &(t, b) in bias {
+            if t < vocab as u32 {
+                v[t as usize] += b;
             }
         }
         v
@@ -796,6 +875,8 @@ pub fn sample_cpu(
 
 /// Maximum penalty (token, count) pairs per row (OpenAI frequency/presence).
 const MAX_PEN: usize = 4096;
+/// Maximum logit_bias (token, value) pairs per row.
+const MAX_BIAS: usize = 4096;
 
 /// Block-local argmax: each block reduces a contiguous 256-element slice.
 const ARGMAX_SLICE: &str = r#"
@@ -1117,7 +1198,10 @@ mod tests {
         let dlogits = upload_logits(h, logits);
         let s = BatchedSampler::new(Arc::clone(h), stream, params.len()).unwrap();
         let empty: Vec<Vec<(u32, u32)>> = (0..params.len()).map(|_| Vec::new()).collect();
-        let (got, _) = s.sample_batched(dlogits, params, &empty, vocab).unwrap();
+        let ebias: Vec<Vec<(u32, f32)>> = (0..params.len()).map(|_| Vec::new()).collect();
+        let (got, _) = s
+            .sample_batched(dlogits, params, &empty, &ebias, vocab)
+            .unwrap();
         hip::free(h, dlogits as *mut _).unwrap();
         unsafe { hip::check(h, (h.api.hip_stream_destroy)(stream)).unwrap() };
         got
@@ -1194,7 +1278,7 @@ mod tests {
         let got = gpu_sample(&h, &logits, &mut params, vocab);
         for (i, p) in cases.iter().enumerate() {
             let mut state = p.seed;
-            let want = sample_cpu(&logits[i * vocab..(i + 1) * vocab], p, &[], &mut state);
+            let want = sample_cpu(&logits[i * vocab..(i + 1) * vocab], p, &[], &[], &mut state);
             assert_eq!(
                 got[i], want,
                 "seq {i} params={p:?}: gpu={} cpu={}",
@@ -1223,7 +1307,7 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for k in 0..200u64 {
             let mut state = p.seed.wrapping_add(k * 7919);
-            seen.insert(sample_cpu(&logits, &p, &[], &mut state));
+            seen.insert(sample_cpu(&logits, &p, &[], &[], &mut state));
         }
         assert!(
             seen.len() >= 8,
@@ -1246,7 +1330,8 @@ mod tests {
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
             let empty: Vec<Vec<(u32, u32)>> = (0..gp.len()).map(|_| Vec::new()).collect();
-            let r = s.sample_batched(d, &mut gp, &empty, vocab).unwrap();
+            let ebias: Vec<Vec<(u32, f32)>> = (0..gp.len()).map(|_| Vec::new()).collect();
+            let r = s.sample_batched(d, &mut gp, &empty, &ebias, vocab).unwrap();
             hip::free(&h, d as *mut _).unwrap();
             unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
             r
@@ -1274,7 +1359,8 @@ mod tests {
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
             let empty: Vec<Vec<(u32, u32)>> = (0..sp.len()).map(|_| Vec::new()).collect();
-            let r = s.sample_batched(d, &mut sp, &empty, vocab).unwrap();
+            let ebias: Vec<Vec<(u32, f32)>> = (0..sp.len()).map(|_| Vec::new()).collect();
+            let r = s.sample_batched(d, &mut sp, &empty, &ebias, vocab).unwrap();
             hip::free(&h, d as *mut _).unwrap();
             unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
             r
@@ -1319,7 +1405,10 @@ mod tests {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
-            let r = s.sample_batched(d, &mut params, &counts, vocab).unwrap();
+            let ebias: Vec<Vec<(u32, f32)>> = (0..params.len()).map(|_| Vec::new()).collect();
+            let r = s
+                .sample_batched(d, &mut params, &counts, &ebias, vocab)
+                .unwrap();
             hip::free(&h, d as *mut _).unwrap();
             unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
             r
@@ -1330,11 +1419,65 @@ mod tests {
                 &logits[i * vocab..(i + 1) * vocab],
                 p,
                 &counts[i],
+                &[],
                 &mut state,
             );
             assert_eq!(
                 got[i], want,
                 "seq {i} penalty sample mismatch: gpu={} cpu={}",
+                got[i], want
+            );
+        }
+    }
+    #[test]
+    fn logit_bias_matches_cpu_reference() {
+        let Some(h) = have_gpu() else { return };
+        let vocab = 2048usize;
+        let n = 4usize;
+        let mut logits = vec![0.0f32; vocab * n];
+        for s in 0..n {
+            let row = &mut logits[s * vocab..(s + 1) * vocab];
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = 0.5 - 1.2 * (i as f32) * 0.25;
+            }
+        }
+        let mut params: Vec<SamplingParams> = (0..n)
+            .map(|i| SamplingParams {
+                temperature: if i == 0 { 0.0 } else { 0.9 },
+                top_k: 0,
+                top_p: 0.95,
+                seed: 4000 + i as u64,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+            })
+            .collect();
+        // Bias strongly toward token 200 and away from token 0.
+        let bias: Vec<Vec<(u32, f32)>> = (0..n).map(|_| vec![(200u32, 12.0), (0, -12.0)]).collect();
+        let cases = params.clone();
+        let (got, _) = {
+            let stream = make_stream(&h);
+            let d = upload_logits(&h, &logits);
+            let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
+            let empty: Vec<Vec<(u32, u32)>> = (0..n).map(|_| Vec::new()).collect();
+            let r = s
+                .sample_batched(d, &mut params, &empty, &bias, vocab)
+                .unwrap();
+            hip::free(&h, d as *mut _).unwrap();
+            unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+            r
+        };
+        for (i, p) in cases.iter().enumerate() {
+            let mut state = p.seed;
+            let want = sample_cpu(
+                &logits[i * vocab..(i + 1) * vocab],
+                p,
+                &[],
+                &bias[i],
+                &mut state,
+            );
+            assert_eq!(
+                got[i], want,
+                "seq {i} logit_bias sample mismatch: gpu={} cpu={}",
                 got[i], want
             );
         }

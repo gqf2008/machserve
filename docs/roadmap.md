@@ -319,3 +319,12 @@
     `/v1/chat/completions` 解析透传;
   - **对拍**:GPU vs CPU 同 seed 逐 token 一致(含贪心+采样);默认 + HIP 全绿,
     clippy/fmt 干净。
+
+- **P3q OpenAI logit_bias(2026-08-23,7900 XTX 真机)**:
+  - kernel 增加 bias 预扫描(就地 `row[tok] += bias`),`sample_batched`/
+    `decode_step_explicit`/引擎按行传递静态 (token, bias) 列表;API 解析 OpenAI
+    `logit_bias` 对象({token_id: bias});
+  - CPU 参考同步(penalty+bias 统一走"改 logits 副本"路径);**GPU vs CPU 同 seed
+    逐 token 对拍一致**(含贪心+采样);
+  - 至此 OpenAI 采样参数面完整:temperature/top_p/top_k/seed/presence/frequency/
+    logit_bias/stop/n/logprobs/stream/finish_reason;默认 + HIP 全绿,clippy/fmt 干净。

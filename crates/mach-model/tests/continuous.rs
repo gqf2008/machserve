@@ -63,6 +63,7 @@ fn run_engine(
                 *max_new,
                 *eos,
                 Vec::new(),
+                Vec::new(),
                 SamplingParams::default(),
             )
             .unwrap(),
@@ -102,7 +103,14 @@ fn slots_reuse_after_finish() {
     // A short sequence finishes quickly, freeing its slot for a new one.
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
     let a = eng
-        .add(&[3], 2, None, Vec::new(), SamplingParams::default())
+        .add(
+            &[3],
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     while !eng.is_done(a) {
         eng.step().unwrap();
@@ -112,7 +120,14 @@ fn slots_reuse_after_finish() {
 
     // Slot is freed: a new sequence can join at the compacted slot.
     let b = eng
-        .add(&[9, 7, 42], 4, None, Vec::new(), SamplingParams::default())
+        .add(
+            &[9, 7, 42],
+            4,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     assert_ne!(b, a, "stable ids differ");
     while !eng.all_done() {
@@ -150,6 +165,7 @@ fn eos_stops_generation() {
             20,
             Some(eos_tok),
             Vec::new(),
+            Vec::new(),
             SamplingParams::default(),
         )
         .unwrap();
@@ -178,7 +194,9 @@ fn sampling_is_deterministic_per_seed() {
         let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
         let mut p = base;
         p.seed = seed;
-        let id = eng.add(&[3, 9, 27], 12, None, Vec::new(), p).unwrap();
+        let id = eng
+            .add(&[3, 9, 27], 12, None, Vec::new(), Vec::new(), p)
+            .unwrap();
         while !eng.is_done(id) {
             eng.step().unwrap();
         }
@@ -212,6 +230,7 @@ fn chunked_prefill_matches_single_token() {
             max_new,
             None,
             Vec::new(),
+            Vec::new(),
             SamplingParams::default(),
         )
         .unwrap();
@@ -234,7 +253,14 @@ fn chunked_prefill_finishes_with_fewer_steps() {
     let capacity = 16usize;
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, capacity).unwrap();
     let id = eng
-        .add(&prompt, 4, None, Vec::new(), SamplingParams::default())
+        .add(
+            &prompt,
+            4,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     let mut steps = 0usize;
     while !eng.is_done(id) {
@@ -274,6 +300,7 @@ fn fp16_prefill_attention_matches_single_token() {
             max_new,
             None,
             Vec::new(),
+            Vec::new(),
             SamplingParams::default(),
         )
         .unwrap();
@@ -304,6 +331,7 @@ fn stop_sequence_terminates_generation() {
             6,
             None,
             vec![vec![stop_tok]],
+            Vec::new(),
             SamplingParams::default(),
         )
         .unwrap();
@@ -322,7 +350,14 @@ fn stop_sequence_terminates_generation() {
     let stop2 = want[..2].to_vec();
     let mut eng2 = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
     let id2 = eng2
-        .add(&prompt, 6, None, vec![stop2], SamplingParams::default())
+        .add(
+            &prompt,
+            6,
+            None,
+            vec![stop2],
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     while !eng2.is_done(id2) {
         eng2.step().unwrap();
@@ -337,7 +372,14 @@ fn stop_sequence_terminates_generation() {
     // A run to max_new without stop/EOS reports "length".
     let mut eng3 = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
     let id3 = eng3
-        .add(&prompt, 6, None, Vec::new(), SamplingParams::default())
+        .add(
+            &prompt,
+            6,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
         .unwrap();
     while !eng3.is_done(id3) {
         eng3.step().unwrap();
