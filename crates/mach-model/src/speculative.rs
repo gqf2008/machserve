@@ -316,3 +316,101 @@ impl SpeculativeBatch {
         Ok(accepted)
     }
 }
+
+/// Serving engine built on batched speculative decoding.
+///
+/// Wraps a [`SpeculativeBatch`] with per-request bookkeeping (stable id ->
+/// slot, generated tokens, EOS / max_new termination, finish reason), giving
+/// the same API shape as `ContinuousModel` so a server can serve requests
+/// through spec-decode (greedy for now).
+pub struct SpeculativeEngine {
+    batch: SpeculativeBatch,
+    /// Per-slot generated tokens.
+    generated: Vec<Vec<u32>>,
+    /// Per-slot max_new.
+    max_new: Vec<usize>,
+    /// Per-slot EOS token.
+    eos: Vec<Option<u32>>,
+}
+
+impl SpeculativeEngine {
+    /// Builds an engine serving up to `capacity` requests with `k` drafts.
+    pub fn new(draft: BatchedModel, target: BatchedModel, k: usize, capacity: usize) -> Self {
+        Self {
+            batch: SpeculativeBatch::new(draft, target, k, capacity),
+            generated: Vec::new(),
+            max_new: Vec::new(),
+            eos: Vec::new(),
+        }
+    }
+
+    /// Adds a request; returns its stable id (its slot).
+    pub fn add(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        eos: Option<u32>,
+    ) -> Result<usize, Error> {
+        let slot = self.generated.len();
+        self.batch.add(prompt)?;
+        self.generated.push(Vec::new());
+        self.max_new.push(max_new);
+        self.eos.push(eos);
+        Ok(slot)
+    }
+
+    /// Advances by one spec round; returns `(seq_id, token)` for each newly
+    /// generated token of still-active sequences.
+    pub fn step(&mut self) -> Result<Vec<(usize, u32)>, Error> {
+        let accepted = self.batch.step()?;
+        let mut outputs = Vec::new();
+        for (s, seq) in accepted.iter().enumerate() {
+            let Some(seq) = seq else { continue };
+            for &t in seq {
+                if !self.batch.is_active(s) {
+                    break;
+                }
+                self.generated[s].push(t);
+                outputs.push((s, t));
+                if self.generated[s].len() >= self.max_new[s] || self.eos[s].is_some_and(|e| t == e)
+                {
+                    self.batch.finish(s);
+                    break;
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// Generated tokens of request `s` (empty if unknown).
+    #[must_use]
+    pub fn generated(&self, s: usize) -> Vec<u32> {
+        self.generated.get(s).cloned().unwrap_or_default()
+    }
+
+    /// OpenAI finish reason for request `s`.
+    #[must_use]
+    pub fn finish_reason(&self, s: usize) -> &'static str {
+        let Some(gens) = self.generated.get(s) else {
+            return "length";
+        };
+        let stopped = gens
+            .last()
+            .is_some_and(|&t| self.eos[s].is_some_and(|e| t == e));
+        if stopped { "stop" } else { "length" }
+    }
+
+    /// Whether request `s` has finished.
+    #[must_use]
+    pub fn is_done(&self, s: usize) -> bool {
+        self.generated.get(s).is_some_and(|gens| {
+            gens.len() >= self.max_new[s] || self.eos[s].is_some_and(|e| gens.last() == Some(&e))
+        }) || !self.batch.is_active(s)
+    }
+
+    /// Whether every request has finished.
+    #[must_use]
+    pub fn all_done(&self) -> bool {
+        self.batch.active() == 0
+    }
+}

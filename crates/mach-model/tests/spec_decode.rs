@@ -309,3 +309,65 @@ fn spec_decode_batch_lifecycle_matches_plain_greedy() {
         );
     }
 }
+
+#[test]
+fn speculative_engine_matches_continuous_model() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F32;
+    let dw = Weights::random(&cfg, 61).unwrap();
+    let tw = Weights::random(&cfg, 73).unwrap();
+    let capacity = 3usize;
+    let k = 4usize;
+    let eos = Some(77u32);
+    let jobs: Vec<(Vec<u32>, usize)> = vec![
+        (vec![5, 9, 3, 200], 10usize),
+        (vec![44, 88, 1], 8usize),
+        (vec![2, 3, 4, 5], 12usize),
+    ];
+
+    // Reference: the standard continuous engine (greedy).
+    let mut cm =
+        mach_model::continuous::ContinuousModel::new(hip.clone(), cfg, &tw, capacity).unwrap();
+    let mut cm_ids = Vec::new();
+    for (p, n) in &jobs {
+        cm_ids.push(
+            cm.add(
+                p,
+                *n,
+                eos,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap(),
+        );
+    }
+    while !cm.all_done() {
+        cm.step().unwrap();
+    }
+
+    // Speculative engine with the same requests.
+    let mut eng = mach_model::speculative::SpeculativeEngine::new(
+        BatchedModel::with_rows(hip.clone(), cfg, &dw, capacity, capacity).unwrap(),
+        BatchedModel::with_rows(hip.clone(), cfg, &tw, capacity, capacity * (k + 1)).unwrap(),
+        k,
+        capacity,
+    );
+    for (p, n) in &jobs {
+        eng.add(p, *n, eos).unwrap();
+    }
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    for (i, (_, n)) in jobs.iter().enumerate() {
+        let want = cm.generated(cm_ids[i]);
+        let got = eng.generated(i);
+        assert_eq!(
+            got, want,
+            "spec engine seq {i} must match continuous engine, got {got:?} want {want:?}"
+        );
+        assert_eq!(eng.finish_reason(i), cm.finish_reason(cm_ids[i]));
+        assert_eq!(got.len(), *n, "seq {i} generated length");
+    }
+}

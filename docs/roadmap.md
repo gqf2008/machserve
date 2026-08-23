@@ -576,3 +576,12 @@
   - **结论:gfx1100 + Windows ROCm 6.2 下 hipBLAS 原生 fp8 GEMM 不可用**,原生 fp8
     路径需自定义 hiprtc fp8 内核(大投入、收益未验证),或等 ROCm 更新;
   - 探针测试保留为回归证据(`mach-kernel-sys` lib 测试,含 fp8 常量 30/31)。
+
+- **P3ar SpeculativeEngine(服务引擎层,2026-08-23,7900 XTX)**:
+  - 新增 `SpeculativeEngine`:包装 `SpeculativeBatch`,提供与 `ContinuousModel` 同
+    形状的 API(add → generated / finish_reason / is_done / all_done),每请求
+    (prompt/max_new/eos)通过 spec-decode(贪心)服务;
+  - **验证**:tiny 模型,与标准 `ContinuousModel`(贪心)逐序列生成结果 + finish_reason
+    完全一致(新测试);全量 HIP 回归全绿,clippy/fmt 干净;
+  - 这是引擎集成的第一个落地形态;后续可接入服务器(需采样参数/penalties + 流式,
+    以及收益测量确认)。
