@@ -87,6 +87,20 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
             lw.rms_mlp.clone(),
             vec![d],
         ));
+        if cfg.num_experts > 0 {
+            let ne = cfg.num_experts;
+            let inter = cfg.intermediate_size;
+            t.push((p("mlp.gate.weight"), lw.moe_router.clone(), vec![ne, d]));
+            for e in 0..ne {
+                let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+                let wg = &lw.moe_wg[e * inter * d..(e + 1) * inter * d];
+                let wu = &lw.moe_wu[e * inter * d..(e + 1) * inter * d];
+                let wd = &lw.moe_wd[e * d * inter..(e + 1) * d * inter];
+                t.push((ep("gate_proj.weight"), wg.to_vec(), vec![inter, d]));
+                t.push((ep("up_proj.weight"), wu.to_vec(), vec![inter, d]));
+                t.push((ep("down_proj.weight"), wd.to_vec(), vec![d, inter]));
+            }
+        }
     }
     t
 }
@@ -125,6 +139,46 @@ fn roundtrip_load_matches_original_weights() {
         assert_eq!(max_abs_diff(&a.wd, &b.wd), 0.0, "layer {li} wd");
         assert_eq!(max_abs_diff(&a.rms_attn, &b.rms_attn), 0.0);
         assert_eq!(max_abs_diff(&a.rms_mlp, &b.rms_mlp), 0.0);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A MoE config: dense `tiny()` plus 4 experts, 2 active per token.
+fn moe_cfg() -> Config {
+    let mut cfg = Config::tiny();
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg
+}
+
+#[test]
+fn roundtrip_moe_load_matches_original_weights() {
+    let cfg = moe_cfg();
+    let path = tmp_path("roundtrip_moe");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let loaded = load_safetensors(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+
+    for (li, (a, b)) in loaded.layers.iter().zip(&original.layers).enumerate() {
+        assert!(!a.moe_router.is_empty(), "layer {li} router loaded");
+        assert_eq!(
+            max_abs_diff(&a.moe_router, &b.moe_router),
+            0.0,
+            "layer {li} router"
+        );
+        assert_eq!(max_abs_diff(&a.moe_wg, &b.moe_wg), 0.0, "layer {li} moe_wg");
+        assert_eq!(max_abs_diff(&a.moe_wu, &b.moe_wu), 0.0, "layer {li} moe_wu");
+        assert_eq!(max_abs_diff(&a.moe_wd, &b.moe_wd), 0.0, "layer {li} moe_wd");
+        // Dense fields must still round-trip under a MoE config (loader reads them too).
+        assert_eq!(max_abs_diff(&a.wg, &b.wg), 0.0, "layer {li} dense wg");
+        assert_eq!(max_abs_diff(&a.wu, &b.wu), 0.0, "layer {li} dense wu");
+        assert_eq!(max_abs_diff(&a.wd, &b.wd), 0.0, "layer {li} dense wd");
     }
     let _ = std::fs::remove_file(&path);
 }

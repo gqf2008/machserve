@@ -193,6 +193,22 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
+        let (moe_router, moe_wg, moe_wu, moe_wd) = if cfg.num_experts > 0 {
+            let ne = cfg.num_experts;
+            let router = get(&p("mlp.gate.weight"), ne * d)?;
+            let mut wg = Vec::with_capacity(ne * cfg.intermediate_size * d);
+            let mut wu = Vec::with_capacity(ne * cfg.intermediate_size * d);
+            let mut wd = Vec::with_capacity(ne * d * cfg.intermediate_size);
+            for e in 0..ne {
+                let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+                wg.extend(get(&ep("gate_proj.weight"), cfg.intermediate_size * d)?);
+                wu.extend(get(&ep("up_proj.weight"), cfg.intermediate_size * d)?);
+                wd.extend(get(&ep("down_proj.weight"), d * cfg.intermediate_size)?);
+            }
+            (router, wg, wu, wd)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
         let lw = LayerWeights {
             wq: get(&p("self_attn.q_proj.weight"), d * nq)?,
             wk: get(&p("self_attn.k_proj.weight"), d * nkv)?,
@@ -208,13 +224,10 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
             bq: get_opt(&p("self_attn.q_proj.bias"), nq)?,
             bk: get_opt(&p("self_attn.k_proj.bias"), nkv)?,
             bv: get_opt(&p("self_attn.v_proj.bias"), nkv)?,
-            // MoE (dense models have none; expert tensors loaded in a later
-            // slice: model.layers.N.mlp.experts.M.{gate,up,down}_proj.weight
-            // + model.layers.N.mlp.gate.weight).
-            moe_router: Vec::new(),
-            moe_wg: Vec::new(),
-            moe_wu: Vec::new(),
-            moe_wd: Vec::new(),
+            moe_router,
+            moe_wg,
+            moe_wu,
+            moe_wd,
         };
         layers.push(lw);
     }

@@ -605,3 +605,13 @@
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 后续切片:loader 读取真实 MoE 张量(`model.layers.N.mlp.experts.M.*` +
     `mlp.gate`)、GPU 路由/专家 GEMM(逐 token top-k 分组)、真实 Qwen2.5-MoE 验证。
+
+- **P3au loader 读取真实 MoE 张量(2026-08-23)**:
+  - `load_safetensors` 在 `num_experts > 0` 时读取路由 `model.layers.N.mlp.gate.weight`
+    ([ne,d]) 与专家 `model.layers.N.mlp.experts.M.{gate,up,down}_proj.weight`
+    (逐专家 [inter,d]/[d,inter]),拼接为与 `Weights::random` 一致的 expert-major 布局;
+  - **验证**:`load_safetensors` 测试增 MoE 回归——合成 MoE checkpoint 读写往返与
+    `Weights::random(moe_cfg)` 逐元素一致(路由 + 专家 + 稠密字段);全量 HIP 回归全绿,
+    clippy/fmt 干净;
+  - 后续切片:GPU 路由 + top-k 专家 GEMM(逐 token 分组批量)、与 ref_model CPU 对拍、
+    真实 Qwen2.5-MoE 验证。
