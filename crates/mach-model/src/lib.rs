@@ -14,6 +14,7 @@ pub mod config;
 pub mod continuous;
 pub mod fp16;
 pub mod loader;
+pub mod moe_backend;
 pub mod ref_model;
 #[cfg(feature = "hip")]
 pub mod sampling;
