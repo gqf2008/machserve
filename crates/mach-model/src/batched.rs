@@ -114,7 +114,6 @@ pub struct BatchedModel {
     moe_pos_dev: *mut i32,
     offsets_dev: *mut i32,
     counts_host: *mut i32,
-    offsets_host: *mut i32,
     xg: *mut f32,
     gw: *mut f32,
     row_idx: *mut i32,
@@ -201,7 +200,6 @@ impl BatchedModel {
             moe_pos_dev: std::ptr::null_mut(),
             offsets_dev: std::ptr::null_mut(),
             counts_host: std::ptr::null_mut(),
-            offsets_host: std::ptr::null_mut(),
             xg: std::ptr::null_mut(),
             gw: std::ptr::null_mut(),
             row_idx: std::ptr::null_mut(),
@@ -348,11 +346,8 @@ impl BatchedModel {
                 self.eh_all = self.dalloc(cap * inter * 4)?;
                 self.down_all = self.dalloc(cap * d * 4)?;
                 let ch = hip::host_malloc(self.k.hip(), ne * 4)?;
-                let oh = hip::host_malloc(self.k.hip(), ne * 4)?;
                 self.counts_host = ch as *mut i32;
-                self.offsets_host = oh as *mut i32;
                 self.host_pins.push(ch);
-                self.host_pins.push(oh);
                 if c.dtype == ModelDType::F16 {
                     let m = c.d_model.max(c.intermediate_size);
                     self.xh_moe = self.alloc_f16(cap * m)?;
@@ -816,29 +811,17 @@ impl BatchedModel {
                         )?;
                     }
                     k.launch_moe_count_experts(self.exp_ids, self.counts_dev, b, topk)?;
-                    // One D2H read per layer: per-expert counts -> host offsets.
-                    hip::memcpy(
+                    // GPU-side exclusive prefix sum -> gather offsets. The
+                    // per-expert counts are still read back once per layer for
+                    // the host GEMM loop (hipBLAS batch counts are host-side);
+                    // the gather itself no longer needs a host round-trip.
+                    k.launch_moe_prefix_sum(self.counts_dev, self.offsets_dev, ne)?;
+                    hip::memcpy_async(
                         self.k.hip(),
                         self.counts_host as *mut core::ffi::c_void,
                         self.counts_dev as *const core::ffi::c_void,
                         (ne as usize) * 4,
                         hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                    )?;
-                    let mut counts = vec![0i32; ne as usize];
-                    let mut offsets = vec![0i32; ne as usize];
-                    let mut acc = 0i32;
-                    for e in 0..ne as usize {
-                        counts[e] = unsafe { *self.counts_host.add(e) };
-                        offsets[e] = acc;
-                        acc += counts[e];
-                        unsafe { *self.offsets_host.add(e) = offsets[e] };
-                    }
-                    hip::memcpy_async(
-                        self.k.hip(),
-                        self.offsets_dev as *mut core::ffi::c_void,
-                        self.offsets_host as *const core::ffi::c_void,
-                        (ne as usize) * 4,
-                        hip::HIP_MEMCPY_HOST_TO_DEVICE,
                         self.k.stream,
                     )?;
                     k.launch_moe_gather_rows(
@@ -854,6 +837,11 @@ impl BatchedModel {
                         topk,
                         d,
                     )?;
+                    // Make the async counts readback visible to the host loop.
+                    self.k.sync()?;
+                    let counts: Vec<i32> = (0..ne)
+                        .map(|e| unsafe { *self.counts_host.add(e as usize) })
+                        .collect();
                     unsafe {
                         hip::check(
                             self.k.hip(),
@@ -865,15 +853,18 @@ impl BatchedModel {
                         )?;
                     }
                     // Per-expert grouped GEMMs (counts known on host after the
-                    // single D2H read; no per-expert sync).
+                    // single D2H read; no per-expert sync). The running base
+                    // mirrors the device prefix-sum output.
                     let d_usize = d as usize;
                     let inter_usize = inter as usize;
-                    for e in 0..ne as usize {
-                        let cnt = counts[e];
+                    let mut base = 0usize;
+                    for (e, &cnt) in counts.iter().enumerate() {
+                        let base_e = base;
+                        base += cnt as usize;
                         if cnt <= 0 {
                             continue;
                         }
-                        let base = offsets[e] as usize;
+                        let base = base_e;
                         let xg_e = unsafe { self.xg.add(base * d_usize) };
                         let down_e = unsafe { self.down_all.add(base * d_usize) };
                         let wg32 = unsafe { lw.moe_wg.add(e * inter_usize * d_usize) };

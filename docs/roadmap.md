@@ -668,3 +668,13 @@
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 后续切片:counts 读回改 GPU 侧调度(去每层 D2H,需自定义 grouped-GEMM 内核)、
     真实 Qwen2.5-MoE 验证(需下载权重)。
+
+- **P3az MoE 专家偏移改设备端 prefix-sum(2026-08-23,7900 XTX)**:
+  - 新增 `moe_prefix_sum` 内核(单 block,ne<=256,Hillis-Steele 独占前缀和),把
+    gather 偏移计算从 host 移到 GPU:count → prefix-sum → gather 全在设备端流水,
+    去掉每层 host 前缀和计算与 offsets H2D 上传;counts 的 D2H 读回保留(hipBLAS
+    per-expert batch 计数仍需 host 侧),改为流上异步拷贝 + 一次 sync;
+  - **验证**:batched MoE 三个对拍测试(F32 tiny / F16 tiny / F32 真实形状)全绿;
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 后续切片:彻底去 D2H 需自定义 grouped-GEMM 内核(设备端按专家分段调度),
+    真实 Qwen2.5-MoE 验证(需下载权重)。

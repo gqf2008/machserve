@@ -915,6 +915,29 @@ extern "C" __global__ void moe_scatter_add(
 }
 "#;
 
+/// Exclusive prefix sum over `counts[ne]` -> `offsets[ne]` (single block;
+/// `ne <= 256` covers all real MoE expert counts). GPU-side replacement for
+/// the host round-trip that computed gather offsets.
+const MOE_PREFIX_SUM: &str = r#"
+extern "C" __global__ void moe_prefix_sum(const int* counts, int* offsets, int ne) {
+    __shared__ int sm[256];
+    int i = threadIdx.x;
+    int v = (i < ne) ? counts[i] : 0;
+    sm[i] = v;
+    __syncthreads();
+    for (int off = 1; off < 256; off <<= 1) {
+        int t = 0;
+        if (i >= off) t = sm[i - off];
+        __syncthreads();
+        sm[i] = sm[i] + t;
+        __syncthreads();
+    }
+    if (i < ne) {
+        offsets[i] = sm[i] - v; // exclusive prefix
+    }
+}
+"#;
+
 /// Compiled kernels plus the hipBLAS handle, bound to one stream.
 pub struct HipKernels {
     hip: std::sync::Arc<Hip>,
@@ -948,6 +971,7 @@ pub struct HipKernels {
     moe_count: HipKernelModule,
     moe_gather_rows: HipKernelModule,
     moe_scatter_add: HipKernelModule,
+    moe_prefix_sum: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -1015,6 +1039,7 @@ impl HipKernels {
             moe_count: HipKernelModule::compile(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
             moe_gather_rows: HipKernelModule::compile(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
             moe_scatter_add: HipKernelModule::compile(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
+            moe_prefix_sum: HipKernelModule::compile(&arch, MOE_PREFIX_SUM, "moe_prefix_sum")?,
         })
     }
 
@@ -1992,6 +2017,26 @@ impl HipKernels {
         Ok(self
             .moe_scatter_add
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Exclusive prefix sum over `counts[ne]` into `offsets[ne]` (single
+    /// block, `ne <= 256`).
+    pub fn launch_moe_prefix_sum(
+        &self,
+        counts: *const i32,
+        offsets: *mut i32,
+        ne: i32,
+    ) -> Result<(), Error> {
+        let cp = counts;
+        let op = offsets;
+        let mut p = vec![
+            &cp as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut i32 as *mut core::ffi::c_void,
+            &ne as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self
+            .moe_prefix_sum
+            .launch([1, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
     pub fn sync(&self) -> Result<(), Error> {
