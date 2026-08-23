@@ -32,6 +32,11 @@ pub struct LayerWeights {
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
     pub bv: Vec<f32>,
+    /// QK-norm (Qwen3): per-head RMSNorm weight `[n_heads * head_dim]` for q;
+    /// empty when qk_norm=false.
+    pub q_norm: Vec<f32>,
+    /// QK-norm per-head RMSNorm weight `[n_kv_heads * head_dim]` for k.
+    pub k_norm: Vec<f32>,
     /// MoE (num_experts > 0): router `[num_experts, d_model]`; empty for dense.
     pub moe_router: Vec<f32>,
     /// Per-expert gate/up `[num_experts, intermediate_size, d_model]`.
@@ -98,6 +103,16 @@ impl Weights {
                 bq: Vec::new(),
                 bk: Vec::new(),
                 bv: Vec::new(),
+                q_norm: if cfg.qk_norm {
+                    vec1(&mut rng, cfg.n_heads * cfg.head_dim)
+                } else {
+                    Vec::new()
+                },
+                k_norm: if cfg.qk_norm {
+                    vec1(&mut rng, cfg.n_kv_heads * cfg.head_dim)
+                } else {
+                    Vec::new()
+                },
                 moe_router,
                 moe_wg,
                 moe_wu,
@@ -127,6 +142,8 @@ impl Weights {
                 + l.wu.len()
                 + l.wd.len()
                 + l.rms_mlp.len()
+                + l.q_norm.len()
+                + l.k_norm.len()
                 + l.moe_router.len()
                 + l.moe_wg.len()
                 + l.moe_wu.len()

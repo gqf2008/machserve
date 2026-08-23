@@ -37,6 +37,9 @@ struct LayerDev {
     bq: *mut f32,
     bk: *mut f32,
     bv: *mut f32,
+    /// QK-norm (Qwen3): per-head RMSNorm weights (null when qk_norm=false).
+    q_norm: *mut f32,
+    k_norm: *mut f32,
     /// MoE (num_experts > 0): router [ne,d] + per-expert gate/up/down.
     moe_router: *mut f32,
     moe_wg: *mut f32,
@@ -325,6 +328,20 @@ impl GpuModel {
                     self.upload(p, &lw.bv)?;
                     p
                 },
+                q_norm: if lw.q_norm.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.q_norm.len() * 4)?;
+                    self.upload(p, &lw.q_norm)?;
+                    p
+                },
+                k_norm: if lw.k_norm.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.k_norm.len() * 4)?;
+                    self.upload(p, &lw.k_norm)?;
+                    p
+                },
                 moe_router: if lw.moe_router.is_empty() {
                     std::ptr::null_mut()
                 } else {
@@ -480,6 +497,20 @@ impl GpuModel {
             }
             if !lw.bv.is_null() {
                 k.launch_add_bias(self.v_buf, lw.bv, 1, nkv)?;
+            }
+            // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
+            if !lw.q_norm.is_null() {
+                k.launch_qk_norm(
+                    self.q,
+                    self.k_buf,
+                    lw.q_norm,
+                    lw.k_norm,
+                    1,
+                    c.n_heads as i32,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.rms_eps,
+                )?;
             }
             k.launch_rope(
                 self.q,

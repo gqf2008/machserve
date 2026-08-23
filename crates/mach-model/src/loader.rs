@@ -224,6 +224,9 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
             bq: get_opt(&p("self_attn.q_proj.bias"), nq)?,
             bk: get_opt(&p("self_attn.k_proj.bias"), nkv)?,
             bv: get_opt(&p("self_attn.v_proj.bias"), nkv)?,
+            // Qwen3 QK-norm: per-head RMSNorm on q/k after projection.
+            q_norm: get_opt(&p("self_attn.q_norm.weight"), cfg.n_heads * cfg.head_dim)?,
+            k_norm: get_opt(&p("self_attn.k_norm.weight"), cfg.n_kv_heads * cfg.head_dim)?,
             moe_router,
             moe_wg,
             moe_wu,

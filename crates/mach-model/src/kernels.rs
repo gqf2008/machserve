@@ -37,6 +37,54 @@ extern "C" __global__ void rms_norm(const float* x, const float* w, float* y, in
 }
 "#;
 
+/// Per-head RMSNorm (Qwen3 QK-norm), one block per (row, head); applied to
+/// q and k in place after the projections, before RoPE.
+const QK_NORM: &str = r#"
+extern "C" __global__ void qk_norm(float* q, float* k,
+                                   const float* qw, const float* kw,
+                                   int rows, int n_heads, int n_kv_heads,
+                                   int head_dim, float eps) {
+    int row = blockIdx.x;
+    int head = blockIdx.y;
+    // q: [rows, n_heads * head_dim]
+    {
+        float* xr = q + ((long long)row * n_heads + head) * head_dim;
+        const float* wr = qw + (long long)head * head_dim;
+        __shared__ float redq[256];
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) ss += xr[i] * xr[i];
+        redq[threadIdx.x] = ss;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) redq[threadIdx.x] += redq[threadIdx.x + s];
+            __syncthreads();
+        }
+        float inv = rsqrtf(redq[0] / (float)head_dim + eps);
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            xr[i] = xr[i] * inv * wr[i];
+        }
+    }
+    // k: [rows, n_kv_heads * head_dim] (skip when head >= n_kv_heads).
+    if (head < n_kv_heads) {
+        float* xr = k + ((long long)row * n_kv_heads + head) * head_dim;
+        const float* wr = kw + (long long)head * head_dim;
+        __shared__ float redk[256];
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) ss += xr[i] * xr[i];
+        redk[threadIdx.x] = ss;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) redk[threadIdx.x] += redk[threadIdx.x + s];
+            __syncthreads();
+        }
+        float inv = rsqrtf(redk[0] / (float)head_dim + eps);
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            xr[i] = xr[i] * inv * wr[i];
+        }
+    }
+}
+"#;
+
 /// SwiGLU: `out = a * silu(b)`.
 const SILU_MUL: &str = r#"
 extern "C" __global__ void silu_mul(const float* a, const float* b, float* out, int n) {
@@ -947,6 +995,7 @@ pub struct HipKernels {
     pub blas: mach_kernel_sys::hipblas::HipBlas,
     embed: HipKernelModule,
     rms_norm: HipKernelModule,
+    qk_norm: HipKernelModule,
     silu_mul: HipKernelModule,
     add: HipKernelModule,
     add_bias: HipKernelModule,
@@ -995,6 +1044,7 @@ impl HipKernels {
             blas,
             embed: HipKernelModule::compile(&arch, EMBED_GATHER, "embed_gather")?,
             rms_norm: HipKernelModule::compile(&arch, RMS_NORM, "rms_norm")?,
+            qk_norm: HipKernelModule::compile(&arch, QK_NORM, "qk_norm")?,
             silu_mul: HipKernelModule::compile(&arch, SILU_MUL, "silu_mul")?,
             add: HipKernelModule::compile(&arch, ADD, "add")?,
             add_bias: HipKernelModule::compile(&arch, ADD_BIAS, "add_bias")?,
@@ -1095,6 +1145,43 @@ impl HipKernels {
         Ok(self
             .rms_norm
             .launch([rows as u32, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Per-head RMSNorm on q and k (Qwen3 QK-norm), in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_qk_norm(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        qw: *const f32,
+        kw: *const f32,
+        rows: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k;
+        let qwp = qw;
+        let kwp = kw;
+        let mut p = vec![
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &kp as *const *mut f32 as *mut core::ffi::c_void,
+            &qwp as *const *const f32 as *mut core::ffi::c_void,
+            &kwp as *const *const f32 as *mut core::ffi::c_void,
+            &rows as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &eps as *const f32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.qk_norm.launch(
+            [rows as u32, n_heads as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
     }
 
     pub fn launch_silu_mul(

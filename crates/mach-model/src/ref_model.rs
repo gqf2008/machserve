@@ -53,6 +53,17 @@ impl RefModel {
             let mut q = matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
             let mut k = matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
             let v = matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
+            // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
+            if !lw.q_norm.is_empty() {
+                qk_norm(&mut q, &lw.q_norm, cfg.n_heads, cfg.head_dim, cfg.rms_eps);
+                qk_norm(
+                    &mut k,
+                    &lw.k_norm,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                    cfg.rms_eps,
+                );
+            }
             apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
             apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
 
@@ -140,6 +151,22 @@ impl RefModel {
         let xf = rms_norm(&x, &self.w.rms_final, cfg.rms_eps);
         self.pos += 1;
         matvec_t(&xf, &self.w.lm_head, cfg.vocab_size)
+    }
+}
+
+/// Per-head RMSNorm (Qwen3 QK-norm): each head's `head_dim` slice is
+/// normalized independently, scaled by that head's weight vector.
+fn qk_norm(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    for h in 0..n_heads {
+        let s = h * head_dim;
+        let mut ss = 0.0;
+        for &v in &x[s..s + head_dim] {
+            ss += v * v;
+        }
+        let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+        for i in 0..head_dim {
+            x[s + i] = x[s + i] * inv * w[s + i];
+        }
     }
 }
 

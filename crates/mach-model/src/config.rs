@@ -39,6 +39,8 @@ pub struct Config {
     pub rms_eps: f32,
     /// Rotary embedding theta.
     pub rope_theta: f32,
+    /// QK-norm (Qwen3): per-head RMSNorm on q/k after projection, before RoPE.
+    pub qk_norm: bool,
 }
 
 impl Config {
@@ -59,6 +61,35 @@ impl Config {
             max_seq_len: 256,
             rms_eps: 1e-6,
             rope_theta: 10000.0,
+            qk_norm: false,
+        }
+    }
+
+    /// Qwen3 dense-family config (QK-norm, 3x hidden MLP, theta=1e6).
+    #[must_use]
+    pub fn qwen3(
+        hidden_size: usize,
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+    ) -> Self {
+        Self {
+            dtype: ModelDType::F32,
+            vocab_size,
+            d_model: hidden_size,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim: hidden_size / n_heads,
+            intermediate_size: 3 * hidden_size,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            max_seq_len,
+            rms_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            qk_norm: true,
         }
     }
 
@@ -86,6 +117,7 @@ impl Config {
             max_seq_len,
             rms_eps: 1e-6,
             rope_theta: 10000.0,
+            qk_norm: false,
         }
     }
 
@@ -106,6 +138,7 @@ impl Config {
             max_seq_len: 1024,
             rms_eps: 1e-6,
             rope_theta: 10000.0,
+            qk_norm: false,
         }
     }
 }
