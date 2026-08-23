@@ -511,3 +511,16 @@
     QKV/gateup 融合的收益上限很低——P3ai 的融合方向正式关闭,不再投入;
   - 真实 0.5B B=64 短 ctx 4.76ms/step 主要由 GEMM 计算(hipBLAS 内核效率)主导,
     属库层,非本项目可调。
+
+- **P3al speculative decoding(草稿-验证,2026-08-23)**:
+  - 新增 `mach_model::speculative::SpeculativeDecoder`(单序列):0.5B 草稿提议 K 个
+    token,目标一次 batched 前向验证(K+1 行:位置 L-1 的末 token + K 个草稿),
+    **argmax 验收**——最长匹配前缀被接受、下一 token 取目标在拒绝点的 argmax,
+    输出与纯贪心**逐 token 一致**;
+  - **算法经 Python 仿真验证**(K×验收率全 parity=MATCH,含首 token 与草稿生成的
+    两个 off-by-one 修正)+ **tiny 随机模型真机测试** `spec_decode.rs`(k=1/2/4 与
+    纯贪心一致,34s 通过);
+  - `spec_check.rs` 示例:0.5B 草稿 + 1.5B 目标测速(parity + speedup;可选运行,
+    加载双模型约数分钟);
+  - **注**:强制中断 spec_check 后 AMD 驱动退化,全量 HIP 回归暂无法复跑(新测试
+    在 GPU 健康时已通过;改动纯增量,不影响现有路径);待驱动恢复后复跑。

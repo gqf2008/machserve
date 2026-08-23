@@ -17,6 +17,8 @@ pub mod loader;
 pub mod ref_model;
 #[cfg(feature = "hip")]
 pub mod sampling;
+#[cfg(feature = "hip")]
+pub mod speculative;
 pub mod tokenizer;
 pub mod weights;
 
