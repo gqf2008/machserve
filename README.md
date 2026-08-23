@@ -11,11 +11,16 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | 指标 | 结果 |
 |---|---|
 | **decode 吞吐(B=512)** | **35251 tok/s ≈ llama.cpp Vulkan(643 tok/s)的 55x** |
-| decode 吞吐(B=64) | 13070 tok/s(0.077 ms/seq-tok) |
-| **长 prompt TTFT** | 512-token 62ms / 2048-token 325ms(分块 prefill,单 token 的 ~58x) |
-| 长 context decode(2048) | 6.99 ms/token |
+| decode 吞吐(B=64,短 ctx) | 12887 tok/s(4.97 ms/step) |
+| **长 context decode(2048)** | **13.40 ms/step(4778 tok/s/seq,GQA 复用 2.6x)** |
+| **长 prompt TTFT** | 512-token 57ms / 2048-token 289ms(分块 prefill) |
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |
+| **OpenAI API** | completions / chat / SSE / 采样全参数 / top_logprobs / stop / n / usage |
+| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16 双路径,head_dim 128) |
+
+> 测量口径:Qwen2.5-0.5B fp16、capacity 64,`lctx_bench`(不 reset、真长 context)。
+> 详细历史见 [docs/roadmap.md](docs/roadmap.md)。
 
 ## 定位
 
