@@ -11,7 +11,7 @@
 //! captured graph can serve every position: update the buffers between
 //! replays, then replay.
 
-use crate::adaptive::{BandwidthProbe, BandwidthProfile};
+use crate::adaptive::{AdaptiveProfile, BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
@@ -163,7 +163,7 @@ pub struct GpuModel {
     slot_ids_dev: *mut i32,
     slot_w_dev: *mut f32,
     /// Bandwidth profile for adaptive (q*) placement; None = static placement.
-    adaptive: Option<BandwidthProfile>,
+    adaptive: Option<AdaptiveProfile>,
 }
 
 impl GpuModel {
@@ -1132,7 +1132,12 @@ impl GpuModel {
     ) -> Result<Self, Error> {
         let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
         m.host_w = Some(Arc::new(w.clone()));
-        m.adaptive = Some(BandwidthProbe::measure(&hip, &cfg)?.profile);
+        let a = BandwidthProbe::measure(&hip, &cfg)?.profile;
+        m.adaptive = Some(AdaptiveProfile::new(
+            a.pcie_bytes_per_sec,
+            a.cpu_expert_sec,
+            0.9,
+        ));
         Ok(m)
     }
 
@@ -1146,7 +1151,7 @@ impl GpuModel {
         li: usize,
         ids: &[i32],
         weights: &[f32],
-        adaptive: Option<&BandwidthProfile>,
+        adaptive: Option<BandwidthProfile>,
         expert_bytes: usize,
     ) -> (Vec<(usize, usize)>, Vec<i32>, Vec<f32>, Vec<(usize, f32)>) {
         let mut to_upload: Vec<(usize, usize)> = Vec::new();
@@ -1230,8 +1235,13 @@ impl GpuModel {
         // in adaptive mode a miss is computed on the CPU when it is cheaper than the
         // PCIe fetch pull for this machine (q*).
         let expert_bytes = 3 * inter as usize * d as usize * 4;
-        let (to_upload, slot_list, gpu_w, cpu) =
-            self.moe_slot_place(li, &ids, &weights, self.adaptive.as_ref(), expert_bytes);
+        let (to_upload, slot_list, gpu_w, cpu) = self.moe_slot_place(
+            li,
+            &ids,
+            &weights,
+            self.adaptive.as_ref().map(|p| p.profile()),
+            expert_bytes,
+        );
 
         // Upload experts that changed slots (on-demand fetch from host RAM).
         if !to_upload.is_empty() {
