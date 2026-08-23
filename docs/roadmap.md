@@ -362,3 +362,15 @@
     或 n>128;`err_response` 泛化为支持任意状态码(503 引擎错误不变);
   - 测试:无需 GPU(校验先于 submit,零容量引擎直接返回 400)的 3 例形状断言;
     默认 + HIP 全绿,clippy/fmt 干净。
+
+- **P3u 尝试 GQA 复用 decode attention(2026-08-23,已回退)**:
+  - 目标:长 context decode(KV 带宽受限)按 roadmap P3j 结论做 GQA 复用——block 改为
+    每 (seq, kv_head),组内 query head 复用同一份 K/V,预期 KV 全局读流量降 groups 倍
+    (Qwen 0.5B = 7x);
+  - **踩坑并回退**:新内核用 online softmax + 每线程持一个输出维,把"单维乘积
+    q[g][dd]·k[p][dd]"当成 score,而 score 必须是**完整 head-dim 点积**(所有输出维
+    共享)——数值对拍误差 0.06→10.8 随 context 涨,旧双遍内核精确(0.000000);已
+    `git checkout` 回退旧内核,全量测试恢复全绿;
+  - **结论(留作专项)**:GQA 复用的真正难点是完整点积需要跨 head_dim 归约或 K 分块进
+    共享(输出维并行只适用于 V 累加),需 flash-decoding 式分块设计,不在一轮里仓促做;
+    经验已沉淀 `~/.agents/rules/LESSON_GPU注意力GQA复用内核softmax分数须完整点积.md`。
