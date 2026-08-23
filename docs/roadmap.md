@@ -421,3 +421,14 @@
     completion = 各 choice 生成 token 数之和);
   - 测试:tiny 模型端到端断言 usage 计数与 choices 对齐;服务器套件 12 个全绿,
     clippy/fmt 干净。
+
+- **P3aa decode attention 成本分析(2026-08-23,7900 XTX 真机)**:
+  - 隔离测量 `attn_decode_batched_f16_gqa`(B=64, pos=2047,f16):**单层 0.33 ms**
+    → 24 层共 ~7.9 ms,占长 context decode 步(13.4 ms)的 60%;理论 KV 流量地板
+    单层 ~0.067 ms(67MB @ ~1TB/s),现为地板的 ~5x;
+  - 尝试 scores 布局转置(消 bank 冲突)与 `#pragma unroll`(防局部数组溢出)均无
+    可测收益(0.33 ms 不变),已回退保持内核与已验证版本一致;
+  - **瓶颈定位**:单 block 处理 2048 位置即需 ~0.35 ms,且 B=8(16 blocks)比 B=64
+    (128 blocks)更慢——受单 block 串行工作/访存延迟主导,非并行度;
+  - **下一步(留作专项)**:flash-decoding 式 **split-K**(位置分多个 block + 跨 block
+    online-softmax 归并)或共享 K tile 化,目标单层 0.33 → 0.1 ms 级。
