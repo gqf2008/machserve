@@ -149,6 +149,31 @@ impl LruExpertCache {
         }
     }
 
+    /// Plans one step routed experts for a bounded-slot offline cache without
+    /// intra-step eviction: resident experts stay on GPU, misses fill free slots up
+    /// to capacity, and any overflow is computed on CPU. Cross-step LRU eviction is
+    /// a follow-up (retention) optimization; this is the correct-placement core.
+    pub fn plan_step(&mut self, routed: &[u32]) -> StepPlan {
+        let mut placements = Vec::with_capacity(routed.len());
+        let mut fetches = Vec::new();
+        for &id in routed {
+            if let Some(slot) = self.get(id) {
+                placements.push(Placement::Gpu(slot));
+            } else if self.slots.len() < self.capacity {
+                let put = self.put(id);
+                fetches.push(Fetch { id, slot: put.slot });
+                placements.push(Placement::Gpu(put.slot));
+            } else {
+                placements.push(Placement::Cpu);
+            }
+        }
+        StepPlan {
+            placements,
+            fetches,
+            evictions: Vec::new(),
+        }
+    }
+
     fn touch(&mut self, id: u32) {
         if let Some(pos) = self.recency.iter().position(|&x| x == id) {
             self.recency.remove(pos);
@@ -240,6 +265,22 @@ mod tests {
         assert_eq!(plan.placements, vec![Placement::Gpu(0), Placement::Cpu]);
         assert!(plan.fetches.is_empty());
         assert!(!c.contains(2));
+    }
+
+    #[test]
+    fn plan_step_fills_free_slots_and_overflow_to_cpu() {
+        let mut c = LruExpertCache::new(2);
+        c.put(1);
+        // resident 1 -> Gpu(0); miss 2 fills free slot -> Gpu(1); miss 3 overflows -> Cpu.
+        let plan = c.plan_step(&[1, 2, 3]);
+        assert_eq!(
+            plan.placements,
+            vec![Placement::Gpu(0), Placement::Gpu(1), Placement::Cpu]
+        );
+        assert_eq!(plan.fetches, vec![Fetch { id: 2, slot: 1 }]);
+        assert!(plan.evictions.is_empty());
+        assert!(c.contains(2));
+        assert!(!c.contains(3));
     }
 
     #[test]
