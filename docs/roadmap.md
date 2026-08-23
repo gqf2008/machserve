@@ -658,3 +658,13 @@
     OpenAI HTTP 服务的完整链路已闭环;
   - 后续切片:counts 读回改 GPU 侧调度(去每层 D2H)、真实 Qwen2.5-MoE 验证
     (需下载权重)。
+
+- **P3ay 真实形状 MoE 分组对拍(2026-08-23,7900 XTX)**:
+  - `batched_moe_small_config_matches_single_seq`:基于 `Config::small` 的真实形状
+    (d=512, inter=2048, 8 专家/3 活跃, batch=8,vocab 收敛到 2048 提速)——token 在
+    专家间充分分散,分组/打包/逐专家 GEMM 在更接近生产的形状下与单序列 GpuModel
+    逐序列对拍(greedy token + logits 容差);
+  - **验证**:batched MoE 三个对拍测试(F32 tiny / F16 tiny / F32 真实形状)全绿;
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 后续切片:counts 读回改 GPU 侧调度(去每层 D2H,需自定义 grouped-GEMM 内核)、
+    真实 Qwen2.5-MoE 验证(需下载权重)。

@@ -151,6 +151,56 @@ fn batched_moe_f16_matches_single_seq() {
 }
 
 #[test]
+fn batched_moe_small_config_matches_single_seq() {
+    let Some(hip) = hip_ctx() else { return };
+    // More realistic MoE shape: 8 experts / 3 active, batch spreads rows
+    // across experts (grouping is exercised harder than the 4-expert tiny
+    // config). Uses Config::small() dims but a smaller vocab for speed.
+    let mut cfg = Config::small();
+    cfg.vocab_size = 2048;
+    cfg.max_seq_len = 128;
+    cfg.num_experts = 8;
+    cfg.num_experts_per_tok = 3;
+    let w = Weights::random(&cfg, 123).unwrap();
+    let batch = 8usize;
+
+    let mut batched = BatchedModel::new(hip.clone(), cfg, &w, batch).unwrap();
+    let mut singles: Vec<GpuModel> = (0..batch)
+        .map(|_| GpuModel::new(hip.clone(), cfg, &w).unwrap())
+        .collect();
+
+    let steps: Vec<Vec<u32>> = vec![
+        vec![5, 9, 33, 7, 200, 3, 11, 42],
+        vec![12, 3, 1, 99, 55, 8, 4, 77],
+    ];
+    for step_tokens in &steps {
+        let got = batched.decode_step(step_tokens).unwrap();
+        let got_logits = batched.read_logits().unwrap();
+        for s in 0..batch {
+            let want_logits = singles[s].decode_step(step_tokens[s]).unwrap();
+            let want = want_logits
+                .iter()
+                .enumerate()
+                .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
+            let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let max = row
+                .iter()
+                .zip(&want_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max <= 2e-3 + 2e-3 * scale,
+                "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
+            );
+        }
+    }
+}
+
+#[test]
 fn batched_sequences_are_independent() {
     let Some(hip) = hip_ctx() else { return };
     let cfg = Config::tiny();
