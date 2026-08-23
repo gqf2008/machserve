@@ -54,6 +54,9 @@ thirdparty/        第三方参考代码(占位)
 - **真实 tokenizer**:字节级 BPE(Qwen2.5/Llama),与 HF tokenizers 逐 token 对拍一致。
 - **SSE 流式**:`stream: true` → 逐 token delta + `[DONE]`,增量 UTF-8 跨 token 不分裂。
 - **对话模板**:Qwen chat template,`<|im_end|>` 停止。
+- **speculative decoding(实验)**:0.5B 草稿 + 1.5B 目标,argmax 验收,输出与纯贪心
+  逐 token 一致(单序列/批量/生命周期已多层验证);**吞吐收益待测**
+  (`spec_check` 示例,0.5B 对 1.5B)。
 - **正确性**:GPU vs 独立 fp64 numpy 参考(~1e-4)+ 真 transformers 模型(4e-5)。
 
 ## 性能优化地图(截至 2026-08-23)
@@ -68,7 +71,8 @@ thirdparty/        第三方参考代码(占位)
 | 内存布局 [slot][kv][pos][dim] | 证伪(0x) | 新布局计时 |
 | V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
 | QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
-| **剩余正式 P3 项** | MoE / FP8 / MLA / spec-decode(均为大特性,需定方向) | — |
+| **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**收益待测** | GPU 测试全绿 |
+| **剩余正式 P3 项** | MoE / FP8 / MLA / spec-decode 引擎集成(大特性,需定方向) | — |
 
 ## 构建与运行
 
