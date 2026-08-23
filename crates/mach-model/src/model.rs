@@ -23,6 +23,7 @@ use mach_engine::graph::{GraphCapture, GraphHandle};
 use mach_engine::hip::HipGraphCapture;
 use mach_kernel_sys::hip::{self, Hip};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Per-layer device weight pointers.
@@ -1154,6 +1155,7 @@ impl GpuModel {
         let mut cpu: Vec<(usize, f32)> = Vec::new();
         let mut ctx = self.slot_ctx[li].borrow_mut();
         let cap = ctx.cap;
+        let routed_set: HashSet<u32> = ids.iter().map(|&e| e as u32).collect();
         for (i, &e) in ids.iter().enumerate() {
             let e = e as usize;
             let w = weights[i];
@@ -1165,7 +1167,7 @@ impl GpuModel {
                 .is_some_and(|p| p.choose(expert_bytes) == crate::adaptive::FetchChoice::ComputeCpu)
             {
                 cpu.push((e, w));
-            } else if ctx.lru.len() < cap {
+            } else if ctx.lru.len() < cap || ctx.lru.evict_lru_not_in(&routed_set).is_some() {
                 let put = ctx.lru.put(id);
                 if ctx.slot_expert[put.slot] != e as i32 {
                     ctx.slot_expert[put.slot] = e as i32;

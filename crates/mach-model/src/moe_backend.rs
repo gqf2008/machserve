@@ -7,7 +7,7 @@
 //! and copy live in the GPU integration (a later P1 step); this module is pure
 //! logic and unit-testable without a device.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Where a routed expert should be computed for one step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +102,14 @@ impl LruExpertCache {
             let (evicted, slot) = self.evict_lru();
             (Some(evicted), slot)
         } else {
-            (None, self.slots.len())
+            // Slots may be sparse after `evict_lru_not_in`; pick the lowest free
+            // slot index rather than `len()` (which would collide with a resident
+            // expert at a higher index).
+            let mut slot = 0;
+            while self.slots.values().any(|&s| s == slot) {
+                slot += 1;
+            }
+            (None, slot)
         };
         self.slots.insert(id, slot);
         self.recency.push_front(id);
@@ -174,6 +181,53 @@ impl LruExpertCache {
         }
     }
 
+    /// Plans one step with cross-step LRU eviction: misses fill free slots; when
+    /// full, the least-recently-used expert that is NOT part of the current step is
+    /// evicted to make room (retention); if every resident expert is needed this
+    /// step, overflow goes to CPU. This is the "global LRU expert cache" behavior.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn plan_lru(&mut self, routed: &[u32]) -> StepPlan {
+        let routed_set: HashSet<u32> = routed.iter().copied().collect();
+        let mut placements = Vec::with_capacity(routed.len());
+        let mut fetches = Vec::new();
+        let mut evictions = Vec::new();
+        for &id in routed {
+            if let Some(slot) = self.get(id) {
+                placements.push(Placement::Gpu(slot));
+            } else if self.slots.len() < self.capacity {
+                let put = self.put(id);
+                fetches.push(Fetch { id, slot: put.slot });
+                placements.push(Placement::Gpu(put.slot));
+            } else if let Some((evicted, slot)) = self.evict_lru_not_in(&routed_set) {
+                evictions.push(evicted);
+                self.slots.insert(id, slot);
+                self.recency.push_front(id);
+                fetches.push(Fetch { id, slot });
+                placements.push(Placement::Gpu(slot));
+            } else {
+                placements.push(Placement::Cpu);
+            }
+        }
+        StepPlan {
+            placements,
+            fetches,
+            evictions,
+        }
+    }
+
+    /// Evicts the least-recently-used expert that is not in `routed`, returning its
+    /// id and slot. Returns None if every resident expert is in `routed`.
+    pub(crate) fn evict_lru_not_in(&mut self, routed: &HashSet<u32>) -> Option<(u32, usize)> {
+        for i in (0..self.recency.len()).rev() {
+            let id = self.recency[i];
+            if !routed.contains(&id) {
+                self.recency.remove(i);
+                let slot = self.slots.remove(&id)?;
+                return Some((id, slot));
+            }
+        }
+        None
+    }
     fn touch(&mut self, id: u32) {
         if let Some(pos) = self.recency.iter().position(|&x| x == id) {
             self.recency.remove(pos);
@@ -267,6 +321,54 @@ mod tests {
         assert!(!c.contains(2));
     }
 
+    #[test]
+    fn put_reuses_lowest_free_slot_after_sparse_eviction() {
+        let mut c = LruExpertCache::new(3);
+        c.put(1); // slot 0
+        c.put(2); // slot 1
+        c.put(3); // slot 2
+        c.get(1); // make 1 MRU, so 2 is LRU
+        // Evict 2 (slot 1) directly to leave sparse {1:0, 3:2}.
+        let routed: HashSet<u32> = [1u32].into_iter().collect();
+        let evicted = c.evict_lru_not_in(&routed).expect("evict");
+        assert_eq!(evicted, (2, 1));
+        assert!(c.len() < c.capacity());
+        // put must reuse the lowest free slot (1), not len()=2 which holds expert 3.
+        let p = c.put(5);
+        assert_eq!(p.slot, 1);
+        assert_eq!(c.get(5), Some(1));
+        assert_eq!(c.len(), 3);
+    }
+    #[test]
+    fn plan_lru_evicts_non_routed() {
+        let mut c = LruExpertCache::new(2);
+        c.put(1);
+        c.put(2);
+        // Make 1 most-recently-used so 2 becomes LRU.
+        assert_eq!(c.get(1), Some(0));
+        // Routed wants 1 and 3; 3 is a miss. Cache full -> evict 2 (LRU, not routed).
+        let plan = c.plan_lru(&[1, 3]);
+        assert_eq!(plan.placements, vec![Placement::Gpu(0), Placement::Gpu(1)]);
+        assert_eq!(plan.evictions, vec![2]);
+        assert_eq!(plan.fetches, vec![Fetch { id: 3, slot: 1 }]);
+        assert!(c.contains(3));
+        assert!(!c.contains(2));
+    }
+
+    #[test]
+    fn plan_lru_no_evict_when_all_routed() {
+        let mut c = LruExpertCache::new(2);
+        c.put(1);
+        c.put(2);
+        c.get(1);
+        // 1 and 2 both routed; miss 3 cannot evict a routed resident -> CPU.
+        let plan = c.plan_lru(&[1, 2, 3]);
+        assert_eq!(
+            plan.placements,
+            vec![Placement::Gpu(0), Placement::Gpu(1), Placement::Cpu]
+        );
+        assert!(plan.evictions.is_empty());
+    }
     #[test]
     fn plan_step_fills_free_slots_and_overflow_to_cpu() {
         let mut c = LruExpertCache::new(2);
