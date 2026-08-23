@@ -68,6 +68,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
     let dtype = std::env::var("MACH_DTYPE").unwrap_or_else(|_| "f16".into());
+    let spec = std::env::var("MACH_SPEC").is_ok();
+    let spec_k = std::env::var("MACH_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let draft_name = std::env::var("MACH_DRAFT").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
+    let draft_config =
+        std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
 
     let root = PathBuf::from(root);
     let mut cfg = config_from_json(&root.join(&config_name));
@@ -76,14 +84,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "f16" => cfg.dtype = ModelDType::F16,
         other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
     }
+
+    // Preflight (before any heavy loading): HIP runtime + device + VRAM. A
+    // missing/busy device or grossly insufficient memory should fail fast with
+    // a readable error, not hang the host during the ~36 serial hiprtc kernel
+    // compiles that follow.
+    let hip = match hip::hip() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!(
+                "HIP runtime unavailable: {e}\n  set MACH_HIP_PATH to the ROCm bin dir if needed"
+            );
+            std::process::exit(1);
+        }
+    };
+    let devices = match hip::device_count() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("hipGetDeviceCount failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if devices <= 0 {
+        eprintln!("no HIP device found (device_count={devices}); refusing to load a model");
+        std::process::exit(1);
+    }
+    let (free, total) = match hip::mem_info() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("hipMemGetInfo failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
+    let file_bytes = std::fs::metadata(root.join(&model_name))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let kv_bytes =
+        capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem * cfg.n_layers;
+    let mut estimate = file_bytes + kv_bytes as u64 + (256 << 20); // +256MiB scratch margin
+    if spec {
+        let dfb = std::fs::metadata(root.join(&draft_name))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut dcfg = config_from_json(&root.join(&draft_config));
+        match dtype.as_str() {
+            "f32" => dcfg.dtype = ModelDType::F32,
+            _ => dcfg.dtype = ModelDType::F16,
+        }
+        let dkv =
+            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * kv_elem * dcfg.n_layers;
+        estimate += dfb + dkv as u64;
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    println!(
+        "GPU preflight: device_count={devices}, VRAM free {:.2}GiB / {:.2}GiB, estimated need {:.2}GiB",
+        gib(free as u64),
+        gib(total as u64),
+        gib(estimate)
+    );
+    if estimate > free as u64 {
+        eprintln!(
+            "insufficient VRAM: need ~{:.2}GiB but only {:.2}GiB free; lower MACH_CAPACITY / MACH_PREFILL_ROWS or use a smaller model",
+            gib(estimate),
+            gib(free as u64)
+        );
+        std::process::exit(1);
+    }
+
+    // Bind early: a port conflict fails here (before the multi-minute model
+    // load + kernel compile) instead of after.
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("listening on http://{addr} (preflight passed)");
+
     let w: Weights = load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
     println!(
         "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
         cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
     );
-
-    let hip = hip::hip().expect("HIP runtime");
-    assert!(hip::device_count().expect("devices") > 0, "no HIP device");
 
     // Load the real tokenizer when available; fall back to naive bytes.
     let tok_path = root.join(&tokenizer_name);
@@ -102,16 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through a
     // draft + target engine (greedy-only; other params rejected).
-    let spec = std::env::var("MACH_SPEC").is_ok();
-    let spec_k = std::env::var("MACH_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
     let (engine, engine_handle) = if spec {
-        let draft_name =
-            std::env::var("MACH_DRAFT").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
-        let draft_config =
-            std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
         let mut dcfg = config_from_json(&root.join(&draft_config));
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
@@ -138,7 +207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tok,
     };
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(
         "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{})",
         if spec { ", spec-decode" } else { "" }
@@ -158,7 +226,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("engine drained; exiting");
     Ok(())
 }
-
 #[cfg(not(feature = "hip"))]
 fn main() {
     eprintln!("mach-server requires the `hip` feature: cargo run -p mach-server --features hip");

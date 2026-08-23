@@ -1275,97 +1275,129 @@ pub struct HipKernels {
 unsafe impl Send for HipKernels {}
 unsafe impl Sync for HipKernels {}
 
+/// A compiled kernel module shared across model loads. HIP modules are never
+/// unloaded and launches are per-stream, so sharing handles across threads is
+/// safe (same rationale as the `unsafe impl Send/Sync for HipKernels` below).
+#[derive(Clone)]
+struct CachedModule(HipKernelModule);
+
+// SAFETY: the wrapped module is only ever launched on this process's HIP
+// context; HIP module handles are context-wide and never unloaded here.
+unsafe impl Send for CachedModule {}
+unsafe impl Sync for CachedModule {}
+
+/// In-process hiprtc compile cache, keyed by `(arch, source)`. Loading several
+/// models in one process (spec-decode draft+target, server, tests) previously
+/// recompiled every kernel per model (~36 serial hiprtc compiles each time);
+/// the cache makes the second and later model loads reuse the compiled modules.
+static KERNEL_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, &'static str), CachedModule>>,
+> = std::sync::OnceLock::new();
+
+/// Compiles `source` for `arch`, or returns a cached clone when this process
+/// already compiled the same source. Prints per-kernel progress to stderr when
+/// `MACH_COMPILE_PROGRESS` is set.
+fn compile_cached(arch: &str, source: &'static str, name: &str) -> Result<HipKernelModule, Error> {
+    let verbose = std::env::var_os("MACH_COMPILE_PROGRESS").is_some();
+    let cache =
+        KERNEL_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (arch.to_string(), source);
+    if let Some(m) = cache.lock().unwrap().get(&key) {
+        if verbose {
+            eprintln!("[hiprtc] {name}: cache hit");
+        }
+        return Ok(m.0.clone());
+    }
+    if verbose {
+        eprintln!("[hiprtc] compiling {name} for {arch} ...");
+    }
+    let m = HipKernelModule::compile(arch, source, name)?;
+    if verbose {
+        eprintln!("[hiprtc] {name}: compiled");
+    }
+    cache.lock().unwrap().insert(key, CachedModule(m.clone()));
+    Ok(m)
+}
+
 impl HipKernels {
     /// Compiles all kernels and initializes hipBLAS on a fresh stream.
     pub fn new(hip: std::sync::Arc<Hip>) -> Result<Self, Error> {
         let arch = hip_arch();
+        let t0 = std::time::Instant::now();
         let mut stream = std::ptr::null_mut();
         unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut stream))? };
 
         let blas = mach_kernel_sys::hipblas::HipBlas::new(std::sync::Arc::clone(&hip))?;
         blas.set_stream(stream)?;
 
-        Ok(Self {
+        let self_ = Self {
             hip,
             stream,
             blas,
-            embed: HipKernelModule::compile(&arch, EMBED_GATHER, "embed_gather")?,
-            rms_norm: HipKernelModule::compile(&arch, RMS_NORM, "rms_norm")?,
-            qk_norm: HipKernelModule::compile(&arch, QK_NORM, "qk_norm")?,
-            silu_mul: HipKernelModule::compile(&arch, SILU_MUL, "silu_mul")?,
-            add: HipKernelModule::compile(&arch, ADD, "add")?,
-            add_bias: HipKernelModule::compile(&arch, ADD_BIAS, "add_bias")?,
-            kv_store: HipKernelModule::compile(&arch, KV_STORE, "kv_store")?,
-            attn_decode: HipKernelModule::compile(&arch, ATTN_DECODE, "attn_decode")?,
-            mla_assemble_q: HipKernelModule::compile(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
-            mla_assemble_kv: HipKernelModule::compile(&arch, MLA_ASSEMBLE_KV, "mla_assemble_kv")?,
-            mla_attn_decode: HipKernelModule::compile(&arch, MLA_ATTN_DECODE, "mla_attn_decode")?,
-            mla_assemble_q_batched: HipKernelModule::compile(
+            embed: compile_cached(&arch, EMBED_GATHER, "embed_gather")?,
+            rms_norm: compile_cached(&arch, RMS_NORM, "rms_norm")?,
+            qk_norm: compile_cached(&arch, QK_NORM, "qk_norm")?,
+            silu_mul: compile_cached(&arch, SILU_MUL, "silu_mul")?,
+            add: compile_cached(&arch, ADD, "add")?,
+            add_bias: compile_cached(&arch, ADD_BIAS, "add_bias")?,
+            kv_store: compile_cached(&arch, KV_STORE, "kv_store")?,
+            attn_decode: compile_cached(&arch, ATTN_DECODE, "attn_decode")?,
+            mla_assemble_q: compile_cached(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
+            mla_assemble_kv: compile_cached(&arch, MLA_ASSEMBLE_KV, "mla_assemble_kv")?,
+            mla_attn_decode: compile_cached(&arch, MLA_ATTN_DECODE, "mla_attn_decode")?,
+            mla_assemble_q_batched: compile_cached(
                 &arch,
                 MLA_ASSEMBLE_Q_BATCHED,
                 "mla_assemble_q_batched",
             )?,
-            mla_extract_kv_lora: HipKernelModule::compile(
-                &arch,
-                MLA_EXTRACT_KV_LORA,
-                "mla_extract_kv_lora",
-            )?,
-            mla_extract_k_rope: HipKernelModule::compile(
-                &arch,
-                MLA_EXTRACT_K_ROPE,
-                "mla_extract_k_rope",
-            )?,
-            mla_assemble_kv_batched: HipKernelModule::compile(
+            mla_extract_kv_lora: compile_cached(&arch, MLA_EXTRACT_KV_LORA, "mla_extract_kv_lora")?,
+            mla_extract_k_rope: compile_cached(&arch, MLA_EXTRACT_K_ROPE, "mla_extract_k_rope")?,
+            mla_assemble_kv_batched: compile_cached(
                 &arch,
                 MLA_ASSEMBLE_KV_BATCHED,
                 "mla_assemble_kv_batched",
             )?,
-            mla_attn_decode_batched: HipKernelModule::compile(
+            mla_attn_decode_batched: compile_cached(
                 &arch,
                 MLA_ATTN_DECODE_BATCHED,
                 "mla_attn_decode_batched",
             )?,
-            rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
-            embed_batched: HipKernelModule::compile(&arch, EMBED_BATCHED, "embed_batched")?,
-            rope_batched: HipKernelModule::compile(&arch, ROPE_BATCHED, "rope_batched")?,
-            kv_store_batched: HipKernelModule::compile(
-                &arch,
-                KV_STORE_BATCHED,
-                "kv_store_batched",
-            )?,
-            attn_decode_batched: HipKernelModule::compile(
-                &arch,
-                ATTN_DECODE_BATCHED,
-                "attn_decode_batched",
-            )?,
-            argmax_batched: HipKernelModule::compile(&arch, ARGMAX_BATCHED, "argmax_batched")?,
-            cast_f32_f16: HipKernelModule::compile(&arch, CAST_F32_F16, "cast_f32_f16")?,
-            cast_f16_f32: HipKernelModule::compile(&arch, CAST_F16_F32, "cast_f16_f32")?,
-            embed_f16: HipKernelModule::compile(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
-            kv_store_f16: HipKernelModule::compile(&arch, KV_F16, "kv_store_batched_f16")?,
-            attn_f16_gqa: HipKernelModule::compile(
+            rope: compile_cached(&arch, ROPE, "rope")?,
+            embed_batched: compile_cached(&arch, EMBED_BATCHED, "embed_batched")?,
+            rope_batched: compile_cached(&arch, ROPE_BATCHED, "rope_batched")?,
+            kv_store_batched: compile_cached(&arch, KV_STORE_BATCHED, "kv_store_batched")?,
+            attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
+            argmax_batched: compile_cached(&arch, ARGMAX_BATCHED, "argmax_batched")?,
+            cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
+            cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
+            embed_f16: compile_cached(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
+            kv_store_f16: compile_cached(&arch, KV_F16, "kv_store_batched_f16")?,
+            attn_f16_gqa: compile_cached(
                 &arch,
                 ATTN_DECODE_BATCHED_F16_GQA,
                 "attn_decode_batched_f16_gqa",
             )?,
-            attn_prefill_f16: HipKernelModule::compile(
-                &arch,
-                ATTN_PREFILL_F16,
-                "attn_prefill_f16",
-            )?,
-            moe_router: HipKernelModule::compile(&arch, MOE_ROUTER, "moe_router")?,
-            moe_gather: HipKernelModule::compile(&arch, MOE_GATHER_WEIGHTS, "moe_gather_weights")?,
-            moe_accumulate: HipKernelModule::compile(&arch, MOE_ACCUMULATE, "moe_accumulate")?,
-            moe_router_batched: HipKernelModule::compile(
-                &arch,
-                MOE_ROUTER_BATCHED,
-                "moe_router_batched",
-            )?,
-            moe_count: HipKernelModule::compile(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
-            moe_gather_rows: HipKernelModule::compile(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
-            moe_scatter_add: HipKernelModule::compile(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
-            moe_prefix_sum: HipKernelModule::compile(&arch, MOE_PREFIX_SUM, "moe_prefix_sum")?,
-        })
+            attn_prefill_f16: compile_cached(&arch, ATTN_PREFILL_F16, "attn_prefill_f16")?,
+            moe_router: compile_cached(&arch, MOE_ROUTER, "moe_router")?,
+            moe_gather: compile_cached(&arch, MOE_GATHER_WEIGHTS, "moe_gather_weights")?,
+            moe_accumulate: compile_cached(&arch, MOE_ACCUMULATE, "moe_accumulate")?,
+            moe_router_batched: compile_cached(&arch, MOE_ROUTER_BATCHED, "moe_router_batched")?,
+            moe_count: compile_cached(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
+            moe_gather_rows: compile_cached(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
+            moe_scatter_add: compile_cached(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
+            moe_prefix_sum: compile_cached(&arch, MOE_PREFIX_SUM, "moe_prefix_sum")?,
+        };
+        if std::env::var_os("MACH_COMPILE_PROGRESS").is_some() {
+            let n = KERNEL_CACHE
+                .get()
+                .map(|c| c.lock().unwrap().len())
+                .unwrap_or(0);
+            eprintln!(
+                "[hiprtc] {n} kernels cached, ready in {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Ok(self_)
     }
 
     /// The raw HIP runtime.

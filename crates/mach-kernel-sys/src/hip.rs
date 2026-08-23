@@ -55,6 +55,7 @@ pub struct HipApi {
     pub hip_get_device_count: unsafe extern "C" fn(*mut c_int) -> c_int,
     pub hip_set_device: unsafe extern "C" fn(c_int) -> c_int,
     pub hip_get_device_name: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int,
+    pub hip_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> c_int,
     pub hip_device_synchronize: unsafe extern "C" fn() -> c_int,
     pub hip_get_last_error: unsafe extern "C" fn() -> c_int,
     pub hip_get_error_string: unsafe extern "C" fn(c_int) -> *const c_char,
@@ -212,6 +213,7 @@ fn load() -> Result<Arc<Hip>, HipError> {
         hip_get_device_count: sym(&hip_lib, "hipGetDeviceCount")?,
         hip_set_device: sym(&hip_lib, "hipSetDevice")?,
         hip_get_device_name: sym(&hip_lib, "hipDeviceGetName")?,
+        hip_mem_get_info: sym(&hip_lib, "hipMemGetInfo")?,
         hip_device_synchronize: sym(&hip_lib, "hipDeviceSynchronize")?,
         hip_get_last_error: sym(&hip_lib, "hipGetLastError")?,
         hip_get_error_string: sym(&hip_lib, "hipGetErrorString")?,
@@ -365,6 +367,15 @@ pub fn device_count() -> Result<i32, HipError> {
     Ok(count)
 }
 
+/// Returns the current device's `(free, total)` memory in bytes.
+pub fn mem_info() -> Result<(usize, usize), HipError> {
+    let h = hip()?;
+    let mut free = 0usize;
+    let mut total = 0usize;
+    unsafe { check(&h, (h.api.hip_mem_get_info)(&mut free, &mut total))? };
+    Ok((free, total))
+}
+
 /// Returns the name of `device`.
 pub fn device_name(device: i32) -> Result<String, HipError> {
     let h = hip()?;
@@ -443,6 +454,18 @@ pub struct HipKernelModule {
     handle: HipModule,
     func: HipFunction,
     _hip: Arc<Hip>,
+}
+
+/// Clones share the loaded module/function handles (modules are never
+/// unloaded, so sharing pointers across clones is safe).
+impl Clone for HipKernelModule {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle,
+            func: self.func,
+            _hip: Arc::clone(&self._hip),
+        }
+    }
 }
 
 impl HipKernelModule {
