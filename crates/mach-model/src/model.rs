@@ -14,6 +14,7 @@
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
+use crate::moe_offload;
 use crate::sampling::HipSampler;
 use crate::{Config, Error, Weights};
 use mach_engine::graph::{GraphCapture, GraphHandle};
@@ -135,6 +136,10 @@ pub struct GpuModel {
     host_pins: Vec<*mut core::ffi::c_void>,
     /// GPU-side greedy sampler (reads only the sampled token).
     sampler: HipSampler,
+    /// MoE offload: max routed experts computed on GPU (`usize::MAX` = full-resident).
+    gpu_budget: usize,
+    /// Host weight copy for the CPU fallback (set only in offload mode).
+    host_w: Option<Arc<Weights>>,
 }
 
 impl GpuModel {
@@ -194,6 +199,8 @@ impl GpuModel {
             pos: 0,
             host_pins: Vec::new(),
             sampler,
+            gpu_budget: usize::MAX,
+            host_w: None,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -775,38 +782,42 @@ impl GpuModel {
                     // Router logits [ne] = xn2 @ moe_router^T.
                     k.gemm(self.router, self.xn2, lw.moe_router, ne, d)?;
                     k.launch_moe_router(self.router, self.exp_ids, self.exp_w, ne, topk)?;
-                    // Pack the selected experts into contiguous scratch (f32 path;
-                    // fp16 MoE weights are a later slice).
-                    k.launch_moe_gather_weights(
-                        lw.moe_wg,
-                        lw.moe_wu,
-                        lw.moe_wd,
-                        self.exp_ids,
-                        self.wg_pack,
-                        self.wu_pack,
-                        self.wd_pack,
-                        ne,
-                        inter,
-                        d,
-                        topk,
-                    )?;
-                    // Concatenated per-expert gate/up GEMMs over the topk slots.
-                    k.gemm(self.gate_all, self.xn2, self.wg_pack, topk * inter, d)?;
-                    k.gemm(self.up_all, self.xn2, self.wu_pack, topk * inter, d)?;
-                    k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, topk * inter)?;
-                    // Per-slot down projections: each slot has its own hidden
-                    // state, so the concat-GEMM trick (shared input) does not
-                    // apply here — launch one small GEMM per selected expert.
-                    for slot in 0..topk {
-                        k.gemm(
-                            unsafe { self.down_all.add((slot * d) as usize) },
-                            unsafe { self.eh_all.add((slot * inter) as usize) },
-                            unsafe { self.wd_pack.add((slot * d * inter) as usize) },
-                            d,
+                    if self.gpu_budget < topk as usize {
+                        self.forward_moe_offload(lw, li, ne, topk, d, inter)?;
+                    } else {
+                        // Pack the selected experts into contiguous scratch (f32 path;
+                        // fp16 MoE weights are a later slice).
+                        k.launch_moe_gather_weights(
+                            lw.moe_wg,
+                            lw.moe_wu,
+                            lw.moe_wd,
+                            self.exp_ids,
+                            self.wg_pack,
+                            self.wu_pack,
+                            self.wd_pack,
+                            ne,
                             inter,
+                            d,
+                            topk,
                         )?;
+                        // Concatenated per-expert gate/up GEMMs over the topk slots.
+                        k.gemm(self.gate_all, self.xn2, self.wg_pack, topk * inter, d)?;
+                        k.gemm(self.up_all, self.xn2, self.wu_pack, topk * inter, d)?;
+                        k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, topk * inter)?;
+                        // Per-slot down projections: each slot has its own hidden
+                        // state, so the concat-GEMM trick (shared input) does not
+                        // apply here — launch one small GEMM per selected expert.
+                        for slot in 0..topk {
+                            k.gemm(
+                                unsafe { self.down_all.add((slot * d) as usize) },
+                                unsafe { self.eh_all.add((slot * inter) as usize) },
+                                unsafe { self.wd_pack.add((slot * d * inter) as usize) },
+                                d,
+                                inter,
+                            )?;
+                        }
+                        k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, topk)?;
                     }
-                    k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, topk)?;
                 }
                 // topk == 0: MoE contributes nothing (matches ref_model).
             } else {
@@ -903,6 +914,133 @@ impl GpuModel {
     }
 
     /// One eager decode step for `token` at position `self.pos`.
+    /// Builds a GPU model with a MoE offload budget: at most `gpu_budget` of the
+    /// top-k routed experts are computed on the GPU per step; the rest fall back
+    /// to the CPU reference. Keeps a host weight copy for the CPU fallback.
+    pub fn with_gpu_budget(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        gpu_budget: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::new(hip, cfg, w)?;
+        m.gpu_budget = gpu_budget;
+        m.host_w = Some(Arc::new(w.clone()));
+        Ok(m)
+    }
+
+    /// MoE step with a GPU/CPU split: the first `gpu_budget` routed experts are
+    /// computed on GPU via the gather+GEMM path; the rest are computed on the CPU
+    /// reference and added back. The output is placement-invariant.
+    fn forward_moe_offload(
+        &self,
+        lw: &LayerDev,
+        li: usize,
+        ne: i32,
+        topk: i32,
+        d: i32,
+        inter: i32,
+    ) -> Result<(), Error> {
+        let k = self.k.clone();
+        let gpu_n = self.gpu_budget.min(topk as usize) as i32;
+        self.k.sync()?;
+
+        // Read the top-k ids + weights back to host (small).
+        let mut ids = vec![0i32; topk as usize];
+        let mut weights = vec![0.0f32; topk as usize];
+        hip::memcpy(
+            self.k.hip(),
+            ids.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_ids as *const core::ffi::c_void,
+            (topk as usize) * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        hip::memcpy(
+            self.k.hip(),
+            weights.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_w as *const core::ffi::c_void,
+            (topk as usize) * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+
+        // GPU-resident part: first gpu_n routed experts, existing gather+GEMM.
+        if gpu_n > 0 {
+            k.launch_moe_gather_weights(
+                lw.moe_wg,
+                lw.moe_wu,
+                lw.moe_wd,
+                self.exp_ids,
+                self.wg_pack,
+                self.wu_pack,
+                self.wd_pack,
+                ne,
+                inter,
+                d,
+                gpu_n,
+            )?;
+            k.gemm(self.gate_all, self.xn2, self.wg_pack, gpu_n * inter, d)?;
+            k.gemm(self.up_all, self.xn2, self.wu_pack, gpu_n * inter, d)?;
+            k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, gpu_n * inter)?;
+            for slot in 0..gpu_n {
+                k.gemm(
+                    unsafe { self.down_all.add((slot * d) as usize) },
+                    unsafe { self.eh_all.add((slot * inter) as usize) },
+                    unsafe { self.wd_pack.add((slot * d * inter) as usize) },
+                    d,
+                    inter,
+                )?;
+            }
+            k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, gpu_n)?;
+        }
+
+        self.k.sync()?;
+        // CPU fallback: routed experts beyond gpu_n.
+        let n_cpu = topk - gpu_n;
+        if n_cpu > 0 {
+            let host_w = self
+                .host_w
+                .as_ref()
+                .ok_or_else(|| Error::Model("offload CPU path requires host weights".into()))?;
+            let lw_h = &host_w.layers[li];
+
+            let mut xn2 = vec![0.0f32; d as usize];
+            hip::memcpy(
+                self.k.hip(),
+                xn2.as_mut_ptr() as *mut core::ffi::c_void,
+                self.xn2 as *const core::ffi::c_void,
+                (d as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+
+            let mut residual = vec![0.0f32; d as usize];
+            for i in (gpu_n as usize)..(topk as usize) {
+                let e = ids[i] as usize;
+                let w = weights[i];
+                let (inter_us, d_us) = (inter as usize, d as usize);
+                let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
+                let down = moe_offload::expert_mlp(&xn2, wg, wu, wd, inter_us, d_us);
+                for kk in 0..d_us {
+                    residual[kk] += w * down[kk];
+                }
+            }
+
+            let mut xh = vec![0.0f32; d as usize];
+            hip::memcpy(
+                self.k.hip(),
+                xh.as_mut_ptr() as *mut core::ffi::c_void,
+                self.x as *const core::ffi::c_void,
+                (d as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            for kk in 0..d as usize {
+                xh[kk] += residual[kk];
+            }
+            self.upload(self.x, &xh)?;
+        }
+        Ok(())
+    }
     pub fn decode_step(&mut self, token: u32) -> Result<Vec<f32>, Error> {
         if self.pos >= self.cfg.max_seq_len {
             return Err(Error::Model("sequence length exceeded".into()));

@@ -92,3 +92,47 @@ fn moe_gpu_forward_matches_cpu_reference() {
         "MoE GPU vs CPU: max diff {max} (scale {scale})"
     );
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn moe_gpu_offload_placement_invariant() {
+    use mach_kernel_sys::hip;
+    use mach_model::model::GpuModel;
+    use std::sync::Arc;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 7).unwrap();
+    let tokens = [5u32, 9, 3, 200];
+    let topk = cfg.num_experts_per_tok;
+
+    // Full-resident reference (gpu_budget = usize::MAX default).
+    let mut full = GpuModel::new(Arc::clone(&hip), cfg, &w).unwrap();
+    let full_logits = full.forward(&tokens).unwrap();
+    let scale = full_logits.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+
+    // Placement invariance: budget in {0 (all CPU), 1 (mixed), topk (all GPU)}
+    // must produce the same logits as full-resident.
+    for &budget in &[0usize, 1usize, topk] {
+        let mut m = GpuModel::with_gpu_budget(Arc::clone(&hip), cfg, &w, budget).unwrap();
+        let logits = m.forward(&tokens).unwrap();
+        let max = max_abs_diff(&full_logits, &logits);
+        assert!(
+            max <= 2e-3 + 2e-3 * scale,
+            "offload budget {budget}: max diff {max} (scale {scale})"
+        );
+    }
+}

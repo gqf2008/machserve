@@ -34,7 +34,14 @@ pub(crate) fn silu(v: f32) -> f32 {
 }
 
 /// Gate/up/down SwiGLU MLP for one expert, returning `[d]`.
-fn expert_mlp(xn: &[f32], wg: &[f32], wu: &[f32], wd: &[f32], inter: usize, d: usize) -> Vec<f32> {
+pub(crate) fn expert_mlp(
+    xn: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    wd: &[f32],
+    inter: usize,
+    d: usize,
+) -> Vec<f32> {
     let gate = matvec_t(xn, wg, inter);
     let up = matvec_t(xn, wu, inter);
     let mut eh = vec![0.0; inter];
