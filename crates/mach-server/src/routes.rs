@@ -5,10 +5,11 @@
 //! (falls back to a naive byte-per-token mapping otherwise). Both endpoints
 //! support OpenAI-shaped `stream: true` -> SSE with per-token deltas.
 
-use crate::engine::ServerEngine;
+use crate::engine::{EngineError, ServerEngine};
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use mach_model::sampling::SamplingParams;
 use mach_model::tokenizer::Tokenizer;
@@ -155,6 +156,37 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// OpenAI-shaped error body: `{"error": {"message", "type", "code"}}`.
+fn err_response(message: &str, err_type: &str, code: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": err_type,
+            "code": code,
+        }
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+/// Maps an engine submission error to an OpenAI-shaped 503 response.
+fn busy_response(e: EngineError) -> Response {
+    match e {
+        EngineError::Busy => err_response(
+            "engine capacity reached; retry later",
+            "server_error",
+            "engine_busy",
+        ),
+        EngineError::ShuttingDown => err_response(
+            "engine is shutting down; retry later",
+            "server_error",
+            "engine_shutting_down",
+        ),
+        EngineError::Model(m) => {
+            err_response(&format!("model error: {m}"), "server_error", "model_error")
+        }
+    }
 }
 
 /// Naive fallback: token id -> byte (lossy UTF-8, no tokenizer configured).
@@ -366,7 +398,7 @@ pub async fn completions(
             .await
         {
             Ok(x) => x,
-            Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(e) => return busy_response(e),
         };
         let st = state.clone();
         let id2 = id.clone();
@@ -409,7 +441,7 @@ pub async fn completions(
             .await
         {
             Ok(o) => o,
-            Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(e) => return busy_response(e),
         };
         let logprobs = if req.logprobs.unwrap_or(false) {
             Some(Logprobs {
@@ -475,7 +507,7 @@ pub async fn chat_completions(
             .await
         {
             Ok(x) => x,
-            Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(e) => return busy_response(e),
         };
         let st = state.clone();
         let id2 = id.clone();
@@ -525,7 +557,7 @@ pub async fn chat_completions(
             .await
         {
             Ok(o) => o,
-            Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(e) => return busy_response(e),
         };
         let logprobs = if req.logprobs.unwrap_or(false) {
             Some(Logprobs {

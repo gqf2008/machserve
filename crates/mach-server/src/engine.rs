@@ -7,7 +7,7 @@ use mach_model::continuous::{ContinuousModel, SeqId};
 use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::oneshot;
 
@@ -36,7 +36,8 @@ pub struct ServerEngine {
     txs: Mutex<HashMap<SeqId, DoneSender>>,
     /// Streaming token channels per active sequence.
     streams: Mutex<HashMap<SeqId, tokio::sync::mpsc::Sender<u32>>>,
-    _requests: AtomicU64,
+    /// Graceful-shutdown flag: the engine thread drains then exits.
+    shutdown: AtomicBool,
 }
 
 /// Errors from the engine API.
@@ -44,6 +45,8 @@ pub struct ServerEngine {
 pub enum EngineError {
     #[error("engine capacity reached")]
     Busy,
+    #[error("engine is shutting down")]
+    ShuttingDown,
     #[error("model error: {0}")]
     Model(#[from] mach_model::Error),
 }
@@ -58,7 +61,7 @@ impl ServerEngine {
             cond: Condvar::new(),
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
-            _requests: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -72,6 +75,9 @@ impl ServerEngine {
         logit_bias: Vec<(u32, f32)>,
         params: SamplingParams,
     ) -> Result<(Vec<u32>, Vec<f32>, &'static str), EngineError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EngineError::ShuttingDown);
+        }
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
@@ -111,6 +117,9 @@ impl ServerEngine {
         ),
         EngineError,
     > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EngineError::ShuttingDown);
+        }
         let (tx, rx) = oneshot::channel();
         let (tokens_tx, tokens_rx) = tokio::sync::mpsc::channel(256);
         {
@@ -131,6 +140,13 @@ impl ServerEngine {
         }
         self.cond.notify_one();
         Ok((rx, tokens_rx))
+    }
+
+    /// Requests graceful shutdown: the engine thread drains queued + active
+    /// sequences, then exits. New submissions fail with `ShuttingDown`.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.cond.notify_all();
     }
 
     /// Runs the engine loop until dropped; owns the model.
@@ -202,10 +218,15 @@ impl ServerEngine {
                     }
                 }
             } else {
-                // Idle: wait for new work.
+                // Idle: wait for new work, or exit once shutting down.
                 let mut pending = self.pending.lock().unwrap();
-                while pending.is_empty() {
-                    pending = self.cond.wait(pending).unwrap();
+                if pending.is_empty() {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    while pending.is_empty() && !self.shutdown.load(Ordering::Acquire) {
+                        pending = self.cond.wait(pending).unwrap();
+                    }
                 }
             }
         }

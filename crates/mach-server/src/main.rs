@@ -96,16 +96,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let engine = ServerEngine::new(capacity);
-    engine.clone().spawn(hip, cfg, w)?;
+    let engine_handle = engine.clone().spawn(hip, cfg, w)?;
     let state = AppState {
-        engine,
+        engine: engine.clone(),
         model: model_name,
         tok,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("mach-server listening on http://{addr} (capacity {capacity})");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("ctrl-c received; draining in-flight requests...");
+            engine.shutdown();
+        })
+        .await?;
+
+    // The engine thread drains queued + active sequences, then exits.
+    engine_handle
+        .join()
+        .map_err(|_| "engine thread panicked during shutdown".to_string())?;
+    println!("engine drained; exiting");
     Ok(())
 }
 

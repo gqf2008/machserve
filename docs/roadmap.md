@@ -328,3 +328,15 @@
     逐 token 对拍一致**(含贪心+采样);
   - 至此 OpenAI 采样参数面完整:temperature/top_p/top_k/seed/presence/frequency/
     logit_bias/stop/n/logprobs/stream/finish_reason;默认 + HIP 全绿,clippy/fmt 干净。
+
+- **P3r OpenAI 错误 JSON + 优雅停机(2026-08-23)**:
+  - `/v1/completions`、`/v1/chat/completions` 4 处 `503` 空响应改为 **OpenAI 风格
+    错误体** `{"error": {"message", "type", "code"}}`:`engine_busy`(容量满)、
+    `engine_shutting_down`(停机中拒绝新请求)、`model_error`;
+  - **优雅停机**:`ServerEngine` 增加 `shutdown: AtomicBool` + `ShuttingDown` 错误;
+    引擎 `run()` 循环收到停机信号后排空**排队 + 在跑**序列再退出(空闲等待用
+    condvar `notify_all` 唤醒,不轮询);`main()` 用 `tokio::signal::ctrl_c()` +
+    axum `with_graceful_shutdown`,Ctrl-C 后置停机标志 → 引擎排空 → join 引擎线程
+    → 打印退出;
+  - 测试:busy 引擎返回 OpenAI 错误 JSON 形状(零容量直接拒,无需 GPU)+ 停机后两个
+    在跑请求排空完成且引擎线程自行退出;默认 + HIP 全绿,clippy/fmt 干净。
