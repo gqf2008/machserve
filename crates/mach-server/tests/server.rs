@@ -90,6 +90,78 @@ async fn completions_endpoint_matches_direct_engine() {
     assert_eq!(got, want, "server output must equal direct engine run");
 }
 
+fn moe_cfg() -> Config {
+    let mut cfg = Config::tiny();
+    cfg.intermediate_size = 64;
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg
+}
+
+#[tokio::test]
+async fn completions_endpoint_moe_matches_direct_engine() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 91).unwrap();
+    let prompt = vec![5u32, 9, 3];
+    let max_new = 4usize;
+
+    // Expected output from a direct engine run (MoE config through
+    // ContinuousModel -> BatchedModel grouped expert GEMMs).
+    let mut cm = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();
+    let id = cm
+        .add(
+            &prompt,
+            max_new,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.is_done(id) {
+        cm.step().unwrap();
+    }
+    let want = cm.generated(id);
+    assert!(!want.is_empty(), "MoE engine must generate tokens");
+
+    // Server path.
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny-moe".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let got: Vec<u32> = json["choices"][0]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert_eq!(got, want, "server MoE output must equal direct engine run");
+}
+
 #[tokio::test]
 async fn healthz_and_text_prompt() {
     let Some(hip) = hip_ctx() else { return };

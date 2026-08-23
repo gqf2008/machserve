@@ -646,3 +646,15 @@
     `moe_pos_dev` 后 memset 仍误指旧 `pos_dev`,把每层注意力位置清零导致 layer≥1
     注意力全错(对拍 0.28 级误差,路由一致仍炸)→ 已修并沉淀 LESSON;
   - 后续切片:counts 读回改 GPU 侧调度(去每层 D2H)、真实 Qwen2.5-MoE 验证。
+
+- **P3ax MoE 端到端服务验证(2026-08-23,7900 XTX)**:
+  - `ContinuousModel` 直接包装 `BatchedModel`,MoE 配置自动走通连续批处理生命周期
+    (prefill → decode → 采样 → 完成);新增 server 端到端测试
+    `completions_endpoint_moe_matches_direct_engine`:合成 tiny MoE(4 专家/2 活跃)
+    权重,HTTP `/v1/completions` 输出与直接引擎逐 token 一致;
+  - **验证**:server 套件 14 个测试全绿(含新 MoE 用例);全量 HIP 回归全绿,
+    clippy/fmt 干净;
+  - 意义:MoE 从权重 → loader → GPU(单序列 + batched 分组 GEMM)→ 连续批处理 →
+    OpenAI HTTP 服务的完整链路已闭环;
+  - 后续切片:counts 读回改 GPU 侧调度(去每层 D2H)、真实 Qwen2.5-MoE 验证
+    (需下载权重)。
