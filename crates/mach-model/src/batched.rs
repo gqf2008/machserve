@@ -556,7 +556,7 @@ impl BatchedModel {
                     c.head_dim as i32,
                     c.max_seq_len as i32,
                 )?;
-                k.launch_attn_decode_batched_f16(
+                k.launch_attn_decode_batched_f16_gqa(
                     self.q,
                     kc as *const u16,
                     vc as *const u16,

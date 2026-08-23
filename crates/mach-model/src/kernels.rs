@@ -408,7 +408,25 @@ extern "C" __global__ void kv_store_batched_f16(const float* kv,
     }
 }
 
-extern "C" __global__ void attn_decode_batched_f16(
+
+"#;
+
+/// GQA-reuse decode attention (f16 KV), fused tiled two-phase.
+///
+/// One block per (sequence, KV head). Phase A (tid = position lane) computes
+/// the FULL head_dim dot `q[g] . k[p]` for every group head, reading each
+/// K[p] row once and reusing it across the group; scores go to shared. Phase B
+/// (tid = (dim, lane)) runs online softmax per (group, dim), reading each
+/// V[p][dim] once and reusing it across the group, then merges the per-dim
+/// lanes. K/V global traffic drops by `groups`x vs block-per-head decode.
+const ATTN_DECODE_BATCHED_F16_GQA: &str = r#"
+__device__ inline float f16_bits_to_f32(unsigned short u) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = u;
+    return (float)c.h;
+}
+
+extern "C" __global__ void attn_decode_batched_f16_gqa(
     const float* __restrict__ q,
     const unsigned short* __restrict__ kc,
     const unsigned short* __restrict__ vc,
@@ -417,70 +435,113 @@ extern "C" __global__ void attn_decode_batched_f16(
     const int* __restrict__ slots,
     const int* __restrict__ run_mask,
     int batch, int n_heads, int n_kv_heads, int head_dim, float scale, int max_seq) {
-    extern __shared__ float smem[];
-    float* scores = smem;
-    float* red = smem + max_seq;
-
-    int s = blockIdx.x / n_heads;
-    int h = blockIdx.x % n_heads;
-    int groups = n_heads / n_kv_heads;
-    int kv = h / groups;
-    int slot = slots[s];
-    int pos = pos_buf[s];
-    // Rows covered by a prefill-attention run are skipped here.
+    const int s = blockIdx.x / n_kv_heads;
+    const int kv = blockIdx.x % n_kv_heads;
+    const int slot = slots[s];
+    const int pos = pos_buf[s];
     if (run_mask[s] != 0) {
         return;
     }
-    const float* qh = q + ((long long)s * n_heads + h) * head_dim;
-
-    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
-        const unsigned short* kp = kc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim;
-        float sc = 0.0f;
-        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * f16_bits_to_f32(kp[dd]);
-        scores[p] = sc * scale;
-    }
-    __syncthreads();
-
-    float maxv = -1e30f;
-    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
-    red[threadIdx.x] = maxv;
-    __syncthreads();
-    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
-        __syncthreads();
-    }
-    float m = red[0];
-
-    float sumv = 0.0f;
-    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
-    red[threadIdx.x] = sumv;
-    __syncthreads();
-    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
-        __syncthreads();
-    }
-    float ssum = red[0];
-
-    // Parallel weighted sum: all 256 threads participate (blockDim/head_dim
-    // threads per output dim partition the keys), so each key's exp is computed
-    // by exactly one thread per dim instead of head_dim times. The `per`
-    // partials of each output dim are reduced over all `per` threads.
-    const int ndd = head_dim;
-    const int per = blockDim.x / ndd;
-    const int dd = threadIdx.x % ndd;
-    const int c = threadIdx.x / ndd;
+    const int T = blockDim.x;
+    const int tid = threadIdx.x;
+    const int groups = n_heads / n_kv_heads;
+    const int per = T / head_dim;   // lanes per output dim (key split)
+    const int tile = T;             // positions per phase-A round
     const int np = pos + 1;
-    float acc = 0.0f;
-    for (int p = c; p < np; p += per) {
-        const unsigned short* vp = vc + ((long long)slot * max_seq + p) * n_kv_heads * head_dim + kv * head_dim + dd;
-        acc += __expf(scores[p] - m) * f16_bits_to_f32(*vp);
+
+    extern __shared__ float sm[];
+    float* scores = sm;                          // [groups][tile]
+    float* sm_m = sm + (long long)groups * tile; // [T][groups] lane partials
+    float* sm_l = sm_m + (long long)T * groups;
+    float* sm_a = sm_l + (long long)T * groups;
+
+    // Phase-B online-softmax state per (dim, lane) per group.
+    float m[16], l[16], acc[16];
+    for (int g = 0; g < groups; g++) {
+        m[g] = -1e30f;
+        l[g] = 0.0f;
+        acc[g] = 0.0f;
     }
-    red[threadIdx.x] = acc;
+
+    for (int tile0 = 0; tile0 < np; tile0 += tile) {
+        const int n_t = (np - tile0 < tile) ? (np - tile0) : tile;
+        // Phase A: full head_dim dot per group, K[p] read once per position.
+        if (tid < n_t) {
+            const int p = tile0 + tid;
+            const unsigned short* krow =
+                kc + (((long long)slot * max_seq + p) * n_kv_heads + kv) * head_dim;
+            float dot[16];
+            for (int g = 0; g < groups; g++) dot[g] = 0.0f;
+            // Vectorized K row reads (8 fp16 per uint4) cut L1 load count.
+            for (int dd8 = 0; dd8 < head_dim; dd8 += 8) {
+                const uint4 v = *((const uint4*)(krow + dd8));
+                float f0 = f16_bits_to_f32(v.x & 0xffffu);
+                float f1 = f16_bits_to_f32(v.x >> 16);
+                float f2 = f16_bits_to_f32(v.y & 0xffffu);
+                float f3 = f16_bits_to_f32(v.y >> 16);
+                float f4 = f16_bits_to_f32(v.z & 0xffffu);
+                float f5 = f16_bits_to_f32(v.z >> 16);
+                float f6 = f16_bits_to_f32(v.w & 0xffffu);
+                float f7 = f16_bits_to_f32(v.w >> 16);
+                for (int g = 0; g < groups; g++) {
+                    const float* qg = q + ((long long)s * n_heads + kv * groups + g) * head_dim + dd8;
+                    dot[g] += qg[0] * f0 + qg[1] * f1 + qg[2] * f2 + qg[3] * f3
+                            + qg[4] * f4 + qg[5] * f5 + qg[6] * f6 + qg[7] * f7;
+                }
+            }
+            for (int g = 0; g < groups; g++) {
+                scores[(long long)g * tile + tid] = dot[g] * scale;
+            }
+        }
+        __syncthreads();
+        // Phase B: V reused across the group; online softmax per (g, dim).
+        const int dd = tid % head_dim;
+        const int c = tid / head_dim;
+        const unsigned short* vrow =
+            vc + (((long long)slot * max_seq + tile0) * n_kv_heads + kv) * head_dim + dd;
+        for (int pp = c; pp < n_t; pp += per) {
+            const float vvv = f16_bits_to_f32(vrow[(long long)pp * n_kv_heads * head_dim]);
+            for (int g = 0; g < groups; g++) {
+                const float sc = scores[(long long)g * tile + pp];
+                const float mnew = fmaxf(m[g], sc);
+                const float alpha = __expf(m[g] - mnew);
+                const float beta = __expf(sc - mnew);
+                l[g] = l[g] * alpha + beta;
+                acc[g] = acc[g] * alpha + beta * vvv;
+                m[g] = mnew;
+            }
+        }
+        __syncthreads(); // protect shared scores before the next tile overwrites
+    }
+
+    // Merge the per-lane partials and write the output.
+    const int dd = tid % head_dim;
+    const int c = tid / head_dim;
+    for (int g = 0; g < groups; g++) {
+        const long long idx = ((long long)c * groups + g) * head_dim + dd;
+        sm_m[idx] = m[g];
+        sm_l[idx] = l[g];
+        sm_a[idx] = acc[g];
+    }
     __syncthreads();
     if (c == 0) {
-        float sum = 0.0f;
-        for (int cc = 0; cc < per; cc++) sum += red[dd + cc * ndd];
-        out[((long long)s * n_heads + h) * head_dim + dd] = sum / ssum;
+        for (int g = 0; g < groups; g++) {
+            float m2 = -1e30f, l2 = 0.0f, a2 = 0.0f;
+            for (int cc = 0; cc < per; cc++) {
+                const long long idx = ((long long)cc * groups + g) * head_dim + dd;
+                const float mi = sm_m[idx];
+                const float li = sm_l[idx];
+                const float ai = sm_a[idx];
+                const float mnew = fmaxf(m2, mi);
+                const float alpha = __expf(m2 - mnew);
+                const float beta = __expf(mi - mnew);
+                l2 = l2 * alpha + li * beta;
+                a2 = a2 * alpha + ai * beta;
+                m2 = mnew;
+            }
+            const int h = kv * groups + g;
+            out[((long long)s * n_heads + h) * head_dim + dd] = a2 / l2;
+        }
     }
 }
 "#;
@@ -643,7 +704,7 @@ pub struct HipKernels {
     cast_f16_f32: HipKernelModule,
     embed_f16: HipKernelModule,
     kv_store_f16: HipKernelModule,
-    attn_f16: HipKernelModule,
+    attn_f16_gqa: HipKernelModule,
     attn_prefill_f16: HipKernelModule,
 }
 
@@ -691,7 +752,11 @@ impl HipKernels {
             cast_f16_f32: HipKernelModule::compile(&arch, CAST_F16_F32, "cast_f16_f32")?,
             embed_f16: HipKernelModule::compile(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
             kv_store_f16: HipKernelModule::compile(&arch, KV_F16, "kv_store_batched_f16")?,
-            attn_f16: HipKernelModule::compile(&arch, KV_F16, "attn_decode_batched_f16")?,
+            attn_f16_gqa: HipKernelModule::compile(
+                &arch,
+                ATTN_DECODE_BATCHED_F16_GQA,
+                "attn_decode_batched_f16_gqa",
+            )?,
             attn_prefill_f16: HipKernelModule::compile(
                 &arch,
                 ATTN_PREFILL_F16,
@@ -1395,7 +1460,7 @@ impl HipKernels {
 
     /// Decode attention over an fp16 KV cache (f32 q, fp32 output).
     #[allow(clippy::too_many_arguments)]
-    pub fn launch_attn_decode_batched_f16(
+    pub fn launch_attn_decode_batched_f16_gqa(
         &self,
         q: *const f32,
         kc: *const u16,
@@ -1433,11 +1498,17 @@ impl HipKernels {
             &scale as *const f32 as *mut core::ffi::c_void,
             &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
-        let grid = (batch * n_heads) as u32;
-        let shared = (max_seq as u32 + 256) * 4;
-        Ok(self
-            .attn_f16
-            .launch_shmem([grid, 1, 1], [256, 1, 1], &mut p, self.stream, shared)?)
+        let grid = (batch * n_kv_heads) as u32;
+        let groups = n_heads / n_kv_heads;
+        // scores [groups][256] + 3 merge arrays [256][groups], all floats.
+        let shared = (groups * 256 + 3 * 256 * groups) as u32 * 4;
+        Ok(self.attn_f16_gqa.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
     }
 
     /// Synchronizes the execution stream.

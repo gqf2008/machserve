@@ -38,6 +38,8 @@ thirdparty/        第三方参考代码(占位)
 
 ## 能力清单
 
+- **GQA 复用 decode attention**:每 KV head 一个 block、K/V 各读一次跨组复用
+  (长 context KV 流量降 groups 倍),2048-token decode +15%。
 - **fp16 计算**:权重/激活/GEMM 输入 fp16、fp32 累加(hipBLAS `GemmEx_v2`);
   隐藏层 GEMM 输出 fp16 + cast(瘦长形状 c16 比 c32 快 3-4x);**fp16 KV cache**。
 - **连续批处理**:序列生命周期(prefill/decode 混合、EOS/max_new、槽位压缩复用)。

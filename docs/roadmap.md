@@ -398,3 +398,16 @@
   - batch 32 跳升 228 ms/step:疑似 hipBLAS 对该 m/n/k 组合切到病态 kernel,或
     该基准 f32 权重 + 大 KV 的显存压力;非正确性 bug(f16 生产路径不受影响);
     完整排查留待后续专项(不跑超长基准)。
+
+- **P3x GQA 复用 decode attention 内核(2026-08-23,7900 XTX 真机)**:
+  - 新 `attn_decode_batched_f16_gqa`:每 (seq, kv_head) 一个 block,分块两阶段——
+    阶段 A 线程按位置算**完整 head_dim 点积**(K 行每位置读一次、组内 7 个 query
+    head 复用,uint4 向量化读),阶段 B 按 (输出维, lane) online softmax(V 每位置
+    读一次跨 group 复用)+ 跨 lane 合并;KV 全局读流量降 groups 倍(0.5B = 7x);
+  - **正确性**:CPU 精确参考逐元素对拍 hd=32/64/128、pos 1~2047 全 **0.000000**;
+    fp16(F32 vs F16)/continuous/real_model 全绿;旧双遍内核已移除,唯一 f16
+    attention 路径为 GQA 内核;
+  - **性能(2048-token 长 context, B=64, f16, Qwen 0.5B)**:旧双遍 5.470 ms/step
+    → GQA 5.003 → uint4 向量化 **4.739 ms/step(13504 tok/s/seq,+15%)**;低于理论
+    7x 是因为旧内核已靠 L2 吃到部分组间复用,且步时中还含 GEMM 等非 attention
+    成本;短 context(B=512)无回归(受 GEMM 主导)。
