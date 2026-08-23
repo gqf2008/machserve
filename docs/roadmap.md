@@ -387,3 +387,14 @@
     (疑似该基准 f32 权重 + 大 KV 显存压力,非引擎逻辑),fp16 批量段未跑;
   - 结论:引擎对 3 倍参数、head_dim 翻倍的大模型开箱即用;完整 1.5B 基准与
     batch≥32 显存/性能排查留作后续(按用户偏好不跑超长基准)。
+
+- **P3w 1.5B 服务器冒烟 + batch-32 分析(2026-08-23,7900 XTX 真机)**:
+  - **1.5B 走完整 serving 路径全部通过**(mach-server f16/capacity 8):chat 补全
+    "Paris"(finish_reason=stop)、SSE 流式逐 token + [DONE]、`top_logprobs` 每个
+    位置降序 top-2、`max_tokens=0` 返回 400 invalid_request_error JSON;
+  - **batch 1→16 恒定 ~32.4 ms/step 的解释**:与 0.5B 的 ~13.8 ms/step 恒定步时
+    同模式——小 m 下 hipBLAS GEMM 的固定开销主导(batched decode 每层 7 个 GEMM
+    × 28 层 + lm_head,步时与 batch 弱相关、与模型规模成正比),非逐批递增;
+  - batch 32 跳升 228 ms/step:疑似 hipBLAS 对该 m/n/k 组合切到病态 kernel,或
+    该基准 f32 权重 + 大 KV 的显存压力;非正确性 bug(f16 生产路径不受影响);
+    完整排查留待后续专项(不跑超长基准)。
