@@ -6,6 +6,8 @@
 //!
 //! Run with:
 //!   cargo run -p mach-model --release --features hip --example qwen_bench
+//! Env: MACH_MODEL (default qwen-0.5b.safetensors), MACH_CONFIG (default
+//! qwen-config.json), MACH_MODELS (default .models), MACH_DTYPE (f16/f32).
 //!
 //! Download first:
 //!   curl -L -o .models/qwen-0.5b.safetensors \
@@ -27,8 +29,10 @@ fn main() {
 
     let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
     let root = PathBuf::from(&root);
-    let model_path = root.join("qwen-0.5b.safetensors");
-    let cfg_path = root.join("qwen-config.json");
+    let model_name = std::env::var("MACH_MODEL").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
+    let config_name = std::env::var("MACH_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
+    let model_path = root.join(&model_name);
+    let cfg_path = root.join(&config_name);
     assert!(
         model_path.exists(),
         "missing {model_path:?} (see doc comment)"
@@ -37,7 +41,7 @@ fn main() {
 
     let cfg = config_from_json(&cfg_path);
     println!(
-        "model: Qwen2.5-0.5B-Instruct (d_model={} layers={} heads={} kv={} head_dim={} inter={} vocab={})",
+        "model: {model_name} (d_model={} layers={} heads={} kv={} head_dim={} inter={} vocab={})",
         cfg.d_model,
         cfg.n_layers,
         cfg.n_heads,

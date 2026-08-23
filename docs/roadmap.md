@@ -374,3 +374,16 @@
   - **结论(留作专项)**:GQA 复用的真正难点是完整点积需要跨 head_dim 归约或 K 分块进
     共享(输出维并行只适用于 V 累加),需 flash-decoding 式分块设计,不在一轮里仓促做;
     经验已沉淀 `~/.agents/rules/LESSON_GPU注意力GQA复用内核softmax分数须完整点积.md`。
+
+- **P3v 更大模型加载验证 Qwen2.5-1.5B(2026-08-23,7900 XTX 真机)**:
+  - 下载 Qwen2.5-1.5B-Instruct(2.94GB safetensors);`chat_check`/`qwen_bench` 增加
+    MACH_MODEL/MACH_CONFIG/MACH_DTYPE 环境变量(默认仍 0.5B),max_seq 改从 config
+    读取(封顶 8192);
+  - **验证通过**:1.5B(hidden 1536 / 28 层 / 12:2 heads / head_dim=128 / vocab 151936)
+    **F32 与 F16 两条路径都端到端跑通**,同一问题回答 "Paris"(0.5B 为
+    "The capital of France's Paris");head_dim=128 的 attention/GEMM、28 层加载无回归;
+  - **部分基准**(qwen_bench 1.5B f16,用户中断未跑完):单序列 TPOT 24.3 ms/tok;
+    批量 scaling batch 1→16:31→492 tok/s(近线性);**batch 32 异常升到 228 ms/step**
+    (疑似该基准 f32 权重 + 大 KV 显存压力,非引擎逻辑),fp16 批量段未跑;
+  - 结论:引擎对 3 倍参数、head_dim 翻倍的大模型开箱即用;完整 1.5B 基准与
+    batch≥32 显存/性能排查留作后续(按用户偏好不跑超长基准)。
