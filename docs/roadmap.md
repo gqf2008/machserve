@@ -595,3 +595,13 @@
   - **验证**:服务器测试——greedy 请求正常生成 max_tokens、非 greedy 返回 400;
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 收益(吞吐加速)仍待 1.5B `spec_check` 测量确认;模式为可选启用,不影响默认路径。
+
+- **P3at MoE 地基(config + 权重 + CPU 参考,2026-08-23)**:
+  - `Config` 增 `num_experts`/`num_experts_per_tok`(默认 0=稠密);`LayerWeights`
+    增 MoE 张量(`moe_router` [ne,d]、`moe_wg/wu` [ne,inter,d]、`moe_wd` [ne,d,inter],
+    稠密为空);`Weights::random` 按配置生成;
+  - `ref_model`(CPU)增 MoE 前向:router softmax → top-k 专家 → 概率加权 SwiGLU 和;
+  - **验证**:合成 MoE 模型——张量形状正确、CPU 前向有限且确定(新测试 moe.rs);
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 后续切片:loader 读取真实 MoE 张量(`model.layers.N.mlp.experts.M.*` +
+    `mlp.gate`)、GPU 路由/专家 GEMM(逐 token top-k 分组)、真实 Qwen2.5-MoE 验证。

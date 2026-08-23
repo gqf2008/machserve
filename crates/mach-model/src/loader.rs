@@ -208,6 +208,13 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
             bq: get_opt(&p("self_attn.q_proj.bias"), nq)?,
             bk: get_opt(&p("self_attn.k_proj.bias"), nkv)?,
             bv: get_opt(&p("self_attn.v_proj.bias"), nkv)?,
+            // MoE (dense models have none; expert tensors loaded in a later
+            // slice: model.layers.N.mlp.experts.M.{gate,up,down}_proj.weight
+            // + model.layers.N.mlp.gate.weight).
+            moe_router: Vec::new(),
+            moe_wg: Vec::new(),
+            moe_wu: Vec::new(),
+            moe_wd: Vec::new(),
         };
         layers.push(lw);
     }

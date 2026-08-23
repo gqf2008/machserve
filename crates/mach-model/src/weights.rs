@@ -32,6 +32,13 @@ pub struct LayerWeights {
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
     pub bv: Vec<f32>,
+    /// MoE (num_experts > 0): router `[num_experts, d_model]`; empty for dense.
+    pub moe_router: Vec<f32>,
+    /// Per-expert gate/up `[num_experts, intermediate_size, d_model]`.
+    pub moe_wg: Vec<f32>,
+    pub moe_wu: Vec<f32>,
+    /// Per-expert down `[num_experts, d_model, intermediate_size]`.
+    pub moe_wd: Vec<f32>,
 }
 
 /// All model weights.
@@ -68,6 +75,16 @@ impl Weights {
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
+            let (moe_router, moe_wg, moe_wu, moe_wd) = if cfg.num_experts > 0 {
+                (
+                    mat(&mut rng, cfg.num_experts, d, scale),
+                    mat(&mut rng, cfg.num_experts * cfg.intermediate_size, d, scale),
+                    mat(&mut rng, cfg.num_experts * cfg.intermediate_size, d, scale),
+                    mat(&mut rng, cfg.num_experts * d, cfg.intermediate_size, scale),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
             layers.push(LayerWeights {
                 wq: mat(&mut rng, d, cfg.n_heads * cfg.head_dim, scale),
                 wk: mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale),
@@ -81,6 +98,10 @@ impl Weights {
                 bq: Vec::new(),
                 bk: Vec::new(),
                 bv: Vec::new(),
+                moe_router,
+                moe_wg,
+                moe_wu,
+                moe_wd,
             });
         }
 
@@ -105,7 +126,11 @@ impl Weights {
                 + l.wg.len()
                 + l.wu.len()
                 + l.wd.len()
-                + l.rms_mlp.len();
+                + l.rms_mlp.len()
+                + l.moe_router.len()
+                + l.moe_wg.len()
+                + l.moe_wu.len()
+                + l.moe_wd.len();
         }
         n * 4
     }

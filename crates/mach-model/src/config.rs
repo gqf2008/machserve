@@ -29,6 +29,10 @@ pub struct Config {
     pub head_dim: usize,
     /// MLP intermediate size (gate/up width).
     pub intermediate_size: usize,
+    /// Number of experts (0 = dense MLP, no MoE).
+    pub num_experts: usize,
+    /// Active experts per token (MoE routing; 0 = dense).
+    pub num_experts_per_tok: usize,
     /// Maximum sequence length (static KV cache size).
     pub max_seq_len: usize,
     /// RMSNorm epsilon.
@@ -50,6 +54,8 @@ impl Config {
             n_kv_heads: 2,
             head_dim: 32,
             intermediate_size: 512,
+            num_experts: 0,
+            num_experts_per_tok: 0,
             max_seq_len: 256,
             rms_eps: 1e-6,
             rope_theta: 10000.0,
@@ -75,6 +81,8 @@ impl Config {
             n_kv_heads,
             head_dim: hidden_size / n_heads,
             intermediate_size: 4 * hidden_size,
+            num_experts: 0,
+            num_experts_per_tok: 0,
             max_seq_len,
             rms_eps: 1e-6,
             rope_theta: 10000.0,
@@ -93,6 +101,8 @@ impl Config {
             n_kv_heads: 4,
             head_dim: 64,
             intermediate_size: 2048,
+            num_experts: 0,
+            num_experts_per_tok: 0,
             max_seq_len: 1024,
             rms_eps: 1e-6,
             rope_theta: 10000.0,

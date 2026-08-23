@@ -69,16 +69,71 @@ impl RefModel {
 
             let inter = cfg.intermediate_size;
             let xn2 = rms_norm(&x, &lw.rms_mlp, cfg.rms_eps);
-            let gate = matvec_t(&xn2, &lw.wg, inter);
-            let up = matvec_t(&xn2, &lw.wu, inter);
-            let mut h = vec![0.0; inter];
-            for i in 0..inter {
-                // SwiGLU: h = silu(gate) * up.
-                h[i] = silu(gate[i]) * up[i];
-            }
-            let down = matvec_t(&h, &lw.wd, d);
-            for i in 0..d {
-                x[i] += down[i];
+            let moe = cfg.num_experts > 0 && !lw.moe_router.is_empty();
+            if moe {
+                // MoE: router softmax -> top-k experts -> weighted sum of
+                // per-expert SwiGLU MLPs.
+                let ne = cfg.num_experts;
+                let topk = cfg.num_experts_per_tok.min(ne);
+                let router = matvec_t(&xn2, &lw.moe_router, ne);
+                let mut probs = vec![0.0; ne];
+                let mut maxr = f32::NEG_INFINITY;
+                for r in &router {
+                    maxr = maxr.max(*r);
+                }
+                let mut sumr = 0.0f32;
+                for i in 0..ne {
+                    probs[i] = (router[i] - maxr).exp();
+                    sumr += probs[i];
+                }
+                for p in probs.iter_mut() {
+                    *p /= sumr;
+                }
+                // Top-k expert indices by probability (ties: lower index).
+                let mut order: Vec<usize> = (0..ne).collect();
+                order.sort_by(|&a, &b| {
+                    probs[b]
+                        .partial_cmp(&probs[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.cmp(&b))
+                });
+                let mut norm = 0.0f32;
+                for &e in order.iter().take(topk) {
+                    norm += probs[e];
+                }
+                let mut h = vec![0.0; d];
+                for &e in order.iter().take(topk) {
+                    // Expert e: gate/up [inter, d], down [d, inter].
+                    let wg = &lw.moe_wg[e * inter * d..(e + 1) * inter * d];
+                    let wu = &lw.moe_wu[e * inter * d..(e + 1) * inter * d];
+                    let wd = &lw.moe_wd[e * d * inter..(e + 1) * d * inter];
+                    let gate = matvec_t(&xn2, wg, inter);
+                    let up = matvec_t(&xn2, wu, inter);
+                    let mut eh = vec![0.0; inter];
+                    for i in 0..inter {
+                        eh[i] = silu(gate[i]) * up[i];
+                    }
+                    let down = matvec_t(&eh, wd, d);
+                    let w = probs[e] / norm;
+                    for i in 0..d {
+                        h[i] += w * down[i];
+                    }
+                }
+                for i in 0..d {
+                    x[i] += h[i];
+                }
+            } else {
+                let gate = matvec_t(&xn2, &lw.wg, inter);
+                let up = matvec_t(&xn2, &lw.wu, inter);
+                let mut h = vec![0.0; inter];
+                for i in 0..inter {
+                    // SwiGLU: h = silu(gate) * up.
+                    h[i] = silu(gate[i]) * up[i];
+                }
+                let down = matvec_t(&h, &lw.wd, d);
+                for i in 0..d {
+                    x[i] += down[i];
+                }
             }
         }
 
