@@ -408,6 +408,12 @@ impl SpeculativeEngine {
         }) || !self.batch.is_active(s)
     }
 
+    /// Number of requests still decoding.
+    #[must_use]
+    pub fn active(&self) -> usize {
+        self.batch.active()
+    }
+
     /// Whether every request has finished.
     #[must_use]
     pub fn all_done(&self) -> bool {

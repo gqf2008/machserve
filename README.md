@@ -101,7 +101,8 @@ cargo run -p mach-model --release --features hip --example chat_check
 # 启动 OpenAI 兼容服务器(fp16 默认;MACH_DTYPE=f32 可关)
 cargo run -p mach-server --release --features hip
 #   环境变量:MACH_MODELS(默认 .models)、MACH_MODEL、MACH_CONFIG、
-#   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)
+#   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)、
+#   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)
 
 # 调用示例
 curl -s http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/json" \

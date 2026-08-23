@@ -585,3 +585,13 @@
     完全一致(新测试);全量 HIP 回归全绿,clippy/fmt 干净;
   - 这是引擎集成的第一个落地形态;后续可接入服务器(需采样参数/penalties + 流式,
     以及收益测量确认)。
+
+- **P3as spec-decode 服务器集成(greedy 模式,2026-08-23,7900 XTX)**:
+  - `ServerEngine` 增加 spec 后端:`with_spec(capacity, k)` + `spawn_spec` +
+    `run_spec`(独立路径,不触碰 continuous run);`MACH_SPEC=1`(可配 MACH_DRAFT/
+    MACH_SPEC_K)启动;
+  - spec 模式为 **greedy-only**:非 greedy 参数/stop/logit_bias 在 submit 时返回
+    400 invalid_request(EngineError::InvalidRequest);
+  - **验证**:服务器测试——greedy 请求正常生成 max_tokens、非 greedy 返回 400;
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 收益(吞吐加速)仍待 1.5B `spec_check` 测量确认;模式为可选启用,不影响默认路径。

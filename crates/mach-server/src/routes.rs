@@ -252,6 +252,12 @@ fn busy_response(e: EngineError) -> Response {
             "server_error",
             "engine_shutting_down",
         ),
+        EngineError::InvalidRequest(m) => err_response(
+            StatusCode::BAD_REQUEST,
+            &m,
+            "invalid_request_error",
+            "invalid_request",
+        ),
         EngineError::Model(m) => err_response(
             status,
             &format!("model error: {m}"),

@@ -792,3 +792,73 @@ async fn usage_is_reported() {
     let toks = json["choices"][0]["tokens"].as_array().unwrap();
     assert_eq!(toks.len(), 4);
 }
+
+#[tokio::test]
+async fn spec_mode_serves_greedy_and_rejects_non_greedy() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let dw = Weights::random(&cfg, 61).unwrap();
+    let tw = Weights::random(&cfg, 73).unwrap();
+    let engine = ServerEngine::with_spec(4, 4);
+    let _handle = engine
+        .clone()
+        .spawn_spec(hip.clone(), cfg, tw, cfg, dw)
+        .unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    // Greedy (default params) request is served.
+    let body = serde_json::json!({ "prompt": [5, 9, 3, 200], "max_tokens": 6 });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "greedy request must be served"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let toks = json["choices"][0]["tokens"].as_array().unwrap();
+    assert_eq!(toks.len(), 6, "spec mode must generate max_tokens");
+
+    // Non-greedy request is rejected with a 400 invalid_request_error.
+    let body = serde_json::json!({
+        "prompt": [5, 9, 3, 200],
+        "max_tokens": 6,
+        "temperature": 0.9,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+}

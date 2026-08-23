@@ -100,8 +100,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let engine = ServerEngine::with_prefill_rows(capacity, prefill_rows);
-    let engine_handle = engine.clone().spawn(hip, cfg, w)?;
+    // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through a
+    // draft + target engine (greedy-only; other params rejected).
+    let spec = std::env::var("MACH_SPEC").is_ok();
+    let spec_k = std::env::var("MACH_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let (engine, engine_handle) = if spec {
+        let draft_name =
+            std::env::var("MACH_DRAFT").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
+        let draft_config =
+            std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
+        let mut dcfg = config_from_json(&root.join(&draft_config));
+        match dtype.as_str() {
+            "f32" => dcfg.dtype = ModelDType::F32,
+            "f16" => dcfg.dtype = ModelDType::F16,
+            _ => {}
+        }
+        let dw: Weights =
+            load_safetensors(&root.join(&draft_name), &dcfg, true).expect("load draft weights");
+        println!(
+            "draft {draft_name}: d_model={} layers={} dtype={:?} K={spec_k}",
+            dcfg.d_model, dcfg.n_layers, dcfg.dtype
+        );
+        let eng = ServerEngine::with_spec(capacity, spec_k);
+        let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
+        (eng, handle)
+    } else {
+        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let handle = eng.clone().spawn(hip, cfg, w)?;
+        (eng, handle)
+    };
     let state = AppState {
         engine: engine.clone(),
         model: model_name,
@@ -110,7 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(
-        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows})"
+        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{})",
+        if spec { ", spec-decode" } else { "" }
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

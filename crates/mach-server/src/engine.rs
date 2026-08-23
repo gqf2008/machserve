@@ -3,8 +3,10 @@
 //! channels, so no GPU state crosses thread boundaries.
 
 use mach_kernel_sys::hip::Hip;
+use mach_model::batched::BatchedModel;
 use mach_model::continuous::{ContinuousModel, SeqId};
 use mach_model::sampling::SamplingParams;
+use mach_model::speculative::SpeculativeEngine;
 use mach_model::{Config, Weights};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +38,10 @@ pub struct ServerEngine {
     capacity: usize,
     /// Rows per prefill step (>= capacity; larger = faster long-prompt TTFT).
     prefill_rows: usize,
+    /// Speculative-decoding mode (greedy-only; draft + target models).
+    spec: bool,
+    /// Draft tokens per verify round in spec mode.
+    spec_k: usize,
     pending: Mutex<VecDeque<Request>>,
     cond: Condvar,
     txs: Mutex<HashMap<SeqId, DoneSender>>,
@@ -52,6 +58,8 @@ pub enum EngineError {
     Busy,
     #[error("engine is shutting down")]
     ShuttingDown,
+    #[error("invalid request for spec mode: {0}")]
+    InvalidRequest(String),
     #[error("model error: {0}")]
     Model(#[from] mach_model::Error),
 }
@@ -67,15 +75,56 @@ impl ServerEngine {
     /// per prefill step.
     #[must_use]
     pub fn with_prefill_rows(capacity: usize, prefill_rows: usize) -> Arc<Self> {
+        Self::with_mode(capacity, prefill_rows.max(capacity), false, 0)
+    }
+
+    /// Creates a speculative-decoding engine (greedy-only) with `k` draft
+    /// tokens per verify round.
+    #[must_use]
+    pub fn with_spec(capacity: usize, k: usize) -> Arc<Self> {
+        Self::with_mode(capacity, capacity, true, k.max(1))
+    }
+
+    fn with_mode(capacity: usize, prefill_rows: usize, spec: bool, spec_k: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
-            prefill_rows: prefill_rows.max(capacity),
+            prefill_rows,
+            spec,
+            spec_k,
             pending: Mutex::new(VecDeque::new()),
             cond: Condvar::new(),
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    /// Rejects requests the (greedy-only) spec engine cannot serve.
+    fn check_spec_request(
+        &self,
+        stop_seqs: &[Vec<u32>],
+        logit_bias: &[(u32, f32)],
+        params: &SamplingParams,
+    ) -> Result<(), EngineError> {
+        if !self.spec {
+            return Ok(());
+        }
+        if !stop_seqs.is_empty() || !logit_bias.is_empty() {
+            return Err(EngineError::InvalidRequest(
+                "stop/logit_bias unsupported in spec mode".into(),
+            ));
+        }
+        if params.temperature != 0.0
+            || params.top_k != 0
+            || params.top_p != 1.0
+            || params.presence_penalty != 0.0
+            || params.frequency_penalty != 0.0
+        {
+            return Err(EngineError::InvalidRequest(
+                "spec mode is greedy-only".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Submits a generation request; resolves when the sequence finishes.
@@ -91,6 +140,7 @@ impl ServerEngine {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::ShuttingDown);
         }
+        self.check_spec_request(&stop_seqs, &logit_bias, &params)?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
@@ -127,6 +177,7 @@ impl ServerEngine {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::ShuttingDown);
         }
+        self.check_spec_request(&stop_seqs, &logit_bias, &params)?;
         let (tx, rx) = oneshot::channel();
         let (tokens_tx, tokens_rx) = tokio::sync::mpsc::channel(256);
         {
@@ -168,6 +219,25 @@ impl ServerEngine {
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))
+            .expect("spawn engine thread"))
+    }
+
+    /// Spawns a speculative-decoding engine thread (greedy-only).
+    pub fn spawn_spec(
+        self: Arc<Self>,
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: Weights,
+        dcfg: Config,
+        dw: Weights,
+    ) -> Result<std::thread::JoinHandle<()>, EngineError> {
+        let k = self.spec_k;
+        let draft = BatchedModel::with_rows(hip.clone(), dcfg, &dw, self.capacity, self.capacity)?;
+        let target = BatchedModel::with_rows(hip, cfg, &w, self.capacity, self.capacity * (k + 1))?;
+        let mut engine = SpeculativeEngine::new(draft, target, k, self.capacity);
+        Ok(std::thread::Builder::new()
+            .name("mach-engine".into())
+            .spawn(move || self.run_spec(&mut engine))
             .expect("spawn engine thread"))
     }
 
@@ -228,6 +298,61 @@ impl ServerEngine {
                 }
             } else {
                 // Idle: wait for new work, or exit once shutting down.
+                let mut pending = self.pending.lock().unwrap();
+                if pending.is_empty() {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    while pending.is_empty() && !self.shutdown.load(Ordering::Acquire) {
+                        pending = self.cond.wait(pending).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Speculative-decoding engine loop (greedy-only; draft + target models).
+    fn run_spec(self: &Arc<Self>, engine: &mut SpeculativeEngine) {
+        loop {
+            // Admit pending requests while capacity allows.
+            {
+                let mut pending = self.pending.lock().unwrap();
+                let mut txs = self.txs.lock().unwrap();
+                let mut streams = self.streams.lock().unwrap();
+                while !pending.is_empty() && engine.active() < self.capacity {
+                    let r = pending.pop_front().expect("checked non-empty");
+                    let id = engine
+                        .add(&r.prompt, r.max_new, r.eos)
+                        .expect("capacity guaranteed") as SeqId;
+                    txs.insert(id, r.done);
+                    if let Some(stx) = r.tokens_tx {
+                        streams.insert(id, stx);
+                    }
+                }
+                drop(streams);
+            }
+            if engine.active() > 0 {
+                let outputs = engine.step().expect("spec step");
+                let mut txs = self.txs.lock().unwrap();
+                let mut streams = self.streams.lock().unwrap();
+                for (id, tok) in outputs {
+                    let id = id as SeqId;
+                    if engine.is_done(id as usize) {
+                        if let Some(stx) = streams.get(&id) {
+                            let _ = stx.try_send(tok);
+                        }
+                        let output = engine.generated(id as usize);
+                        let reason = engine.finish_reason(id as usize);
+                        if let Some(tx) = txs.remove(&id) {
+                            // Spec mode is greedy-only: no logprobs tracked.
+                            let _ = tx.send((output, Vec::new(), Vec::new(), reason));
+                        }
+                        streams.remove(&id);
+                    } else if let Some(stx) = streams.get(&id) {
+                        let _ = stx.try_send(tok);
+                    }
+                }
+            } else {
                 let mut pending = self.pending.lock().unwrap();
                 if pending.is_empty() {
                     if self.shutdown.load(Ordering::Acquire) {
