@@ -746,6 +746,12 @@ impl BatchedModel {
     /// Batched decode with explicit per-sequence lengths and a variable active
     /// count (`tokens.len()` may be <= capacity). The engine owns `lens`; this
     /// method does not touch the internal lens used by [`decode_step`](Self::decode_step).
+    /// Row capacity of the model (max rows per step).
+    #[must_use]
+    pub const fn row_capacity(&self) -> usize {
+        self.rows
+    }
+
     pub fn decode_step_explicit(
         &mut self,
         tokens: &[u32],

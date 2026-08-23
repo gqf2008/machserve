@@ -543,3 +543,14 @@
     stop 序列在验收后按接受 token 判断;
   - 验收:与现引擎输出逐 token 一致(连续批处理测试)+ 吞吐提升;工作量中等偏大,
     作为独立专项实施。
+
+- **P3an 批量 spec-decode 实现 + 验证(2026-08-23,7900 XTX)**:
+  - `SpeculativeBatch`(多序列):共享草稿/目标模型,草稿阶段每轮 m=活跃序列数批量
+    前向,验证阶段一次 `n*(k+1)` 行批量前向,每序列独立 argmax 验收;目标模型用
+    `with_rows(capacity, capacity*(k+1))` 满足验证行容量;
+  - prefill 分块化(`prefill_chunked`,按模型行容量)解决长 prompt 超行容量;
+    `BatchedModel::row_capacity()` 访问器;
+  - **验证**:tiny 模型 3 序列 × k=4 批量 spec-decode 与逐序列纯贪心**逐 token 一致**
+    (GPU 测试通过);全量 HIP 回归全绿;clippy/fmt 干净;
+  - 引擎集成路径已打通:验证行分块/扩容量、草稿推进按位置逐轮,均为连续批处理
+    集成所需的批处理原语。

@@ -148,3 +148,56 @@ fn spec_decode_full_accept_matches_plain_greedy() {
         );
     }
 }
+
+#[test]
+fn spec_decode_batch_matches_plain_greedy_per_sequence() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F32;
+    let dw = Weights::random(&cfg, 61).unwrap();
+    let tw = Weights::random(&cfg, 73).unwrap();
+    let capacity = 3usize;
+    let k = 4usize;
+    let prompts: Vec<Vec<u32>> = vec![vec![5, 9, 3, 200], vec![44, 88, 1, 300, 77], vec![2, 3, 4]];
+    let max_new = 8usize;
+
+    // Per-sequence plain-greedy references.
+    let mut wants = Vec::new();
+    for p in &prompts {
+        wants.push(plain_greedy(&hip, cfg, &tw, p, max_new));
+    }
+
+    let draft =
+        mach_model::batched::BatchedModel::with_rows(hip.clone(), cfg, &dw, capacity, capacity)
+            .unwrap();
+    let target = mach_model::batched::BatchedModel::with_rows(
+        hip.clone(),
+        cfg,
+        &tw,
+        capacity,
+        capacity * (k + 1),
+    )
+    .unwrap();
+    let mut batch = mach_model::speculative::SpeculativeBatch::new(draft, target, k, capacity);
+    for p in &prompts {
+        batch.add(p).unwrap();
+    }
+    let mut got: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    while got.iter().any(|g| g.len() < max_new) {
+        let accepted = batch.step().unwrap();
+        for (s, seq) in accepted.iter().enumerate() {
+            for &t in seq {
+                if got[s].len() < max_new {
+                    got[s].push(t);
+                }
+            }
+        }
+    }
+    for (s, p) in prompts.iter().enumerate() {
+        assert_eq!(
+            got[s], wants[s],
+            "batched spec-decode seq {s} (prompt {:?}) must equal plain greedy, got {:?} want {:?}",
+            p, got[s], wants[s]
+        );
+    }
+}

@@ -14,6 +14,26 @@ use crate::Error;
 use crate::batched::BatchedModel;
 use crate::sampling::SamplingParams;
 
+/// Prefills `prompt` into slot `slot` of `m`, chunked to the model's row
+/// capacity.
+fn prefill_chunked(m: &mut BatchedModel, slot: u32, prompt: &[u32]) -> Result<(), Error> {
+    let rows = m.row_capacity();
+    let mut pos = 0usize;
+    while pos < prompt.len() {
+        let take = (prompt.len() - pos).min(rows);
+        let lens: Vec<u32> = (0..take as u32)
+            .map(|i| (pos + i as usize) as u32)
+            .collect();
+        let slots = vec![slot; take];
+        let mut p = vec![SamplingParams::greedy(0); take];
+        let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); take];
+        let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); take];
+        m.decode_step_explicit(&prompt[pos..pos + take], &lens, &slots, &mut p, &ec, &eb)?;
+        pos += take;
+    }
+    Ok(())
+}
+
 /// Single-sequence speculative decoder (draft + target sharing one vocab).
 #[allow(clippy::len_without_is_empty)]
 pub struct SpeculativeDecoder {
@@ -37,14 +57,8 @@ impl SpeculativeDecoder {
     ) -> Result<Self, Error> {
         assert!(!prompt.is_empty(), "prompt must not be empty");
         assert!(k >= 1, "k must be >= 1");
-        let lens: Vec<u32> = (0..prompt.len() as u32).collect();
-        let slots = vec![0u32; prompt.len()];
-        let empty_counts: Vec<Vec<(u32, u32)>> = vec![Vec::new(); prompt.len()];
-        let empty_bias: Vec<Vec<(u32, f32)>> = vec![Vec::new(); prompt.len()];
-        let mut gp = vec![SamplingParams::greedy(0); prompt.len()];
-        target.decode_step_explicit(prompt, &lens, &slots, &mut gp, &empty_counts, &empty_bias)?;
-        let mut dp = vec![SamplingParams::greedy(0); prompt.len()];
-        draft.decode_step_explicit(prompt, &lens, &slots, &mut dp, &empty_counts, &empty_bias)?;
+        prefill_chunked(&mut target, 0, prompt)?;
+        prefill_chunked(&mut draft, 0, prompt)?;
         Ok(Self {
             draft,
             target,
@@ -121,5 +135,164 @@ impl SpeculativeDecoder {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
+    }
+}
+
+/// Batched (multi-sequence) speculative decoding.
+///
+/// One shared draft model + one shared target model; each sequence keeps its
+/// own context (draft_last, len). A spec round:
+///   1. draft: k batched forwards on the draft, one row per active sequence;
+///   2. verify: one batched forward on the target with `active*(k+1)` rows
+///      ([draft_last, c[0..k-1]] per sequence at its positions);
+///   3. accept per sequence (argmax, longest matching prefix) — output stays
+///      identical to plain greedy.
+///
+/// The target model must be built with `with_rows(capacity, capacity*(k+1))`
+/// so the verify rows fit; the draft needs `rows >= capacity`.
+pub struct SpeculativeBatch {
+    draft: BatchedModel,
+    target: BatchedModel,
+    k: usize,
+    /// Slots / capacity (one per sequence).
+    capacity: usize,
+    /// Per-sequence accepted context length.
+    lens: Vec<usize>,
+    /// Per-sequence token at position `len - 1`.
+    draft_last: Vec<u32>,
+}
+
+impl SpeculativeBatch {
+    /// Builds a batched speculative decoder for up to `capacity` sequences.
+    pub fn new(draft: BatchedModel, target: BatchedModel, k: usize, capacity: usize) -> Self {
+        assert!(k >= 1, "k must be >= 1");
+        assert!(capacity >= 1, "capacity must be >= 1");
+        Self {
+            draft,
+            target,
+            k,
+            capacity,
+            lens: Vec::new(),
+            draft_last: Vec::new(),
+        }
+    }
+
+    /// Prefills a new sequence (slot = current active count) in both models.
+    pub fn add(&mut self, prompt: &[u32]) -> Result<(), Error> {
+        assert!(!prompt.is_empty(), "prompt must not be empty");
+        assert!(self.lens.len() < self.capacity, "capacity reached");
+        let slot = self.lens.len();
+        prefill_chunked(&mut self.target, slot as u32, prompt)?;
+        prefill_chunked(&mut self.draft, slot as u32, prompt)?;
+        self.lens.push(prompt.len());
+        self.draft_last.push(*prompt.last().expect("non-empty"));
+        Ok(())
+    }
+
+    /// Active sequence count.
+    #[must_use]
+    pub fn active(&self) -> usize {
+        self.lens.len()
+    }
+
+    /// One speculative round for all active sequences; returns the accepted
+    /// tokens per sequence (>= 1 token each).
+    #[allow(clippy::needless_range_loop)] // parallel per-sequence arrays
+    pub fn step(&mut self) -> Result<Vec<Vec<u32>>, Error> {
+        let n = self.lens.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // 1. Draft k tokens per sequence (one batched row per sequence per
+        //    round).
+        let mut c: Vec<Vec<u32>> = vec![Vec::with_capacity(self.k); n];
+        for i in 0..self.k {
+            let mut toks = Vec::with_capacity(n);
+            let mut lens = Vec::with_capacity(n);
+            let mut slots = Vec::with_capacity(n);
+            let mut p = Vec::with_capacity(n);
+            for s in 0..n {
+                let input = if i == 0 {
+                    self.draft_last[s]
+                } else {
+                    c[s][i - 1]
+                };
+                toks.push(input);
+                lens.push((self.lens[s] - 1 + i) as u32);
+                slots.push(s as u32);
+                p.push(SamplingParams::greedy(0));
+            }
+            let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
+            let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
+            let out = self
+                .draft
+                .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
+            for s in 0..n {
+                c[s].push(out.0[s]);
+            }
+        }
+        // 2. Verify: `n * (k+1)` rows on the target.
+        let mut toks = Vec::with_capacity(n * (self.k + 1));
+        let mut lens = Vec::with_capacity(n * (self.k + 1));
+        let mut slots = Vec::with_capacity(n * (self.k + 1));
+        let mut p = Vec::with_capacity(n * (self.k + 1));
+        for s in 0..n {
+            for j in 0..=self.k {
+                let input = if j == 0 {
+                    self.draft_last[s]
+                } else {
+                    c[s][j - 1]
+                };
+                toks.push(input);
+                lens.push((self.lens[s] - 1 + j) as u32);
+                slots.push(s as u32);
+                p.push(SamplingParams::greedy(0));
+            }
+        }
+        let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n * (self.k + 1)];
+        let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n * (self.k + 1)];
+        let out = self
+            .target
+            .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
+        // pred[s][j] = target's guess for position len[s] + j.
+        let mut accepted = Vec::with_capacity(n);
+        for s in 0..n {
+            let base = s * (self.k + 1);
+            let mut a = 0usize;
+            while a < self.k && out.0[base + a] == c[s][a] {
+                a += 1;
+            }
+            let next = out.0[base + a];
+            let mut seq = c[s][..a].to_vec();
+            seq.push(next);
+            accepted.push(seq);
+        }
+        // 3. Advance the draft context with the accepted tokens, position by
+        //    position (<= active rows per call, fitting the draft capacity).
+        for j in 0..=self.k {
+            let mut toks = Vec::new();
+            let mut lens = Vec::new();
+            let mut slots = Vec::new();
+            for s in 0..n {
+                if let Some(&t) = accepted[s].get(j) {
+                    toks.push(t);
+                    lens.push((self.lens[s] + j) as u32);
+                    slots.push(s as u32);
+                }
+            }
+            if toks.is_empty() {
+                continue;
+            }
+            let mut p = vec![SamplingParams::greedy(0); toks.len()];
+            let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); toks.len()];
+            let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); toks.len()];
+            self.draft
+                .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
+        }
+        for s in 0..n {
+            self.lens[s] += accepted[s].len();
+            self.draft_last[s] = *accepted[s].last().expect("non-empty");
+        }
+        Ok(accepted)
     }
 }
