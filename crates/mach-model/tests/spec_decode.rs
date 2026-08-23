@@ -112,13 +112,39 @@ fn spec_decode_matches_plain_greedy() {
     // the greedy output identical).
     let dw = Weights::random(&cfg, 61).unwrap();
     let tw = Weights::random(&cfg, 73).unwrap();
+    for (prompt, n) in [
+        (vec![5u32, 9, 3, 200, 44, 88], 12usize),
+        (vec![1u32], 20usize),
+        (vec![300u32, 77, 5, 9, 3, 200, 44, 88, 1, 22, 333], 25usize),
+    ] {
+        let want = plain_greedy(&hip, cfg, &tw, &prompt, n);
+        for k in [1usize, 2, 4] {
+            let got = spec_decode(&hip, cfg, &dw, cfg, &tw, &prompt, n, k);
+            assert_eq!(
+                got,
+                want,
+                "spec-decode (prompt len {}, k={k}) must equal plain greedy, got {got:?} want {want:?}",
+                prompt.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn spec_decode_full_accept_matches_plain_greedy() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F32;
+    // Draft == target (same weights): every draft token is accepted, so the
+    // a == k full-accept path is exercised each round.
+    let w = Weights::random(&cfg, 61).unwrap();
     let prompt: Vec<u32> = vec![5, 9, 3, 200, 44, 88];
-    let want = plain_greedy(&hip, cfg, &tw, &prompt, 12);
+    let want = plain_greedy(&hip, cfg, &w, &prompt, 12);
     for k in [1usize, 2, 4] {
-        let got = spec_decode(&hip, cfg, &dw, cfg, &tw, &prompt, 12, k);
+        let got = spec_decode(&hip, cfg, &w, cfg, &w, &prompt, 12, k);
         assert_eq!(
             got, want,
-            "spec-decode (k={k}) must equal plain greedy, got {got:?} want {want:?}"
+            "spec-decode full-accept (k={k}) must equal plain greedy, got {got:?} want {want:?}"
         );
     }
 }
