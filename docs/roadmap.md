@@ -432,3 +432,13 @@
     (128 blocks)更慢——受单 block 串行工作/访存延迟主导,非并行度;
   - **下一步(留作专项)**:flash-decoding 式 **split-K**(位置分多个 block + 跨 block
     online-softmax 归并)或共享 K tile 化,目标单层 0.33 → 0.1 ms 级。
+
+- **P3ab split-K 去风险实验(2026-08-23,7900 XTX 真机)**:
+  - 临时把 GQA 内核改为 2-split(blockIdx.y 拆两个连续位置半区,每 block 半量工作、
+    2x block,不做跨区归并只计时):full 0.345 ms vs half 0.345 ms,**0x 加速**;
+  - **结论:split-K 被证伪**——每位置计算/字节总量不变时加 block 无收益,瓶颈不是
+    单 block 串行或并行度;
+  - 方向修正:瓶颈是**每位置的 compute 或 DRAM 效率**(单层 0.33ms、67MB、~190GB/s,
+    约 HBM 峰值的 20%);下一步应减少每位置计算(如两遍 softmax、softmax 权重按
+    (g,p) 缓存到共享避免 64x 冗余 exp/online 更新),而非拆位置;
+  - 临时变体与 probe 已清理,内核保持与已验证 2.6x 版本一致。
