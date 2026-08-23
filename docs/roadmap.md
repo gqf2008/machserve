@@ -354,3 +354,11 @@
   - **对拍**:GPU vs CPU `topk_cpu` 逐位置 token 完全一致、logprob 差 < 1e-3;
     服务器端到端测试(每位置 n 项、降序、无 logprobs 时忽略);默认 + HIP 全绿,
     clippy/fmt 干净;`chat_check` 真实模型输出不变。
+
+- **P3t OpenAI 请求校验 400(2026-08-23)**:
+  - `/v1/completions`、`/v1/chat/completions` 参数校验:非法请求返回 **400
+    `invalid_request_error`** JSON(`{"error": {message, type: invalid_request_error,
+    code: invalid_request}}`),而不是进入引擎:max_tokens=0、top_logprobs>20、n=0
+    或 n>128;`err_response` 泛化为支持任意状态码(503 引擎错误不变);
+  - 测试:无需 GPU(校验先于 submit,零容量引擎直接返回 400)的 3 例形状断言;
+    默认 + HIP 全绿,clippy/fmt 干净。

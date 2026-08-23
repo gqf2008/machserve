@@ -694,3 +694,60 @@ async fn top_logprobs_returned_when_requested() {
         "logprobs must be absent without logprobs: true"
     );
 }
+
+#[tokio::test]
+async fn invalid_request_returns_openai_error_json() {
+    // Validation happens before any engine work, so no GPU/model is needed
+    // (a zero-capacity engine never gets a chance to run).
+    let engine = ServerEngine::new(0);
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+    let cases = [
+        (
+            serde_json::json!({ "prompt": [1, 2, 3], "max_tokens": 0 }),
+            "max_tokens",
+        ),
+        (
+            serde_json::json!({
+                "prompt": [1, 2, 3],
+                "max_tokens": 4,
+                "logprobs": true,
+                "top_logprobs": 21,
+            }),
+            "top_logprobs",
+        ),
+        (
+            serde_json::json!({ "prompt": [1, 2, 3], "max_tokens": 4, "n": 0 }),
+            "n",
+        ),
+    ];
+    for (body, needle) in cases {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "case {needle}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "invalid_request");
+        assert!(
+            json["error"]["message"].as_str().unwrap().contains(needle),
+            "message should mention {needle}: {json}"
+        );
+    }
+}

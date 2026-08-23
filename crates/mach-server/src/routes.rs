@@ -177,7 +177,7 @@ fn now() -> u64 {
 }
 
 /// OpenAI-shaped error body: `{"error": {"message", "type", "code"}}`.
-fn err_response(message: &str, err_type: &str, code: &str) -> Response {
+fn err_response(status: StatusCode, message: &str, err_type: &str, code: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": message,
@@ -185,25 +185,70 @@ fn err_response(message: &str, err_type: &str, code: &str) -> Response {
             "code": code,
         }
     });
-    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    (status, Json(body)).into_response()
+}
+
+/// OpenAI-shaped 400 response for invalid request parameters.
+fn bad_request(message: &str) -> Response {
+    err_response(
+        StatusCode::BAD_REQUEST,
+        message,
+        "invalid_request_error",
+        "invalid_request",
+    )
+}
+
+/// Request-parameter limits (mirroring OpenAI's API surface).
+const MAX_N: usize = 128;
+const MAX_TOP_LOGPROBS: usize = 20;
+
+/// Validates request parameters; returns a 400 response for the first invalid
+/// one (OpenAI `invalid_request_error`).
+fn validate_request(
+    max_tokens: usize,
+    top_logprobs: Option<usize>,
+    n: Option<usize>,
+) -> Option<Response> {
+    if max_tokens == 0 {
+        return Some(bad_request("max_tokens must be greater than 0"));
+    }
+    if let Some(k) = top_logprobs
+        && k > MAX_TOP_LOGPROBS
+    {
+        return Some(bad_request(&format!(
+            "top_logprobs must be between 0 and {MAX_TOP_LOGPROBS}"
+        )));
+    }
+    if let Some(n) = n
+        && (n == 0 || n > MAX_N)
+    {
+        return Some(bad_request(&format!("n must be between 1 and {MAX_N}")));
+    }
+    None
 }
 
 /// Maps an engine submission error to an OpenAI-shaped 503 response.
 fn busy_response(e: EngineError) -> Response {
+    let status = StatusCode::SERVICE_UNAVAILABLE;
     match e {
         EngineError::Busy => err_response(
+            status,
             "engine capacity reached; retry later",
             "server_error",
             "engine_busy",
         ),
         EngineError::ShuttingDown => err_response(
+            status,
             "engine is shutting down; retry later",
             "server_error",
             "engine_shutting_down",
         ),
-        EngineError::Model(m) => {
-            err_response(&format!("model error: {m}"), "server_error", "model_error")
-        }
+        EngineError::Model(m) => err_response(
+            status,
+            &format!("model error: {m}"),
+            "server_error",
+            "model_error",
+        ),
     }
 }
 
@@ -418,6 +463,10 @@ pub async fn completions(
     let id = format!("cmpl-{}", now());
     let created = now();
 
+    if let Some(resp) = validate_request(req.max_tokens, req.top_logprobs, req.n) {
+        return resp;
+    }
+
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
@@ -546,6 +595,10 @@ pub async fn chat_completions(
     );
     let id = format!("chatcmpl-{}", now());
     let created = now();
+
+    if let Some(resp) = validate_request(req.max_tokens, req.top_logprobs, req.n) {
+        return resp;
+    }
 
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
