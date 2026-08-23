@@ -135,3 +135,51 @@ fn qwen3_batched_matches_cpu_reference() {
         }
     }
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn qwen3_gpu_f16_matches_fp32_argmax() {
+    use mach_kernel_sys::hip;
+    use mach_model::config::ModelDType;
+    use mach_model::model::GpuModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let cfg = qwen3_cfg();
+    let w = Weights::random(&cfg, 13).unwrap();
+    let tokens = [5u32, 9, 3, 200];
+
+    let mut m32 = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+    let l32 = m32.forward(&tokens).unwrap();
+    let mut cfg16 = cfg;
+    cfg16.dtype = ModelDType::F16;
+    let mut m16 = GpuModel::new(hip.clone(), cfg16, &w).unwrap();
+    let l16 = m16.forward(&tokens).unwrap();
+
+    let max = max_abs_diff(&l16, &l32);
+    let scale = l32.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        max <= 0.1 + 0.1 * scale,
+        "Qwen3 fp16 vs fp32 logit diff too large: {max} (scale {scale})"
+    );
+    let arg = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    assert_eq!(arg(&l16), arg(&l32), "fp16 greedy argmax must match fp32");
+}

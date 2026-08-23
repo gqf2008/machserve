@@ -258,6 +258,18 @@ impl BatchedModel {
         Ok(p as *mut u16)
     }
 
+    /// Allocates + uploads an f32 matrix, or returns null on the F16 path
+    /// (fp16 weights live in `LayerDevF16`; the f32 copy is not needed).
+    fn upload_mat32(&mut self, src: &[f32], f16: bool) -> Result<*mut f32, Error> {
+        if f16 {
+            Ok(std::ptr::null_mut())
+        } else {
+            let p = self.dalloc(src.len() * 4)?;
+            self.upload(p, src)?;
+            Ok(p)
+        }
+    }
+
     fn alloc_buffers(&mut self) -> Result<(), Error> {
         let c = self.cfg;
         let b = self.rows; // row buffers sized for the prefill row capacity
@@ -366,12 +378,11 @@ impl BatchedModel {
         let d = c.d_model;
         let nq = c.n_heads * c.head_dim;
         let nkv = c.n_kv_heads * c.head_dim;
-        self.emb_dev = self.dalloc(w.tok_emb.len() * 4)?;
+        let f16 = c.dtype == ModelDType::F16;
+        self.emb_dev = self.upload_mat32(&w.tok_emb, f16)?;
         self.rms_final_dev = self.dalloc(w.rms_final.len() * 4)?;
-        self.lm_head_dev = self.dalloc(w.lm_head.len() * 4)?;
-        self.upload(self.emb_dev, &w.tok_emb)?;
+        self.lm_head_dev = self.upload_mat32(&w.lm_head, f16)?;
         self.upload(self.rms_final_dev, &w.rms_final)?;
-        self.upload(self.lm_head_dev, &w.lm_head)?;
         if c.dtype == ModelDType::F16 {
             self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
             self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
@@ -380,14 +391,14 @@ impl BatchedModel {
         }
         for lw in &w.layers {
             let l = LayerDev {
-                wq: self.dalloc(lw.wq.len() * 4)?,
-                wk: self.dalloc(lw.wk.len() * 4)?,
-                wv: self.dalloc(lw.wv.len() * 4)?,
-                wo: self.dalloc(lw.wo.len() * 4)?,
+                wq: self.upload_mat32(&lw.wq, f16)?,
+                wk: self.upload_mat32(&lw.wk, f16)?,
+                wv: self.upload_mat32(&lw.wv, f16)?,
+                wo: self.upload_mat32(&lw.wo, f16)?,
                 rms_attn: self.dalloc(lw.rms_attn.len() * 4)?,
-                wg: self.dalloc(lw.wg.len() * 4)?,
-                wu: self.dalloc(lw.wu.len() * 4)?,
-                wd: self.dalloc(lw.wd.len() * 4)?,
+                wg: self.upload_mat32(&lw.wg, f16)?,
+                wu: self.upload_mat32(&lw.wu, f16)?,
+                wd: self.upload_mat32(&lw.wd, f16)?,
                 rms_mlp: self.dalloc(lw.rms_mlp.len() * 4)?,
                 bq: if lw.bq.is_empty() {
                     std::ptr::null_mut()
@@ -453,14 +464,7 @@ impl BatchedModel {
                     p
                 },
             };
-            self.upload(l.wq, &lw.wq)?;
-            self.upload(l.wk, &lw.wk)?;
-            self.upload(l.wv, &lw.wv)?;
-            self.upload(l.wo, &lw.wo)?;
             self.upload(l.rms_attn, &lw.rms_attn)?;
-            self.upload(l.wg, &lw.wg)?;
-            self.upload(l.wu, &lw.wu)?;
-            self.upload(l.wd, &lw.wd)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
             let _ = (d, nq, nkv);
             self.layers_dev.push(l);
