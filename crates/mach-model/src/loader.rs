@@ -154,11 +154,52 @@ fn bf16_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
-/// Loads a safetensors checkpoint into [`Weights`], mapping Llama/Qwen-style
-/// tensor names onto the slice layout. `tie_embeddings` reuses the embedding
-/// matrix for the LM head when no `lm_head.weight` is present.
+/// Loads a single safetensors checkpoint into [`Weights`].
 pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Result<Weights, Error> {
     let (tensors, data) = parse_safetensors(path)?;
+    build_weights(&tensors, &data, cfg, tie_embeddings)
+}
+
+/// Loads every `*.safetensors` shard in `path` and merges them into one
+/// [`Weights`] (Qwen-8B+ checkpoints ship as 5..65 shards; per-file tensor
+/// offsets are rebased onto the concatenated data section).
+pub fn load_safetensors_dir(
+    path: &Path,
+    cfg: &Config,
+    tie_embeddings: bool,
+) -> Result<Weights, Error> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+        .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(Error::Model(format!("no .safetensors files in {path:?}")));
+    }
+    let mut tensors = HashMap::new();
+    let mut data = Vec::new();
+    for f in &files {
+        let (mut t, d) = parse_safetensors(f)?;
+        let base = data.len();
+        for rt in t.values_mut() {
+            rt.start += base;
+            rt.end += base;
+        }
+        tensors.extend(t);
+        data.extend(d);
+    }
+    build_weights(&tensors, &data, cfg, tie_embeddings)
+}
+
+/// Builds [`Weights`] from a merged tensor map (single file or shards).
+fn build_weights(
+    tensors: &HashMap<String, RawTensor>,
+    data: &[u8],
+    cfg: &Config,
+    tie_embeddings: bool,
+) -> Result<Weights, Error> {
     let d = cfg.d_model;
     let nq = cfg.n_heads * cfg.head_dim;
     let nkv = cfg.n_kv_heads * cfg.head_dim;
@@ -169,13 +210,13 @@ pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Resu
         if !tensors.contains_key(name) {
             return Ok(Vec::new());
         }
-        tensor_f32(&data, &tensors[name], expected, name)
+        tensor_f32(data, &tensors[name], expected, name)
     };
     let get = |name: &str, expected: usize| -> Result<Vec<f32>, Error> {
         let t = tensors
             .get(name)
             .ok_or_else(|| Error::Model(format!("missing tensor {name}")))?;
-        tensor_f32(&data, t, expected, name)
+        tensor_f32(data, t, expected, name)
     };
 
     let tok_emb = get("model.embed_tokens.weight", cfg.vocab_size * d)?;

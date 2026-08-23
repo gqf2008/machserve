@@ -5,7 +5,7 @@
 //! weights and (with the `hip` feature) that a GPU model built from the loaded
 //! weights decodes identically to the CPU reference.
 
-use mach_model::loader::load_safetensors;
+use mach_model::loader::{load_safetensors, load_safetensors_dir};
 use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
@@ -228,4 +228,50 @@ fn loaded_weights_decode_matches_cpu_reference() {
         "loaded-weights GPU vs CPU: max diff {max} (scale {scale})"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn sharded_load_matches_single_file() {
+    let cfg = Config::tiny();
+    let tensors = tensor_names(&cfg);
+    // Split the tensor list across two shard files; offsets are per-file and
+    // must be rebased by the directory loader.
+    let mid = tensors.len() / 2;
+    let (first, second) = tensors.split_at(mid);
+    let dir = std::env::temp_dir().join("machserve-shards");
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("model-00001-of-00002.safetensors");
+    let p2 = dir.join("model-00002-of-00002.safetensors");
+    let flat1: Vec<(&str, &[f32], &[usize])> = first
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    let flat2: Vec<(&str, &[f32], &[usize])> = second
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&p1, &flat1);
+    write_safetensors(&p2, &flat2);
+
+    let loaded = load_safetensors_dir(&dir, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+
+    assert_eq!(max_abs_diff(&loaded.tok_emb, &original.tok_emb), 0.0);
+    assert_eq!(max_abs_diff(&loaded.rms_final, &original.rms_final), 0.0);
+    assert_eq!(max_abs_diff(&loaded.lm_head, &original.lm_head), 0.0);
+    for (li, (a, b)) in loaded.layers.iter().zip(&original.layers).enumerate() {
+        assert_eq!(max_abs_diff(&a.wq, &b.wq), 0.0, "layer {li} wq");
+        assert_eq!(max_abs_diff(&a.wk, &b.wk), 0.0, "layer {li} wk");
+        assert_eq!(max_abs_diff(&a.wv, &b.wv), 0.0, "layer {li} wv");
+        assert_eq!(max_abs_diff(&a.wo, &b.wo), 0.0, "layer {li} wo");
+        assert_eq!(max_abs_diff(&a.wg, &b.wg), 0.0, "layer {li} wg");
+        assert_eq!(max_abs_diff(&a.wu, &b.wu), 0.0, "layer {li} wu");
+        assert_eq!(max_abs_diff(&a.wd, &b.wd), 0.0, "layer {li} wd");
+        assert_eq!(max_abs_diff(&a.rms_attn, &b.rms_attn), 0.0);
+        assert_eq!(max_abs_diff(&a.rms_mlp, &b.rms_mlp), 0.0);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
