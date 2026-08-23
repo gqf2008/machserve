@@ -112,13 +112,59 @@ impl BandwidthProbe {
     }
 }
 
+/// Realtime q* profile: continually folds newly-measured PCIe bandwidth samples
+/// into a smoothed estimate so that, when the bus is contended (bandwidth drops),
+/// the per-miss decision flips to CPU, and recovers only gradually on the CPU
+/// (or as the bus frees).
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveProfile {
+    current: BandwidthProfile,
+    /// EMA weight for a degrading (slower) sample; recovery uses 0.25.
+    alpha: f64,
+}
+
+impl AdaptiveProfile {
+    #[must_use]
+    pub fn new(pcie_bytes_per_sec: f64, cpu_expert_sec: f64, alpha: f64) -> Self {
+        Self {
+            current: BandwidthProfile {
+                pcie_bytes_per_sec,
+                cpu_expert_sec,
+            },
+            alpha,
+        }
+    }
+
+    /// Folds a freshly-measured PCIe sample into the estimate. Degradation
+    /// (contention) reacts at `alpha`; recovery (bandwidth back) is slower (0.25),
+    /// so a burst of I/O promptly shifts work to CPU but does not thrash.
+    pub fn observe(&mut self, sample_bytes_per_sec: f64) {
+        let w = if sample_bytes_per_sec < self.current.pcie_bytes_per_sec {
+            self.alpha
+        } else {
+            0.25
+        };
+        let cur = self.current.pcie_bytes_per_sec;
+        self.current.pcie_bytes_per_sec = cur * (1.0 - w) + sample_bytes_per_sec * w;
+    }
+
+    #[must_use]
+    pub fn profile(&self) -> BandwidthProfile {
+        self.current
+    }
+
+    /// Per-miss decision under the current (possibly contended) estimate.
+    pub fn choose(&self, expert_bytes: usize) -> FetchChoice {
+        self.current.choose(expert_bytes)
+    }
+}
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn high_bandwidth_prefers_gpu() {
-        // 10 GB/s PCIe, 96 KiB expert -> fetch ~9.8us; CPU 100us is slower -> GPU.
         let prof = BandwidthProfile {
             pcie_bytes_per_sec: 10_000_000_000.0,
             cpu_expert_sec: 100e-6,
@@ -128,8 +174,6 @@ mod tests {
 
     #[test]
     fn contended_bus_prefers_cpu() {
-        // 100 MB/s PCIe (bus contended), 96 KiB expert -> fetch ~0.98ms; CPU 10us is
-        // cheaper -> compute on CPU (this is the q* behavior under a saturated bus).
         let prof = BandwidthProfile {
             pcie_bytes_per_sec: 100_000_000.0,
             cpu_expert_sec: 10e-6,
@@ -143,7 +187,31 @@ mod tests {
             pcie_bytes_per_sec: 0.0,
             cpu_expert_sec: 1e-6,
         };
-        // max(1.0) guard: fetch_sec is huge, so CPU wins (no division by zero).
         assert_eq!(prof.choose(96 * 1024), FetchChoice::ComputeCpu);
+    }
+
+    #[test]
+    fn realtime_contention_flips_choice_to_cpu() {
+        let mut q = AdaptiveProfile::new(10_000_000_000.0, 10e-6, 0.9);
+        assert_eq!(q.choose(96 * 1024), FetchChoice::FetchGpu);
+        q.observe(100_000_000.0);
+        assert_eq!(q.choose(96 * 1024), FetchChoice::ComputeCpu);
+    }
+
+    #[test]
+    fn realtime_recovery_is_slower() {
+        let mut q = AdaptiveProfile::new(100_000_000.0, 30e-6, 0.9);
+        q.observe(10_000_000_000.0);
+        assert_eq!(q.choose(96 * 1024), FetchChoice::ComputeCpu);
+        q.observe(10_000_000_000.0);
+        q.observe(10_000_000_000.0);
+        assert_eq!(q.choose(96 * 1024), FetchChoice::FetchGpu);
+    }
+
+    #[test]
+    fn zero_bandwidth_observe_is_safe() {
+        let mut q = AdaptiveProfile::new(10e6, 1e-6, 0.5);
+        q.observe(0.0);
+        assert_eq!(q.choose(96 * 1024), FetchChoice::ComputeCpu);
     }
 }
