@@ -47,8 +47,11 @@ struct LayerDevF16 {
 /// Multi-sequence transformer on the GPU.
 pub struct BatchedModel {
     cfg: Config,
-    /// Max sequences per step.
+    /// KV slot capacity (concurrent sequences).
     batch: usize,
+    /// Row capacity (>= batch): prefill may pack more prompt positions than
+    /// there are slots; all rows of one sequence share its slot.
+    rows: usize,
     k: Arc<HipKernels>,
     sampler: BatchedSampler,
     // device inputs
@@ -106,12 +109,26 @@ pub struct BatchedModel {
 impl BatchedModel {
     /// Builds a batched model for `batch` sequences and uploads `w`.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights, batch: usize) -> Result<Self, Error> {
-        assert!(batch >= 1, "batch must be >= 1");
+        Self::with_rows(hip, cfg, w, batch, batch)
+    }
+
+    /// Builds a batched model with `slots` KV slots and `rows` row capacity
+    /// (`rows >= slots`; prefill can pack more prompt positions per step).
+    pub fn with_rows(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        assert!(slots >= 1, "slots must be >= 1");
+        assert!(rows >= slots, "rows must be >= slots");
         let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
-        let sampler = BatchedSampler::new(Arc::clone(&hip), k.stream, batch)?;
+        let sampler = BatchedSampler::new(Arc::clone(&hip), k.stream, rows)?;
         let mut m = Self {
             cfg,
-            batch,
+            batch: slots,
+            rows,
             k,
             sampler,
             tokens_dev: std::ptr::null_mut(),
@@ -148,7 +165,7 @@ impl BatchedModel {
             xh: std::ptr::null_mut(),
             yh: std::ptr::null_mut(),
             kv_cache: Vec::new(),
-            lens: vec![0; batch],
+            lens: vec![0; slots],
             allocs: Vec::new(),
             host_pins: Vec::new(),
         };
@@ -194,7 +211,7 @@ impl BatchedModel {
 
     fn alloc_buffers(&mut self) -> Result<(), Error> {
         let c = self.cfg;
-        let b = self.batch;
+        let b = self.rows; // row buffers sized for the prefill row capacity
         let d = c.d_model;
         let nq = c.n_heads * c.head_dim;
         let nkv = c.n_kv_heads * c.head_dim;
@@ -255,7 +272,8 @@ impl BatchedModel {
         self.host_pins.push(oh);
 
         let kv_elem = if c.dtype == ModelDType::F16 { 2 } else { 4 };
-        let kv_bytes = b * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
+        // KV caches are sized by the slot count, not the row capacity.
+        let kv_bytes = self.batch * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
         for _ in 0..c.n_layers {
             let kk = self.dalloc(kv_bytes)?;
             let vv = self.dalloc(kv_bytes)?;
@@ -740,7 +758,7 @@ impl BatchedModel {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
-        assert!(n <= self.batch, "active count exceeds capacity");
+        assert!(n <= self.rows, "active count exceeds row capacity");
         // Prefill-attention runs are currently disabled: the naive shared-KV
         // kernel is occupancy-bound and slower than decode attention on this
         // GPU (see roadmap). All rows use decode attention (run_mask = 0).

@@ -6,7 +6,8 @@
 //!
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
-//! MACH_CAPACITY (default 64), MACH_ADDR (default "127.0.0.1:8080").
+//! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 256),
+//! MACH_ADDR (default "127.0.0.1:8080").
 
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
@@ -59,6 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
+    let prefill_rows = std::env::var("MACH_PREFILL_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -95,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let engine = ServerEngine::new(capacity);
+    let engine = ServerEngine::with_prefill_rows(capacity, prefill_rows);
     let engine_handle = engine.clone().spawn(hip, cfg, w)?;
     let state = AppState {
         engine: engine.clone(),
@@ -104,7 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("mach-server listening on http://{addr} (capacity {capacity})");
+    println!(
+        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows})"
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;

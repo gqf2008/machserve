@@ -73,6 +73,8 @@ struct FinishedSeq {
 /// Continuous-batching engine over a fixed-capacity batched model.
 pub struct ContinuousModel {
     model: BatchedModel,
+    /// Rows consumed per prefill step (>= capacity for chunked prefill).
+    prefill_rows: usize,
     /// Active slot state; active slots always occupy `[0, active)`.
     seqs: Vec<Option<SeqState>>,
     active: usize,
@@ -86,9 +88,23 @@ unsafe impl Send for ContinuousModel {}
 impl ContinuousModel {
     /// Builds an engine with `capacity` concurrent sequence slots.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights, capacity: usize) -> Result<Self, Error> {
-        let model = BatchedModel::new(hip, cfg, w, capacity)?;
+        Self::with_prefill_rows(hip, cfg, w, capacity, capacity)
+    }
+
+    /// Builds an engine with `capacity` slots and `prefill_rows` rows per
+    /// prefill step (`>= capacity`): longer prompts prefill in fewer, larger
+    /// steps).
+    pub fn with_prefill_rows(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        capacity: usize,
+        prefill_rows: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_rows(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
         Ok(Self {
             model,
+            prefill_rows: prefill_rows.max(capacity),
             seqs: (0..capacity).map(|_| None).collect(),
             active: 0,
             finished: Vec::new(),
@@ -175,7 +191,7 @@ impl ContinuousModel {
         let mut row_bias: Vec<Vec<(u32, f32)>> = Vec::new();
         // (row_start, row_count, was_prefill) per active slot.
         let mut rows: Vec<(usize, usize, bool)> = Vec::with_capacity(self.active);
-        let mut budget = self.capacity();
+        let mut budget = self.prefill_rows;
         for i in 0..self.active {
             let s = self.seqs[i].as_ref().expect("active slot");
             if budget == 0 {

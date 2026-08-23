@@ -13,7 +13,7 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | **decode 吞吐(B=512)** | **35251 tok/s ≈ llama.cpp Vulkan(643 tok/s)的 55x** |
 | decode 吞吐(B=64,短 ctx) | 12887 tok/s(4.97 ms/step) |
 | **长 context decode(2048)** | **13.40 ms/step(4778 tok/s/seq,GQA 复用 2.6x)** |
-| **长 prompt TTFT** | 512-token 57ms / 2048-token 289ms(分块 prefill) |
+| **长 prompt TTFT** | 512-token 57ms / 2048-token 289ms(分块 prefill;`MACH_PREFILL_ROWS=256` 默认,长 prompt -25~34%) |
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |
 | **OpenAI API** | completions / chat / SSE / 采样全参数 / top_logprobs / stop / n / usage |
@@ -48,7 +48,8 @@ thirdparty/        第三方参考代码(占位)
 - **fp16 计算**:权重/激活/GEMM 输入 fp16、fp32 累加(hipBLAS `GemmEx_v2`);
   隐藏层 GEMM 输出 fp16 + cast(瘦长形状 c16 比 c32 快 3-4x);**fp16 KV cache**。
 - **连续批处理**:序列生命周期(prefill/decode 混合、EOS/max_new、槽位压缩复用)。
-- **分块 prefill**:每步消费最多 `capacity` 个 prompt tokens,长 prompt TTFT 降 ~58x。
+- **分块 prefill**:每步消费最多 `capacity` 个 prompt tokens,长 prompt TTFT 降 ~58x;
+  行批量与 KV 槽位解耦(`MACH_PREFILL_ROWS`,默认 256),长 prompt 再降 25-34%。
 - **GPU 采样**:top-k / top-p / temperature,确定性 SplitMix64 RNG,CPU 参考可对拍。
 - **真实 tokenizer**:字节级 BPE(Qwen2.5/Llama),与 HF tokenizers 逐 token 对拍一致。
 - **SSE 流式**:`stream: true` → 逐 token delta + `[DONE]`,增量 UTF-8 跨 token 不分裂。

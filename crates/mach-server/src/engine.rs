@@ -34,6 +34,8 @@ type DoneReceiver = oneshot::Receiver<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>,
 /// thread).
 pub struct ServerEngine {
     capacity: usize,
+    /// Rows per prefill step (>= capacity; larger = faster long-prompt TTFT).
+    prefill_rows: usize,
     pending: Mutex<VecDeque<Request>>,
     cond: Condvar,
     txs: Mutex<HashMap<SeqId, DoneSender>>,
@@ -58,8 +60,16 @@ impl ServerEngine {
     /// Creates an engine handle with `capacity` concurrent sequences.
     #[must_use]
     pub fn new(capacity: usize) -> Arc<Self> {
+        Self::with_prefill_rows(capacity, capacity)
+    }
+
+    /// Creates an engine handle with `capacity` slots and `prefill_rows` rows
+    /// per prefill step.
+    #[must_use]
+    pub fn with_prefill_rows(capacity: usize, prefill_rows: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
+            prefill_rows: prefill_rows.max(capacity),
             pending: Mutex::new(VecDeque::new()),
             cond: Condvar::new(),
             txs: Mutex::new(HashMap::new()),
@@ -153,7 +163,8 @@ impl ServerEngine {
         cfg: Config,
         w: Weights,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
-        let mut model = ContinuousModel::new(hip, cfg, &w, self.capacity)?;
+        let mut model =
+            ContinuousModel::with_prefill_rows(hip, cfg, &w, self.capacity, self.prefill_rows)?;
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))

@@ -473,3 +473,14 @@
   - **结论**:进一步优化需要 rocprof 级剖析或全新算法结构,黑盒实验已到边际;
     2.6x GQA 复用为已落地收益,长 context decode 34.8→13.4 ms/step;
   - v2 临时变体与 probe 已清理,内核保持 2.6x 已验证版。
+
+- **P3ag prefill 行批量解耦 + TTFT 提速(2026-08-23,7900 XTX 真机)**:
+  - BatchedModel 解耦 **行容量(rows)与 KV 槽位(slots)**:`with_rows(slots, rows)`;
+    ContinuousModel/ServerEngine 加 `with_prefill_rows` / `MACH_PREFILL_ROWS`(服务器
+    默认 256);连续引擎 step() 的 prefill 预算用 prefill_rows,长 prompt 每步打包更多
+    提示位置、步数变少、GEMM m 更大;
+  - **实测(Qwen 0.5B f16, capacity 64, 生成 8 token 的总耗时)**:
+    512-token 98.5→**73.9 ms**(-25%)、2048-token 371→**244.6 ms**(-34%);
+  - **正确性**:prefill_rows=256 与默认生成结果逐 token 完全一致(parity MATCH +
+    committed 测试 `prefill_rows_gives_identical_output`);默认 + HIP 全量回归全绿;
+  - 内存影响:行缓冲区按 rows 分配(KV 仍按 slots),0.5B rows=256 约 +250MB,可忽略。

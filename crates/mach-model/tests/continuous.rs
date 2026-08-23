@@ -387,3 +387,40 @@ fn stop_sequence_terminates_generation() {
     }
     assert_eq!(eng3.finish_reason(id3), "length");
 }
+
+#[test]
+fn prefill_rows_gives_identical_output() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 67).unwrap();
+    // A prompt long enough to need several prefill steps at capacity 2.
+    let prompt: Vec<u32> = (0..40).map(|i| (i % 977) as u32).collect();
+
+    let run = |prefill_rows: usize| -> Vec<u32> {
+        let mut eng =
+            ContinuousModel::with_prefill_rows(hip.clone(), cfg, &w, 2, prefill_rows).unwrap();
+        let id = eng
+            .add(
+                &prompt,
+                6,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        let mut steps = 0usize;
+        while !eng.is_done(id) {
+            eng.step().unwrap();
+            steps += 1;
+        }
+        let g = eng.generated(id);
+        eprintln!("prefill_rows={prefill_rows}: {steps} steps -> {g:?}");
+        g
+    };
+
+    let base = run(2); // default: one row per step of capacity 2
+    let big = run(8); // larger prefill rows: fewer, wider steps
+    assert!(!base.is_empty());
+    assert_eq!(base, big, "prefill_rows must not change generated output");
+}
