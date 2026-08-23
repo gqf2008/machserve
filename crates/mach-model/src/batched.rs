@@ -1409,6 +1409,37 @@ impl BatchedModel {
                 hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
             )?;
         }
+        // MLA (kv_lora_rank > 0) keeps its expanded per-head KV in a separate
+        // cache; compaction must move it with the slot or the sequence's KV
+        // silently points at the wrong slot after a lower slot finishes.
+        if !self.mla_kv_cache.is_empty() {
+            let c = self.cfg;
+            let heads = c.n_heads;
+            let k_row = c.max_seq_len * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_row = c.max_seq_len * heads * c.v_head_dim * 4;
+            let k_bytes = len * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_bytes = len * heads * c.v_head_dim * 4;
+            for (kc, vc) in &self.mla_kv_cache {
+                let src_k = (*kc as usize + from * k_row) as *const core::ffi::c_void;
+                let dst_k = (*kc as usize + to * k_row) as *mut core::ffi::c_void;
+                let src_v = (*vc as usize + from * v_row) as *const core::ffi::c_void;
+                let dst_v = (*vc as usize + to * v_row) as *mut core::ffi::c_void;
+                hip::memcpy(
+                    self.k.hip(),
+                    dst_k,
+                    src_k,
+                    k_bytes,
+                    hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+                )?;
+                hip::memcpy(
+                    self.k.hip(),
+                    dst_v,
+                    src_v,
+                    v_bytes,
+                    hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+                )?;
+            }
+        }
         Ok(())
     }
 
