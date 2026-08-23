@@ -201,3 +201,116 @@ fn spec_decode_batch_matches_plain_greedy_per_sequence() {
         );
     }
 }
+
+/// EOS/max_new-aware plain greedy reference (emit-then-predict).
+fn plain_greedy_eos(
+    hip: &std::sync::Arc<hip::Hip>,
+    cfg: Config,
+    w: &Weights,
+    prompt: &[u32],
+    max_new: usize,
+    eos: Option<u32>,
+) -> Vec<u32> {
+    let mut m = BatchedModel::new(hip.clone(), cfg, w, 64).unwrap();
+    let lens: Vec<u32> = (0..prompt.len() as u32).collect();
+    let slots = vec![0u32; prompt.len()];
+    let mut gp = vec![SamplingParams::greedy(0); prompt.len()];
+    m.decode_step_explicit(
+        prompt,
+        &lens,
+        &slots,
+        &mut gp,
+        &vec![Vec::new(); prompt.len()],
+        &vec![Vec::new(); prompt.len()],
+    )
+    .unwrap();
+    let mut rnext = m
+        .decode_step_explicit(
+            &[prompt[prompt.len() - 1]],
+            &[(prompt.len() - 1) as u32],
+            &[0],
+            &mut [SamplingParams::greedy(0)],
+            &vec![Vec::new(); 1],
+            &vec![Vec::new(); 1],
+        )
+        .unwrap()
+        .0[0];
+    let mut out = Vec::new();
+    for rpos in prompt.len()..prompt.len() + max_new {
+        if eos.is_some_and(|e| rnext == e) {
+            break;
+        }
+        out.push(rnext);
+        let mut p = [SamplingParams::greedy(0)];
+        rnext = m
+            .decode_step_explicit(
+                &[rnext],
+                &[rpos as u32],
+                &[0],
+                &mut p,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+            )
+            .unwrap()
+            .0[0];
+    }
+    out
+}
+
+#[test]
+fn spec_decode_batch_lifecycle_matches_plain_greedy() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F32;
+    let dw = Weights::random(&cfg, 61).unwrap();
+    let tw = Weights::random(&cfg, 73).unwrap();
+    let capacity = 3usize;
+    let k = 4usize;
+    let eos = Some(77u32);
+    let jobs: Vec<(Vec<u32>, usize)> = vec![
+        (vec![5, 9, 3, 200], 10usize),
+        (vec![44, 88, 1], 8usize),
+        (vec![2, 3, 4, 5], 12usize),
+    ];
+
+    let mut wants = Vec::new();
+    for (p, n) in &jobs {
+        wants.push(plain_greedy_eos(&hip, cfg, &tw, p, *n, eos));
+    }
+
+    let draft = BatchedModel::with_rows(hip.clone(), cfg, &dw, capacity, capacity).unwrap();
+    let target =
+        BatchedModel::with_rows(hip.clone(), cfg, &tw, capacity, capacity * (k + 1)).unwrap();
+    let mut batch = mach_model::speculative::SpeculativeBatch::new(draft, target, k, capacity);
+    for (p, _) in &jobs {
+        batch.add(p).unwrap();
+    }
+    let mut got: Vec<Vec<u32>> = vec![Vec::new(); jobs.len()];
+    let mut done = vec![false; jobs.len()];
+    while !done.iter().all(|&d| d) {
+        let accepted = batch.step().unwrap();
+        for (s, seq) in accepted.iter().enumerate() {
+            if done[s] {
+                continue;
+            }
+            for &t in seq {
+                if got[s].len() >= jobs[s].1 {
+                    done[s] = true;
+                    break;
+                }
+                if eos.is_some_and(|e| t == e) {
+                    done[s] = true;
+                    break;
+                }
+                got[s].push(t);
+            }
+        }
+    }
+    for (s, (p, _)) in jobs.iter().enumerate() {
+        assert_eq!(
+            got[s], wants[s],
+            "batch lifecycle seq {s} (prompt {p:?}) must equal plain greedy, got {:?} want {:?}",
+            got[s], wants[s]
+        );
+    }
+}

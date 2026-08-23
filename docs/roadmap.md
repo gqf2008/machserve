@@ -554,3 +554,11 @@
     (GPU 测试通过);全量 HIP 回归全绿;clippy/fmt 干净;
   - 引擎集成路径已打通:验证行分块/扩容量、草稿推进按位置逐轮,均为连续批处理
     集成所需的批处理原语。
+
+- **P3ao spec-decode 生成生命周期验证(2026-08-23,7900 XTX)**:
+  - 验证 `SpeculativeBatch` 走完整 serving 生命周期:prefill → spec 轮 → 每序列
+    EOS/stop/max_new 终止,与纯贪心(EOS/max_new 感知)逐 token 一致;
+  - 新增生命周期测试(3 序列、各自 max_new、EOS=77):GPU 通过;全量 HIP 回归全绿,
+    clippy/fmt 干净;
+  - 引擎集成的生命周期模式已实证(终止判定在验收 token 上进行),下一步是把
+    `SpeculativeBatch` 接入 `ContinuousModel`(连续批处理 + 槽位复用)。
