@@ -569,3 +569,10 @@
     (None=已完成)——连续批处理集成必需(避免对已完成序列浪费算力,支持槽位复用);
   - 生命周期测试改用 `finish()` + `active()>0` 驱动,验证跳过逻辑正确;
     全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3aq FP8 可行性探针(2026-08-23,7900 XTX)**:
+  - 加 `gemm_ex_fp8_probe`(E4M3 量化 + `hipblasGemmEx` fp8×fp8→f32):**hipBLAS 拒绝
+    fp8**(错误 "profiler already started",fp8 专属;fp16 探针同设置正常);
+  - **结论:gfx1100 + Windows ROCm 6.2 下 hipBLAS 原生 fp8 GEMM 不可用**,原生 fp8
+    路径需自定义 hiprtc fp8 内核(大投入、收益未验证),或等 ROCm 更新;
+  - 探针测试保留为回归证据(`mach-kernel-sys` lib 测试,含 fp8 常量 30/31)。

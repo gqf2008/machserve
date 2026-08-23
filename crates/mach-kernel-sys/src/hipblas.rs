@@ -16,6 +16,9 @@ pub const HIPBLAS_OP_C: i32 = 113;
 pub const HIPBLAS_R_32F: i32 = 0;
 pub const HIPBLAS_R_16F: i32 = 2;
 pub const HIPBLAS_R_16B: i32 = 14;
+/// fp8 E4M3 / E5M2 (`hipDataType` values; support on gfx1100 is probe-tested).
+pub const HIPBLAS_R_8F_E4M3: i32 = 30;
+pub const HIPBLAS_R_8F_E5M2: i32 = 31;
 /// hipblasComputeType_t: at least 32-bit precision.
 pub const HIPBLAS_COMPUTE_32F: i32 = 2;
 /// hipblasGemmAlgo_t: default.
@@ -638,5 +641,150 @@ mod tests {
         hip::free(&h, dc).unwrap();
         unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
         eprintln!("gemm_ex fp16 probe OK");
+    }
+
+    /// fp8 (E4M3) GEMM probe: quantize weights/activations to fp8 with a
+    /// per-tensor scale and run `hipblasGemmEx`. The KEY signal is whether
+    /// hipBLAS accepts fp8 on this GPU: an error here means fp8 GEMM is not
+    /// available via hipBLAS on gfx1100 (ROCm 6.2), which blocks a native fp8
+    /// path.
+    #[test]
+    fn gemm_ex_fp8_probe() {
+        if !have_gpu() {
+            eprintln!("skipping: no device");
+            return;
+        }
+        let h = hip::hip().expect("hip runtime");
+        let blas = HipBlas::new(h.clone()).expect("hipblas handle");
+        let mut stream = std::ptr::null_mut();
+        unsafe { hip::check(&h, (h.api.hip_stream_create)(&mut stream)).unwrap() };
+        blas.set_stream(stream).unwrap();
+
+        let f32_to_e4m3 = |x: f32| -> u8 {
+            let sign: u8 = if x < 0.0 { 0x80 } else { 0 };
+            let a = x.abs();
+            if a > 448.0 {
+                return sign | 0x7F; // saturate
+            }
+            if a < 2f32.powi(-6) * 0.5 {
+                return sign; // ~zero
+            }
+            let bits = a.to_bits();
+            let e = ((bits >> 23) & 0xFF) as i32 - 127;
+            let m = bits & 0x7F_FFFF;
+            let biased = (e + 7).clamp(1, 14);
+            let m3 = ((m + (1 << 20)) >> 20) as u8; // top 3 bits, round-nearest
+            sign | ((biased as u8) << 3) | (m3 & 0x7)
+        };
+        let e4m3_to_f32 = |u: u8| -> f32 {
+            let sign = if u & 0x80 != 0 { -1.0f32 } else { 1.0 };
+            let e = ((u >> 3) & 0x0F) as i32;
+            let m = (u & 0x07) as f32;
+            if e == 0 {
+                sign * (m / 8.0) * 2f32.powi(-6)
+            } else if e == 15 {
+                f32::NAN
+            } else {
+                sign * (1.0 + m / 8.0) * 2f32.powi(e - 7)
+            }
+        };
+
+        let (n, batch, k) = (6i32, 4i32, 8i32);
+        let w: Vec<f32> = (0..(n * k) as usize)
+            .map(|i| ((i * 7) % 100) as f32 / 100.0 - 0.4)
+            .collect();
+        let x: Vec<f32> = (0..(batch * k) as usize)
+            .map(|i| ((i * 13) % 100) as f32 / 100.0 - 0.4)
+            .collect();
+        // Per-tensor scales.
+        let w_scale = w.iter().map(|v| v.abs()).fold(1e-9f32, f32::max) / 448.0;
+        let x_scale = x.iter().map(|v| v.abs()).fold(1e-9f32, f32::max) / 448.0;
+        let w8: Vec<u8> = w.iter().map(|&v| f32_to_e4m3(v / w_scale)).collect();
+        let x8: Vec<u8> = x.iter().map(|&v| f32_to_e4m3(v / x_scale)).collect();
+
+        let dw = hip::malloc(&h, w8.len()).unwrap();
+        let dx = hip::malloc(&h, x8.len()).unwrap();
+        let dc = hip::malloc(&h, (batch * n) as usize * 4).unwrap();
+        hip::memcpy(
+            &h,
+            dw,
+            w8.as_ptr() as *const _,
+            w8.len(),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            dx,
+            x8.as_ptr() as *const _,
+            x8.len(),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+
+        let err = blas.gemm_ex(
+            HIPBLAS_OP_T,
+            HIPBLAS_OP_N,
+            n,
+            batch,
+            k,
+            HIPBLAS_R_8F_E4M3,
+            dw as *const core::ffi::c_void,
+            k,
+            HIPBLAS_R_8F_E4M3,
+            dx as *const core::ffi::c_void,
+            k,
+            HIPBLAS_R_32F,
+            dc,
+            n,
+            HIPBLAS_COMPUTE_32F,
+        );
+        match err {
+            Err(e) => {
+                eprintln!("gemm_ex fp8: hipBLAS REJECTED fp8 on this GPU: {e}");
+                eprintln!("=> native fp8 GEMM via hipBLAS unavailable on gfx1100/ROCm 6.2");
+                hip::free(&h, dw).unwrap();
+                hip::free(&h, dx).unwrap();
+                hip::free(&h, dc).unwrap();
+                unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+                return;
+            }
+            Ok(()) => {
+                eprintln!("gemm_ex fp8: hipBLAS ACCEPTED fp8 on this GPU");
+            }
+        }
+        // Compare dequantized vs CPU fp32 reference (fp8 error ~1e-2).
+        let mut c = vec![0.0f32; (batch * n) as usize];
+        hip::memcpy(
+            &h,
+            c.as_mut_ptr() as *mut _,
+            dc as *const _,
+            c.len() * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        let wf: Vec<f32> = w8.iter().map(|&u| e4m3_to_f32(u) * w_scale).collect();
+        let xf: Vec<f32> = x8.iter().map(|&u| e4m3_to_f32(u) * x_scale).collect();
+        let mut maxerr = 0.0f32;
+        let mut maxabs = 0.0f32;
+        for b in 0..batch as usize {
+            for j in 0..n as usize {
+                let mut want = 0.0f32;
+                for t in 0..k as usize {
+                    want += wf[j * k as usize + t] * xf[b * k as usize + t];
+                }
+                maxabs = maxabs.max(want.abs());
+                maxerr = maxerr.max((c[b * n as usize + j] - want).abs());
+            }
+        }
+        eprintln!("gemm_ex fp8 maxerr={maxerr} (ref max {maxabs})");
+        assert!(
+            c.iter().all(|v| v.is_finite()),
+            "fp8 GEMM produced non-finite output"
+        );
+        hip::free(&h, dw).unwrap();
+        hip::free(&h, dx).unwrap();
+        hip::free(&h, dc).unwrap();
+        unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
     }
 }
