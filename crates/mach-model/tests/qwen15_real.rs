@@ -56,6 +56,11 @@ fn qwen2_1_5b_cfg() -> Config {
         rms_eps: 1e-6,
         rope_theta: 1_000_000.0,
         qk_norm: false,
+        q_lora_rank: 0,
+        kv_lora_rank: 0,
+        qk_nope_head_dim: 0,
+        qk_rope_head_dim: 0,
+        v_head_dim: 0,
     }
 }
 

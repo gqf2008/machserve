@@ -227,6 +227,104 @@ extern "C" __global__ void attn_decode(
 }
 "#;
 
+/// MLA: merge q_nope `[heads*nope]` and q_rope `[heads*rope]` into
+/// q `[heads*(nope+rope)]`.
+const MLA_ASSEMBLE_Q: &str = r#"
+extern "C" __global__ void mla_assemble_q(const float* __restrict__ q_nope,
+                                          const float* __restrict__ q_rope,
+                                          float* __restrict__ q,
+                                          int n_heads, int nope, int rope) {
+    int hd = nope + rope;
+    int total = n_heads * hd;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int h = i / hd;
+        int dd = i % hd;
+        q[i] = (dd < nope) ? q_nope[h * nope + dd] : q_rope[h * rope + (dd - nope)];
+    }
+}
+"#;
+
+/// MLA: expand `kv [heads*(nope+v_hd)]` + shared `k_rope [rope]` into per-head
+/// k `[heads*(nope+rope)]` and v `[heads*v_hd]`, stored at `*pos` in caches.
+const MLA_ASSEMBLE_KV: &str = r#"
+extern "C" __global__ void mla_assemble_kv(const float* __restrict__ kv,
+                                           const float* __restrict__ k_rope,
+                                           float* __restrict__ kc,
+                                           float* __restrict__ vc,
+                                           const int* __restrict__ pos_buf,
+                                           int n_heads, int nope, int rope, int v_hd) {
+    int pos = *pos_buf;
+    int hd = nope + rope;
+    int total = n_heads * hd;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int h = i / hd;
+        int dd = i % hd;
+        float val = (dd < nope) ? kv[h * (nope + v_hd) + dd] : k_rope[dd - nope];
+        kc[(long long)pos * n_heads * hd + i] = val;
+    }
+    int total_v = n_heads * v_hd;
+    if (i < total_v) {
+        int h = i / v_hd;
+        int dd = i % v_hd;
+        vc[(long long)pos * n_heads * v_hd + i] = kv[h * (nope + v_hd) + nope + dd];
+    }
+}
+"#;
+
+/// MLA decode attention over the expanded per-head k/v caches (k head_dim =
+/// qk_nope+qk_rope, v head_dim = v_head_dim; one block per head).
+const MLA_ATTN_DECODE: &str = r#"
+extern "C" __global__ void mla_attn_decode(
+    const float* __restrict__ q,
+    const float* __restrict__ kc,
+    const float* __restrict__ vc,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads, int k_hd, int v_hd, float scale) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + 1024;
+    int h = blockIdx.x;
+    const float* qh = q + h * k_hd;
+    int pos = *pos_buf;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        const float* kp = kc + (long long)p * n_heads * k_hd + h * k_hd;
+        float s = 0.0f;
+        for (int d = 0; d < k_hd; d++) s += qh[d] * kp[d];
+        scores[p] = s * scale;
+    }
+    __syncthreads();
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float m = red[0];
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float ssum = red[0];
+    for (int d = threadIdx.x; d < v_hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            float vp = vc[(long long)p * n_heads * v_hd + h * v_hd + d];
+            acc += __expf(scores[p] - m) * vp;
+        }
+        out[h * v_hd + d] = acc / ssum;
+    }
+}
+"#;
+
 /// Batched embedding: `x[s, :] = emb[tok[s], :]`.
 const EMBED_BATCHED: &str = r#"
 extern "C" __global__ void embed_batched(const int* tok, const float* emb, float* x,
@@ -1001,6 +1099,9 @@ pub struct HipKernels {
     add_bias: HipKernelModule,
     kv_store: HipKernelModule,
     attn_decode: HipKernelModule,
+    mla_assemble_q: HipKernelModule,
+    mla_assemble_kv: HipKernelModule,
+    mla_attn_decode: HipKernelModule,
     rope: HipKernelModule,
     embed_batched: HipKernelModule,
     rope_batched: HipKernelModule,
@@ -1050,6 +1151,9 @@ impl HipKernels {
             add_bias: HipKernelModule::compile(&arch, ADD_BIAS, "add_bias")?,
             kv_store: HipKernelModule::compile(&arch, KV_STORE, "kv_store")?,
             attn_decode: HipKernelModule::compile(&arch, ATTN_DECODE, "attn_decode")?,
+            mla_assemble_q: HipKernelModule::compile(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
+            mla_assemble_kv: HipKernelModule::compile(&arch, MLA_ASSEMBLE_KV, "mla_assemble_kv")?,
+            mla_attn_decode: HipKernelModule::compile(&arch, MLA_ATTN_DECODE, "mla_attn_decode")?,
             rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
             embed_batched: HipKernelModule::compile(&arch, EMBED_BATCHED, "embed_batched")?,
             rope_batched: HipKernelModule::compile(&arch, ROPE_BATCHED, "rope_batched")?,
@@ -1300,6 +1404,111 @@ impl HipKernels {
         // Dynamic shared memory: scores[1024] + red[256] floats.
         const SHARED_FLOATS: u32 = 1024 + 256;
         Ok(self.attn_decode.launch_shmem(
+            [n_heads as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            SHARED_FLOATS * 4,
+        )?)
+    }
+
+    /// MLA: merge q_nope + q_rope into q `[heads*(nope+rope)]`.
+    pub fn launch_mla_assemble_q(
+        &self,
+        q_nope: *const f32,
+        q_rope: *const f32,
+        q: *mut f32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let qnp = q_nope;
+        let qrp = q_rope;
+        let qp = q;
+        let mut p = vec![
+            &qnp as *const *const f32 as *mut core::ffi::c_void,
+            &qrp as *const *const f32 as *mut core::ffi::c_void,
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (n_heads * (nope + rope)) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_q
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA: expand kv + shared k_rope into per-head k/v caches at `*pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_assemble_kv(
+        &self,
+        kv: *const f32,
+        k_rope: *const f32,
+        kc: *mut f32,
+        vc: *mut f32,
+        pos: *const i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+        v_hd: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let krp = k_rope;
+        let kcp = kc;
+        let vcp = vc;
+        let pp = pos;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &krp as *const *const f32 as *mut core::ffi::c_void,
+            &kcp as *const *mut f32 as *mut core::ffi::c_void,
+            &vcp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (n_heads * (nope + rope)).max(n_heads * v_hd) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_kv
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA decode attention over expanded per-head k/v caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_attn_decode(
+        &self,
+        q: *const f32,
+        kc: *const f32,
+        vc: *const f32,
+        out: *mut f32,
+        pos: *const i32,
+        n_heads: i32,
+        k_hd: i32,
+        v_hd: i32,
+        scale: f32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = kc;
+        let vp = vc;
+        let op = out;
+        let pp = pos;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &k_hd as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+        ];
+        const SHARED_FLOATS: u32 = 1024 + 256;
+        Ok(self.mla_attn_decode.launch_shmem(
             [n_heads as u32, 1, 1],
             [256, 1, 1],
             &mut p,

@@ -68,3 +68,48 @@ fn mla_ref_forward_is_finite_and_deterministic() {
     let l2 = m2.forward(&tokens);
     assert_eq!(l1, l2, "MLA forward must be deterministic");
 }
+
+#[cfg(feature = "hip")]
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn mla_gpu_matches_cpu_reference() {
+    use mach_kernel_sys::hip;
+    use mach_model::model::GpuModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let cfg = mla_cfg();
+    let w = Weights::random(&cfg, 7).unwrap();
+    let tokens = [5u32, 9, 3, 200];
+
+    let mut gpu = GpuModel::new(hip, cfg, &w).unwrap();
+    let gpu_logits = gpu.forward(&tokens).unwrap();
+    let mut cpu = RefModel::new(cfg, w);
+    let cpu_logits = cpu.forward(&tokens);
+
+    let max = max_abs_diff(&gpu_logits, &cpu_logits);
+    let scale = cpu_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        max <= 2e-3 + 2e-3 * scale,
+        "MLA GPU vs CPU: max diff {max} (scale {scale})"
+    );
+}

@@ -40,6 +40,15 @@ struct LayerDev {
     /// QK-norm (Qwen3): per-head RMSNorm weights (null when qk_norm=false).
     q_norm: *mut f32,
     k_norm: *mut f32,
+    /// MLA (kv_lora_rank > 0): low-rank Q / compressed KV weights.
+    mla_q_a: *mut f32,
+    mla_q_a_norm: *mut f32,
+    mla_q_b: *mut f32,
+    mla_q_rope: *mut f32,
+    mla_kv_a: *mut f32,
+    mla_kv_a_norm: *mut f32,
+    mla_kv_b: *mut f32,
+    mla_o: *mut f32,
     /// MoE (num_experts > 0): router [ne,d] + per-expert gate/up/down.
     moe_router: *mut f32,
     moe_wg: *mut f32,
@@ -105,8 +114,20 @@ pub struct GpuModel {
     up_all: *mut f32,
     eh_all: *mut f32,
     down_all: *mut f32,
+    // MLA scratch (kv_lora_rank > 0): low-rank Q / compressed KV activations.
+    mla_q_lora: *mut f32,
+    mla_q_lora_n: *mut f32,
+    q_nope: *mut f32,
+    q_rope: *mut f32,
+    mla_kv_a: *mut f32,
+    mla_kv_a_n: *mut f32,
+    mla_kv: *mut f32,
+    mla_attn: *mut f32,
     // KV caches: (k, v) per layer
     kv_cache: Vec<(*mut f32, *mut f32)>,
+    /// MLA KV caches (kv_lora_rank > 0): expanded per-head
+    /// k `[max_seq, heads*(nope+rope)]` / v `[max_seq, heads*v_hd]`.
+    mla_kv_cache: Vec<(*mut f32, *mut f32)>,
     /// All device allocations (freed on drop).
     allocs: Vec<*mut core::ffi::c_void>,
     /// Number of tokens stored so far.
@@ -159,7 +180,16 @@ impl GpuModel {
             up_all: std::ptr::null_mut(),
             eh_all: std::ptr::null_mut(),
             down_all: std::ptr::null_mut(),
+            mla_q_lora: std::ptr::null_mut(),
+            mla_q_lora_n: std::ptr::null_mut(),
+            q_nope: std::ptr::null_mut(),
+            q_rope: std::ptr::null_mut(),
+            mla_kv_a: std::ptr::null_mut(),
+            mla_kv_a_n: std::ptr::null_mut(),
+            mla_kv: std::ptr::null_mut(),
+            mla_attn: std::ptr::null_mut(),
             kv_cache: Vec::new(),
+            mla_kv_cache: Vec::new(),
             allocs: Vec::new(),
             pos: 0,
             host_pins: Vec::new(),
@@ -225,6 +255,28 @@ impl GpuModel {
             let kk = self.dalloc(kv_bytes)?;
             let vv = self.dalloc(kv_bytes)?;
             self.kv_cache.push((kk, vv));
+        }
+        if c.kv_lora_rank > 0 {
+            let qlr = c.q_lora_rank;
+            let nope = c.qk_nope_head_dim;
+            let rope = c.qk_rope_head_dim;
+            let v_hd = c.v_head_dim;
+            let heads = c.n_heads;
+            self.mla_q_lora = self.dalloc(qlr * 4)?;
+            self.mla_q_lora_n = self.dalloc(qlr * 4)?;
+            self.q_nope = self.dalloc(heads * nope * 4)?;
+            self.q_rope = self.dalloc(heads * rope * 4)?;
+            self.mla_kv_a = self.dalloc((c.kv_lora_rank + rope) * 4)?;
+            self.mla_kv_a_n = self.dalloc(c.kv_lora_rank * 4)?;
+            self.mla_kv = self.dalloc(heads * (nope + v_hd) * 4)?;
+            self.mla_attn = self.dalloc(heads * v_hd * 4)?;
+            let k_bytes = c.max_seq_len * heads * (nope + rope) * 4;
+            let v_bytes = c.max_seq_len * heads * v_hd * 4;
+            for _ in 0..c.n_layers {
+                let kk = self.dalloc(k_bytes)?;
+                let vv = self.dalloc(v_bytes)?;
+                self.mla_kv_cache.push((kk, vv));
+            }
         }
         if c.num_experts > 0 {
             let ne = c.num_experts;
@@ -353,6 +405,62 @@ impl GpuModel {
                     self.upload(p, &lw.k_norm)?;
                     p
                 },
+                mla_q_a: if lw.mla_q_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_a.len() * 4)?;
+                    self.upload(p, &lw.mla_q_a)?;
+                    p
+                },
+                mla_q_a_norm: if lw.mla_q_a_norm.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_a_norm.len() * 4)?;
+                    self.upload(p, &lw.mla_q_a_norm)?;
+                    p
+                },
+                mla_q_b: if lw.mla_q_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_b.len() * 4)?;
+                    self.upload(p, &lw.mla_q_b)?;
+                    p
+                },
+                mla_q_rope: if lw.mla_q_rope.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_rope.len() * 4)?;
+                    self.upload(p, &lw.mla_q_rope)?;
+                    p
+                },
+                mla_kv_a: if lw.mla_kv_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_kv_a.len() * 4)?;
+                    self.upload(p, &lw.mla_kv_a)?;
+                    p
+                },
+                mla_kv_a_norm: if lw.mla_kv_a_norm.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_kv_a_norm.len() * 4)?;
+                    self.upload(p, &lw.mla_kv_a_norm)?;
+                    p
+                },
+                mla_kv_b: if lw.mla_kv_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_kv_b.len() * 4)?;
+                    self.upload(p, &lw.mla_kv_b)?;
+                    p
+                },
+                mla_o: if lw.mla_o.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_o.len() * 4)?;
+                    self.upload(p, &lw.mla_o)?;
+                    p
+                },
                 moe_router: if lw.moe_router.is_empty() {
                     std::ptr::null_mut()
                 } else {
@@ -468,102 +576,195 @@ impl GpuModel {
             let nkv = (c.n_kv_heads * c.head_dim) as i32;
             let l16 = if f16 { Some(self.layers_f16[li]) } else { None };
             k.launch_rms_norm(self.x, lw.rms_attn, self.xn, 1, d, c.rms_eps)?;
-            gemm(
-                self.q,
-                self.xn,
-                lw.wq,
-                l16.map_or(std::ptr::null_mut(), |l| l.wq),
-                nq,
-                d,
-            )?;
-            gemm(
-                self.k_buf,
-                self.xn,
-                lw.wk,
-                l16.map_or(std::ptr::null_mut(), |l| l.wk),
-                nkv,
-                d,
-            )?;
-            gemm(
-                self.v_buf,
-                self.xn,
-                lw.wv,
-                l16.map_or(std::ptr::null_mut(), |l| l.wv),
-                nkv,
-                d,
-            )?;
-            // Qwen2 checkpoints ship q/k/v biases.
-            if !lw.bq.is_null() {
-                k.launch_add_bias(self.q, lw.bq, 1, nq)?;
-            }
-            if !lw.bk.is_null() {
-                k.launch_add_bias(self.k_buf, lw.bk, 1, nkv)?;
-            }
-            if !lw.bv.is_null() {
-                k.launch_add_bias(self.v_buf, lw.bv, 1, nkv)?;
-            }
-            // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
-            if !lw.q_norm.is_null() {
-                k.launch_qk_norm(
+            if c.kv_lora_rank > 0 {
+                let heads = c.n_heads as i32;
+                let qlr = c.q_lora_rank as i32;
+                let nope = c.qk_nope_head_dim as i32;
+                let rope = c.qk_rope_head_dim as i32;
+                let v_hd = c.v_head_dim as i32;
+                let kvlr = c.kv_lora_rank as i32;
+                // q_lora = q_a(xn); rms; q_nope = q_b(q_lora)
+                k.gemm(self.mla_q_lora, self.xn, lw.mla_q_a, qlr, d)?;
+                k.launch_rms_norm(
+                    self.mla_q_lora,
+                    lw.mla_q_a_norm,
+                    self.mla_q_lora_n,
+                    1,
+                    qlr,
+                    c.rms_eps,
+                )?;
+                k.gemm(
+                    self.q_nope,
+                    self.mla_q_lora_n,
+                    lw.mla_q_b,
+                    heads * nope,
+                    qlr,
+                )?;
+                // q_rope = q_rope_proj(xn) + RoPE (k_buf is scratch on this path).
+                k.gemm(self.q_rope, self.xn, lw.mla_q_rope, heads * rope, d)?;
+                k.launch_rope(
+                    self.q_rope,
+                    self.k_buf,
+                    self.dev_pos,
+                    heads,
+                    heads,
+                    rope,
+                    c.rope_theta,
+                )?;
+                // compressed_kv = kv_a(xn); latent rms; k_rope (shared) + RoPE.
+                k.gemm(self.mla_kv_a, self.xn, lw.mla_kv_a, kvlr + rope, d)?;
+                k.launch_rms_norm(
+                    self.mla_kv_a,
+                    lw.mla_kv_a_norm,
+                    self.mla_kv_a_n,
+                    1,
+                    kvlr,
+                    c.rms_eps,
+                )?;
+                let k_rope_ptr = unsafe { self.mla_kv_a.add(kvlr as usize) };
+                k.launch_rope(
+                    k_rope_ptr,
+                    self.v_buf,
+                    self.dev_pos,
+                    1,
+                    1,
+                    rope,
+                    c.rope_theta,
+                )?;
+                // kv = kv_b_proj(latent): [heads*(nope + v_hd)].
+                k.gemm(
+                    self.mla_kv,
+                    self.mla_kv_a_n,
+                    lw.mla_kv_b,
+                    heads * (nope + v_hd),
+                    kvlr,
+                )?;
+                // Assemble per-head q/k/v and store into the MLA caches.
+                k.launch_mla_assemble_q(self.q_nope, self.q_rope, self.q, heads, nope, rope)?;
+                let (kc, vc) = self.mla_kv_cache[li];
+                k.launch_mla_assemble_kv(
+                    self.mla_kv,
+                    k_rope_ptr,
+                    kc,
+                    vc,
+                    self.dev_pos,
+                    heads,
+                    nope,
+                    rope,
+                    v_hd,
+                )?;
+                let scale = 1.0 / ((nope + rope) as f32).sqrt();
+                k.launch_mla_attn_decode(
+                    self.q,
+                    kc,
+                    vc,
+                    self.mla_attn,
+                    self.dev_pos,
+                    heads,
+                    nope + rope,
+                    v_hd,
+                    scale,
+                )?;
+                k.gemm(self.proj, self.mla_attn, lw.mla_o, d, heads * v_hd)?;
+                k.launch_add(self.x, self.proj, d)?;
+            } else {
+                gemm(
+                    self.q,
+                    self.xn,
+                    lw.wq,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wq),
+                    nq,
+                    d,
+                )?;
+                gemm(
+                    self.k_buf,
+                    self.xn,
+                    lw.wk,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wk),
+                    nkv,
+                    d,
+                )?;
+                gemm(
+                    self.v_buf,
+                    self.xn,
+                    lw.wv,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wv),
+                    nkv,
+                    d,
+                )?;
+                // Qwen2 checkpoints ship q/k/v biases.
+                if !lw.bq.is_null() {
+                    k.launch_add_bias(self.q, lw.bq, 1, nq)?;
+                }
+                if !lw.bk.is_null() {
+                    k.launch_add_bias(self.k_buf, lw.bk, 1, nkv)?;
+                }
+                if !lw.bv.is_null() {
+                    k.launch_add_bias(self.v_buf, lw.bv, 1, nkv)?;
+                }
+                // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
+                if !lw.q_norm.is_null() {
+                    k.launch_qk_norm(
+                        self.q,
+                        self.k_buf,
+                        lw.q_norm,
+                        lw.k_norm,
+                        1,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.rms_eps,
+                    )?;
+                }
+                k.launch_rope(
                     self.q,
                     self.k_buf,
-                    lw.q_norm,
-                    lw.k_norm,
-                    1,
+                    self.dev_pos,
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
-                    c.rms_eps,
+                    c.rope_theta,
                 )?;
+
+                let (kc, vc) = self.kv_cache[li];
+                k.launch_kv_store(
+                    self.k_buf,
+                    kc,
+                    self.dev_pos,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.max_seq_len as i32,
+                )?;
+                k.launch_kv_store(
+                    self.v_buf,
+                    vc,
+                    self.dev_pos,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    c.max_seq_len as i32,
+                )?;
+
+                k.launch_attn_decode(
+                    self.q,
+                    kc,
+                    vc,
+                    self.attn,
+                    self.dev_pos,
+                    c.n_heads as i32,
+                    c.n_kv_heads as i32,
+                    c.head_dim as i32,
+                    scale,
+                )?;
+                gemm(
+                    self.proj,
+                    self.attn,
+                    lw.wo,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wo),
+                    d,
+                    nq,
+                )?;
+                k.launch_add(self.x, self.proj, d)?;
             }
-            k.launch_rope(
-                self.q,
-                self.k_buf,
-                self.dev_pos,
-                c.n_heads as i32,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                c.rope_theta,
-            )?;
-
-            let (kc, vc) = self.kv_cache[li];
-            k.launch_kv_store(
-                self.k_buf,
-                kc,
-                self.dev_pos,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                c.max_seq_len as i32,
-            )?;
-            k.launch_kv_store(
-                self.v_buf,
-                vc,
-                self.dev_pos,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                c.max_seq_len as i32,
-            )?;
-
-            k.launch_attn_decode(
-                self.q,
-                kc,
-                vc,
-                self.attn,
-                self.dev_pos,
-                c.n_heads as i32,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                scale,
-            )?;
-            gemm(
-                self.proj,
-                self.attn,
-                lw.wo,
-                l16.map_or(std::ptr::null_mut(), |l| l.wo),
-                d,
-                nq,
-            )?;
-            k.launch_add(self.x, self.proj, d)?;
 
             let inter = c.intermediate_size as i32;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, 1, d, c.rms_eps)?;
@@ -753,6 +954,24 @@ impl GpuModel {
                     self.k.hip(),
                     (self.k.hip().api.hip_memset)(*vc as *mut _, 0, bytes),
                 )?;
+            }
+        }
+        if !self.mla_kv_cache.is_empty() {
+            let c = self.cfg;
+            let heads = c.n_heads;
+            let k_bytes = c.max_seq_len * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_bytes = c.max_seq_len * heads * c.v_head_dim * 4;
+            for (kc, vc) in &self.mla_kv_cache {
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(*kc as *mut _, 0, k_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(*vc as *mut _, 0, v_bytes),
+                    )?;
+                }
             }
         }
         unsafe { *self.host_pos = 0 };

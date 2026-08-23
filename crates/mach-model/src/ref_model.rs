@@ -266,9 +266,9 @@ fn decode_step_mla(
             maxv = maxv.max(s);
         }
         let mut sum = 0.0;
-        for pp in 0..=pos {
-            scores[pp] = (scores[pp] - maxv).exp();
-            sum += scores[pp];
+        for item in scores.iter_mut().take(pos + 1) {
+            *item = (*item - maxv).exp();
+            sum += *item;
         }
         for dd in 0..v_hd {
             let mut acc = 0.0;
