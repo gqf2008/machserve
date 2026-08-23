@@ -160,6 +160,8 @@ pub struct SpeculativeBatch {
     lens: Vec<usize>,
     /// Per-sequence token at position `len - 1`.
     draft_last: Vec<u32>,
+    /// Whether each sequence is still decoding (finished ones are skipped).
+    active: Vec<bool>,
 }
 
 impl SpeculativeBatch {
@@ -174,6 +176,7 @@ impl SpeculativeBatch {
             capacity,
             lens: Vec::new(),
             draft_last: Vec::new(),
+            active: Vec::new(),
         }
     }
 
@@ -186,32 +189,45 @@ impl SpeculativeBatch {
         prefill_chunked(&mut self.draft, slot as u32, prompt)?;
         self.lens.push(prompt.len());
         self.draft_last.push(*prompt.last().expect("non-empty"));
+        self.active.push(true);
         Ok(())
     }
 
-    /// Active sequence count.
+    /// Number of sequences still decoding.
     #[must_use]
     pub fn active(&self) -> usize {
-        self.lens.len()
+        self.active.iter().filter(|&&a| a).count()
     }
 
-    /// One speculative round for all active sequences; returns the accepted
-    /// tokens per sequence (>= 1 token each).
+    /// Marks sequence `s` as finished; it is skipped in later rounds.
+    pub fn finish(&mut self, s: usize) {
+        self.active[s] = false;
+    }
+
+    /// Whether sequence `s` is still decoding.
+    #[must_use]
+    pub fn is_active(&self, s: usize) -> bool {
+        self.active[s]
+    }
+
+    /// One speculative round for the sequences still decoding; returns the
+    /// accepted tokens per sequence, index-aligned (`None` = finished).
     #[allow(clippy::needless_range_loop)] // parallel per-sequence arrays
-    pub fn step(&mut self) -> Result<Vec<Vec<u32>>, Error> {
+    pub fn step(&mut self) -> Result<Vec<Option<Vec<u32>>>, Error> {
         let n = self.lens.len();
-        if n == 0 {
-            return Ok(Vec::new());
+        let active_idx: Vec<usize> = (0..n).filter(|&s| self.active[s]).collect();
+        let m = active_idx.len();
+        if m == 0 {
+            return Ok(vec![None; n]);
         }
-        // 1. Draft k tokens per sequence (one batched row per sequence per
-        //    round).
+        // 1. Draft k tokens per active sequence.
         let mut c: Vec<Vec<u32>> = vec![Vec::with_capacity(self.k); n];
         for i in 0..self.k {
-            let mut toks = Vec::with_capacity(n);
-            let mut lens = Vec::with_capacity(n);
-            let mut slots = Vec::with_capacity(n);
-            let mut p = Vec::with_capacity(n);
-            for s in 0..n {
+            let mut toks = Vec::with_capacity(m);
+            let mut lens = Vec::with_capacity(m);
+            let mut slots = Vec::with_capacity(m);
+            let mut p = Vec::with_capacity(m);
+            for &s in &active_idx {
                 let input = if i == 0 {
                     self.draft_last[s]
                 } else {
@@ -222,21 +238,21 @@ impl SpeculativeBatch {
                 slots.push(s as u32);
                 p.push(SamplingParams::greedy(0));
             }
-            let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
-            let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
+            let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); m];
+            let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); m];
             let out = self
                 .draft
                 .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
-            for s in 0..n {
-                c[s].push(out.0[s]);
+            for (si, &s) in active_idx.iter().enumerate() {
+                c[s].push(out.0[si]);
             }
         }
-        // 2. Verify: `n * (k+1)` rows on the target.
-        let mut toks = Vec::with_capacity(n * (self.k + 1));
-        let mut lens = Vec::with_capacity(n * (self.k + 1));
-        let mut slots = Vec::with_capacity(n * (self.k + 1));
-        let mut p = Vec::with_capacity(n * (self.k + 1));
-        for s in 0..n {
+        // 2. Verify: `m * (k+1)` rows on the target.
+        let mut toks = Vec::with_capacity(m * (self.k + 1));
+        let mut lens = Vec::with_capacity(m * (self.k + 1));
+        let mut slots = Vec::with_capacity(m * (self.k + 1));
+        let mut p = Vec::with_capacity(m * (self.k + 1));
+        for &s in &active_idx {
             for j in 0..=self.k {
                 let input = if j == 0 {
                     self.draft_last[s]
@@ -249,15 +265,16 @@ impl SpeculativeBatch {
                 p.push(SamplingParams::greedy(0));
             }
         }
-        let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n * (self.k + 1)];
-        let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n * (self.k + 1)];
+        let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); m * (self.k + 1)];
+        let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); m * (self.k + 1)];
         let out = self
             .target
             .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
-        // pred[s][j] = target's guess for position len[s] + j.
-        let mut accepted = Vec::with_capacity(n);
-        for s in 0..n {
-            let base = s * (self.k + 1);
+        // pred per active sequence: pred[si][j] = guess for position
+        // len[s] + j.
+        let mut accepted: Vec<Option<Vec<u32>>> = vec![None; n];
+        for (si, &s) in active_idx.iter().enumerate() {
+            let base = si * (self.k + 1);
             let mut a = 0usize;
             while a < self.k && out.0[base + a] == c[s][a] {
                 a += 1;
@@ -265,7 +282,7 @@ impl SpeculativeBatch {
             let next = out.0[base + a];
             let mut seq = c[s][..a].to_vec();
             seq.push(next);
-            accepted.push(seq);
+            accepted[s] = Some(seq);
         }
         // 3. Advance the draft context with the accepted tokens, position by
         //    position (<= active rows per call, fitting the draft capacity).
@@ -273,8 +290,10 @@ impl SpeculativeBatch {
             let mut toks = Vec::new();
             let mut lens = Vec::new();
             let mut slots = Vec::new();
-            for s in 0..n {
-                if let Some(&t) = accepted[s].get(j) {
+            for &s in &active_idx {
+                if let Some(seq) = accepted[s].as_ref()
+                    && let Some(&t) = seq.get(j)
+                {
                     toks.push(t);
                     lens.push((self.lens[s] + j) as u32);
                     slots.push(s as u32);
@@ -289,9 +308,10 @@ impl SpeculativeBatch {
             self.draft
                 .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
         }
-        for s in 0..n {
-            self.lens[s] += accepted[s].len();
-            self.draft_last[s] = *accepted[s].last().expect("non-empty");
+        for &s in &active_idx {
+            let seq = accepted[s].as_ref().expect("active produced tokens");
+            self.lens[s] += seq.len();
+            self.draft_last[s] = *seq.last().expect("non-empty");
         }
         Ok(accepted)
     }

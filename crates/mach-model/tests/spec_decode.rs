@@ -186,9 +186,11 @@ fn spec_decode_batch_matches_plain_greedy_per_sequence() {
     while got.iter().any(|g| g.len() < max_new) {
         let accepted = batch.step().unwrap();
         for (s, seq) in accepted.iter().enumerate() {
-            for &t in seq {
-                if got[s].len() < max_new {
-                    got[s].push(t);
+            if let Some(seq) = seq {
+                for &t in seq {
+                    if got[s].len() < max_new {
+                        got[s].push(t);
+                    }
                 }
             }
         }
@@ -286,20 +288,13 @@ fn spec_decode_batch_lifecycle_matches_plain_greedy() {
         batch.add(p).unwrap();
     }
     let mut got: Vec<Vec<u32>> = vec![Vec::new(); jobs.len()];
-    let mut done = vec![false; jobs.len()];
-    while !done.iter().all(|&d| d) {
+    while batch.active() > 0 {
         let accepted = batch.step().unwrap();
         for (s, seq) in accepted.iter().enumerate() {
-            if done[s] {
-                continue;
-            }
+            let Some(seq) = seq else { continue };
             for &t in seq {
-                if got[s].len() >= jobs[s].1 {
-                    done[s] = true;
-                    break;
-                }
-                if eos.is_some_and(|e| t == e) {
-                    done[s] = true;
+                if got[s].len() >= jobs[s].1 || eos.is_some_and(|e| t == e) {
+                    batch.finish(s);
                     break;
                 }
                 got[s].push(t);

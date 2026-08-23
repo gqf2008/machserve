@@ -562,3 +562,10 @@
     clippy/fmt 干净;
   - 引擎集成的生命周期模式已实证(终止判定在验收 token 上进行),下一步是把
     `SpeculativeBatch` 接入 `ContinuousModel`(连续批处理 + 槽位复用)。
+
+- **P3ap SpeculativeBatch 跳过已完成序列(2026-08-23,7900 XTX)**:
+  - `SpeculativeBatch` 增加 `active` 状态 + `finish(s)`/`is_active(s)`;
+    `step()` 只对活跃序列草稿/验证/推进,返回索引对齐的 `Vec<Option<Vec<u32>>>`
+    (None=已完成)——连续批处理集成必需(避免对已完成序列浪费算力,支持槽位复用);
+  - 生命周期测试改用 `finish()` + `active()>0` 驱动,验证跳过逻辑正确;
+    全量 HIP 回归全绿,clippy/fmt 干净。
