@@ -61,11 +61,19 @@ fn main() {
     let hip = hip::hip().expect("hip");
     let mut bm = BatchedModel::new(hip, cfg, &w, batch).expect("model");
     let mut tokens: Vec<u32> = (0..batch).map(|i| (i % 977) as u32).collect();
-    // Fill KV to `ctx` positions (each decode_step advances one position).
+    // Fill KV: `ctx` decode steps advance every sequence's position, so the
+    // cache holds positions 0..ctx (per-step time grows with context).
+    let tf0 = Instant::now();
     for _ in 0..ctx {
-        tokens = bm.decode_step(&tokens).expect("prefill");
+        tokens = bm.decode_step(&tokens).expect("fill");
     }
-    bm.reset_state().expect("reset");
+    let fill_ms = tf0.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "KV fill {ctx} steps (growing ctx): {fill_ms:.0} ms total | {:.2} ms/step avg",
+        fill_ms / ctx as f64
+    );
+    // NOTE: no reset_state() here -- lens must stay at `ctx` so the timed
+    // steps really attend to `ctx` keys (long-context decode).
     for _ in 0..10 {
         tokens = bm.decode_step(&tokens).expect("warmup");
     }

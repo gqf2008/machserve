@@ -407,10 +407,13 @@
   - **正确性**:CPU 精确参考逐元素对拍 hd=32/64/128、pos 1~2047 全 **0.000000**;
     fp16(F32 vs F16)/continuous/real_model 全绿;旧双遍内核已移除,唯一 f16
     attention 路径为 GQA 内核;
-  - **性能(2048-token 长 context, B=64, f16, Qwen 0.5B)**:旧双遍 5.470 ms/step
-    → GQA 5.003 → uint4 向量化 **4.739 ms/step(13504 tok/s/seq,+15%)**;低于理论
+  - **性能(2048-token 长 context, B=64, f16, Qwen 0.5B, 真 A/B)**:旧双遍
+    **34.8 ms/step → GQA+uint4 13.4 ms/step(2.6x,1840→4777 tok/s/seq)**;低于理论
     7x 是因为旧内核已靠 L2 吃到部分组间复用,且步时中还含 GEMM 等非 attention
-    成本;短 context(B=512)无回归(受 GEMM 主导)。
+    成本;短 context(B=64, pos<60)为 4.76 ms/step 无回归(GEMM 主导)。
+  - **测量纠偏**:初版 lctx_bench 计时前误调 `reset_state()`(lens 清零),把"长
+    context"测成了短 context(+15% 是伪影);修正后真实长 context A/B 见上(GQA
+    2.6x)。
 
 - **P3z OpenAI `usage` 字段(2026-08-23)**:
   - `/v1/completions`、`/v1/chat/completions` 非流式响应补齐 OpenAI **`usage`**

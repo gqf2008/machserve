@@ -71,11 +71,12 @@ fp32 输出以保采样精度)。关键发现:**rocBLAS 对瘦长形状(m >> n)�
 
 | 内核 | 2048-token, B=64, f16 | per-seq |
 |---|---|---|
-| 旧双遍(block-per-head) | 5.470 ms/step | 11701 tok/s |
-| GQA 复用 + uint4 向量化 | 4.74-5.00 ms/step | 12860-13504 tok/s |
+| 旧双遍(block-per-head) | 34.8 ms/step | 1840 tok/s |
+| GQA 复用 + uint4 向量化 | 13.4 ms/step | 4777 tok/s |
 
-- 长 context decode 较旧内核 **+9~15%**;低于理论 `groups`(7x)是因为旧内核已靠
+- 长 context decode 较旧内核 **2.6x**;低于理论 `groups`(7x)是因为旧内核已靠
   L2 吃到部分组间复用,且步时含 GEMM 等非 attention 成本;
+- 注:lctx_bench 计时前**不能** `reset_state()`(会把 lens 清零、误测成短 context);
 - 复现:`MACH_CTX=2048 MACH_BATCH=64 cargo run -p mach-model --release --features
   hip --example lctx_bench`。
 
