@@ -80,12 +80,23 @@ fp32 输出以保采样精度)。关键发现:**rocBLAS 对瘦长形状(m >> n)�
 - 复现:`MACH_CTX=2048 MACH_BATCH=64 cargo run -p mach-model --release --features
   hip --example lctx_bench`。
 
+## 当前能力与结论(2026-08-23)
+
+- **OpenAI 兼容服务面完整**(采样全参数/top_logprobs/stop/n/usage/SSE/错误 JSON);
+- **TTFT**:512-token ~57ms、2048-token ~289ms(分块 prefill;`MACH_PREFILL_ROWS=512`
+  默认再降 25-40%);
+- **spec-decode(greedy,实验)**:`MACH_SPEC=1` 服务器模式可用(草稿+目标双模型),
+  正确性已多层验证;**收益待测**(`spec_check`,0.5B 草稿 vs 1.5B 目标);
+- **FP8**:hipBLAS 在 gfx1100/ROCm6.2 拒绝 fp8(探针证据),原生路径不可行;
+- **模型**:Qwen2.5-0.5B / 1.5B(F32+F16),head_dim 128 兼容。
+
 ## 复现
 
 ```bash
 # MachServe
 cargo run -p mach-model --release --features hip --example qwen_bench
 cargo run -p mach-model --release --features hip --example lctx_bench   # 长 context
+cargo run -p mach-model --release --features hip --example spec_check   # spec-decode 收益(需同意运行)
 # llama.cpp
 llama-bench -m models/qwen2.5-0.5b-instruct-q8_0.gguf -p 512 -n 128 -b 1,16,128 -r 2
 ```
