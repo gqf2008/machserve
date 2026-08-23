@@ -3,7 +3,7 @@
 //! Used as the golden reference for the GPU path: identical math, naive
 //! loops, no SIMD. The GPU tests compare against this within tolerance.
 
-use crate::{Config, Weights};
+use crate::{Config, LayerWeights, Weights};
 
 /// CPU reference model with an explicit KV cache.
 #[derive(Debug)]
@@ -12,6 +12,9 @@ pub struct RefModel {
     w: Weights,
     /// Per layer: (k, v), each `[n_kv_heads, max_seq_len, head_dim]`.
     kv: Vec<(Vec<f32>, Vec<f32>)>,
+    /// Per layer MLA (kv_lora_rank > 0): expanded per-head k `[n_heads,
+    /// max_seq_len, qk_nope+qk_rope]` and v `[n_heads, max_seq_len, v_head_dim]`.
+    mla_kv: Vec<(Vec<f32>, Vec<f32>)>,
     /// Number of tokens stored so far.
     pos: usize,
 }
@@ -24,7 +27,23 @@ impl RefModel {
         let kv = (0..cfg.n_layers)
             .map(|_| (vec![0.0; kv_slots], vec![0.0; kv_slots]))
             .collect();
-        Self { cfg, w, kv, pos: 0 }
+        let mla_kv = if cfg.kv_lora_rank > 0 {
+            let hd = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+            let k_slots = cfg.n_heads * cfg.max_seq_len * hd;
+            let v_slots = cfg.n_heads * cfg.max_seq_len * cfg.v_head_dim;
+            (0..cfg.n_layers)
+                .map(|_| (vec![0.0; k_slots], vec![0.0; v_slots]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            cfg,
+            w,
+            kv,
+            mla_kv,
+            pos: 0,
+        }
     }
 
     /// Processes `tokens` one by one and returns logits of the final token.
@@ -50,32 +69,38 @@ impl RefModel {
 
         for (li, lw) in self.w.layers.iter().enumerate() {
             let xn = rms_norm(&x, &lw.rms_attn, cfg.rms_eps);
-            let mut q = matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
-            let mut k = matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
-            let v = matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
-            // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
-            if !lw.q_norm.is_empty() {
-                qk_norm(&mut q, &lw.q_norm, cfg.n_heads, cfg.head_dim, cfg.rms_eps);
-                qk_norm(
-                    &mut k,
-                    &lw.k_norm,
-                    cfg.n_kv_heads,
-                    cfg.head_dim,
-                    cfg.rms_eps,
-                );
-            }
-            apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
-            apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            if cfg.kv_lora_rank > 0 {
+                // MLA (DeepSeek-V2 style): low-rank Q + compressed KV.
+                let (kc, vc) = &mut self.mla_kv[li];
+                decode_step_mla(&mut x, &xn, lw, kc, vc, pos, cfg);
+            } else {
+                let mut q = matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
+                let mut k = matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
+                let v = matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
+                // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
+                if !lw.q_norm.is_empty() {
+                    qk_norm(&mut q, &lw.q_norm, cfg.n_heads, cfg.head_dim, cfg.rms_eps);
+                    qk_norm(
+                        &mut k,
+                        &lw.k_norm,
+                        cfg.n_kv_heads,
+                        cfg.head_dim,
+                        cfg.rms_eps,
+                    );
+                }
+                apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
+                apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
 
-            // Store into KV cache.
-            store_row(&mut self.kv[li].0, &k, pos, cfg);
-            store_row(&mut self.kv[li].1, &v, pos, cfg);
+                // Store into KV cache.
+                store_row(&mut self.kv[li].0, &k, pos, cfg);
+                store_row(&mut self.kv[li].1, &v, pos, cfg);
 
-            // Attention over positions 0..=pos.
-            let attn = attention_decode(&q, &self.kv[li].0, &self.kv[li].1, pos, cfg);
-            let attn_proj = matvec_t(&attn, &lw.wo, d);
-            for i in 0..d {
-                x[i] += attn_proj[i];
+                // Attention over positions 0..=pos.
+                let attn = attention_decode(&q, &self.kv[li].0, &self.kv[li].1, pos, cfg);
+                let attn_proj = matvec_t(&attn, &lw.wo, d);
+                for i in 0..d {
+                    x[i] += attn_proj[i];
+                }
             }
 
             let inter = cfg.intermediate_size;
@@ -167,6 +192,96 @@ fn qk_norm(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) 
         for i in 0..head_dim {
             x[s + i] = x[s + i] * inv * w[s + i];
         }
+    }
+}
+
+/// MLA attention for one decode step (expanded per-head KV form, matching
+/// the transformers DeepseekV2 reference math).
+fn decode_step_mla(
+    x: &mut [f32],
+    xn: &[f32],
+    lw: &LayerWeights,
+    kc: &mut [f32],
+    vc: &mut [f32],
+    pos: usize,
+    cfg: Config,
+) {
+    let d = cfg.d_model;
+    let heads = cfg.n_heads;
+    let nope = cfg.qk_nope_head_dim;
+    let rope_hd = cfg.qk_rope_head_dim;
+    let v_hd = cfg.v_head_dim;
+    let hd = nope + rope_hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    // q_nope = q_b(rms(q_a(x))), q_rope = q_rope(x) + RoPE.
+    let q_lora = matvec_t(xn, &lw.mla_q_a, cfg.q_lora_rank);
+    let q_lora = rms_norm(&q_lora, &lw.mla_q_a_norm, cfg.rms_eps);
+    let q_nope = matvec_t(&q_lora, &lw.mla_q_b, heads * nope);
+    let mut q_rope = matvec_t(xn, &lw.mla_q_rope, heads * rope_hd);
+    apply_rope(&mut q_rope, heads, rope_hd, pos, cfg.rope_theta);
+
+    // compressed_kv = kv_a(x); kv_lora (rms) feeds kv_b; k_rope is shared
+    // across heads and rotated like a single-head rope.
+    let kv_a = matvec_t(xn, &lw.mla_kv_a, cfg.kv_lora_rank + rope_hd);
+    let kv_lora = rms_norm(&kv_a[..cfg.kv_lora_rank], &lw.mla_kv_a_norm, cfg.rms_eps);
+    let mut k_rope = kv_a[cfg.kv_lora_rank..].to_vec();
+    apply_rope(&mut k_rope, 1, rope_hd, pos, cfg.rope_theta);
+
+    // kv_b expands the latent into per-head k_nope + v.
+    let kv = matvec_t(&kv_lora, &lw.mla_kv_b, heads * (nope + v_hd));
+
+    // Assemble per-head q (nope || rope), k (nope || rope broadcast), v.
+    let mut qm = vec![0.0; heads * hd];
+    let mut km = vec![0.0; heads * hd];
+    let mut vm = vec![0.0; heads * v_hd];
+    for h in 0..heads {
+        let base = h * (nope + v_hd);
+        qm[h * hd..h * hd + nope].copy_from_slice(&q_nope[h * nope..(h + 1) * nope]);
+        qm[h * hd + nope..(h + 1) * hd].copy_from_slice(&q_rope[h * rope_hd..(h + 1) * rope_hd]);
+        km[h * hd..h * hd + nope].copy_from_slice(&kv[base..base + nope]);
+        km[h * hd + nope..(h + 1) * hd].copy_from_slice(&k_rope);
+        vm[h * v_hd..(h + 1) * v_hd].copy_from_slice(&kv[base + nope..base + nope + v_hd]);
+    }
+
+    let ko = pos * heads * hd;
+    kc[ko..ko + heads * hd].copy_from_slice(&km);
+    let vo = pos * heads * v_hd;
+    vc[vo..vo + heads * v_hd].copy_from_slice(&vm);
+
+    // Per-head attention over positions 0..=pos.
+    let mut attn = vec![0.0; heads * v_hd];
+    for h in 0..heads {
+        let qh = &qm[h * hd..(h + 1) * hd];
+        let mut scores = vec![0.0; pos + 1];
+        let mut maxv = f32::NEG_INFINITY;
+        for pp in 0..=pos {
+            let kp = &kc[pp * heads * hd + h * hd..pp * heads * hd + (h + 1) * hd];
+            let mut s = 0.0;
+            for dd in 0..hd {
+                s += qh[dd] * kp[dd];
+            }
+            s *= scale;
+            scores[pp] = s;
+            maxv = maxv.max(s);
+        }
+        let mut sum = 0.0;
+        for pp in 0..=pos {
+            scores[pp] = (scores[pp] - maxv).exp();
+            sum += scores[pp];
+        }
+        for dd in 0..v_hd {
+            let mut acc = 0.0;
+            for pp in 0..=pos {
+                acc += scores[pp] * vc[pp * heads * v_hd + h * v_hd + dd];
+            }
+            attn[h * v_hd + dd] = acc / sum;
+        }
+    }
+
+    let attn_proj = matvec_t(&attn, &lw.mla_o, d);
+    for i in 0..d {
+        x[i] += attn_proj[i];
     }
 }
 

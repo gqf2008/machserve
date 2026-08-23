@@ -37,6 +37,20 @@ pub struct LayerWeights {
     pub q_norm: Vec<f32>,
     /// QK-norm per-head RMSNorm weight `[n_kv_heads * head_dim]` for k.
     pub k_norm: Vec<f32>,
+    /// MLA (kv_lora_rank > 0, DeepSeek-V2 style): low-rank Q / compressed KV.
+    /// `q_a [q_lora_rank, d]`, `q_a_norm [q_lora_rank]`,
+    /// `q_b [n_heads*qk_nope, q_lora_rank]`, `q_rope [n_heads*qk_rope, d]`,
+    /// `kv_a [kv_lora_rank + qk_rope, d]`, `kv_a_norm [kv_lora_rank]`,
+    /// `kv_b [n_heads*(qk_nope + v_head), kv_lora_rank]`,
+    /// `o [d, n_heads*v_head]`. Empty for standard attention.
+    pub mla_q_a: Vec<f32>,
+    pub mla_q_a_norm: Vec<f32>,
+    pub mla_q_b: Vec<f32>,
+    pub mla_q_rope: Vec<f32>,
+    pub mla_kv_a: Vec<f32>,
+    pub mla_kv_a_norm: Vec<f32>,
+    pub mla_kv_b: Vec<f32>,
+    pub mla_o: Vec<f32>,
     /// MoE (num_experts > 0): router `[num_experts, d_model]`; empty for dense.
     pub moe_router: Vec<f32>,
     /// Per-expert gate/up `[num_experts, intermediate_size, d_model]`.
@@ -78,6 +92,7 @@ impl Weights {
             (0..n).map(|_| 1.0 + (rng.next_f32() - 0.5) * 0.1).collect()
         }
 
+        let mla = cfg.kv_lora_rank > 0;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
             let (moe_router, moe_wg, moe_wu, moe_wd) = if cfg.num_experts > 0 {
@@ -91,10 +106,27 @@ impl Weights {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
             layers.push(LayerWeights {
-                wq: mat(&mut rng, d, cfg.n_heads * cfg.head_dim, scale),
-                wk: mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale),
-                wv: mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale),
-                wo: mat(&mut rng, cfg.n_heads * cfg.head_dim, d, scale),
+                // MLA replaces the standard q/k/v/o projections.
+                wq: if mla {
+                    Vec::new()
+                } else {
+                    mat(&mut rng, d, cfg.n_heads * cfg.head_dim, scale)
+                },
+                wk: if mla {
+                    Vec::new()
+                } else {
+                    mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale)
+                },
+                wv: if mla {
+                    Vec::new()
+                } else {
+                    mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale)
+                },
+                wo: if mla {
+                    Vec::new()
+                } else {
+                    mat(&mut rng, cfg.n_heads * cfg.head_dim, d, scale)
+                },
                 rms_attn: vec1(&mut rng, d),
                 wg: mat(&mut rng, cfg.intermediate_size, d, scale),
                 wu: mat(&mut rng, cfg.intermediate_size, d, scale),
@@ -110,6 +142,56 @@ impl Weights {
                 },
                 k_norm: if cfg.qk_norm {
                     vec1(&mut rng, cfg.n_kv_heads * cfg.head_dim)
+                } else {
+                    Vec::new()
+                },
+                mla_q_a: if mla {
+                    mat(&mut rng, cfg.q_lora_rank, d, scale)
+                } else {
+                    Vec::new()
+                },
+                mla_q_a_norm: if mla {
+                    vec1(&mut rng, cfg.q_lora_rank)
+                } else {
+                    Vec::new()
+                },
+                mla_q_b: if mla {
+                    mat(
+                        &mut rng,
+                        cfg.n_heads * cfg.qk_nope_head_dim,
+                        cfg.q_lora_rank,
+                        scale,
+                    )
+                } else {
+                    Vec::new()
+                },
+                mla_q_rope: if mla {
+                    mat(&mut rng, cfg.n_heads * cfg.qk_rope_head_dim, d, scale)
+                } else {
+                    Vec::new()
+                },
+                mla_kv_a: if mla {
+                    mat(&mut rng, cfg.kv_lora_rank + cfg.qk_rope_head_dim, d, scale)
+                } else {
+                    Vec::new()
+                },
+                mla_kv_a_norm: if mla {
+                    vec1(&mut rng, cfg.kv_lora_rank)
+                } else {
+                    Vec::new()
+                },
+                mla_kv_b: if mla {
+                    mat(
+                        &mut rng,
+                        cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
+                        cfg.kv_lora_rank,
+                        scale,
+                    )
+                } else {
+                    Vec::new()
+                },
+                mla_o: if mla {
+                    mat(&mut rng, d, cfg.n_heads * cfg.v_head_dim, scale)
                 } else {
                     Vec::new()
                 },
@@ -144,6 +226,14 @@ impl Weights {
                 + l.rms_mlp.len()
                 + l.q_norm.len()
                 + l.k_norm.len()
+                + l.mla_q_a.len()
+                + l.mla_q_a_norm.len()
+                + l.mla_q_b.len()
+                + l.mla_q_rope.len()
+                + l.mla_kv_a.len()
+                + l.mla_kv_a_norm.len()
+                + l.mla_kv_b.len()
+                + l.mla_o.len()
                 + l.moe_router.len()
                 + l.moe_wg.len()
                 + l.moe_wu.len()

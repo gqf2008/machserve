@@ -1,0 +1,70 @@
+//! MLA (DeepSeek-V2 style) foundation: config + weights + CPU reference forward.
+//!
+//! Verifies the data plumbing (low-rank Q / compressed KV tensors) and the
+//! reference forward math against a synthetic model; GPU kernels land in a
+//! later slice.
+
+use mach_model::ref_model::RefModel;
+use mach_model::{Config, Weights};
+
+fn mla_cfg() -> Config {
+    Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16)
+}
+
+#[test]
+fn mla_weights_have_expected_shapes() {
+    let cfg = mla_cfg();
+    let w = Weights::random(&cfg, 42).unwrap();
+    let l = &w.layers[0];
+    let d = cfg.d_model;
+    let heads = cfg.n_heads;
+    assert_eq!(l.mla_q_a.len(), cfg.q_lora_rank * d, "q_a [q_lora, d]");
+    assert_eq!(l.mla_q_a_norm.len(), cfg.q_lora_rank, "q_a_norm");
+    assert_eq!(
+        l.mla_q_b.len(),
+        heads * cfg.qk_nope_head_dim * cfg.q_lora_rank,
+        "q_b [heads*nope, q_lora]"
+    );
+    assert_eq!(
+        l.mla_q_rope.len(),
+        heads * cfg.qk_rope_head_dim * d,
+        "q_rope [heads*rope, d]"
+    );
+    assert_eq!(
+        l.mla_kv_a.len(),
+        (cfg.kv_lora_rank + cfg.qk_rope_head_dim) * d,
+        "kv_a [kv_lora+rope, d]"
+    );
+    assert_eq!(l.mla_kv_a_norm.len(), cfg.kv_lora_rank, "kv_a_norm");
+    assert_eq!(
+        l.mla_kv_b.len(),
+        heads * (cfg.qk_nope_head_dim + cfg.v_head_dim) * cfg.kv_lora_rank,
+        "kv_b [heads*(nope+v), kv_lora]"
+    );
+    assert_eq!(l.mla_o.len(), d * heads * cfg.v_head_dim, "o [d, heads*v]");
+    // Standard attention tensors stay empty on the MLA path.
+    assert!(l.wq.is_empty());
+    assert!(l.wk.is_empty());
+    assert!(l.wv.is_empty());
+    assert!(l.wo.is_empty());
+    // A dense config has no MLA tensors.
+    let dense = Weights::random(&Config::tiny(), 42).unwrap();
+    assert!(dense.layers[0].mla_q_a.is_empty());
+    assert!(dense.layers[0].mla_kv_b.is_empty());
+}
+
+#[test]
+fn mla_ref_forward_is_finite_and_deterministic() {
+    let cfg = mla_cfg();
+    let w = Weights::random(&cfg, 7).unwrap();
+    let tokens = [5u32, 9, 3, 200];
+    let mut m1 = RefModel::new(cfg, w.clone());
+    let l1 = m1.forward(&tokens);
+    assert!(
+        l1.iter().all(|v| v.is_finite()),
+        "MLA logits must be finite"
+    );
+    let mut m2 = RefModel::new(cfg, w);
+    let l2 = m2.forward(&tokens);
+    assert_eq!(l1, l2, "MLA forward must be deterministic");
+}

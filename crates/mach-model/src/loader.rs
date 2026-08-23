@@ -250,11 +250,69 @@ fn build_weights(
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
+        // MLA (DeepSeek-V2 style): low-rank Q + compressed KV replaces the
+        // standard q/k/v/o projections when kv_lora_rank > 0.
+        let mla = cfg.kv_lora_rank > 0;
+        let (mla_q_a, mla_q_a_norm, mla_q_b, mla_q_rope, mla_kv_a, mla_kv_a_norm, mla_kv_b, mla_o) =
+            if mla {
+                (
+                    get(&p("self_attn.q_a_proj.weight"), cfg.q_lora_rank * d)?,
+                    get(&p("self_attn.q_a_layernorm.weight"), cfg.q_lora_rank)?,
+                    get(
+                        &p("self_attn.q_b_proj.weight"),
+                        cfg.n_heads * cfg.qk_nope_head_dim * cfg.q_lora_rank,
+                    )?,
+                    get(
+                        &p("self_attn.q_rope_proj.weight"),
+                        cfg.n_heads * cfg.qk_rope_head_dim * d,
+                    )?,
+                    get(
+                        &p("self_attn.kv_a_proj_with_mqa.weight"),
+                        (cfg.kv_lora_rank + cfg.qk_rope_head_dim) * d,
+                    )?,
+                    get(&p("self_attn.kv_a_layernorm.weight"), cfg.kv_lora_rank)?,
+                    get(
+                        &p("self_attn.kv_b_proj.weight"),
+                        cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim) * cfg.kv_lora_rank,
+                    )?,
+                    get(
+                        &p("self_attn.o_proj.weight"),
+                        d * cfg.n_heads * cfg.v_head_dim,
+                    )?,
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
         let lw = LayerWeights {
-            wq: get(&p("self_attn.q_proj.weight"), d * nq)?,
-            wk: get(&p("self_attn.k_proj.weight"), d * nkv)?,
-            wv: get(&p("self_attn.v_proj.weight"), d * nkv)?,
-            wo: get(&p("self_attn.o_proj.weight"), nq * d)?,
+            wq: if mla {
+                Vec::new()
+            } else {
+                get(&p("self_attn.q_proj.weight"), d * nq)?
+            },
+            wk: if mla {
+                Vec::new()
+            } else {
+                get(&p("self_attn.k_proj.weight"), d * nkv)?
+            },
+            wv: if mla {
+                Vec::new()
+            } else {
+                get(&p("self_attn.v_proj.weight"), d * nkv)?
+            },
+            wo: if mla {
+                Vec::new()
+            } else {
+                get(&p("self_attn.o_proj.weight"), nq * d)?
+            },
             rms_attn: get(&p("input_layernorm.weight"), d)?,
             wg: get(&p("mlp.gate_proj.weight"), cfg.intermediate_size * d)?,
             wu: get(&p("mlp.up_proj.weight"), cfg.intermediate_size * d)?,
@@ -268,6 +326,14 @@ fn build_weights(
             // Qwen3 QK-norm: per-head RMSNorm on q/k after projection.
             q_norm: get_opt(&p("self_attn.q_norm.weight"), cfg.n_heads * cfg.head_dim)?,
             k_norm: get_opt(&p("self_attn.k_norm.weight"), cfg.n_kv_heads * cfg.head_dim)?,
+            mla_q_a,
+            mla_q_a_norm,
+            mla_q_b,
+            mla_q_rope,
+            mla_kv_a,
+            mla_kv_a_norm,
+            mla_kv_b,
+            mla_o,
             moe_router,
             moe_wg,
             moe_wu,

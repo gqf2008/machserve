@@ -41,6 +41,16 @@ pub struct Config {
     pub rope_theta: f32,
     /// QK-norm (Qwen3): per-head RMSNorm on q/k after projection, before RoPE.
     pub qk_norm: bool,
+    /// MLA (DeepSeek-style): q low-rank projection rank; 0 = disabled.
+    pub q_lora_rank: usize,
+    /// MLA: compressed KV latent rank; 0 = disabled (standard attention).
+    pub kv_lora_rank: usize,
+    /// MLA: non-RoPE head dim for q/k.
+    pub qk_nope_head_dim: usize,
+    /// MLA: decoupled RoPE head dim for q/k.
+    pub qk_rope_head_dim: usize,
+    /// MLA: value head dim.
+    pub v_head_dim: usize,
 }
 
 impl Config {
@@ -62,6 +72,11 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            q_lora_rank: 0,
+            kv_lora_rank: 0,
+            qk_nope_head_dim: 0,
+            qk_rope_head_dim: 0,
+            v_head_dim: 0,
         }
     }
 
@@ -90,6 +105,11 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 1_000_000.0,
             qk_norm: true,
+            q_lora_rank: 0,
+            kv_lora_rank: 0,
+            qk_nope_head_dim: 0,
+            qk_rope_head_dim: 0,
+            v_head_dim: 0,
         }
     }
 
@@ -118,6 +138,11 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            q_lora_rank: 0,
+            kv_lora_rank: 0,
+            qk_nope_head_dim: 0,
+            qk_rope_head_dim: 0,
+            v_head_dim: 0,
         }
     }
 
@@ -139,6 +164,49 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            q_lora_rank: 0,
+            kv_lora_rank: 0,
+            qk_nope_head_dim: 0,
+            qk_rope_head_dim: 0,
+            v_head_dim: 0,
+        }
+    }
+
+    /// DeepSeek-V2-style MLA config (low-rank Q + compressed KV).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla(
+        hidden_size: usize,
+        n_layers: usize,
+        n_heads: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+        q_lora_rank: usize,
+        kv_lora_rank: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        v_head_dim: usize,
+    ) -> Self {
+        Self {
+            dtype: ModelDType::F32,
+            vocab_size,
+            d_model: hidden_size,
+            n_layers,
+            n_heads,
+            n_kv_heads: n_heads,
+            head_dim: qk_nope_head_dim + qk_rope_head_dim,
+            intermediate_size: 4 * hidden_size,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            max_seq_len,
+            rms_eps: 1e-6,
+            rope_theta: 10000.0,
+            qk_norm: false,
+            q_lora_rank,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
         }
     }
 }
