@@ -30,6 +30,11 @@ struct LayerDev {
     bq: *mut f32,
     bk: *mut f32,
     bv: *mut f32,
+    /// MoE (num_experts > 0): router [ne,d] + per-expert gate/up/down.
+    moe_router: *mut f32,
+    moe_wg: *mut f32,
+    moe_wu: *mut f32,
+    moe_wd: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -42,6 +47,11 @@ struct LayerDevF16 {
     wg: *mut u16,
     wu: *mut u16,
     wd: *mut u16,
+    /// MoE fp16 (num_experts > 0): router + per-expert gate/up/down.
+    moe_router: *mut u16,
+    moe_wg: *mut u16,
+    moe_wu: *mut u16,
+    moe_wd: *mut u16,
 }
 
 /// Multi-sequence transformer on the GPU.
@@ -96,6 +106,26 @@ pub struct BatchedModel {
     xh: *mut u16,
     /// fp16 scratch for hidden GEMM outputs (batch * max hidden n).
     yh: *mut u16,
+    // MoE scratch (grouped per-expert GEMM; sized by rows * topk capacity).
+    router: *mut f32,
+    exp_ids: *mut i32,
+    exp_w: *mut f32,
+    counts_dev: *mut i32,
+    moe_pos_dev: *mut i32,
+    offsets_dev: *mut i32,
+    counts_host: *mut i32,
+    offsets_host: *mut i32,
+    xg: *mut f32,
+    gw: *mut f32,
+    row_idx: *mut i32,
+    h_acc: *mut f32,
+    gate_all: *mut f32,
+    up_all: *mut f32,
+    eh_all: *mut f32,
+    down_all: *mut f32,
+    /// fp16 scratch for grouped MoE GEMMs (rows * topk * max(d, inter)).
+    xh_moe: *mut u16,
+    yh_moe: *mut u16,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
@@ -164,6 +194,24 @@ impl BatchedModel {
             layers_f16: Vec::new(),
             xh: std::ptr::null_mut(),
             yh: std::ptr::null_mut(),
+            router: std::ptr::null_mut(),
+            exp_ids: std::ptr::null_mut(),
+            exp_w: std::ptr::null_mut(),
+            counts_dev: std::ptr::null_mut(),
+            moe_pos_dev: std::ptr::null_mut(),
+            offsets_dev: std::ptr::null_mut(),
+            counts_host: std::ptr::null_mut(),
+            offsets_host: std::ptr::null_mut(),
+            xg: std::ptr::null_mut(),
+            gw: std::ptr::null_mut(),
+            row_idx: std::ptr::null_mut(),
+            h_acc: std::ptr::null_mut(),
+            gate_all: std::ptr::null_mut(),
+            up_all: std::ptr::null_mut(),
+            eh_all: std::ptr::null_mut(),
+            down_all: std::ptr::null_mut(),
+            xh_moe: std::ptr::null_mut(),
+            yh_moe: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             lens: vec![0; slots],
             allocs: Vec::new(),
@@ -280,6 +328,38 @@ impl BatchedModel {
             self.kv_cache
                 .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
         }
+        if c.num_experts > 0 {
+            let ne = c.num_experts;
+            let topk = c.num_experts_per_tok.min(ne);
+            if topk > 0 {
+                let cap = b * topk; // packed grouped-row capacity
+                self.router = self.dalloc(b * ne * 4)?;
+                self.exp_ids = self.dalloc(cap * 4)? as *mut i32;
+                self.exp_w = self.dalloc(cap * 4)?;
+                self.counts_dev = self.dalloc(ne * 4)? as *mut i32;
+                self.moe_pos_dev = self.dalloc(ne * 4)? as *mut i32;
+                self.offsets_dev = self.dalloc(ne * 4)? as *mut i32;
+                self.xg = self.dalloc(cap * d * 4)?;
+                self.gw = self.dalloc(cap * 4)?;
+                self.row_idx = self.dalloc(cap * 4)? as *mut i32;
+                self.h_acc = self.dalloc(b * d * 4)?;
+                self.gate_all = self.dalloc(cap * inter * 4)?;
+                self.up_all = self.dalloc(cap * inter * 4)?;
+                self.eh_all = self.dalloc(cap * inter * 4)?;
+                self.down_all = self.dalloc(cap * d * 4)?;
+                let ch = hip::host_malloc(self.k.hip(), ne * 4)?;
+                let oh = hip::host_malloc(self.k.hip(), ne * 4)?;
+                self.counts_host = ch as *mut i32;
+                self.offsets_host = oh as *mut i32;
+                self.host_pins.push(ch);
+                self.host_pins.push(oh);
+                if c.dtype == ModelDType::F16 {
+                    let m = c.d_model.max(c.intermediate_size);
+                    self.xh_moe = self.alloc_f16(cap * m)?;
+                    self.yh_moe = self.alloc_f16(cap * m)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -332,6 +412,34 @@ impl BatchedModel {
                     self.upload(p, &lw.bv)?;
                     p
                 },
+                moe_router: if lw.moe_router.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_router.len() * 4)?;
+                    self.upload(p, &lw.moe_router)?;
+                    p
+                },
+                moe_wg: if lw.moe_wg.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_wg.len() * 4)?;
+                    self.upload(p, &lw.moe_wg)?;
+                    p
+                },
+                moe_wu: if lw.moe_wu.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_wu.len() * 4)?;
+                    self.upload(p, &lw.moe_wu)?;
+                    p
+                },
+                moe_wd: if lw.moe_wd.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_wd.len() * 4)?;
+                    self.upload(p, &lw.moe_wd)?;
+                    p
+                },
             };
             self.upload(l.wq, &lw.wq)?;
             self.upload(l.wk, &lw.wk)?;
@@ -353,6 +461,10 @@ impl BatchedModel {
                     wg: self.alloc_f16(lw.wg.len())?,
                     wu: self.alloc_f16(lw.wu.len())?,
                     wd: self.alloc_f16(lw.wd.len())?,
+                    moe_router: self.alloc_f16(lw.moe_router.len())?,
+                    moe_wg: self.alloc_f16(lw.moe_wg.len())?,
+                    moe_wu: self.alloc_f16(lw.moe_wu.len())?,
+                    moe_wd: self.alloc_f16(lw.moe_wd.len())?,
                 };
                 self.upload_f16(l16.wq, &lw.wq)?;
                 self.upload_f16(l16.wk, &lw.wk)?;
@@ -361,6 +473,10 @@ impl BatchedModel {
                 self.upload_f16(l16.wg, &lw.wg)?;
                 self.upload_f16(l16.wu, &lw.wu)?;
                 self.upload_f16(l16.wd, &lw.wd)?;
+                self.upload_f16(l16.moe_router, &lw.moe_router)?;
+                self.upload_f16(l16.moe_wg, &lw.moe_wg)?;
+                self.upload_f16(l16.moe_wu, &lw.moe_wu)?;
+                self.upload_f16(l16.moe_wd, &lw.moe_wd)?;
                 self.layers_f16.push(l16);
             }
         }
@@ -659,33 +775,191 @@ impl BatchedModel {
             )?;
             k.launch_add(self.x, self.proj, b * d)?;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
-            gemm(
-                self.gate,
-                self.xn2,
-                lw.wg,
-                l16.map_or(std::ptr::null_mut(), |l| l.wg),
-                inter,
-                d,
-            )?;
-            gemm(
-                self.up,
-                self.xn2,
-                lw.wu,
-                l16.map_or(std::ptr::null_mut(), |l| l.wu),
-                inter,
-                d,
-            )?;
-            // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
-            k.launch_silu_mul(self.up, self.gate, self.h, b * inter)?;
-            gemm(
-                self.proj,
-                self.h,
-                lw.wd,
-                l16.map_or(std::ptr::null_mut(), |l| l.wd),
-                d,
-                inter,
-            )?;
-            k.launch_add(self.x, self.proj, b * d)?;
+            if c.num_experts > 0 {
+                let ne = c.num_experts as i32;
+                let topk = c.num_experts_per_tok.min(c.num_experts) as i32;
+                if topk > 0 {
+                    // Router logits [B, ne] (shared input -> batched GEMM).
+                    gemm(
+                        self.router,
+                        self.xn2,
+                        lw.moe_router,
+                        l16.map_or(std::ptr::null_mut(), |l| l.moe_router),
+                        ne,
+                        d,
+                    )?;
+                    k.launch_moe_router_batched(
+                        self.router,
+                        self.exp_ids,
+                        self.exp_w,
+                        ne,
+                        topk,
+                        b,
+                    )?;
+                    // Count routed (token, slot) pairs per expert on device.
+                    unsafe {
+                        hip::check(
+                            self.k.hip(),
+                            (self.k.hip().api.hip_memset)(
+                                self.counts_dev as *mut _,
+                                0,
+                                (ne as usize) * 4,
+                            ),
+                        )?;
+                        hip::check(
+                            self.k.hip(),
+                            (self.k.hip().api.hip_memset)(
+                                self.moe_pos_dev as *mut _,
+                                0,
+                                (ne as usize) * 4,
+                            ),
+                        )?;
+                    }
+                    k.launch_moe_count_experts(self.exp_ids, self.counts_dev, b, topk)?;
+                    // One D2H read per layer: per-expert counts -> host offsets.
+                    hip::memcpy(
+                        self.k.hip(),
+                        self.counts_host as *mut core::ffi::c_void,
+                        self.counts_dev as *const core::ffi::c_void,
+                        (ne as usize) * 4,
+                        hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                    )?;
+                    let mut counts = vec![0i32; ne as usize];
+                    let mut offsets = vec![0i32; ne as usize];
+                    let mut acc = 0i32;
+                    for e in 0..ne as usize {
+                        counts[e] = unsafe { *self.counts_host.add(e) };
+                        offsets[e] = acc;
+                        acc += counts[e];
+                        unsafe { *self.offsets_host.add(e) = offsets[e] };
+                    }
+                    hip::memcpy_async(
+                        self.k.hip(),
+                        self.offsets_dev as *mut core::ffi::c_void,
+                        self.offsets_host as *const core::ffi::c_void,
+                        (ne as usize) * 4,
+                        hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                        self.k.stream,
+                    )?;
+                    k.launch_moe_gather_rows(
+                        self.xn2,
+                        self.exp_ids,
+                        self.exp_w,
+                        self.offsets_dev,
+                        self.moe_pos_dev,
+                        self.xg,
+                        self.gw,
+                        self.row_idx,
+                        b,
+                        topk,
+                        d,
+                    )?;
+                    unsafe {
+                        hip::check(
+                            self.k.hip(),
+                            (self.k.hip().api.hip_memset)(
+                                self.h_acc as *mut _,
+                                0,
+                                (b as usize) * (d as usize) * 4,
+                            ),
+                        )?;
+                    }
+                    // Per-expert grouped GEMMs (counts known on host after the
+                    // single D2H read; no per-expert sync).
+                    let d_usize = d as usize;
+                    let inter_usize = inter as usize;
+                    for e in 0..ne as usize {
+                        let cnt = counts[e];
+                        if cnt <= 0 {
+                            continue;
+                        }
+                        let base = offsets[e] as usize;
+                        let xg_e = unsafe { self.xg.add(base * d_usize) };
+                        let down_e = unsafe { self.down_all.add(base * d_usize) };
+                        let wg32 = unsafe { lw.moe_wg.add(e * inter_usize * d_usize) };
+                        let wu32 = unsafe { lw.moe_wu.add(e * inter_usize * d_usize) };
+                        let wd32 = unsafe { lw.moe_wd.add(e * d_usize * inter_usize) };
+                        let (wg16, wu16, wd16) = if f16 {
+                            let l = self.layers_f16[li];
+                            (
+                                unsafe { l.moe_wg.add(e * inter_usize * d_usize) },
+                                unsafe { l.moe_wu.add(e * inter_usize * d_usize) },
+                                unsafe { l.moe_wd.add(e * d_usize * inter_usize) },
+                            )
+                        } else {
+                            (
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        let gemm_e = |out: *mut f32,
+                                      x: *const f32,
+                                      w32: *mut f32,
+                                      w16: *mut u16,
+                                      n: i32,
+                                      kk: i32|
+                         -> Result<(), Error> {
+                            if f16 {
+                                k.gemm_batched_f16(
+                                    out,
+                                    x,
+                                    w16,
+                                    cnt,
+                                    n,
+                                    kk,
+                                    self.xh_moe,
+                                    self.yh_moe,
+                                )
+                            } else {
+                                k.gemm_batched(out, x, w32, cnt, n, kk)
+                            }
+                        };
+                        gemm_e(self.gate_all, xg_e, wg32, wg16, inter, d)?;
+                        gemm_e(self.up_all, xg_e, wu32, wu16, inter, d)?;
+                        k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, cnt * inter)?;
+                        gemm_e(down_e, self.eh_all, wd32, wd16, d, inter)?;
+                        k.launch_moe_scatter_add(
+                            self.h_acc,
+                            unsafe { self.row_idx.add(base) },
+                            unsafe { self.gw.add(base) },
+                            down_e,
+                            cnt,
+                            d,
+                        )?;
+                    }
+                    k.launch_add(self.x, self.h_acc, b * d)?;
+                }
+                // topk == 0: MoE contributes nothing (matches ref_model).
+            } else {
+                gemm(
+                    self.gate,
+                    self.xn2,
+                    lw.wg,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wg),
+                    inter,
+                    d,
+                )?;
+                gemm(
+                    self.up,
+                    self.xn2,
+                    lw.wu,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wu),
+                    inter,
+                    d,
+                )?;
+                // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
+                k.launch_silu_mul(self.up, self.gate, self.h, b * inter)?;
+                gemm(
+                    self.proj,
+                    self.h,
+                    lw.wd,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wd),
+                    d,
+                    inter,
+                )?;
+                k.launch_add(self.x, self.proj, b * d)?;
+            }
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
         if f16 {

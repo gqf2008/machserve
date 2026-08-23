@@ -783,6 +783,138 @@ extern "C" __global__ void moe_accumulate(
 }
 "#;
 
+/// Batched MoE routing: one block per token, softmax + top-k with the same
+/// tie-breaking (lower index) as the CPU reference. Outputs `out_ids[B, topk]`
+/// and normalized `out_w[B, topk]`.
+const MOE_ROUTER_BATCHED: &str = r#"
+extern "C" __global__ void moe_router_batched(
+    const float* __restrict__ logits,
+    int* __restrict__ out_ids,
+    float* __restrict__ out_w,
+    int ne, int topk, int batch) {
+    int s = blockIdx.x;
+    const float* lg = logits + (long long)s * ne;
+    int* ids = out_ids + (long long)s * topk;
+    float* w = out_w + (long long)s * topk;
+    extern __shared__ float sm[];
+    float* probs = sm;
+    __shared__ float red[256];
+    float maxv = -1e30f;
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) maxv = fmaxf(maxv, lg[i]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+    float sumv = 0.0f;
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) {
+        probs[i] = __expf(lg[i] - m);
+        sumv += probs[i];
+    }
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) probs[i] *= inv;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float norm = 0.0f;
+        for (int k = 0; k < topk; k++) {
+            int best = -1;
+            float bestv = -1e30f;
+            for (int i = 0; i < ne; i++) {
+                int used = 0;
+                for (int j = 0; j < k; j++) {
+                    if (ids[j] == i) { used = 1; break; }
+                }
+                if (!used) {
+                    if (probs[i] > bestv || (probs[i] == bestv && (best < 0 || i < best))) {
+                        bestv = probs[i];
+                        best = i;
+                    }
+                }
+            }
+            ids[k] = best;
+            norm += probs[best];
+        }
+        for (int k = 0; k < topk; k++) w[k] = probs[ids[k]] / norm;
+    }
+}
+"#;
+
+/// Batched MoE: count how many (token, slot) pairs route to each expert via
+/// atomicAdd on `counts[ne]` (must be zeroed before launch).
+const MOE_COUNT_EXPERTS: &str = r#"
+extern "C" __global__ void moe_count_experts(
+    const int* __restrict__ ids,
+    int* __restrict__ counts,
+    int batch, int topk) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * topk;
+    if (i < total) {
+        int e = ids[i];
+        atomicAdd(&counts[e], 1);
+    }
+}
+"#;
+
+/// Batched MoE: gather routed rows into a packed per-expert layout. For each
+/// (token, slot) pair routed to expert e, atomically claims position `j` in
+/// expert e's segment and copies the token row from `x[B, d]` into
+/// `xg[B*topk, d]` at `offsets[e] + j`, recording the source row and weight.
+const MOE_GATHER_ROWS: &str = r#"
+extern "C" __global__ void moe_gather_rows(
+    const float* __restrict__ x,
+    const int* __restrict__ ids,
+    const float* __restrict__ w,
+    const int* __restrict__ offsets,
+    int* __restrict__ pos,
+    float* __restrict__ xg,
+    float* __restrict__ gw,
+    int* __restrict__ row_idx,
+    int batch, int topk, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * topk;
+    if (i < total) {
+        int t = i / topk;
+        int k = i % topk;
+        int e = ids[i];
+        int j = atomicAdd(&pos[e], 1);
+        int dst = offsets[e] + j;
+        row_idx[dst] = t;
+        gw[dst] = w[i];
+        const float* src = x + (long long)t * d;
+        float* dstp = xg + (long long)dst * d;
+        for (int c = 0; c < d; c++) dstp[c] = src[c];
+    }
+}
+"#;
+
+/// Batched MoE: `h_acc[src] += gw[j] * down[j]` for a packed expert segment.
+/// `row_idx`/`gw`/`down` are already offset to the segment base.
+const MOE_SCATTER_ADD: &str = r#"
+extern "C" __global__ void moe_scatter_add(
+    float* __restrict__ h_acc,
+    const int* __restrict__ row_idx,
+    const float* __restrict__ gw,
+    const float* __restrict__ down,
+    int cnt, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = cnt * d;
+    if (i < total) {
+        int j = i / d;
+        int c = i % d;
+        int t = row_idx[j];
+        h_acc[(long long)t * d + c] += gw[j] * down[(long long)j * d + c];
+    }
+}
+"#;
+
 /// Compiled kernels plus the hipBLAS handle, bound to one stream.
 pub struct HipKernels {
     hip: std::sync::Arc<Hip>,
@@ -812,6 +944,10 @@ pub struct HipKernels {
     moe_router: HipKernelModule,
     moe_gather: HipKernelModule,
     moe_accumulate: HipKernelModule,
+    moe_router_batched: HipKernelModule,
+    moe_count: HipKernelModule,
+    moe_gather_rows: HipKernelModule,
+    moe_scatter_add: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -871,6 +1007,14 @@ impl HipKernels {
             moe_router: HipKernelModule::compile(&arch, MOE_ROUTER, "moe_router")?,
             moe_gather: HipKernelModule::compile(&arch, MOE_GATHER_WEIGHTS, "moe_gather_weights")?,
             moe_accumulate: HipKernelModule::compile(&arch, MOE_ACCUMULATE, "moe_accumulate")?,
+            moe_router_batched: HipKernelModule::compile(
+                &arch,
+                MOE_ROUTER_BATCHED,
+                "moe_router_batched",
+            )?,
+            moe_count: HipKernelModule::compile(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
+            moe_gather_rows: HipKernelModule::compile(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
+            moe_scatter_add: HipKernelModule::compile(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
         })
     }
 
@@ -1716,6 +1860,137 @@ impl HipKernels {
         let blocks = (d as u32).div_ceil(256);
         Ok(self
             .moe_accumulate
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Batched MoE router: one block per token, softmax + top-k selection;
+    /// writes `out_ids[B, topk]` and normalized `out_w[B, topk]`.
+    pub fn launch_moe_router_batched(
+        &self,
+        logits: *const f32,
+        out_ids: *mut i32,
+        out_w: *mut f32,
+        ne: i32,
+        topk: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        let lp = logits;
+        let ip = out_ids;
+        let wp = out_w;
+        let mut p = vec![
+            &lp as *const *const f32 as *mut core::ffi::c_void,
+            &ip as *const *mut i32 as *mut core::ffi::c_void,
+            &wp as *const *mut f32 as *mut core::ffi::c_void,
+            &ne as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.moe_router_batched.launch_shmem(
+            [batch as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            (ne as u32) * 4,
+        )?)
+    }
+
+    /// Batched MoE expert histogram: `counts[e] += 1` per routed (token, slot)
+    /// pair (counts must be zeroed before launch).
+    pub fn launch_moe_count_experts(
+        &self,
+        ids: *const i32,
+        counts: *mut i32,
+        batch: i32,
+        topk: i32,
+    ) -> Result<(), Error> {
+        let ip = ids;
+        let cp = counts;
+        let mut p = vec![
+            &ip as *const *const i32 as *mut core::ffi::c_void,
+            &cp as *const *mut i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = batch * topk;
+        let blocks = (total as u32).div_ceil(256);
+        Ok(self
+            .moe_count
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Batched MoE row gather: packs routed token rows into a per-expert
+    /// contiguous layout using prefix-sum `offsets[ne]` and `pos[ne]` counters
+    /// (zeroed before launch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_gather_rows(
+        &self,
+        x: *const f32,
+        ids: *const i32,
+        w: *const f32,
+        offsets: *const i32,
+        pos: *mut i32,
+        xg: *mut f32,
+        gw: *mut f32,
+        row_idx: *mut i32,
+        batch: i32,
+        topk: i32,
+        d: i32,
+    ) -> Result<(), Error> {
+        let xp = x;
+        let idp = ids;
+        let wp = w;
+        let op = offsets;
+        let pp = pos;
+        let xgp = xg;
+        let gwp = gw;
+        let rip = row_idx;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &idp as *const *const i32 as *mut core::ffi::c_void,
+            &wp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *const i32 as *mut core::ffi::c_void,
+            &pp as *const *mut i32 as *mut core::ffi::c_void,
+            &xgp as *const *mut f32 as *mut core::ffi::c_void,
+            &gwp as *const *mut f32 as *mut core::ffi::c_void,
+            &rip as *const *mut i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = batch * topk;
+        let blocks = (total as u32).div_ceil(256);
+        Ok(self
+            .moe_gather_rows
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Batched MoE scatter-add: `h_acc[src] += gw[j] * down[j]` for a packed
+    /// expert segment (`row_idx`/`gw`/`down` pre-offset to the segment base).
+    pub fn launch_moe_scatter_add(
+        &self,
+        h_acc: *mut f32,
+        row_idx: *const i32,
+        gw: *const f32,
+        down: *const f32,
+        cnt: i32,
+        d: i32,
+    ) -> Result<(), Error> {
+        let hp = h_acc;
+        let rip = row_idx;
+        let gwp = gw;
+        let dp = down;
+        let mut p = vec![
+            &hp as *const *mut f32 as *mut core::ffi::c_void,
+            &rip as *const *const i32 as *mut core::ffi::c_void,
+            &gwp as *const *const f32 as *mut core::ffi::c_void,
+            &dp as *const *const f32 as *mut core::ffi::c_void,
+            &cnt as *const i32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = cnt * d;
+        let blocks = (total as u32).div_ceil(256);
+        Ok(self
+            .moe_scatter_add
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 

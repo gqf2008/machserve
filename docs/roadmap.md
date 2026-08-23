@@ -629,3 +629,20 @@
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 后续切片:fp16 MoE 权重、batched/continuous 路径的逐 token 分组批量专家 GEMM、
     真实 Qwen2.5-MoE 验证。
+
+- **P3aw batched MoE 分组批量专家 GEMM(2026-08-23,7900 XTX)**:
+  - `BatchedModel` MoE MLP:路由 GEMM([B,ne]) → `moe_router_batched`(每 token
+    softmax+top-k,与 ref_model 一致)→ `moe_count_experts` 直方图 → 每层单次 D2H
+    读回 counts → host 算 prefix offsets → `moe_gather_rows` 按专家打包 token 行
+    (atomic 定位)→ 逐专家 `gemm_batched`(gate/up → silu_mul → down,counts 已知
+    无额外同步)→ `moe_scatter_add` 加权回填 h_acc → 残差相加;
+  - fp16 路径完整支持(逐专家 fp16 权重 + xh_moe/yh_moe scratch);真正的稀疏收益点
+    (只算路由到的专家,而非稠密全专家);
+  - **验证**:`batched.rs` 增 `batched_moe_matches_single_seq`(F32)与
+    `batched_moe_f16_matches_single_seq`(F16,router 放大保证跨精度路由一致):
+    与单序列 GpuModel 逐序列对拍,greedy token 一致 + logits 在容差内;全量 HIP
+    回归全绿,clippy/fmt 干净;
+  - 踩坑记录:MoE 分组计数器初名 `pos_dev` 与既有每序列位置缓冲冲突,rename 为
+    `moe_pos_dev` 后 memset 仍误指旧 `pos_dev`,把每层注意力位置清零导致 layer≥1
+    注意力全错(对拍 0.28 级误差,路由一致仍炸)→ 已修并沉淀 LESSON;
+  - 后续切片:counts 读回改 GPU 侧调度(去每层 D2H)、真实 Qwen2.5-MoE 验证。

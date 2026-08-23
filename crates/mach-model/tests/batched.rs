@@ -4,6 +4,7 @@
 
 use mach_kernel_sys::hip;
 use mach_model::batched::BatchedModel;
+use mach_model::config::ModelDType;
 use mach_model::model::GpuModel;
 use mach_model::{Config, Weights};
 
@@ -48,6 +49,102 @@ fn batched_matches_single_seq() {
                 got[s], want,
                 "step {step_tokens:?} seq {s}: batched={} single={}",
                 got[s], want
+            );
+        }
+    }
+}
+
+fn moe_cfg() -> Config {
+    let mut cfg = Config::tiny();
+    cfg.intermediate_size = 64;
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg
+}
+
+#[test]
+fn batched_moe_matches_single_seq() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 51).unwrap();
+    let batch = 4usize;
+
+    let mut batched = BatchedModel::new(hip.clone(), cfg, &w, batch).unwrap();
+    let mut singles: Vec<GpuModel> = (0..batch)
+        .map(|_| GpuModel::new(hip.clone(), cfg, &w).unwrap())
+        .collect();
+
+    let steps: Vec<Vec<u32>> = vec![vec![5, 9, 33, 7], vec![12, 3, 1, 200], vec![8, 55, 4, 99]];
+    for step_tokens in &steps {
+        let got = batched.decode_step(step_tokens).unwrap();
+        let got_logits = batched.read_logits().unwrap();
+        assert_eq!(got.len(), batch);
+        for s in 0..batch {
+            let want_logits = singles[s].decode_step(step_tokens[s]).unwrap();
+            let want = want_logits
+                .iter()
+                .enumerate()
+                .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
+            let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let max = row
+                .iter()
+                .zip(&want_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max <= 2e-3 + 2e-3 * scale,
+                "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
+            );
+        }
+    }
+}
+
+#[test]
+fn batched_moe_f16_matches_single_seq() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let mut w = Weights::random(&cfg, 77).unwrap();
+    // Peak the router so fp16/fp32 paths select the same experts robustly
+    // (fp16 router logits carry ~1e-3 rounding).
+    for lw in w.layers.iter_mut() {
+        for v in lw.moe_router.iter_mut() {
+            *v *= 6.0;
+        }
+    }
+    let batch = 4usize;
+
+    let mut batched = BatchedModel::new(hip.clone(), cfg, &w, batch).unwrap();
+    let mut singles: Vec<GpuModel> = (0..batch)
+        .map(|_| GpuModel::new(hip.clone(), cfg, &w).unwrap())
+        .collect();
+
+    let steps: Vec<Vec<u32>> = vec![vec![5, 9, 33, 7], vec![12, 3, 1, 200], vec![8, 55, 4, 99]];
+    for step_tokens in &steps {
+        let got = batched.decode_step(step_tokens).unwrap();
+        let got_logits = batched.read_logits().unwrap();
+        for s in 0..batch {
+            let want_logits = singles[s].decode_step(step_tokens[s]).unwrap();
+            let want = want_logits
+                .iter()
+                .enumerate()
+                .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
+            let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let max = row
+                .iter()
+                .zip(&want_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max < 0.1,
+                "step {step_tokens:?} seq {s}: f16 logits max diff {max}"
             );
         }
     }
