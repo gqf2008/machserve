@@ -678,3 +678,49 @@
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 后续切片:彻底去 D2H 需自定义 grouped-GEMM 内核(设备端按专家分段调度),
     真实 Qwen2.5-MoE 验证(需下载权重)。
+
+- **P3ba Qwen3 QK-norm(2026-08-23,7900 XTX)**:
+  - `Config` 增 `qk_norm` 标志 + per-head RMSNorm 权重;`ref_model`/`GpuModel`/
+    `BatchedModel` 在 Q/K 投影后、RoPE 前逐 head 做 RMSNorm;
+  - 验证:`qwen3.rs` 增 QK-norm 权重形状 + GPU==CPU 对拍;全量 HIP 回归全绿,
+    clippy/fmt 干净。
+
+- **P3bb F16 路径只保留 fp16 权重驻留(2026-08-23,7900 XTX)**:
+  - `BatchedModel`/`GpuModel` 的 F16 路径不再同时保留 fp32 权重副本,仅驻留 fp16
+    权重以降低显存占用;
+  - 验证:`qwen3.rs` 增 F16 vs F32 argmax 对拍;全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3bc 多 shard safetensors loader + Qwen3 真实模型 smoke(2026-08-23)**:
+  - `load_safetensors` 支持多 shard checkpoint(按张量名聚合);新增 `qwen3_real`
+    smoke 测试(真实 Qwen3-8B 比例 + F16,下载 ~16GB,缺 checkpoint 自动 skip);
+  - 验证:`load_safetensors` 增 sharded 往返一致测试;全量 HIP 回归全绿,
+    clippy/fmt 干净。
+
+- **P3bd Qwen2-1.5B 真实模型 smoke(2026-08-23,7900 XTX)**:
+  - `qwen15_real.rs` 用已下载的 Qwen2-1.5B checkpoint(BF16、tie_word_embeddings、
+    GQA + rope_theta=1e6、F16 设备路径)做真实模型解码 smoke;
+  - 验证:真实模型解码有限且确定(本机 checkpoint 存在,回归中实际运行);
+    全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3ca MLA 地基(config/weights/loader/CPU 参考,2026-08-23)**:
+  - `Config` 增 MLA 字段(q_lora_rank / kv_lora_rank / qk_nope_head_dim /
+    qk_rope_head_dim / v_head_dim);`LayerWeights` 增低秩 Q 与压缩 KV 张量;
+    loader 读 DeepSeek-V2 风格 MLA 权重;`ref_model` 增 MLA 前向;
+  - 验证:`mla.rs` 增张量形状 + CPU 前向有限确定;全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3cb MLA 单序列 GPU decode(expanded KV,2026-08-23,7900 XTX)**:
+  - `GpuModel` MLA 路径:q_lora/kv_lora 低秩投影 + RMSNorm + q_b/kv_b 展开 +
+    手写 MLA assemble/attn 内核,expanded per-head KV cache;
+  - 验证:`mla.rs` 增 `mla_gpu_matches_cpu_reference` 对拍;全量 HIP 回归全绿,
+    clippy/fmt 干净。
+
+- **P3cc MLA batched decode(expanded KV,2026-08-23,7900 XTX)**:
+  - `BatchedModel` MLA 分支(run_kernels 内,decode-only、f32):q_lora/kv_lora
+    投影 → RMSNorm → q_b/kv_b 展开 → 5 个 batched 内核(`mla_assemble_q_batched` /
+    `mla_extract_kv_lora` / `mla_extract_k_rope` / `mla_assemble_kv_batched` /
+    `mla_attn_decode_batched`)→ mla_o 投影;MLA KV 走独立 `mla_kv_cache`
+    (expanded per-head f32);
+  - 验证:`mla.rs` 增 `mla_batched_matches_cpu_reference`(2 序列逐 token 对拍);
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 已知边界:仅 f32 + decode 步(ContinuousModel 槽位压缩/真实 MLA checkpoint
+    尚未接入);后续切片:MLA 连续批处理/服务集成 + 真实 DeepSeek MLA 权重验证。
