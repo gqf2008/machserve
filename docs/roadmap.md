@@ -340,3 +340,17 @@
     → 打印退出;
   - 测试:busy 引擎返回 OpenAI 错误 JSON 形状(零容量直接拒,无需 GPU)+ 停机后两个
     在跑请求排空完成且引擎线程自行退出;默认 + HIP 全绿,clippy/fmt 干净。
+
+- **P3s OpenAI `top_logprobs`(2026-08-23,7900 XTX 真机)**:
+  - 新 GPU 内核 `topk_batched`:每行一个 block(256 线程),max-subtracted softmax +
+    per-thread 局部 top-k(≤20)+ 动态共享内存合并,输出每 token 的 top-k
+    (token, logprob);`logprob = (logit - max) * inv_t - log(total)`,并列按较小
+    token id 排序;`t <= 0`(贪心)按 `inv_t = 1.0` 报告;读 penalty/bias 就地修改
+    后的 logits,与采样分布一致;
+  - `SamplingParams.top_logprobs`(0 关,≤20)、`sample_batched` 第三返回值
+    `SampleOutput`、引擎按序列累计 `generated_top_logprobs`;`/v1/completions`、
+    `/v1/chat/completions` 支持 `top_logprobs: n`(需 `logprobs: true`),响应
+    `logprobs.top_logprobs` 每个生成位置返回按 logprob 降序的 top-n;
+  - **对拍**:GPU vs CPU `topk_cpu` 逐位置 token 完全一致、logprob 差 < 1e-3;
+    服务器端到端测试(每位置 n 项、降序、无 logprobs 时忽略);默认 + HIP 全绿,
+    clippy/fmt 干净;`chat_check` 真实模型输出不变。

@@ -47,7 +47,7 @@ fn main() {
     let lens: Vec<u32> = (0..ids.len() as u32).collect();
     let slots = vec![0u32; ids.len()];
     let mut params = vec![SamplingParams::greedy(0); ids.len()];
-    let (sampled, _) = model
+    let (sampled, _, _) = model
         .decode_step_explicit(
             &ids,
             &lens,

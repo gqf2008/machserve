@@ -102,6 +102,7 @@ fn real_model_samples_with_seed_deterministically() {
         seed: 99,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        top_logprobs: 0,
     };
     let run = || -> Vec<u32> {
         let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).expect("engine");

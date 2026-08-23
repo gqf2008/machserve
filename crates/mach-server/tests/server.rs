@@ -153,6 +153,7 @@ async fn sampling_params_flow_through_http() {
         seed: 1234,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        top_logprobs: 0,
     };
 
     // Direct engine reference with the same params + seed.
@@ -591,8 +592,8 @@ async fn engine_shutdown_drains_queued_work_then_exits() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     engine.shutdown();
 
-    let (oa, _, ra) = a.await.unwrap().unwrap();
-    let (ob, _, rb) = b.await.unwrap().unwrap();
+    let (oa, _, _, ra) = a.await.unwrap().unwrap();
+    let (ob, _, _, rb) = b.await.unwrap().unwrap();
     assert_eq!(oa.len(), 4);
     assert_eq!(ob.len(), 4);
     assert_eq!(ra, "length");
@@ -602,4 +603,94 @@ async fn engine_shutdown_drains_queued_work_then_exits() {
     handle
         .join()
         .expect("engine thread must exit after shutdown");
+}
+
+#[tokio::test]
+async fn top_logprobs_returned_when_requested() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 101).unwrap();
+    let prompt = vec![5u32, 9, 3];
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    // top_logprobs=3 with logprobs: true -> one sorted list per position.
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": 4,
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "seed": 99,
+        "logprobs": true,
+        "top_logprobs": 3,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let lp = &json["choices"][0]["logprobs"];
+    let top = lp["top_logprobs"].as_array().expect("top_logprobs array");
+    assert_eq!(top.len(), 4, "one top_logprobs list per generated token");
+    for row in top {
+        let entries = row.as_array().expect("top_logprobs row");
+        assert_eq!(entries.len(), 3, "top_logprobs=3 per position");
+        let lps: Vec<f64> = entries
+            .iter()
+            .map(|e| e["logprob"].as_f64().unwrap())
+            .collect();
+        assert!(lps.windows(2).all(|w| w[0] >= w[1]), "descending logprobs");
+        for e in entries {
+            assert!(e["token"].as_str().is_some(), "token string present");
+        }
+    }
+
+    // Without logprobs: true, top_logprobs is ignored (no logprobs payload).
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "max_tokens": 2,
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "seed": 99,
+        "top_logprobs": 3,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        json["choices"][0]["logprobs"].is_null(),
+        "logprobs must be absent without logprobs: true"
+    );
 }

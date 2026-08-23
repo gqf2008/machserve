@@ -189,6 +189,7 @@ fn sampling_is_deterministic_per_seed() {
         seed: 0,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        top_logprobs: 0,
     };
     let run = |seed: u64| -> Vec<u32> {
         let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 4).unwrap();

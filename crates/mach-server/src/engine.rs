@@ -19,13 +19,16 @@ struct Request {
     stop_seqs: Vec<Vec<u32>>,
     logit_bias: Vec<(u32, f32)>,
     params: SamplingParams,
-    done: oneshot::Sender<(Vec<u32>, Vec<f32>, &'static str)>,
+    done: DoneSender,
     /// Streaming: per-token channel (None for non-streaming requests).
     tokens_tx: Option<tokio::sync::mpsc::Sender<u32>>,
 }
 
-/// Completion delivery: generated tokens plus the OpenAI finish reason.
-type DoneSender = oneshot::Sender<(Vec<u32>, Vec<f32>, &'static str)>;
+/// Completion delivery: generated tokens, per-token log-probs, per-token
+/// top-`k` log-probs (OpenAI `top_logprobs`), and the OpenAI finish reason.
+type DoneSender = oneshot::Sender<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str)>;
+/// Completion delivery receiver (the `submit`/`submit_stream` resolution).
+type DoneReceiver = oneshot::Receiver<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str)>;
 
 /// Shared engine handle (channel side only; the model stays on the engine
 /// thread).
@@ -74,7 +77,7 @@ impl ServerEngine {
         stop_seqs: Vec<Vec<u32>>,
         logit_bias: Vec<(u32, f32)>,
         params: SamplingParams,
-    ) -> Result<(Vec<u32>, Vec<f32>, &'static str), EngineError> {
+    ) -> Result<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str), EngineError> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::ShuttingDown);
         }
@@ -110,13 +113,7 @@ impl ServerEngine {
         stop_seqs: Vec<Vec<u32>>,
         logit_bias: Vec<(u32, f32)>,
         params: SamplingParams,
-    ) -> Result<
-        (
-            oneshot::Receiver<(Vec<u32>, Vec<f32>, &'static str)>,
-            tokio::sync::mpsc::Receiver<u32>,
-        ),
-        EngineError,
-    > {
+    ) -> Result<(DoneReceiver, tokio::sync::mpsc::Receiver<u32>), EngineError> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::ShuttingDown);
         }
@@ -202,10 +199,11 @@ impl ServerEngine {
                         }
                         let output = model.generated(id);
                         let lps = model.generated_logprobs(id);
+                        let tlps = model.generated_top_logprobs(id);
                         let reason = model.finish_reason(id);
                         model.ack(id);
                         if let Some(tx) = txs.remove(&id) {
-                            let _ = tx.send((output, lps, reason));
+                            let _ = tx.send((output, lps, tlps, reason));
                         }
                         // Closing the stream sender signals end-of-stream.
                         streams.remove(&id);

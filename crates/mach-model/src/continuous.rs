@@ -47,6 +47,8 @@ struct SeqState {
     stop_seqs: Vec<Vec<u32>>,
     /// Per-token log-probabilities of `generated` (OpenAI `logprobs`).
     logprobs: Vec<f32>,
+    /// Per-token top-`k` (token, logprob) lists (OpenAI `top_logprobs`).
+    top_logprobs: Vec<Vec<(u32, f32)>>,
     /// Token occurrence counts of `generated` (presence/frequency penalties).
     counts: HashMap<u32, u32>,
     /// Static logit_bias (token, value) pairs applied to every sampled step.
@@ -58,6 +60,16 @@ struct SeqState {
     first_decode: Option<u32>,
 }
 
+/// Finished sequence output retained until `ack` (keyed by stable id).
+#[derive(Debug)]
+struct FinishedSeq {
+    id: SeqId,
+    generated: Vec<u32>,
+    logprobs: Vec<f32>,
+    top_logprobs: Vec<Vec<(u32, f32)>>,
+    stopped: bool,
+}
+
 /// Continuous-batching engine over a fixed-capacity batched model.
 pub struct ContinuousModel {
     model: BatchedModel,
@@ -65,7 +77,7 @@ pub struct ContinuousModel {
     seqs: Vec<Option<SeqState>>,
     active: usize,
     /// Finished sequences' outputs, keyed by stable id.
-    finished: Vec<(SeqId, Vec<u32>, Vec<f32>, bool)>,
+    finished: Vec<FinishedSeq>,
     next_id: SeqId,
 }
 
@@ -128,6 +140,7 @@ impl ContinuousModel {
             eos,
             stop_seqs,
             logprobs: Vec::new(),
+            top_logprobs: Vec::new(),
             counts: HashMap::new(),
             logit_bias,
             params,
@@ -193,7 +206,7 @@ impl ContinuousModel {
             }
         }
 
-        let (sampled, logprobs) = self.model.decode_step_explicit(
+        let (sampled, logprobs, topk) = self.model.decode_step_explicit(
             &tokens,
             &lens,
             &slots,
@@ -227,6 +240,7 @@ impl ContinuousModel {
                 if s.prompt.is_empty() {
                     s.generated.push(last_out);
                     s.logprobs.push(logprobs[start + count - 1]);
+                    s.top_logprobs.push(topk[start + count - 1].clone());
                     *s.counts.entry(last_out).or_insert(0) += 1;
                     s.first_decode = Some(last_out);
                     if s.eos.is_some_and(|e| last_out == e)
@@ -241,6 +255,7 @@ impl ContinuousModel {
                 let out = sampled[start];
                 s.generated.push(out);
                 s.logprobs.push(logprobs[start]);
+                s.top_logprobs.push(topk[start].clone());
                 *s.counts.entry(out).or_insert(0) += 1;
                 s.len += 1;
                 s.first_decode = Some(out);
@@ -268,7 +283,7 @@ impl ContinuousModel {
     /// Whether the sequence with `id` has finished (or is unknown).
     #[must_use]
     pub fn is_done(&self, id: SeqId) -> bool {
-        if self.finished.iter().any(|(fid, _, _, _)| *fid == id) {
+        if self.finished.iter().any(|f| f.id == id) {
             return true;
         }
         self.seqs.iter().flatten().find(|s| s.id == id).is_none()
@@ -277,8 +292,8 @@ impl ContinuousModel {
     /// Generated tokens of the sequence with `id` (empty if unknown).
     #[must_use]
     pub fn generated(&self, id: SeqId) -> Vec<u32> {
-        if let Some((_, g, _, _)) = self.finished.iter().find(|(fid, _, _, _)| *fid == id) {
-            return g.clone();
+        if let Some(f) = self.finished.iter().find(|f| f.id == id) {
+            return f.generated.clone();
         }
         self.seqs
             .iter()
@@ -292,8 +307,8 @@ impl ContinuousModel {
     /// `logprobs`), empty when unknown.
     #[must_use]
     pub fn generated_logprobs(&self, id: SeqId) -> Vec<f32> {
-        if let Some((_, _, lp, _)) = self.finished.iter().find(|(fid, _, _, _)| *fid == id) {
-            return lp.clone();
+        if let Some(f) = self.finished.iter().find(|f| f.id == id) {
+            return f.logprobs.clone();
         }
         self.seqs
             .iter()
@@ -303,16 +318,27 @@ impl ContinuousModel {
             .unwrap_or_default()
     }
 
+    /// Per-token top-`k` (token, logprob) lists of the generated output
+    /// (OpenAI `top_logprobs`), empty when unknown or not requested.
+    #[must_use]
+    pub fn generated_top_logprobs(&self, id: SeqId) -> Vec<Vec<(u32, f32)>> {
+        if let Some(f) = self.finished.iter().find(|f| f.id == id) {
+            return f.top_logprobs.clone();
+        }
+        self.seqs
+            .iter()
+            .flatten()
+            .find(|s| s.id == id)
+            .map(|s| s.top_logprobs.clone())
+            .unwrap_or_default()
+    }
+
     /// OpenAI finish reason for a finished sequence: `"stop"` when the last
     /// token was the EOS or a stop sequence, `"length"` otherwise. Unknown ids
     /// (or still-active sequences) report `"length"`.
     #[must_use]
     pub fn finish_reason(&self, id: SeqId) -> &'static str {
-        if self
-            .finished
-            .iter()
-            .any(|(fid, _, _, stopped)| *fid == id && *stopped)
-        {
+        if self.finished.iter().any(|f| f.id == id && f.stopped) {
             "stop"
         } else {
             "length"
@@ -321,18 +347,30 @@ impl ContinuousModel {
 
     /// Removes a finished sequence from the finished list (freeing bookkeeping).
     pub fn ack(&mut self, id: SeqId) {
-        self.finished.retain(|(fid, _, _, _)| *fid != id);
+        self.finished.retain(|f| f.id != id);
     }
 
     fn finish(&mut self, slot: usize) {
         assert!(slot < self.active, "finish out of range");
-        let (id, generated, logprobs, stopped) = {
+        let (id, generated, logprobs, top_logprobs, stopped) = {
             let s = self.seqs[slot].as_ref().expect("active slot");
             let stopped = s.generated.last().is_some_and(|&t| s.eos == Some(t))
                 || ends_with_stop(&s.generated, &s.stop_seqs);
-            (s.id, s.generated.clone(), s.logprobs.clone(), stopped)
+            (
+                s.id,
+                s.generated.clone(),
+                s.logprobs.clone(),
+                s.top_logprobs.clone(),
+                stopped,
+            )
         };
-        self.finished.push((id, generated, logprobs, stopped));
+        self.finished.push(FinishedSeq {
+            id,
+            generated,
+            logprobs,
+            top_logprobs,
+            stopped,
+        });
         // Compact: move every sequence above `slot` down by one, copying KV.
         for i in (slot + 1)..self.active {
             let from = i;

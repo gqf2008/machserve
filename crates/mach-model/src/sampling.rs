@@ -60,6 +60,9 @@ pub struct SamplingParams {
     /// Frequency penalty: subtract `frequency_penalty * count` from a token's
     /// logit for each prior occurrence (OpenAI `frequency_penalty`).
     pub frequency_penalty: f32,
+    /// Report top-`top_logprobs` tokens + log-probs per sampled token (OpenAI
+    /// `logprobs.top_logprobs`); `0` disables.
+    pub top_logprobs: usize,
 }
 
 impl Default for SamplingParams {
@@ -72,6 +75,7 @@ impl Default for SamplingParams {
             seed: 0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            top_logprobs: 0,
         }
     }
 }
@@ -88,9 +92,14 @@ impl SamplingParams {
             seed,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            top_logprobs: 0,
         }
     }
 }
+
+/// Batched sampling result: per-row sampled token, its log-probability, and
+/// the per-row top-`k` (token, logprob) lists (empty when `top_logprobs == 0`).
+pub type SampleOutput = (Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>);
 
 /// Batched sampling kernel: one block per sequence row (256 threads).
 ///
@@ -391,12 +400,150 @@ extern "C" __global__ void sample_batched(
     }
 }
 "#;
+/// Batched top-`k` log-prob kernel: one block per row (256 threads).
+///
+/// Ranks tokens by post-penalty/bias softmax probability (temperature per row,
+/// `inv_t = 1/t` with `t <= 0` treated as `1.0`), reporting
+/// `logprob = (logit - max) * inv_t - log(total)`. Ties break on the smaller
+/// token id (deterministic). Each thread keeps a local top-k over its strided
+/// slice; lists are merged through dynamic shared memory and thread 0 scans
+/// `T * TOPK_MAX` entries for the global top-k.
+const TOPK_BATCHED: &str = r#"
+#define TOPK_MAX 20
+
+extern "C" __global__ void topk_batched(
+    const float* __restrict__ logits,
+    const float* __restrict__ inv_t,
+    int* __restrict__ out_tok,
+    float* __restrict__ out_lp,
+    int vocab, int batch, int k)
+{
+    const int s = blockIdx.x;
+    const float* row = logits + (long long)s * vocab;
+    const int T = blockDim.x;
+    const int tid = threadIdx.x;
+    const float it = inv_t[s];
+    const int kk = (k < 1) ? 1 : (k > TOPK_MAX ? TOPK_MAX : k);
+
+    __shared__ float s_red[256];
+    __shared__ float s_maxv;
+    __shared__ float s_tot;
+
+    // Row max (max-subtracted softmax, matching sample_batched).
+    float mx = -1e30f;
+    for (int i = tid; i < vocab; i += T) mx = fmaxf(mx, row[i]);
+    s_red[tid] = mx;
+    __syncthreads();
+    for (int st = T / 2; st > 0; st >>= 1) {
+        if (tid < st) s_red[tid] = fmaxf(s_red[tid], s_red[tid + st]);
+        __syncthreads();
+    }
+    if (tid == 0) s_maxv = s_red[0];
+    __syncthreads();
+    const float maxv = s_maxv;
+
+    // Softmax total.
+    float tot = 0.0f;
+    for (int i = tid; i < vocab; i += T) tot += __expf((row[i] - maxv) * it);
+    s_red[tid] = tot;
+    __syncthreads();
+    for (int st = T / 2; st > 0; st >>= 1) {
+        if (tid < st) s_red[tid] += s_red[tid + st];
+        __syncthreads();
+    }
+    if (tid == 0) s_tot = s_red[0];
+    __syncthreads();
+    const float logZ = logf(s_tot);
+
+    // Per-thread local top-k over its strided slice, sorted by prob desc
+    // (ties: token id asc). `lp = (logit - max) * it` avoids underflow.
+    float lt_p[TOPK_MAX];
+    int lt_t[TOPK_MAX];
+    int lt_n = 0;
+    for (int i = tid; i < vocab; i += T) {
+        float lp = (row[i] - maxv) * it;
+        float p = __expf(lp);
+        if (lt_n < kk) {
+            int pos = lt_n;
+            while (pos > 0 && (lt_p[pos - 1] < p || (lt_p[pos - 1] == p && lt_t[pos - 1] > i))) {
+                lt_p[pos] = lt_p[pos - 1];
+                lt_t[pos] = lt_t[pos - 1];
+                pos--;
+            }
+            lt_p[pos] = p;
+            lt_t[pos] = i;
+            lt_n++;
+        } else if (p > lt_p[kk - 1] || (p == lt_p[kk - 1] && i < lt_t[kk - 1])) {
+            int pos = kk - 1;
+            while (pos > 0 && (lt_p[pos - 1] < p || (lt_p[pos - 1] == p && lt_t[pos - 1] > i))) {
+                lt_p[pos] = lt_p[pos - 1];
+                lt_t[pos] = lt_t[pos - 1];
+                pos--;
+            }
+            lt_p[pos] = p;
+            lt_t[pos] = i;
+        }
+    }
+
+    // Merge local lists through dynamic shared memory; thread 0 scans all
+    // entries for the global top-k.
+    extern __shared__ float sm[];
+    float* sm_p = (float*)sm;
+    int* sm_t = (int*)(sm + (long long)T * TOPK_MAX);
+    for (int j = 0; j < TOPK_MAX; j++) {
+        if (j < lt_n) {
+            sm_p[tid * TOPK_MAX + j] = lt_p[j];
+            sm_t[tid * TOPK_MAX + j] = lt_t[j];
+        } else {
+            sm_p[tid * TOPK_MAX + j] = -1e30f;
+            sm_t[tid * TOPK_MAX + j] = -1;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float g_p[TOPK_MAX];
+        int g_t[TOPK_MAX];
+        int g_n = 0;
+        for (int e = 0; e < T * TOPK_MAX; e++) {
+            float p = sm_p[e];
+            int t = sm_t[e];
+            if (t < 0) continue;
+            if (g_n < kk) {
+                int pos = g_n;
+                while (pos > 0 && (g_p[pos - 1] < p || (g_p[pos - 1] == p && g_t[pos - 1] > t))) {
+                    g_p[pos] = g_p[pos - 1];
+                    g_t[pos] = g_t[pos - 1];
+                    pos--;
+                }
+                g_p[pos] = p;
+                g_t[pos] = t;
+                g_n++;
+            } else if (p > g_p[kk - 1] || (p == g_p[kk - 1] && t < g_t[kk - 1])) {
+                int pos = kk - 1;
+                while (pos > 0 && (g_p[pos - 1] < p || (g_p[pos - 1] == p && g_t[pos - 1] > t))) {
+                    g_p[pos] = g_p[pos - 1];
+                    g_t[pos] = g_t[pos - 1];
+                    pos--;
+                }
+                g_p[pos] = p;
+                g_t[pos] = t;
+            }
+        }
+        for (int j = 0; j < kk; j++) {
+            out_tok[(long long)s * TOPK_MAX + j] = g_t[j];
+            out_lp[(long long)s * TOPK_MAX + j] = (row[g_t[j]] - maxv) * it - logZ;
+        }
+    }
+}
+"#;
 
 /// Batched top-k/top-p/temperature sampler bound to the model stream.
 pub struct BatchedSampler {
     hip: Arc<Hip>,
     stream: HipStream,
     kernel: HipKernelModule,
+    topk_kernel: HipKernelModule,
     temp_dev: *mut f32,
     topk_dev: *mut i32,
     topp_dev: *mut f32,
@@ -411,6 +558,9 @@ pub struct BatchedSampler {
     bias_tokens_dev: *mut i32,
     bias_vals_dev: *mut f32,
     bias_count_dev: *mut i32,
+    topk_inv_t_dev: *mut f32,
+    topk_tok_dev: *mut i32,
+    topk_lp_dev: *mut f32,
     temp_host: *mut f32,
     topk_host: *mut i32,
     topp_host: *mut f32,
@@ -425,6 +575,9 @@ pub struct BatchedSampler {
     bias_tokens_host: *mut i32,
     bias_vals_host: *mut f32,
     bias_count_host: *mut i32,
+    topk_inv_t_host: *mut f32,
+    topk_tok_host: *mut i32,
+    topk_lp_host: *mut f32,
     capacity: usize,
     allocs: Vec<*mut core::ffi::c_void>,
     pins: Vec<*mut core::ffi::c_void>,
@@ -440,6 +593,7 @@ impl BatchedSampler {
     pub fn new(hip: Arc<Hip>, stream: HipStream, capacity: usize) -> Result<Self, Error> {
         let arch = hip_arch();
         let kernel = HipKernelModule::compile(&arch, SAMPLE_BATCHED, "sample_batched")?;
+        let topk_kernel = HipKernelModule::compile(&arch, TOPK_BATCHED, "topk_batched")?;
         let mut allocs = Vec::new();
         let mut pins = Vec::new();
         let mut dalloc = |bytes: usize| -> Result<*mut core::ffi::c_void, Error> {
@@ -466,6 +620,9 @@ impl BatchedSampler {
         let bias_tokens_dev = dalloc(capacity * MAX_BIAS * 4)? as *mut i32;
         let bias_vals_dev = dalloc(capacity * MAX_BIAS * 4)? as *mut f32;
         let bias_count_dev = dalloc(capacity * 4)? as *mut i32;
+        let topk_inv_t_dev = dalloc(capacity * 4)? as *mut f32;
+        let topk_tok_dev = dalloc(capacity * MAX_TOPK * 4)? as *mut i32;
+        let topk_lp_dev = dalloc(capacity * MAX_TOPK * 4)? as *mut f32;
         let temp_host = pall(capacity * 4)? as *mut f32;
         let topk_host = pall(capacity * 4)? as *mut i32;
         let topp_host = pall(capacity * 4)? as *mut f32;
@@ -480,10 +637,14 @@ impl BatchedSampler {
         let bias_tokens_host = pall(capacity * MAX_BIAS * 4)? as *mut i32;
         let bias_vals_host = pall(capacity * MAX_BIAS * 4)? as *mut f32;
         let bias_count_host = pall(capacity * 4)? as *mut i32;
+        let topk_inv_t_host = pall(capacity * 4)? as *mut f32;
+        let topk_tok_host = pall(capacity * MAX_TOPK * 4)? as *mut i32;
+        let topk_lp_host = pall(capacity * MAX_TOPK * 4)? as *mut f32;
         Ok(Self {
             hip,
             stream,
             kernel,
+            topk_kernel,
             temp_dev,
             topk_dev,
             topp_dev,
@@ -498,6 +659,9 @@ impl BatchedSampler {
             bias_tokens_dev,
             bias_vals_dev,
             bias_count_dev,
+            topk_inv_t_dev,
+            topk_tok_dev,
+            topk_lp_dev,
             temp_host,
             topk_host,
             topp_host,
@@ -512,6 +676,9 @@ impl BatchedSampler {
             bias_tokens_host,
             bias_vals_host,
             bias_count_host,
+            topk_inv_t_host,
+            topk_tok_host,
+            topk_lp_host,
             capacity,
             allocs,
             pins,
@@ -529,7 +696,7 @@ impl BatchedSampler {
         counts: &[Vec<(u32, u32)>],
         bias: &[Vec<(u32, f32)>],
         vocab: usize,
-    ) -> Result<(Vec<u32>, Vec<f32>), Error> {
+    ) -> Result<SampleOutput, Error> {
         let n = params.len();
         assert!(n <= self.capacity, "sampler capacity exceeded");
         assert_eq!(counts.len(), n, "counts must be per-row");
@@ -733,7 +900,103 @@ impl BatchedSampler {
                 lps.push(*self.logprobs_host.add(i));
             }
         }
-        Ok((out, lps))
+        let topk = self.sample_topk(logits, params, n, vocab)?;
+        Ok((out, lps, topk))
+    }
+
+    /// Optional per-row top-`k` log-probs (OpenAI `top_logprobs`), computed on
+    /// device from the post-penalty/bias logits. Rows with
+    /// `params[i].top_logprobs == 0` get an empty list. `k` is clamped to
+    /// [`MAX_TOPK`].
+    fn sample_topk(
+        &self,
+        logits: *const f32,
+        params: &[SamplingParams],
+        n: usize,
+        vocab: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>, Error> {
+        let k_global = params.iter().map(|p| p.top_logprobs).max().unwrap_or(0);
+        if k_global == 0 || n == 0 {
+            return Ok(vec![Vec::new(); n]);
+        }
+        let k_global = k_global.min(MAX_TOPK);
+        for (i, p) in params.iter().enumerate() {
+            let it = if p.temperature > 0.0 {
+                1.0 / p.temperature
+            } else {
+                1.0
+            };
+            unsafe {
+                *self.topk_inv_t_host.add(i) = it;
+            }
+        }
+        hip::memcpy_async(
+            &self.hip,
+            self.topk_inv_t_dev as *mut core::ffi::c_void,
+            self.topk_inv_t_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        let vocab_i = vocab as i32;
+        let n_i = n as i32;
+        let k_i = k_global as i32;
+        let lp = logits as *mut f32; // kernel arg convention (reads const)
+        let itp = self.topk_inv_t_dev;
+        let otp = self.topk_tok_dev;
+        let olp = self.topk_lp_dev;
+        let mut args: Vec<*mut core::ffi::c_void> = vec![
+            &lp as *const *mut f32 as *mut core::ffi::c_void,
+            &itp as *const *mut f32 as *mut core::ffi::c_void,
+            &otp as *const *mut i32 as *mut core::ffi::c_void,
+            &olp as *const *mut f32 as *mut core::ffi::c_void,
+            &vocab_i as *const i32 as *mut core::ffi::c_void,
+            &n_i as *const i32 as *mut core::ffi::c_void,
+            &k_i as *const i32 as *mut core::ffi::c_void,
+        ];
+        // Dynamic shared: T * TOPK_MAX probs + T * TOPK_MAX tokens.
+        let shared = 2 * 256 * MAX_TOPK * 4;
+        self.topk_kernel.launch_shmem(
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            &mut args,
+            self.stream,
+            shared as u32,
+        )?;
+        unsafe {
+            hip::check(
+                &self.hip,
+                (self.hip.api.hip_stream_synchronize)(self.stream),
+            )?;
+            hip::memcpy(
+                &self.hip,
+                self.topk_tok_host as *mut core::ffi::c_void,
+                self.topk_tok_dev as *const core::ffi::c_void,
+                n * MAX_TOPK * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            hip::memcpy(
+                &self.hip,
+                self.topk_lp_host as *mut core::ffi::c_void,
+                self.topk_lp_dev as *const core::ffi::c_void,
+                n * MAX_TOPK * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+        }
+        let mut rows = Vec::with_capacity(n);
+        unsafe {
+            for (i, p) in params.iter().enumerate() {
+                let want = p.top_logprobs.min(MAX_TOPK);
+                let mut row = Vec::with_capacity(want);
+                for j in 0..want {
+                    let tok = *self.topk_tok_host.add(i * MAX_TOPK + j) as u32;
+                    let lpv = *self.topk_lp_host.add(i * MAX_TOPK + j);
+                    row.push((tok, lpv));
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -873,10 +1136,62 @@ pub fn sample_cpu(
     chosen.unwrap_or_else(|| argmax_first(logits))
 }
 
+/// CPU reference for top-`k` log-probs (OpenAI `top_logprobs`), mirroring the
+/// `topk_batched` kernel: post-penalty/bias softmax at the row temperature
+/// (`t <= 0` treated as `1.0`), ranked by probability descending (token id
+/// ascending on ties), `logprob = (logit - max) * inv_t - log(total)`.
+#[must_use]
+pub fn topk_cpu(
+    logits: &[f32],
+    p: &SamplingParams,
+    counts: &[(u32, u32)],
+    bias: &[(u32, f32)],
+    k: usize,
+) -> Vec<(u32, f32)> {
+    let vocab = logits.len();
+    let need_edit = p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 || !bias.is_empty();
+    let mut v = logits.to_vec();
+    if need_edit {
+        for &(t, c) in counts {
+            if (t as usize) < vocab && c > 0 {
+                v[t as usize] -= p.presence_penalty + p.frequency_penalty * c as f32;
+            }
+        }
+        for &(t, b) in bias {
+            if (t as usize) < vocab {
+                v[t as usize] += b;
+            }
+        }
+    }
+    let inv_t = if p.temperature > 0.0 {
+        1.0 / p.temperature
+    } else {
+        1.0
+    };
+    let maxv = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f32 = v.iter().map(|&x| ((x - maxv) * inv_t).exp()).sum();
+    let log_z = total.ln();
+    let mut ranked: Vec<(u32, f32)> = v
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (i as u32, (x - maxv) * inv_t - log_z))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(k.min(MAX_TOPK));
+    ranked
+}
+
 /// Maximum penalty (token, count) pairs per row (OpenAI frequency/presence).
 const MAX_PEN: usize = 4096;
 /// Maximum logit_bias (token, value) pairs per row.
 const MAX_BIAS: usize = 4096;
+/// Maximum reported top log-probs per sampled token (OpenAI `top_logprobs`
+/// upper bound).
+const MAX_TOPK: usize = 20;
 
 /// Block-local argmax: each block reduces a contiguous 256-element slice.
 const ARGMAX_SLICE: &str = r#"
@@ -1199,7 +1514,7 @@ mod tests {
         let s = BatchedSampler::new(Arc::clone(h), stream, params.len()).unwrap();
         let empty: Vec<Vec<(u32, u32)>> = (0..params.len()).map(|_| Vec::new()).collect();
         let ebias: Vec<Vec<(u32, f32)>> = (0..params.len()).map(|_| Vec::new()).collect();
-        let (got, _) = s
+        let (got, _, _) = s
             .sample_batched(dlogits, params, &empty, &ebias, vocab)
             .unwrap();
         hip::free(h, dlogits as *mut _).unwrap();
@@ -1236,6 +1551,7 @@ mod tests {
                 seed: 500 + i as u64,
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
+                top_logprobs: 0,
             })
             .collect();
         let mut b = a.clone();
@@ -1272,6 +1588,7 @@ mod tests {
                 seed: 7000 + i as u64,
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
+                top_logprobs: 0,
             })
             .collect();
         let mut params = cases.clone();
@@ -1303,6 +1620,7 @@ mod tests {
             seed: 0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            top_logprobs: 0,
         };
         let mut seen = std::collections::BTreeSet::new();
         for k in 0..200u64 {
@@ -1325,7 +1643,7 @@ mod tests {
         let mut gp: Vec<SamplingParams> = (0..n)
             .map(|i| SamplingParams::greedy(10 + i as u64))
             .collect();
-        let (toks, lps) = {
+        let (toks, lps, _) = {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
@@ -1352,9 +1670,10 @@ mod tests {
                 seed: 500 + i as u64,
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
+                top_logprobs: 0,
             })
             .collect();
-        let (_, lps2) = {
+        let (_, lps2, _) = {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
@@ -1394,6 +1713,7 @@ mod tests {
                 seed: 9000 + i as u64,
                 presence_penalty: 0.5,
                 frequency_penalty: 0.3,
+                top_logprobs: 0,
             })
             .collect();
         // Counts: token 0 has appeared 3x, token 1 x1, token 10 x2.
@@ -1401,7 +1721,7 @@ mod tests {
             .map(|_| vec![(0u32, 3u32), (1, 1), (10, 2)])
             .collect();
         let cases = params.clone();
-        let (got, _) = {
+        let (got, _, _) = {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
@@ -1449,12 +1769,13 @@ mod tests {
                 seed: 4000 + i as u64,
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
+                top_logprobs: 0,
             })
             .collect();
         // Bias strongly toward token 200 and away from token 0.
         let bias: Vec<Vec<(u32, f32)>> = (0..n).map(|_| vec![(200u32, 12.0), (0, -12.0)]).collect();
         let cases = params.clone();
-        let (got, _) = {
+        let (got, _, _) = {
             let stream = make_stream(&h);
             let d = upload_logits(&h, &logits);
             let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
@@ -1480,6 +1801,67 @@ mod tests {
                 "seq {i} logit_bias sample mismatch: gpu={} cpu={}",
                 got[i], want
             );
+        }
+    }
+
+    #[test]
+    fn topk_matches_cpu_reference() {
+        let Some(h) = have_gpu() else { return };
+        let vocab = 4096usize;
+        let n = 4usize;
+        // Monotonic, well-separated logits: top-k tokens are unambiguous and
+        // the GPU/CPU float sums cannot flip the ordering.
+        let mut logits = vec![0.0f32; vocab * n];
+        for s in 0..n {
+            let row = &mut logits[s * vocab..(s + 1) * vocab];
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = 0.5 - 1.1 * (i as f32) * 0.2;
+            }
+        }
+        let mut params: Vec<SamplingParams> = (0..n)
+            .map(|i| SamplingParams {
+                temperature: [0.0, 0.9, 1.0, 1.2][i],
+                top_k: 0,
+                top_p: 1.0,
+                seed: 11_000 + i as u64,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                top_logprobs: [0, 3, 5, 8][i],
+            })
+            .collect();
+        let (_, _, got) = {
+            let stream = make_stream(&h);
+            let d = upload_logits(&h, &logits);
+            let s = BatchedSampler::new(Arc::clone(&h), stream, n).unwrap();
+            let empty: Vec<Vec<(u32, u32)>> = (0..n).map(|_| Vec::new()).collect();
+            let ebias: Vec<Vec<(u32, f32)>> = (0..n).map(|_| Vec::new()).collect();
+            let r = s
+                .sample_batched(d, &mut params, &empty, &ebias, vocab)
+                .unwrap();
+            hip::free(&h, d as *mut _).unwrap();
+            unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+            r
+        };
+        for (i, p) in params.iter().enumerate() {
+            assert_eq!(
+                got[i].len(),
+                p.top_logprobs,
+                "seq {i} top_logprobs length mismatch"
+            );
+            let want = topk_cpu(
+                &logits[i * vocab..(i + 1) * vocab],
+                p,
+                &[],
+                &[],
+                p.top_logprobs,
+            );
+            for (j, ((g_tok, g_lp), (c_tok, c_lp))) in got[i].iter().zip(want.iter()).enumerate() {
+                assert_eq!(g_tok, c_tok, "seq {i} topk token {j} mismatch");
+                assert!(
+                    (g_lp - c_lp).abs() < 1e-3,
+                    "seq {i} topk logprob {j}: gpu={g_lp} cpu={c_lp}"
+                );
+            }
         }
     }
 }

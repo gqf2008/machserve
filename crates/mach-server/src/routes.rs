@@ -83,6 +83,10 @@ pub struct CompletionRequest {
     /// Add bias to specific token logits (OpenAI logit_bias: {token_id: bias}).
     #[serde(default)]
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// Report the top-`n` tokens + log-probs per generated position (OpenAI
+    /// `logprobs.top_logprobs`; requires `logprobs: true`).
+    #[serde(default)]
+    pub top_logprobs: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +122,10 @@ pub struct ChatRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// Report the top-`n` tokens + log-probs per generated position (OpenAI
+    /// `logprobs.top_logprobs`; requires `logprobs: true`).
+    #[serde(default)]
+    pub top_logprobs: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,11 +139,21 @@ pub struct CompletionChoice {
     pub finish_reason: String,
 }
 
+/// One reported alternative token (OpenAI `top_logprobs` entry).
+#[derive(Debug, Serialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f32,
+}
+
 /// OpenAI `logprobs` payload (tokens + per-token log-probabilities).
 #[derive(Debug, Serialize)]
 pub struct Logprobs {
     pub tokens: Vec<String>,
     pub token_logprobs: Vec<f32>,
+    /// Per-position top-k alternatives (present when `top_logprobs` > 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<Vec<Vec<TopLogprob>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -270,6 +288,7 @@ fn sampling_params(
     seed: Option<u64>,
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
+    top_logprobs: usize,
 ) -> SamplingParams {
     SamplingParams {
         temperature: temperature.unwrap_or(0.0),
@@ -278,6 +297,7 @@ fn sampling_params(
         seed: seed.unwrap_or(0),
         presence_penalty: presence_penalty.unwrap_or(0.0),
         frequency_penalty: frequency_penalty.unwrap_or(0.0),
+        top_logprobs: top_logprobs.min(20),
     }
 }
 
@@ -380,6 +400,12 @@ pub async fn completions(
     let tokens = prompt_tokens(&state.tok, &req.prompt);
     let stop = stop_seqs(&state.tok, &req.stop);
     let bias = logit_bias_pairs(&req.logit_bias);
+    // top_logprobs only applies when logprobs are requested (OpenAI).
+    let top_logprobs = if req.logprobs.unwrap_or(false) {
+        req.top_logprobs.unwrap_or(0).min(20)
+    } else {
+        0
+    };
     let params = sampling_params(
         req.temperature,
         req.top_k,
@@ -387,6 +413,7 @@ pub async fn completions(
         req.seed,
         req.presence_penalty,
         req.frequency_penalty,
+        top_logprobs,
     );
     let id = format!("cmpl-{}", now());
     let created = now();
@@ -404,7 +431,7 @@ pub async fn completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let reason = rx_final.await.map(|(_, _, r)| r).unwrap_or("length");
+            let reason = rx_final.await.map(|(_, _, _, r)| r).unwrap_or("length");
             stream_tokens(st, id2, "text_completion", created, reason, rx_tokens, tx).await;
         });
         return sse_response(rx);
@@ -427,8 +454,9 @@ pub async fn completions(
             seed,
             req.presence_penalty,
             req.frequency_penalty,
+            top_logprobs,
         );
-        let (output, lps, reason) = match state
+        let (output, lps, tlps, reason) = match state
             .engine
             .submit(
                 tokens.clone(),
@@ -450,6 +478,18 @@ pub async fn completions(
                     .map(|&t| decode_text(&state.tok, &[t]))
                     .collect(),
                 token_logprobs: lps.clone(),
+                top_logprobs: (top_logprobs > 0).then(|| {
+                    tlps.iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|&(t, lp)| TopLogprob {
+                                    token: decode_text(&state.tok, &[t]),
+                                    logprob: lp,
+                                })
+                                .collect()
+                        })
+                        .collect()
+                }),
             })
         } else {
             None
@@ -489,6 +529,12 @@ pub async fn chat_completions(
         .and_then(|t| t.special_token_id("<|im_end|>"));
     let stop = stop_seqs(&state.tok, &req.stop);
     let bias = logit_bias_pairs(&req.logit_bias);
+    // top_logprobs only applies when logprobs are requested (OpenAI).
+    let top_logprobs = if req.logprobs.unwrap_or(false) {
+        req.top_logprobs.unwrap_or(0).min(20)
+    } else {
+        0
+    };
     let params = sampling_params(
         req.temperature,
         req.top_k,
@@ -496,6 +542,7 @@ pub async fn chat_completions(
         req.seed,
         req.presence_penalty,
         req.frequency_penalty,
+        top_logprobs,
     );
     let id = format!("chatcmpl-{}", now());
     let created = now();
@@ -513,7 +560,7 @@ pub async fn chat_completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let reason = rx_final.await.map(|(_, _, r)| r).unwrap_or("length");
+            let reason = rx_final.await.map(|(_, _, _, r)| r).unwrap_or("length");
             stream_tokens(
                 st,
                 id2,
@@ -543,8 +590,9 @@ pub async fn chat_completions(
             seed,
             req.presence_penalty,
             req.frequency_penalty,
+            top_logprobs,
         );
-        let (output, lps, reason) = match state
+        let (output, lps, tlps, reason) = match state
             .engine
             .submit(
                 tokens.clone(),
@@ -566,6 +614,18 @@ pub async fn chat_completions(
                     .map(|&t| decode_text(&state.tok, &[t]))
                     .collect(),
                 token_logprobs: lps.clone(),
+                top_logprobs: (top_logprobs > 0).then(|| {
+                    tlps.iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|&(t, lp)| TopLogprob {
+                                    token: decode_text(&state.tok, &[t]),
+                                    logprob: lp,
+                                })
+                                .collect()
+                        })
+                        .collect()
+                }),
             })
         } else {
             None

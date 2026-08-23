@@ -9,7 +9,7 @@
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
-use crate::sampling::{BatchedSampler, SamplingParams};
+use crate::sampling::{BatchedSampler, SampleOutput, SamplingParams};
 use crate::{Config, Error, Weights};
 use mach_kernel_sys::hip::{self, Hip};
 use std::sync::Arc;
@@ -736,7 +736,7 @@ impl BatchedModel {
         params: &mut [SamplingParams],
         counts: &[Vec<(u32, u32)>],
         bias: &[Vec<(u32, f32)>],
-    ) -> Result<(Vec<u32>, Vec<f32>), Error> {
+    ) -> Result<SampleOutput, Error> {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
