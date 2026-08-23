@@ -11,10 +11,11 @@
 //! captured graph can serve every position: update the buffers between
 //! replays, then replay.
 
+use crate::adaptive::{BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
-use crate::moe_backend::{LruExpertCache, Placement};
+use crate::moe_backend::LruExpertCache;
 use crate::moe_offload;
 use crate::sampling::HipSampler;
 use crate::{Config, Error, Weights};
@@ -160,6 +161,8 @@ pub struct GpuModel {
     /// Small device scratch for slot indices + reordered expert weights.
     slot_ids_dev: *mut i32,
     slot_w_dev: *mut f32,
+    /// Bandwidth profile for adaptive (q*) placement; None = static placement.
+    adaptive: Option<BandwidthProfile>,
 }
 
 impl GpuModel {
@@ -231,6 +234,7 @@ impl GpuModel {
             slot_ctx: Vec::new(),
             slot_ids_dev: std::ptr::null_mut(),
             slot_w_dev: std::ptr::null_mut(),
+            adaptive: None,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -999,7 +1003,7 @@ impl GpuModel {
         w: &Weights,
         expert_slots: usize,
     ) -> Result<Self, Error> {
-        let mut m = Self::build(hip, cfg, w, expert_slots)?;
+        let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
         m.host_w = Some(Arc::new(w.clone()));
         Ok(m)
     }
@@ -1116,6 +1120,65 @@ impl GpuModel {
         }
         Ok(())
     }
+    /// Builds a GPU model in adaptive (q*) mode: measures the machine PCIe
+    /// bandwidth and CPU expert cost at init, and per miss decides whether to
+    /// fetch an expert to a GPU slot or compute it on the CPU (the BandwidthProbe).
+    pub fn with_adaptive(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        expert_slots: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
+        m.host_w = Some(Arc::new(w.clone()));
+        m.adaptive = Some(BandwidthProbe::measure(&hip, &cfg)?.profile);
+        Ok(m)
+    }
+
+    /// Places a step routed experts into GPU slots (bounded by `cap`), applying
+    /// the adaptive q* choice when `adaptive` is provided. Returns (to_upload,
+    /// slot_list, gpu_w, cpu): experts to copy into slots, slot indices for the GPU
+    /// gather (in routed order), their weights, and the CPU fallback.
+    #[allow(clippy::type_complexity)]
+    fn moe_slot_place(
+        &self,
+        li: usize,
+        ids: &[i32],
+        weights: &[f32],
+        adaptive: Option<&BandwidthProfile>,
+        expert_bytes: usize,
+    ) -> (Vec<(usize, usize)>, Vec<i32>, Vec<f32>, Vec<(usize, f32)>) {
+        let mut to_upload: Vec<(usize, usize)> = Vec::new();
+        let mut slot_list: Vec<i32> = Vec::new();
+        let mut gpu_w: Vec<f32> = Vec::new();
+        let mut cpu: Vec<(usize, f32)> = Vec::new();
+        let mut ctx = self.slot_ctx[li].borrow_mut();
+        let cap = ctx.cap;
+        for (i, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let w = weights[i];
+            let id = e as u32;
+            if let Some(slot) = ctx.lru.get(id) {
+                slot_list.push(slot as i32);
+                gpu_w.push(w);
+            } else if adaptive
+                .is_some_and(|p| p.choose(expert_bytes) == crate::adaptive::FetchChoice::ComputeCpu)
+            {
+                cpu.push((e, w));
+            } else if ctx.lru.len() < cap {
+                let put = ctx.lru.put(id);
+                if ctx.slot_expert[put.slot] != e as i32 {
+                    ctx.slot_expert[put.slot] = e as i32;
+                    to_upload.push((put.slot, e));
+                }
+                slot_list.push(put.slot as i32);
+                gpu_w.push(w);
+            } else {
+                cpu.push((e, w));
+            }
+        }
+        (to_upload, slot_list, gpu_w, cpu)
+    }
     /// MoE step with bounded GPU-resident expert slots: experts stay in host RAM
     /// and are fetched on demand into a fixed set of per-layer slots via the LRU
     /// cache (`plan_step`); misses beyond capacity are computed on the CPU. The
@@ -1161,33 +1224,12 @@ impl GpuModel {
             (ctx.wg, ctx.wu, ctx.wd, ctx.cap)
         };
 
-        // Decide placement: fill free slots, overflow to CPU, no intra-step eviction.
-        let routed: Vec<u32> = ids.iter().map(|&e| e as u32).collect();
-        let plan = self.slot_ctx[li].borrow_mut().lru.plan_step(&routed);
-
-        let mut to_upload: Vec<(usize, usize)> = Vec::new(); // (slot, expert)
-        let mut slot_list: Vec<i32> = Vec::new();
-        let mut gpu_w: Vec<f32> = Vec::new();
-        let mut cpu: Vec<(usize, f32)> = Vec::new();
-        {
-            let mut ctx = self.slot_ctx[li].borrow_mut();
-            for (i, p) in plan.placements.iter().enumerate() {
-                let e = ids[i] as usize;
-                let w = weights[i];
-                match p {
-                    Placement::Gpu(slot) => {
-                        let s = *slot;
-                        if ctx.slot_expert[s] != e as i32 {
-                            ctx.slot_expert[s] = e as i32;
-                            to_upload.push((s, e));
-                        }
-                        slot_list.push(s as i32);
-                        gpu_w.push(w);
-                    }
-                    Placement::Cpu => cpu.push((e, w)),
-                }
-            }
-        }
+        // Decide placement: fill free slots, overflow to CPU, no intra-step eviction;
+        // in adaptive mode a miss is computed on the CPU when it is cheaper than the
+        // PCIe fetch pull for this machine (q*).
+        let expert_bytes = 3 * inter as usize * d as usize * 4;
+        let (to_upload, slot_list, gpu_w, cpu) =
+            self.moe_slot_place(li, &ids, &weights, self.adaptive.as_ref(), expert_bytes);
 
         // Upload experts that changed slots (on-demand fetch from host RAM).
         if !to_upload.is_empty() {

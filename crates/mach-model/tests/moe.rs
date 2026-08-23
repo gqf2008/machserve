@@ -178,3 +178,43 @@ fn moe_gpu_slot_offload_matches_full() {
         );
     }
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn moe_gpu_adaptive_offload_matches_full() {
+    use mach_kernel_sys::hip;
+    use mach_model::model::GpuModel;
+    use std::sync::Arc;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 7).unwrap();
+    let tokens = [5u32, 9, 3, 200];
+
+    let mut full = GpuModel::new(Arc::clone(&hip), cfg, &w).unwrap();
+    let full_logits = full.forward(&tokens).unwrap();
+    let scale = full_logits.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+
+    // Adaptive q*: per-miss GPU-vs-CPU decided from the measured PCIe bandwidth and
+    // CPU expert cost. Placement-invariant, so output must match full-resident.
+    let mut m = GpuModel::with_adaptive(Arc::clone(&hip), cfg, &w, 2).unwrap();
+    let logits = m.forward(&tokens).unwrap();
+    let max = max_abs_diff(&full_logits, &logits);
+    assert!(
+        max <= 2e-3 + 2e-3 * scale,
+        "adaptive offload: max diff {max} (scale {scale})"
+    );
+}

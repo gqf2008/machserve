@@ -7,6 +7,8 @@
 //! used by TokenSpeed on CUDA.
 
 #[cfg(feature = "hip")]
+pub mod adaptive;
+#[cfg(feature = "hip")]
 #[cfg(feature = "hip")]
 pub mod batched;
 pub mod config;
