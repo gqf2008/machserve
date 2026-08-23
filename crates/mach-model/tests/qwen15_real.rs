@@ -16,11 +16,7 @@ use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
 fn model_path() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("../../.models/qwen-1.5b.safetensors"),
-        PathBuf::from(".models/qwen-1.5b.safetensors"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+    mach_model::real_test_model_path()
 }
 
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
@@ -67,7 +63,7 @@ fn qwen2_1_5b_cfg() -> Config {
 #[test]
 fn qwen2_1_5b_decodes_finite_and_deterministic() {
     let Some(path) = model_path() else {
-        eprintln!("skipping qwen2_1_5b: .models/qwen-1.5b.safetensors not present");
+        eprintln!("skipping qwen2_1_5b: set MACH_TEST_MODEL to a .safetensors path");
         return;
     };
     let Some(hip) = hip_ctx() else { return };

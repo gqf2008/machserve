@@ -111,3 +111,39 @@ impl BandwidthProbe {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_bandwidth_prefers_gpu() {
+        // 10 GB/s PCIe, 96 KiB expert -> fetch ~9.8us; CPU 100us is slower -> GPU.
+        let prof = BandwidthProfile {
+            pcie_bytes_per_sec: 10_000_000_000.0,
+            cpu_expert_sec: 100e-6,
+        };
+        assert_eq!(prof.choose(96 * 1024), FetchChoice::FetchGpu);
+    }
+
+    #[test]
+    fn contended_bus_prefers_cpu() {
+        // 100 MB/s PCIe (bus contended), 96 KiB expert -> fetch ~0.98ms; CPU 10us is
+        // cheaper -> compute on CPU (this is the q* behavior under a saturated bus).
+        let prof = BandwidthProfile {
+            pcie_bytes_per_sec: 100_000_000.0,
+            cpu_expert_sec: 10e-6,
+        };
+        assert_eq!(prof.choose(96 * 1024), FetchChoice::ComputeCpu);
+    }
+
+    #[test]
+    fn zero_bandwidth_is_safe() {
+        let prof = BandwidthProfile {
+            pcie_bytes_per_sec: 0.0,
+            cpu_expert_sec: 1e-6,
+        };
+        // max(1.0) guard: fetch_sec is huge, so CPU wins (no division by zero).
+        assert_eq!(prof.choose(96 * 1024), FetchChoice::ComputeCpu);
+    }
+}

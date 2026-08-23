@@ -27,8 +27,18 @@ pub mod tokenizer;
 pub mod weights;
 
 pub use config::Config;
+use std::path::PathBuf;
 pub use weights::{LayerWeights, Weights};
 
+/// Opt-in path for real-model integration tests. Returns the configured model
+/// path only when MACH_TEST_MODEL is set and exists; real-model tests skip
+/// otherwise (they load multi-GB weights, so default-off prevents accidental
+/// loads during a plain cargo test).
+#[doc(hidden)]
+pub fn real_test_model_path() -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var("MACH_TEST_MODEL").ok()?);
+    p.exists().then_some(p)
+}
 /// Errors from the model layer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
