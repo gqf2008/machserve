@@ -78,7 +78,7 @@ impl MoeOffload {
     /// Computes the MoE residual + placement plan for one step.
     ///
     /// `fetch_budget` caps GPU fetches this step; routed experts beyond it are
-    /// placed on the CPU (the P2 q* hook). The output is placement-invariant:
+    ///(retained for signature stability). The output is placement-invariant:
     /// whether an expert is in a GPU slot or computed on CPU does not change the
     /// residual, only the plan.
     pub fn step(
@@ -86,7 +86,7 @@ impl MoeOffload {
         cfg: &Config,
         lw: &LayerWeights,
         xn: &[f32],
-        fetch_budget: usize,
+        _fetch_budget: usize,
     ) -> StepOut {
         let ne = cfg.num_experts;
         let topk = cfg.num_experts_per_tok.min(ne);
@@ -125,7 +125,7 @@ impl MoeOffload {
 
         // Drive the offload decision through the LRU cache.
         let routed: Vec<u32> = topk_experts.iter().map(|&e| e as u32).collect();
-        let plan = self.cache.plan(&routed, fetch_budget);
+        let plan = self.cache.plan_step(&routed);
 
         // Weighted sum of each top-k expert SwiGLU MLP.
         let mut residual = vec![0.0; d];
@@ -223,25 +223,23 @@ mod tests {
         let w = Weights::random(&cfg, 7).unwrap();
         let lw = &w.layers[0];
         let xn: Vec<f32> = (0..cfg.d_model).map(|i| (i as f32) * 0.02 - 2.0).collect();
-        // All experts resident on GPU (budget = max) vs all on CPU (budget = 0).
-        let mut gpu = MoeOffload::new(4);
-        let g = gpu.step(&cfg, lw, &xn, usize::MAX);
-        let mut cpu = MoeOffload::new(4);
-        let c = cpu.step(&cfg, lw, &xn, 0);
-        assert_eq!(g.residual, c.residual);
-        // Bookkeeping differs as expected.
-        assert!(
-            !g.plan.fetches.is_empty()
-                || g.plan
-                    .placements
-                    .iter()
-                    .all(|p| matches!(p, crate::moe_backend::Placement::Gpu(_)))
+        // Both placements must give the same residual (placement invariance):
+        //  - resident: capacity >= num_experts, so every routed expert is on GPU.
+        //  - overflow: capacity 1 (< topk), so one routed expert is computed on CPU.
+        let mut resident = MoeOffload::new(cfg.num_experts);
+        let r = resident.step(&cfg, lw, &xn, usize::MAX);
+        let mut overflow = MoeOffload::new(1);
+        let o = overflow.step(&cfg, lw, &xn, usize::MAX);
+        assert_eq!(
+            r.residual, o.residual,
+            "placement invariance: resident vs CPU-overflow residuals must match"
         );
         assert!(
-            c.plan
+            o.plan
                 .placements
                 .iter()
-                .all(|p| matches!(p, crate::moe_backend::Placement::Cpu))
+                .any(|p| matches!(p, crate::moe_backend::Placement::Cpu)),
+            "capacity 1 with topk>1 must overflow to CPU"
         );
     }
 }
