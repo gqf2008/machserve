@@ -37,6 +37,11 @@ struct LayerDev {
     bq: *mut f32,
     bk: *mut f32,
     bv: *mut f32,
+    /// MoE (num_experts > 0): router [ne,d] + per-expert gate/up/down.
+    moe_router: *mut f32,
+    moe_wg: *mut f32,
+    moe_wu: *mut f32,
+    moe_wd: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -86,6 +91,17 @@ pub struct GpuModel {
     xh: *mut u16,
     /// fp16 scratch for hidden GEMM outputs (size max over n of hidden GEMMs).
     yh: *mut u16,
+    // MoE scratch (single-token decode; reused across layers).
+    router: *mut f32,
+    exp_ids: *mut i32,
+    exp_w: *mut f32,
+    wg_pack: *mut f32,
+    wu_pack: *mut f32,
+    wd_pack: *mut f32,
+    gate_all: *mut f32,
+    up_all: *mut f32,
+    eh_all: *mut f32,
+    down_all: *mut f32,
     // KV caches: (k, v) per layer
     kv_cache: Vec<(*mut f32, *mut f32)>,
     /// All device allocations (freed on drop).
@@ -130,6 +146,16 @@ impl GpuModel {
             layers_f16: Vec::new(),
             xh: std::ptr::null_mut(),
             yh: std::ptr::null_mut(),
+            router: std::ptr::null_mut(),
+            exp_ids: std::ptr::null_mut(),
+            exp_w: std::ptr::null_mut(),
+            wg_pack: std::ptr::null_mut(),
+            wu_pack: std::ptr::null_mut(),
+            wd_pack: std::ptr::null_mut(),
+            gate_all: std::ptr::null_mut(),
+            up_all: std::ptr::null_mut(),
+            eh_all: std::ptr::null_mut(),
+            down_all: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             allocs: Vec::new(),
             pos: 0,
@@ -196,6 +222,26 @@ impl GpuModel {
             let kk = self.dalloc(kv_bytes)?;
             let vv = self.dalloc(kv_bytes)?;
             self.kv_cache.push((kk, vv));
+        }
+        if c.num_experts > 0 {
+            let ne = c.num_experts;
+            let topk = c.num_experts_per_tok.min(ne);
+            if topk > 0 {
+                self.router = self.dalloc(ne * 4)?;
+                let ip = hip::malloc(self.k.hip(), topk * 4)?;
+                self.exp_ids = ip as *mut i32;
+                self.allocs.push(ip);
+                self.exp_w = self.dalloc(topk * 4)?;
+                let slot_g = topk * c.intermediate_size * d;
+                let slot_d = topk * d * c.intermediate_size;
+                self.wg_pack = self.dalloc(slot_g * 4)?;
+                self.wu_pack = self.dalloc(slot_g * 4)?;
+                self.wd_pack = self.dalloc(slot_d * 4)?;
+                self.gate_all = self.dalloc(topk * c.intermediate_size * 4)?;
+                self.up_all = self.dalloc(topk * c.intermediate_size * 4)?;
+                self.eh_all = self.dalloc(topk * c.intermediate_size * 4)?;
+                self.down_all = self.dalloc(topk * d * 4)?;
+            }
         }
         Ok(())
     }
@@ -277,6 +323,34 @@ impl GpuModel {
                 } else {
                     let p = self.dalloc(lw.bv.len() * 4)?;
                     self.upload(p, &lw.bv)?;
+                    p
+                },
+                moe_router: if lw.moe_router.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_router.len() * 4)?;
+                    self.upload(p, &lw.moe_router)?;
+                    p
+                },
+                moe_wg: if lw.moe_wg.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_wg.len() * 4)?;
+                    self.upload(p, &lw.moe_wg)?;
+                    p
+                },
+                moe_wu: if lw.moe_wu.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_wu.len() * 4)?;
+                    self.upload(p, &lw.moe_wu)?;
+                    p
+                },
+                moe_wd: if lw.moe_wd.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.moe_wd.len() * 4)?;
+                    self.upload(p, &lw.moe_wd)?;
                     p
                 },
             };
@@ -458,33 +532,76 @@ impl GpuModel {
 
             let inter = c.intermediate_size as i32;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, 1, d, c.rms_eps)?;
-            gemm(
-                self.gate,
-                self.xn2,
-                lw.wg,
-                l16.map_or(std::ptr::null_mut(), |l| l.wg),
-                inter,
-                d,
-            )?;
-            gemm(
-                self.up,
-                self.xn2,
-                lw.wu,
-                l16.map_or(std::ptr::null_mut(), |l| l.wu),
-                inter,
-                d,
-            )?;
-            // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
-            k.launch_silu_mul(self.up, self.gate, self.h, inter)?;
-            gemm(
-                self.proj,
-                self.h,
-                lw.wd,
-                l16.map_or(std::ptr::null_mut(), |l| l.wd),
-                d,
-                inter,
-            )?;
-            k.launch_add(self.x, self.proj, d)?;
+            if c.num_experts > 0 {
+                let ne = c.num_experts as i32;
+                let topk = c.num_experts_per_tok.min(c.num_experts) as i32;
+                if topk > 0 {
+                    // Router logits [ne] = xn2 @ moe_router^T.
+                    k.gemm(self.router, self.xn2, lw.moe_router, ne, d)?;
+                    k.launch_moe_router(self.router, self.exp_ids, self.exp_w, ne, topk)?;
+                    // Pack the selected experts into contiguous scratch (f32 path;
+                    // fp16 MoE weights are a later slice).
+                    k.launch_moe_gather_weights(
+                        lw.moe_wg,
+                        lw.moe_wu,
+                        lw.moe_wd,
+                        self.exp_ids,
+                        self.wg_pack,
+                        self.wu_pack,
+                        self.wd_pack,
+                        ne,
+                        inter,
+                        d,
+                        topk,
+                    )?;
+                    // Concatenated per-expert gate/up GEMMs over the topk slots.
+                    k.gemm(self.gate_all, self.xn2, self.wg_pack, topk * inter, d)?;
+                    k.gemm(self.up_all, self.xn2, self.wu_pack, topk * inter, d)?;
+                    k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, topk * inter)?;
+                    // Per-slot down projections: each slot has its own hidden
+                    // state, so the concat-GEMM trick (shared input) does not
+                    // apply here — launch one small GEMM per selected expert.
+                    for slot in 0..topk {
+                        k.gemm(
+                            unsafe { self.down_all.add((slot * d) as usize) },
+                            unsafe { self.eh_all.add((slot * inter) as usize) },
+                            unsafe { self.wd_pack.add((slot * d * inter) as usize) },
+                            d,
+                            inter,
+                        )?;
+                    }
+                    k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, topk)?;
+                }
+                // topk == 0: MoE contributes nothing (matches ref_model).
+            } else {
+                gemm(
+                    self.gate,
+                    self.xn2,
+                    lw.wg,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wg),
+                    inter,
+                    d,
+                )?;
+                gemm(
+                    self.up,
+                    self.xn2,
+                    lw.wu,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wu),
+                    inter,
+                    d,
+                )?;
+                // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
+                k.launch_silu_mul(self.up, self.gate, self.h, inter)?;
+                gemm(
+                    self.proj,
+                    self.h,
+                    lw.wd,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wd),
+                    d,
+                    inter,
+                )?;
+                k.launch_add(self.x, self.proj, d)?;
+            }
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, 1, d, c.rms_eps)?;
         if f16 {

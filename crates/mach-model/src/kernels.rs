@@ -680,6 +680,109 @@ extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short
 }
 "#;
 
+/// MoE routing (single token): softmax over `ne` expert logits, select the
+/// `topk` highest-probability experts (ties: lower index, matching the CPU
+/// reference), and emit per-slot normalized weights (prob / top-k sum).
+const MOE_ROUTER: &str = r#"
+extern "C" __global__ void moe_router(
+    const float* __restrict__ logits,
+    int* __restrict__ out_ids,
+    float* __restrict__ out_w,
+    int ne, int topk) {
+    extern __shared__ float sm[];
+    float* probs = sm;
+    __shared__ float red[256];
+    float maxv = -1e30f;
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) maxv = fmaxf(maxv, logits[i]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float m = red[0];
+    float sumv = 0.0f;
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) {
+        probs[i] = __expf(logits[i] - m);
+        sumv += probs[i];
+    }
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    for (int i = threadIdx.x; i < ne; i += blockDim.x) probs[i] *= inv;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float norm = 0.0f;
+        for (int k = 0; k < topk; k++) {
+            int best = -1;
+            float bestv = -1e30f;
+            for (int i = 0; i < ne; i++) {
+                int used = 0;
+                for (int j = 0; j < k; j++) {
+                    if (out_ids[j] == i) { used = 1; break; }
+                }
+                if (!used) {
+                    if (probs[i] > bestv || (probs[i] == bestv && (best < 0 || i < best))) {
+                        bestv = probs[i];
+                        best = i;
+                    }
+                }
+            }
+            out_ids[k] = best;
+            norm += probs[best];
+        }
+        for (int k = 0; k < topk; k++) out_w[k] = probs[out_ids[k]] / norm;
+    }
+}
+"#;
+
+/// MoE weight gather: pack the selected experts' gate/up/down matrices into
+/// contiguous per-slot scratch (slot k holds expert `ids[k]`).
+const MOE_GATHER_WEIGHTS: &str = r#"
+extern "C" __global__ void moe_gather_weights(
+    const float* __restrict__ wg, const float* __restrict__ wu, const float* __restrict__ wd,
+    const int* __restrict__ ids,
+    float* __restrict__ wg_pack, float* __restrict__ wu_pack, float* __restrict__ wd_pack,
+    int ne, int inter, int d, int topk) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    long long gi = (long long)inter * d;
+    long long di = (long long)d * inter;
+    if (i < topk * gi) {
+        int slot = (int)(i / gi);
+        long long rem = i % gi;
+        long long src = (long long)ids[slot] * gi + rem;
+        wg_pack[i] = wg[src];
+        wu_pack[i] = wu[src];
+    }
+    if (i < topk * di) {
+        int slot = (int)(i / di);
+        long long rem = i % di;
+        long long src = (long long)ids[slot] * di + rem;
+        wd_pack[i] = wd[src];
+    }
+}
+"#;
+
+/// MoE residual accumulate: `x[i] += sum_k w[k] * down_all[k*d + i]`.
+const MOE_ACCUMULATE: &str = r#"
+extern "C" __global__ void moe_accumulate(
+    float* __restrict__ x,
+    const float* __restrict__ down_all,
+    const float* __restrict__ w,
+    int d, int topk) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < d) {
+        float acc = 0.0f;
+        for (int k = 0; k < topk; k++) acc += w[k] * down_all[(long long)k * d + i];
+        x[i] += acc;
+    }
+}
+"#;
+
 /// Compiled kernels plus the hipBLAS handle, bound to one stream.
 pub struct HipKernels {
     hip: std::sync::Arc<Hip>,
@@ -706,6 +809,9 @@ pub struct HipKernels {
     kv_store_f16: HipKernelModule,
     attn_f16_gqa: HipKernelModule,
     attn_prefill_f16: HipKernelModule,
+    moe_router: HipKernelModule,
+    moe_gather: HipKernelModule,
+    moe_accumulate: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is used by one model on one thread; the raw
@@ -762,6 +868,9 @@ impl HipKernels {
                 ATTN_PREFILL_F16,
                 "attn_prefill_f16",
             )?,
+            moe_router: HipKernelModule::compile(&arch, MOE_ROUTER, "moe_router")?,
+            moe_gather: HipKernelModule::compile(&arch, MOE_GATHER_WEIGHTS, "moe_gather_weights")?,
+            moe_accumulate: HipKernelModule::compile(&arch, MOE_ACCUMULATE, "moe_accumulate")?,
         })
     }
 
@@ -1512,6 +1621,104 @@ impl HipKernels {
     }
 
     /// Synchronizes the execution stream.
+    /// MoE router for a single token: softmax over `ne` logits + top-k
+    /// selection; writes `out_ids[topk]` and normalized `out_w[topk]`.
+    pub fn launch_moe_router(
+        &self,
+        logits: *const f32,
+        out_ids: *mut i32,
+        out_w: *mut f32,
+        ne: i32,
+        topk: i32,
+    ) -> Result<(), Error> {
+        let lp = logits;
+        let ip = out_ids;
+        let wp = out_w;
+        let mut p = vec![
+            &lp as *const *const f32 as *mut core::ffi::c_void,
+            &ip as *const *mut i32 as *mut core::ffi::c_void,
+            &wp as *const *mut f32 as *mut core::ffi::c_void,
+            &ne as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.moe_router.launch_shmem(
+            [1, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            (ne as u32) * 4,
+        )?)
+    }
+
+    /// Packs the selected experts' gate/up/down weights into per-slot scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_gather_weights(
+        &self,
+        wg: *const f32,
+        wu: *const f32,
+        wd: *const f32,
+        ids: *const i32,
+        wg_pack: *mut f32,
+        wu_pack: *mut f32,
+        wd_pack: *mut f32,
+        ne: i32,
+        inter: i32,
+        d: i32,
+        topk: i32,
+    ) -> Result<(), Error> {
+        let wgp = wg;
+        let wup = wu;
+        let wdp = wd;
+        let idp = ids;
+        let wgpp = wg_pack;
+        let wupp = wu_pack;
+        let wdpp = wd_pack;
+        let mut p = vec![
+            &wgp as *const *const f32 as *mut core::ffi::c_void,
+            &wup as *const *const f32 as *mut core::ffi::c_void,
+            &wdp as *const *const f32 as *mut core::ffi::c_void,
+            &idp as *const *const i32 as *mut core::ffi::c_void,
+            &wgpp as *const *mut f32 as *mut core::ffi::c_void,
+            &wupp as *const *mut f32 as *mut core::ffi::c_void,
+            &wdpp as *const *mut f32 as *mut core::ffi::c_void,
+            &ne as *const i32 as *mut core::ffi::c_void,
+            &inter as *const i32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = ((topk as i64) * (inter as i64) * (d as i64))
+            .max((topk as i64) * (d as i64) * (inter as i64));
+        let blocks = (total as u32).div_ceil(256);
+        Ok(self
+            .moe_gather
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MoE residual accumulate: `x[i] += sum_k w[k] * down_all[k*d + i]`.
+    pub fn launch_moe_accumulate(
+        &self,
+        x: *mut f32,
+        down_all: *const f32,
+        w: *const f32,
+        d: i32,
+        topk: i32,
+    ) -> Result<(), Error> {
+        let xp = x;
+        let dp = down_all;
+        let wp = w;
+        let mut p = vec![
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &dp as *const *const f32 as *mut core::ffi::c_void,
+            &wp as *const *const f32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (d as u32).div_ceil(256);
+        Ok(self
+            .moe_accumulate
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
     pub fn sync(&self) -> Result<(), Error> {
         unsafe {
             hip::check(

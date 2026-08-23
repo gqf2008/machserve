@@ -615,3 +615,17 @@
     clippy/fmt 干净;
   - 后续切片:GPU 路由 + top-k 专家 GEMM(逐 token 分组批量)、与 ref_model CPU 对拍、
     真实 Qwen2.5-MoE 验证。
+
+- **P3av GPU 路由 + top-k 专家 GEMM(2026-08-23,7900 XTX)**:
+  - `GpuModel` MoE MLP:路由 GEMM([ne,d]) → `moe_router` 内核(softmax + top-k,
+    平局取小下标,与 ref_model 完全一致,输出归一化权重)→ `moe_gather_weights`
+    把选中专家权重打包进连续 scratch → gate/up 用 concat-GEMM(各 slot 共享输入 x,
+    [topk*inter,d] 一次 sgemm)→ silu_mul → **down 必须逐 slot 各自 GEMM**(各 slot
+    有自己的 hidden state,concat 技巧不适用;初版误用单 GEMM 只算了 slot 0,对拍
+    抓到 806 级误差后修正)→ `moe_accumulate` 加权残差累加;
+  - 全程无 D2H,保持 HIP graph 可捕获;MoE 走 f32 GEMM(fp16 MoE 权重留待后续);
+  - **验证**:`moe.rs` 增 GPU vs CPU 对拍(合成 tiny MoE,4 专家/2 活跃,随机权重,
+    max diff 满足 2e-3+2e-3*scale);主导路由(不可能翻车)对拍 max diff 2e-6;
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 后续切片:fp16 MoE 权重、batched/continuous 路径的逐 token 分组批量专家 GEMM、
+    真实 Qwen2.5-MoE 验证。
