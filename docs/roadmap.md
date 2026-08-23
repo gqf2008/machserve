@@ -489,3 +489,16 @@
   - 2048-token 扫描(全部 parity MATCH):rows=256 248.1ms → 512 **228.7ms**(-8%)
     → 1024 216.7ms(-5%,递减);512 为甜点(行缓冲 ~500MB 可忽略),服务器默认
     MACH_PREFILL_ROWS 从 256 提到 **512**。
+
+- **P3ai QKV/gateup GEMM 融合尝试(已回退,教训记录)**:
+  - 目标:decode 步是 launch 开销主导(B=64 短 ctx 4.76ms ≈ 168 个小 GEMM),融合
+    wq/wk/wv(3→1)与 wg/wu(2→1)可省 43% launch;
+  - **踩坑**:用"fused 缓冲 + 指针偏移"实现(单次 GEMM 写 `[b, nq+2nkv]`,q/k_buf/
+    v_buf 指向其偏移)——**下游内核假设每个张量连续**(kv_store/attention/rope 按
+    `s*nkv*hd`/`s*nq` 步长索引行),而 fused 缓冲行步长是 `nq+2nkv` → batch>1 全错
+    (n=1 恰好对,连续测试 n=2 起全红);
+  - 正确路径(留作专项):hipBLAS 无 strided 输出,需给 5 个下游内核(kv_store/
+    attention/rope/add_bias/silu_mul)加行步长参数,或 GEMM 后加转置/拷贝(摊薄
+    收益);已回退,内核保持回归全绿;
+  - 经验:融合 GEMM 输出布局必须与下游内核的连续步长假设一致,否则指针别名在
+    batch>1 静默出错。
