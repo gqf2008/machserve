@@ -751,3 +751,44 @@ async fn invalid_request_returns_openai_error_json() {
         );
     }
 }
+
+#[tokio::test]
+async fn usage_is_reported() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 113).unwrap();
+    let prompt = vec![5u32, 9, 3];
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+    let body = serde_json::json!({ "prompt": prompt, "max_tokens": 4 });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let u = &json["usage"];
+    assert_eq!(u["prompt_tokens"], 3, "prompt token count");
+    assert_eq!(u["completion_tokens"], 4, "generated token count");
+    assert_eq!(u["total_tokens"], 7, "total = prompt + completion");
+    // choices[0].tokens must match completion_tokens.
+    let toks = json["choices"][0]["tokens"].as_array().unwrap();
+    assert_eq!(toks.len(), 4);
+}

@@ -156,6 +156,14 @@ pub struct Logprobs {
     pub top_logprobs: Option<Vec<Vec<TopLogprob>>>,
 }
 
+/// OpenAI token usage (`usage`).
+#[derive(Debug, Serialize)]
+pub struct Usage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
@@ -163,6 +171,7 @@ pub struct CompletionResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
+    pub usage: Usage,
 }
 
 fn default_max_tokens() -> usize {
@@ -551,12 +560,18 @@ pub async fn completions(
             finish_reason: reason.into(),
         });
     }
+    let completion_tokens: usize = choices.iter().map(|c| c.tokens.len()).sum();
     Json(CompletionResponse {
         id,
         object: "text_completion".into(),
         created,
         model: state.model.clone(),
         choices,
+        usage: Usage {
+            prompt_tokens: tokens.len(),
+            completion_tokens,
+            total_tokens: tokens.len() + completion_tokens,
+        },
     })
     .into_response()
 }
@@ -691,12 +706,18 @@ pub async fn chat_completions(
             finish_reason: reason.into(),
         });
     }
+    let completion_tokens: usize = choices.iter().map(|c| c.tokens.len()).sum();
     Json(CompletionResponse {
         id,
         object: "chat.completion".into(),
         created,
         model: state.model.clone(),
         choices,
+        usage: Usage {
+            prompt_tokens: tokens.len(),
+            completion_tokens,
+            total_tokens: tokens.len() + completion_tokens,
+        },
     })
     .into_response()
 }

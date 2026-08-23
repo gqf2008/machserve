@@ -411,3 +411,10 @@
     → GQA 5.003 → uint4 向量化 **4.739 ms/step(13504 tok/s/seq,+15%)**;低于理论
     7x 是因为旧内核已靠 L2 吃到部分组间复用,且步时中还含 GEMM 等非 attention
     成本;短 context(B=512)无回归(受 GEMM 主导)。
+
+- **P3z OpenAI `usage` 字段(2026-08-23)**:
+  - `/v1/completions`、`/v1/chat/completions` 非流式响应补齐 OpenAI **`usage`**
+    (`prompt_tokens` / `completion_tokens` / `total_tokens`;prompt = 编码后长度,
+    completion = 各 choice 生成 token 数之和);
+  - 测试:tiny 模型端到端断言 usage 计数与 choices 对齐;服务器套件 12 个全绿,
+    clippy/fmt 干净。

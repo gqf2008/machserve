@@ -7,7 +7,7 @@
 //! Env: MACH_MODEL (default qwen-0.5b.safetensors), MACH_CONFIG (default
 //! qwen-config.json), MACH_DTYPE (f16/f32, default f16), MACH_BATCH (default
 //! 64), MACH_CTX (default 2048).
-#![cfg(feature = "hip")]
+#[cfg(feature = "hip")]
 fn main() {
     use mach_kernel_sys::hip;
     use mach_model::batched::BatchedModel;
@@ -80,4 +80,8 @@ fn main() {
         "long-context decode: {ms:.3} ms/step | {per_tok_us:.1} us/seq-tok | {:.0} tok/s/seq",
         1e6 / per_tok_us
     );
+}
+#[cfg(not(feature = "hip"))]
+fn main() {
+    eprintln!("lctx_bench requires the hip feature");
 }
