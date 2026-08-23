@@ -56,6 +56,20 @@ thirdparty/        第三方参考代码(占位)
 - **对话模板**:Qwen chat template,`<|im_end|>` 停止。
 - **正确性**:GPU vs 独立 fp64 numpy 参考(~1e-4)+ 真 transformers 模型(4e-5)。
 
+## 性能优化地图(截至 2026-08-23)
+
+| 方向 | 结果 | 证据 |
+|---|---|---|
+| **GQA 复用 decode attention** | **长 context 2.6x**(34.8→13.4 ms/step) | 真 A/B,全回归绿 |
+| **prefill 行批量解耦** | 长 prompt TTFT -25~40%(512:98→74ms,2048:371→245ms) | parity 逐 token 一致 |
+| fp16 计算 / 分块 prefill / GPU 采样 / 真实 tokenizer | 已落地 | 全回归绿 |
+| split-K attention | 证伪(0x) | 2-split 计时 |
+| 削减 exp/计算 | 证伪(-13% 非主导) | 控制变量计时 |
+| 内存布局 [slot][kv][pos][dim] | 证伪(0x) | 新布局计时 |
+| V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
+| QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
+| **剩余正式 P3 项** | MoE / FP8 / MLA / spec-decode(均为大特性,需定方向) | — |
+
 ## 构建与运行
 
 ```bash
