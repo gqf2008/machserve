@@ -67,12 +67,24 @@ fp32 输出以保采样精度)。关键发现:**rocBLAS 对瘦长形状(m >> n)�
 - 数值:fp16 vs fp32 真实权重最大 logit 差 5e-5(tiny-llama)/2e-3(随机权重),贪心 token 一致;
 - 服务默认 dtype=f16(`MACH_DTYPE=f32` 关闭)。
 
-## 复现
+## 长 context decode(P3x,GQA 复用 attention,2026-08-23)
+
+| 内核 | 2048-token, B=64, f16 | per-seq |
+|---|---|---|
+| 旧双遍(block-per-head) | 5.470 ms/step | 11701 tok/s |
+| GQA 复用 + uint4 向量化 | 4.74-5.00 ms/step | 12860-13504 tok/s |
+
+- 长 context decode 较旧内核 **+9~15%**;低于理论 `groups`(7x)是因为旧内核已靠
+  L2 吃到部分组间复用,且步时含 GEMM 等非 attention 成本;
+- 复现:`MACH_CTX=2048 MACH_BATCH=64 cargo run -p mach-model --release --features
+  hip --example lctx_bench`。
+
 ## 复现
 
 ```bash
 # MachServe
 cargo run -p mach-model --release --features hip --example qwen_bench
+cargo run -p mach-model --release --features hip --example lctx_bench   # 长 context
 # llama.cpp
 llama-bench -m models/qwen2.5-0.5b-instruct-q8_0.gguf -p 512 -n 128 -b 1,16,128 -r 2
 ```
