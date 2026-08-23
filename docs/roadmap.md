@@ -484,3 +484,8 @@
   - **正确性**:prefill_rows=256 与默认生成结果逐 token 完全一致(parity MATCH +
     committed 测试 `prefill_rows_gives_identical_output`);默认 + HIP 全量回归全绿;
   - 内存影响:行缓冲区按 rows 分配(KV 仍按 slots),0.5B rows=256 约 +250MB,可忽略。
+
+- **P3ah prefill_rows 扫描定标(2026-08-23,7900 XTX)**:
+  - 2048-token 扫描(全部 parity MATCH):rows=256 248.1ms → 512 **228.7ms**(-8%)
+    → 1024 216.7ms(-5%,递减);512 为甜点(行缓冲 ~500MB 可忽略),服务器默认
+    MACH_PREFILL_ROWS 从 256 提到 **512**。

@@ -6,7 +6,7 @@
 //!
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
-//! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 256),
+//! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
 //! MACH_ADDR (default "127.0.0.1:8080").
 
 #[cfg(feature = "hip")]
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefill_rows = std::env::var("MACH_PREFILL_ROWS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(512);
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
