@@ -113,3 +113,48 @@ fn mla_gpu_matches_cpu_reference() {
         "MLA GPU vs CPU: max diff {max} (scale {scale})"
     );
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn mla_batched_matches_cpu_reference() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let cfg = mla_cfg();
+    let w = Weights::random(&cfg, 11).unwrap();
+    let batch = 2usize;
+    // Same-length token streams so every decode step advances all sequences.
+    let seqs: Vec<Vec<u32>> = vec![vec![5, 9, 3], vec![200, 7, 11]];
+
+    let mut batched = BatchedModel::new(hip, cfg, &w, batch).unwrap();
+    for step in 0..seqs[0].len() {
+        let tokens: Vec<u32> = seqs.iter().map(|s| s[step]).collect();
+        batched.decode_step(&tokens).unwrap();
+        let got = batched.read_logits().unwrap();
+        for s in 0..batch {
+            let mut cpu = RefModel::new(cfg, w.clone());
+            let cpu_logits = cpu.forward(&seqs[s][..=step]);
+            let row = &got[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let max = max_abs_diff(row, &cpu_logits);
+            let scale = cpu_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                max <= 2e-3 + 2e-3 * scale,
+                "step {step} seq {s} MLA batched GPU vs CPU: max diff {max} (scale {scale})"
+            );
+        }
+    }
+}

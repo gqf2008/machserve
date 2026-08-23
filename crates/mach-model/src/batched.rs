@@ -33,6 +33,15 @@ struct LayerDev {
     /// QK-norm (Qwen3): per-head RMSNorm weights (null when qk_norm=false).
     q_norm: *mut f32,
     k_norm: *mut f32,
+    /// MLA (kv_lora_rank > 0): low-rank Q / compressed KV weights.
+    mla_q_a: *mut f32,
+    mla_q_a_norm: *mut f32,
+    mla_q_b: *mut f32,
+    mla_q_rope: *mut f32,
+    mla_kv_a: *mut f32,
+    mla_kv_a_norm: *mut f32,
+    mla_kv_b: *mut f32,
+    mla_o: *mut f32,
     /// MoE (num_experts > 0): router [ne,d] + per-expert gate/up/down.
     moe_router: *mut f32,
     moe_wg: *mut f32,
@@ -128,10 +137,24 @@ pub struct BatchedModel {
     /// fp16 scratch for grouped MoE GEMMs (rows * topk * max(d, inter)).
     xh_moe: *mut u16,
     yh_moe: *mut u16,
+    // MLA scratch (kv_lora_rank > 0): low-rank Q / compressed KV activations.
+    mla_q_lora: *mut f32,
+    mla_q_lora_n: *mut f32,
+    q_nope: *mut f32,
+    q_rope: *mut f32,
+    mla_kv_a: *mut f32,
+    mla_kv_a_n: *mut f32,
+    mla_kv_lora: *mut f32,
+    mla_kv: *mut f32,
+    mla_k_rope: *mut f32,
+    mla_attn: *mut f32,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
     kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
+    /// MLA KV caches (kv_lora_rank > 0): expanded per-head k/v, layout
+    /// `[batch, max_seq, heads, hd]` / `[batch, max_seq, heads, v_hd]`.
+    mla_kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
     /// Per-sequence lengths (host).
     lens: Vec<u32>,
     allocs: Vec<*mut core::ffi::c_void>,
@@ -213,7 +236,18 @@ impl BatchedModel {
             down_all: std::ptr::null_mut(),
             xh_moe: std::ptr::null_mut(),
             yh_moe: std::ptr::null_mut(),
+            mla_q_lora: std::ptr::null_mut(),
+            mla_q_lora_n: std::ptr::null_mut(),
+            q_nope: std::ptr::null_mut(),
+            q_rope: std::ptr::null_mut(),
+            mla_kv_a: std::ptr::null_mut(),
+            mla_kv_a_n: std::ptr::null_mut(),
+            mla_kv_lora: std::ptr::null_mut(),
+            mla_kv: std::ptr::null_mut(),
+            mla_k_rope: std::ptr::null_mut(),
+            mla_attn: std::ptr::null_mut(),
             kv_cache: Vec::new(),
+            mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
             allocs: Vec::new(),
             host_pins: Vec::new(),
@@ -341,6 +375,32 @@ impl BatchedModel {
             self.kv_cache
                 .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
         }
+        if c.kv_lora_rank > 0 {
+            let qlr = c.q_lora_rank;
+            let nope = c.qk_nope_head_dim;
+            let rope = c.qk_rope_head_dim;
+            let v_hd = c.v_head_dim;
+            let heads = c.n_heads;
+            self.mla_q_lora = self.dalloc(b * qlr * 4)?;
+            self.mla_q_lora_n = self.dalloc(b * qlr * 4)?;
+            self.q_nope = self.dalloc(b * heads * nope * 4)?;
+            self.q_rope = self.dalloc(b * heads * rope * 4)?;
+            self.mla_kv_a = self.dalloc(b * (c.kv_lora_rank + rope) * 4)?;
+            self.mla_kv_a_n = self.dalloc(b * c.kv_lora_rank * 4)?;
+            self.mla_kv_lora = self.dalloc(b * c.kv_lora_rank * 4)?;
+            self.mla_kv = self.dalloc(b * heads * (nope + v_hd) * 4)?;
+            self.mla_k_rope = self.dalloc(b * rope * 4)?;
+            self.mla_attn = self.dalloc(b * heads * v_hd * 4)?;
+            // MLA KV caches are stored as f32 (expanded per-head layout).
+            let k_bytes = self.batch * c.max_seq_len * heads * (nope + rope) * 4;
+            let v_bytes = self.batch * c.max_seq_len * heads * v_hd * 4;
+            for _ in 0..c.n_layers {
+                let kk = self.dalloc(k_bytes)?;
+                let vv = self.dalloc(v_bytes)?;
+                self.mla_kv_cache
+                    .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
+            }
+        }
         if c.num_experts > 0 {
             let ne = c.num_experts;
             let topk = c.num_experts_per_tok.min(ne);
@@ -435,6 +495,62 @@ impl BatchedModel {
                     self.upload(p, &lw.k_norm)?;
                     p
                 },
+                mla_q_a: if lw.mla_q_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_a.len() * 4)?;
+                    self.upload(p, &lw.mla_q_a)?;
+                    p
+                },
+                mla_q_a_norm: if lw.mla_q_a_norm.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_a_norm.len() * 4)?;
+                    self.upload(p, &lw.mla_q_a_norm)?;
+                    p
+                },
+                mla_q_b: if lw.mla_q_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_b.len() * 4)?;
+                    self.upload(p, &lw.mla_q_b)?;
+                    p
+                },
+                mla_q_rope: if lw.mla_q_rope.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_q_rope.len() * 4)?;
+                    self.upload(p, &lw.mla_q_rope)?;
+                    p
+                },
+                mla_kv_a: if lw.mla_kv_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_kv_a.len() * 4)?;
+                    self.upload(p, &lw.mla_kv_a)?;
+                    p
+                },
+                mla_kv_a_norm: if lw.mla_kv_a_norm.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_kv_a_norm.len() * 4)?;
+                    self.upload(p, &lw.mla_kv_a_norm)?;
+                    p
+                },
+                mla_kv_b: if lw.mla_kv_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_kv_b.len() * 4)?;
+                    self.upload(p, &lw.mla_kv_b)?;
+                    p
+                },
+                mla_o: if lw.mla_o.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.mla_o.len() * 4)?;
+                    self.upload(p, &lw.mla_o)?;
+                    p
+                },
                 moe_router: if lw.moe_router.is_empty() {
                     std::ptr::null_mut()
                 } else {
@@ -518,6 +634,25 @@ impl BatchedModel {
                     self.k.hip(),
                     (self.k.hip().api.hip_memset)(*vc as *mut _, 0, kv_bytes),
                 )?;
+            }
+        }
+        if !self.mla_kv_cache.is_empty() {
+            let c = self.cfg;
+            let heads = c.n_heads;
+            let k_bytes =
+                self.batch * c.max_seq_len * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_bytes = self.batch * c.max_seq_len * heads * c.v_head_dim * 4;
+            for (kc, vc) in &self.mla_kv_cache {
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(*kc as *mut _, 0, k_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(*vc as *mut _, 0, v_bytes),
+                    )?;
+                }
             }
         }
         for l in self.lens.iter_mut() {
@@ -640,170 +775,285 @@ impl BatchedModel {
         for (li, lw) in self.layers_dev.iter().enumerate() {
             let l16 = if f16 { Some(self.layers_f16[li]) } else { None };
             k.launch_rms_norm(self.x, lw.rms_attn, self.xn, b, d, c.rms_eps)?;
-            gemm(
-                self.q,
-                self.xn,
-                lw.wq,
-                l16.map_or(std::ptr::null_mut(), |l| l.wq),
-                nq,
-                d,
-            )?;
-            gemm(
-                self.k_buf,
-                self.xn,
-                lw.wk,
-                l16.map_or(std::ptr::null_mut(), |l| l.wk),
-                nkv,
-                d,
-            )?;
-            gemm(
-                self.v_buf,
-                self.xn,
-                lw.wv,
-                l16.map_or(std::ptr::null_mut(), |l| l.wv),
-                nkv,
-                d,
-            )?;
-            // Qwen2 checkpoints ship q/k/v biases.
-            if !lw.bq.is_null() {
-                k.launch_add_bias(self.q, lw.bq, b, nq)?;
-            }
-            if !lw.bk.is_null() {
-                k.launch_add_bias(self.k_buf, lw.bk, b, nkv)?;
-            }
-            if !lw.bv.is_null() {
-                k.launch_add_bias(self.v_buf, lw.bv, b, nkv)?;
-            }
-            // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
-            if !lw.q_norm.is_null() {
-                k.launch_qk_norm(
-                    self.q,
-                    self.k_buf,
-                    lw.q_norm,
-                    lw.k_norm,
+            if c.kv_lora_rank > 0 {
+                let heads = c.n_heads as i32;
+                let qlr = c.q_lora_rank as i32;
+                let nope = c.qk_nope_head_dim as i32;
+                let rope = c.qk_rope_head_dim as i32;
+                let v_hd = c.v_head_dim as i32;
+                let kvlr = c.kv_lora_rank as i32;
+                let max_seq = c.max_seq_len as i32;
+                // q_lora = q_a(xn); rms; q_nope = q_b(q_lora).
+                k.gemm_batched(self.mla_q_lora, self.xn, lw.mla_q_a, b, qlr, d)?;
+                k.launch_rms_norm(
+                    self.mla_q_lora,
+                    lw.mla_q_a_norm,
+                    self.mla_q_lora_n,
                     b,
-                    c.n_heads as i32,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
+                    qlr,
                     c.rms_eps,
                 )?;
-            }
-            k.launch_rope_batched(
-                self.q,
-                self.k_buf,
-                self.pos_dev,
-                b,
-                c.n_heads as i32,
-                c.n_kv_heads as i32,
-                c.head_dim as i32,
-                c.rope_theta,
-            )?;
-            let (kc, vc) = self.kv_cache[li];
-            if f16 {
-                k.launch_kv_store_batched_f16(
+                k.gemm_batched(
+                    self.q_nope,
+                    self.mla_q_lora_n,
+                    lw.mla_q_b,
+                    b,
+                    heads * nope,
+                    qlr,
+                )?;
+                // q_rope = q_rope_proj(xn) + RoPE (k_buf is scratch here).
+                k.gemm_batched(self.q_rope, self.xn, lw.mla_q_rope, b, heads * rope, d)?;
+                k.launch_rope_batched(
+                    self.q_rope,
                     self.k_buf,
-                    kc as *mut u16,
                     self.pos_dev,
-                    slots,
                     b,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
-                    c.max_seq_len as i32,
+                    heads,
+                    heads,
+                    rope,
+                    c.rope_theta,
                 )?;
-                k.launch_kv_store_batched_f16(
+                // compressed_kv = kv_a(xn); latent is followed by k_rope in
+                // kv_a, so extract it to a contiguous buffer before the RMSNorm
+                // (rms_norm assumes row stride == cols); shared k_rope + RoPE.
+                k.gemm_batched(self.mla_kv_a, self.xn, lw.mla_kv_a, b, kvlr + rope, d)?;
+                k.launch_mla_extract_kv_lora(self.mla_kv_a, self.mla_kv_lora, b, kvlr, rope)?;
+                k.launch_rms_norm(
+                    self.mla_kv_lora,
+                    lw.mla_kv_a_norm,
+                    self.mla_kv_a_n,
+                    b,
+                    kvlr,
+                    c.rms_eps,
+                )?;
+                k.launch_mla_extract_k_rope(self.mla_kv_a, self.mla_k_rope, b, kvlr, rope)?;
+                k.launch_rope_batched(
+                    self.mla_k_rope,
                     self.v_buf,
-                    vc as *mut u16,
+                    self.pos_dev,
+                    b,
+                    1,
+                    1,
+                    rope,
+                    c.rope_theta,
+                )?;
+                // kv = kv_b_proj(latent): [batch, heads*(nope + v_hd)].
+                k.gemm_batched(
+                    self.mla_kv,
+                    self.mla_kv_a_n,
+                    lw.mla_kv_b,
+                    b,
+                    heads * (nope + v_hd),
+                    kvlr,
+                )?;
+                // Assemble per-head q/k/v and store into the MLA caches.
+                k.launch_mla_assemble_q_batched(
+                    self.q_nope,
+                    self.q_rope,
+                    self.q,
+                    b,
+                    heads,
+                    nope,
+                    rope,
+                )?;
+                let (kc, vc) = self.mla_kv_cache[li];
+                k.launch_mla_assemble_kv_batched(
+                    self.mla_kv,
+                    self.mla_k_rope,
+                    kc as *mut f32,
+                    vc as *mut f32,
                     self.pos_dev,
                     slots,
                     b,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
-                    c.max_seq_len as i32,
+                    max_seq,
+                    heads,
+                    nope,
+                    rope,
+                    v_hd,
                 )?;
-                k.launch_attn_decode_batched_f16_gqa(
+                let scale = 1.0 / ((nope + rope) as f32).sqrt();
+                k.launch_mla_attn_decode_batched(
                     self.q,
-                    kc as *const u16,
-                    vc as *const u16,
-                    self.attn,
+                    kc as *const f32,
+                    vc as *const f32,
+                    self.mla_attn,
                     self.pos_dev,
                     slots,
-                    run_mask,
+                    b,
+                    heads,
+                    nope + rope,
+                    v_hd,
+                    scale,
+                    max_seq,
+                )?;
+                k.gemm_batched(self.proj, self.mla_attn, lw.mla_o, b, d, heads * v_hd)?;
+                k.launch_add(self.x, self.proj, b * d)?;
+            } else {
+                gemm(
+                    self.q,
+                    self.xn,
+                    lw.wq,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wq),
+                    nq,
+                    d,
+                )?;
+                gemm(
+                    self.k_buf,
+                    self.xn,
+                    lw.wk,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wk),
+                    nkv,
+                    d,
+                )?;
+                gemm(
+                    self.v_buf,
+                    self.xn,
+                    lw.wv,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wv),
+                    nkv,
+                    d,
+                )?;
+                // Qwen2 checkpoints ship q/k/v biases.
+                if !lw.bq.is_null() {
+                    k.launch_add_bias(self.q, lw.bq, b, nq)?;
+                }
+                if !lw.bk.is_null() {
+                    k.launch_add_bias(self.k_buf, lw.bk, b, nkv)?;
+                }
+                if !lw.bv.is_null() {
+                    k.launch_add_bias(self.v_buf, lw.bv, b, nkv)?;
+                }
+                // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
+                if !lw.q_norm.is_null() {
+                    k.launch_qk_norm(
+                        self.q,
+                        self.k_buf,
+                        lw.q_norm,
+                        lw.k_norm,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.rms_eps,
+                    )?;
+                }
+                k.launch_rope_batched(
+                    self.q,
+                    self.k_buf,
+                    self.pos_dev,
                     b,
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
-                    scale,
-                    c.max_seq_len as i32,
+                    c.rope_theta,
                 )?;
-                // Shared-KV prefill attention for detected runs.
-                // Run descriptors are read from the pinned host copy.
-                let runs = self.runs_host;
-                for ri in 0..num_runs {
-                    let qoff = unsafe { *runs.add((ri * 4) as usize) };
-                    let cc = unsafe { *runs.add((ri * 4 + 1) as usize) };
-                    let base = unsafe { *runs.add((ri * 4 + 2) as usize) };
-                    let slot = unsafe { *runs.add((ri * 4 + 3) as usize) };
-                    k.launch_attn_prefill_f16(
+                let (kc, vc) = self.kv_cache[li];
+                if f16 {
+                    k.launch_kv_store_batched_f16(
+                        self.k_buf,
+                        kc as *mut u16,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.max_seq_len as i32,
+                    )?;
+                    k.launch_kv_store_batched_f16(
+                        self.v_buf,
+                        vc as *mut u16,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.max_seq_len as i32,
+                    )?;
+                    k.launch_attn_decode_batched_f16_gqa(
                         self.q,
                         kc as *const u16,
                         vc as *const u16,
                         self.attn,
-                        qoff,
-                        cc,
-                        base,
+                        self.pos_dev,
+                        slots,
+                        run_mask,
+                        b,
                         c.n_heads as i32,
                         c.n_kv_heads as i32,
                         c.head_dim as i32,
                         scale,
                         c.max_seq_len as i32,
-                        slot,
+                    )?;
+                    // Shared-KV prefill attention for detected runs.
+                    // Run descriptors are read from the pinned host copy.
+                    let runs = self.runs_host;
+                    for ri in 0..num_runs {
+                        let qoff = unsafe { *runs.add((ri * 4) as usize) };
+                        let cc = unsafe { *runs.add((ri * 4 + 1) as usize) };
+                        let base = unsafe { *runs.add((ri * 4 + 2) as usize) };
+                        let slot = unsafe { *runs.add((ri * 4 + 3) as usize) };
+                        k.launch_attn_prefill_f16(
+                            self.q,
+                            kc as *const u16,
+                            vc as *const u16,
+                            self.attn,
+                            qoff,
+                            cc,
+                            base,
+                            c.n_heads as i32,
+                            c.n_kv_heads as i32,
+                            c.head_dim as i32,
+                            scale,
+                            c.max_seq_len as i32,
+                            slot,
+                        )?;
+                    }
+                } else {
+                    k.launch_kv_store_batched(
+                        self.k_buf,
+                        kc as *mut f32,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.max_seq_len as i32,
+                    )?;
+                    k.launch_kv_store_batched(
+                        self.v_buf,
+                        vc as *mut f32,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.max_seq_len as i32,
+                    )?;
+                    k.launch_attn_decode_batched(
+                        self.q,
+                        kc as *const f32,
+                        vc as *const f32,
+                        self.attn,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        c.max_seq_len as i32,
                     )?;
                 }
-            } else {
-                k.launch_kv_store_batched(
-                    self.k_buf,
-                    kc as *mut f32,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
-                    c.max_seq_len as i32,
-                )?;
-                k.launch_kv_store_batched(
-                    self.v_buf,
-                    vc as *mut f32,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
-                    c.max_seq_len as i32,
-                )?;
-                k.launch_attn_decode_batched(
-                    self.q,
-                    kc as *const f32,
-                    vc as *const f32,
+                gemm(
+                    self.proj,
                     self.attn,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    c.n_heads as i32,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
-                    scale,
-                    c.max_seq_len as i32,
+                    lw.wo,
+                    l16.map_or(std::ptr::null_mut(), |l| l.wo),
+                    d,
+                    nq,
                 )?;
+                k.launch_add(self.x, self.proj, b * d)?;
             }
-            gemm(
-                self.proj,
-                self.attn,
-                lw.wo,
-                l16.map_or(std::ptr::null_mut(), |l| l.wo),
-                d,
-                nq,
-            )?;
-            k.launch_add(self.x, self.proj, b * d)?;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
             if c.num_experts > 0 {
                 let ne = c.num_experts as i32;

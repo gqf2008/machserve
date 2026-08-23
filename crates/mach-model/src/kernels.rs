@@ -458,6 +458,147 @@ extern "C" __global__ void attn_decode_batched(
 }
 "#;
 
+/// MLA batched: merge q_nope / q_rope into q across `batch` rows.
+const MLA_ASSEMBLE_Q_BATCHED: &str = r#"
+extern "C" __global__ void mla_assemble_q_batched(
+    const float* __restrict__ q_nope, const float* __restrict__ q_rope,
+    float* __restrict__ q, int batch, int n_heads, int nope, int rope) {
+    int hd = nope + rope;
+    int total = batch * n_heads * hd;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / (n_heads * hd);
+        int rem = i % (n_heads * hd);
+        int h = rem / hd;
+        int dd = rem % hd;
+        q[i] = (dd < nope)
+            ? q_nope[(long long)s * n_heads * nope + h * nope + dd]
+            : q_rope[(long long)s * n_heads * rope + h * rope + (dd - nope)];
+    }
+}
+"#;
+
+/// MLA batched: extract the latent columns from kv_a `[batch, kv_lora+rope]`
+/// into a contiguous `[batch, kv_lora]` buffer (rms_norm needs contiguous rows;
+/// the latent is followed by the k_rope columns in kv_a).
+const MLA_EXTRACT_KV_LORA: &str = r#"
+extern "C" __global__ void mla_extract_kv_lora(const float* __restrict__ kv_a,
+                                               float* __restrict__ out,
+                                               int batch, int kv_lora_rank, int rope) {
+    int total = batch * kv_lora_rank;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / kv_lora_rank;
+        int dd = i % kv_lora_rank;
+        out[i] = kv_a[(long long)s * (kv_lora_rank + rope) + dd];
+    }
+}
+"#;
+
+/// MLA batched: extract the shared k_rope columns from kv_a
+/// `[batch, kv_lora + rope]` into a contiguous `[batch, rope]` buffer.
+const MLA_EXTRACT_K_ROPE: &str = r#"
+extern "C" __global__ void mla_extract_k_rope(const float* __restrict__ kv_a,
+                                              float* __restrict__ k_rope,
+                                              int batch, int kv_lora, int rope) {
+    int total = batch * rope;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / rope;
+        int dd = i % rope;
+        k_rope[i] = kv_a[(long long)s * (kv_lora + rope) + kv_lora + dd];
+    }
+}
+"#;
+
+/// MLA batched: expand kv + shared k_rope into per-head k/v caches at the
+/// per-row (slot, pos) position.
+const MLA_ASSEMBLE_KV_BATCHED: &str = r#"
+extern "C" __global__ void mla_assemble_kv_batched(
+    const float* __restrict__ kv, const float* __restrict__ k_rope,
+    float* __restrict__ kc, float* __restrict__ vc,
+    const int* __restrict__ pos_buf, const int* __restrict__ slots,
+    int batch, int max_seq, int n_heads, int nope, int rope, int v_hd) {
+    int hd = nope + rope;
+    int total = batch * n_heads * hd;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / (n_heads * hd);
+        int rem = i % (n_heads * hd);
+        int h = rem / hd;
+        int dd = rem % hd;
+        int slot = slots[s];
+        int pos = pos_buf[s];
+        float val = (dd < nope)
+            ? kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + dd]
+            : k_rope[(long long)s * rope + (dd - nope)];
+        kc[((long long)slot * max_seq + pos) * n_heads * hd + h * hd + dd] = val;
+    }
+    int total_v = batch * n_heads * v_hd;
+    if (i < total_v) {
+        int s = i / (n_heads * v_hd);
+        int rem = i % (n_heads * v_hd);
+        int h = rem / v_hd;
+        int dd = rem % v_hd;
+        int slot = slots[s];
+        int pos = pos_buf[s];
+        vc[((long long)slot * max_seq + pos) * n_heads * v_hd + h * v_hd + dd] =
+            kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
+    }
+}
+"#;
+
+/// MLA batched decode attention over the expanded per-head k/v caches.
+const MLA_ATTN_DECODE_BATCHED: &str = r#"
+extern "C" __global__ void mla_attn_decode_batched(
+    const float* __restrict__ q, const float* __restrict__ kc,
+    const float* __restrict__ vc, float* __restrict__ out,
+    const int* __restrict__ pos_buf, const int* __restrict__ slots,
+    int batch, int n_heads, int k_hd, int v_hd, float scale, int max_seq) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_seq;
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int slot = slots[s];
+    int pos = pos_buf[s];
+    const float* qh = q + ((long long)s * n_heads + h) * k_hd;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        const float* kp = kc + ((long long)slot * max_seq + p) * n_heads * k_hd + h * k_hd;
+        float sc = 0.0f;
+        for (int dd = 0; dd < k_hd; dd++) sc += qh[dd] * kp[dd];
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+    for (int dd = threadIdx.x; dd < v_hd; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            float vp = vc[((long long)slot * max_seq + p) * n_heads * v_hd + h * v_hd + dd];
+            acc += __expf(scores[p] - m) * vp;
+        }
+        out[((long long)s * n_heads + h) * v_hd + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// Per-row argmax over a [batch, vocab] logits matrix.
 const ARGMAX_BATCHED: &str = r#"
 extern "C" __global__ void argmax_batched(const float* logits, int* out_tok,
@@ -1102,6 +1243,11 @@ pub struct HipKernels {
     mla_assemble_q: HipKernelModule,
     mla_assemble_kv: HipKernelModule,
     mla_attn_decode: HipKernelModule,
+    mla_assemble_q_batched: HipKernelModule,
+    mla_extract_kv_lora: HipKernelModule,
+    mla_extract_k_rope: HipKernelModule,
+    mla_assemble_kv_batched: HipKernelModule,
+    mla_attn_decode_batched: HipKernelModule,
     rope: HipKernelModule,
     embed_batched: HipKernelModule,
     rope_batched: HipKernelModule,
@@ -1154,6 +1300,31 @@ impl HipKernels {
             mla_assemble_q: HipKernelModule::compile(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
             mla_assemble_kv: HipKernelModule::compile(&arch, MLA_ASSEMBLE_KV, "mla_assemble_kv")?,
             mla_attn_decode: HipKernelModule::compile(&arch, MLA_ATTN_DECODE, "mla_attn_decode")?,
+            mla_assemble_q_batched: HipKernelModule::compile(
+                &arch,
+                MLA_ASSEMBLE_Q_BATCHED,
+                "mla_assemble_q_batched",
+            )?,
+            mla_extract_kv_lora: HipKernelModule::compile(
+                &arch,
+                MLA_EXTRACT_KV_LORA,
+                "mla_extract_kv_lora",
+            )?,
+            mla_extract_k_rope: HipKernelModule::compile(
+                &arch,
+                MLA_EXTRACT_K_ROPE,
+                "mla_extract_k_rope",
+            )?,
+            mla_assemble_kv_batched: HipKernelModule::compile(
+                &arch,
+                MLA_ASSEMBLE_KV_BATCHED,
+                "mla_assemble_kv_batched",
+            )?,
+            mla_attn_decode_batched: HipKernelModule::compile(
+                &arch,
+                MLA_ATTN_DECODE_BATCHED,
+                "mla_attn_decode_batched",
+            )?,
             rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
             embed_batched: HipKernelModule::compile(&arch, EMBED_BATCHED, "embed_batched")?,
             rope_batched: HipKernelModule::compile(&arch, ROPE_BATCHED, "rope_batched")?,
@@ -1514,6 +1685,179 @@ impl HipKernels {
             &mut p,
             self.stream,
             SHARED_FLOATS * 4,
+        )?)
+    }
+
+    /// MLA batched: merge q_nope / q_rope into q across rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_assemble_q_batched(
+        &self,
+        q_nope: *const f32,
+        q_rope: *const f32,
+        q: *mut f32,
+        batch: i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let qnp = q_nope;
+        let qrp = q_rope;
+        let qp = q;
+        let mut p = vec![
+            &qnp as *const *const f32 as *mut core::ffi::c_void,
+            &qrp as *const *const f32 as *mut core::ffi::c_void,
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads * (nope + rope)) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_q_batched
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched: extract the latent columns into a contiguous buffer.
+    pub fn launch_mla_extract_kv_lora(
+        &self,
+        kv_a: *const f32,
+        kv_lora: *mut f32,
+        batch: i32,
+        kv_lora_rank: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let kvap = kv_a;
+        let kvlp = kv_lora;
+        let mut p = vec![
+            &kvap as *const *const f32 as *mut core::ffi::c_void,
+            &kvlp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_lora_rank as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_lora_rank) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_extract_kv_lora
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched: extract shared k_rope columns into a contiguous buffer.
+    pub fn launch_mla_extract_k_rope(
+        &self,
+        kv_a: *const f32,
+        k_rope: *mut f32,
+        batch: i32,
+        kv_lora: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let kvap = kv_a;
+        let krp = k_rope;
+        let mut p = vec![
+            &kvap as *const *const f32 as *mut core::ffi::c_void,
+            &krp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_lora as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * rope) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_extract_k_rope
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched: expand kv + k_rope into per-head k/v caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_assemble_kv_batched(
+        &self,
+        kv: *const f32,
+        k_rope: *const f32,
+        kc: *mut f32,
+        vc: *mut f32,
+        pos: *const i32,
+        slots: *const i32,
+        batch: i32,
+        max_seq: i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+        v_hd: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let krp = k_rope;
+        let kcp = kc;
+        let vcp = vc;
+        let pp = pos;
+        let sp = slots;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &krp as *const *const f32 as *mut core::ffi::c_void,
+            &kcp as *const *mut f32 as *mut core::ffi::c_void,
+            &vcp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads * (nope + rope)).max(batch * n_heads * v_hd) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_kv_batched
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched decode attention over expanded per-head k/v caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_attn_decode_batched(
+        &self,
+        q: *const f32,
+        kc: *const f32,
+        vc: *const f32,
+        out: *mut f32,
+        pos: *const i32,
+        slots: *const i32,
+        batch: i32,
+        n_heads: i32,
+        k_hd: i32,
+        v_hd: i32,
+        scale: f32,
+        max_seq: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = kc;
+        let vp = vc;
+        let op = out;
+        let pp = pos;
+        let sp = slots;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &k_hd as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+        ];
+        let grid = (batch * n_heads) as u32;
+        let shared = (max_seq as u32 + 256) * 4;
+        Ok(self.mla_attn_decode_batched.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
         )?)
     }
 
