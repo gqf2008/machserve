@@ -917,9 +917,6 @@ impl BatchedModel {
         let nq = (c.n_heads * c.head_dim) as i32;
         let nkv = (c.n_kv_heads * c.head_dim) as i32;
         let inter = c.intermediate_size as i32;
-        // MoE expert FFN width: `moe_intermediate_size` when set (Qwen-MoE
-        // checkpoints), else `intermediate_size` (single-size families).
-        let einter = c.expert_size() as i32;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
         let k = &self.k;
         let f16 = c.dtype == ModelDType::F16;
