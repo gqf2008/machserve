@@ -48,6 +48,44 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg
 }
 
+/// Rough device-memory estimate for the preflight: weight file + KV cache +
+/// 256MiB scratch margin (+ draft model in spec mode). MLA uses the expanded
+/// per-head KV cache (always f32); dense uses the GQA formula with the dtype's
+/// element size. Sharded weight files, hipBLAS workspace and compiled kernels
+/// are not counted; the margin covers today's scenarios.
+fn estimate_vram(
+    cfg: &Config,
+    capacity: usize,
+    model_file_bytes: u64,
+    draft: Option<(&Config, u64)>,
+) -> u64 {
+    let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
+    let kv = if cfg.kv_lora_rank > 0 {
+        capacity
+            * cfg.max_seq_len
+            * cfg.n_heads
+            * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
+            * 4
+    } else {
+        capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem
+    };
+    let mut est = model_file_bytes + (kv * cfg.n_layers) as u64 + (256 << 20);
+    if let Some((dcfg, dfb)) = draft {
+        let dkv_elem = if dcfg.dtype == ModelDType::F16 { 2 } else { 4 };
+        let dkv = if dcfg.kv_lora_rank > 0 {
+            capacity
+                * dcfg.max_seq_len
+                * dcfg.n_heads
+                * (dcfg.qk_nope_head_dim + dcfg.qk_rope_head_dim + dcfg.v_head_dim)
+                * 4
+        } else {
+            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * dkv_elem
+        };
+        est += dfb + (dkv * dcfg.n_layers) as u64;
+    }
+    est
+}
+
 #[cfg(feature = "hip")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -116,19 +154,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    // NOTE: the estimate uses the dense-GQA KV formula; MLA's expanded
-    // per-head KV cache (heads * (nope+rope+v_hd), f32) is larger and is not
-    // accounted for yet — revisit before serving real MLA checkpoints. Sharded
-    // weight files, hipBLAS workspace and compiled modules are also omitted;
-    // the 256MiB margin covers today's dense tiny/1.5B scenarios.
-    let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
+    // NOTE: sharded weight files, hipBLAS workspace and compiled kernels are
+    // not counted; the 256MiB margin covers today's tiny/1.5B scenarios.
     let file_bytes = std::fs::metadata(root.join(&model_name))
         .map(|m| m.len())
         .unwrap_or(0);
-    let kv_bytes =
-        capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem * cfg.n_layers;
-    let mut estimate = file_bytes + kv_bytes as u64 + (256 << 20); // +256MiB scratch margin
-    if spec {
+    let draft_est = if spec {
         let dfb = std::fs::metadata(root.join(&draft_name))
             .map(|m| m.len())
             .unwrap_or(0);
@@ -137,10 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "f32" => dcfg.dtype = ModelDType::F32,
             _ => dcfg.dtype = ModelDType::F16,
         }
-        let dkv =
-            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * kv_elem * dcfg.n_layers;
-        estimate += dfb + dkv as u64;
-    }
+        Some((dcfg, dfb))
+    } else {
+        None
+    };
+    let estimate = estimate_vram(
+        &cfg,
+        capacity,
+        file_bytes,
+        draft_est.as_ref().map(|(c, b)| (c, *b)),
+    );
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     println!(
         "GPU preflight: device_count={devices}, VRAM free {:.2}GiB / {:.2}GiB, estimated need {:.2}GiB",
@@ -234,4 +271,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(feature = "hip"))]
 fn main() {
     eprintln!("mach-server requires the `hip` feature: cargo run -p mach-server --features hip");
+}
+
+#[cfg(all(test, feature = "hip"))]
+#[cfg(all(test, feature = "hip"))]
+mod tests {
+    use super::*;
+
+    fn dense_cfg() -> Config {
+        Config::llama(128, 2, 4, 2, 1024, 64)
+    }
+
+    fn mla_cfg() -> Config {
+        Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16)
+    }
+
+    #[test]
+    fn dense_estimate_includes_weights_kv_and_margin() {
+        let cfg = dense_cfg();
+        let est = estimate_vram(&cfg, 8, 1_000_000, None);
+        // KV (f32) = capacity*max_seq*kv_heads*head_dim*4 per layer.
+        let kv = (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * cfg.n_layers) as u64;
+        assert_eq!(est, 1_000_000 + kv + (256 << 20));
+    }
+
+    #[test]
+    fn f16_dense_uses_two_byte_kv() {
+        let mut cfg = dense_cfg();
+        cfg.dtype = ModelDType::F16;
+        let f16 = estimate_vram(&cfg, 8, 0, None);
+        cfg.dtype = ModelDType::F32;
+        let f32 = estimate_vram(&cfg, 8, 0, None);
+        // KV diff = layers * capacity*max_seq*kv_heads*head_dim*(4-2).
+        let kv_diff =
+            (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2) as u64;
+        assert_eq!(
+            f32 - f16,
+            kv_diff,
+            "f32 KV must exceed f16 KV by the elem diff"
+        );
+    }
+
+    #[test]
+    fn mla_estimate_uses_expanded_per_head_kv() {
+        let cfg = mla_cfg();
+        // MLA KV/layer is f32: capacity*max_seq*heads*(nope+rope+v_hd)*4.
+        let kv = (8
+            * cfg.max_seq_len
+            * cfg.n_heads
+            * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
+            * 4
+            * cfg.n_layers) as u64;
+        assert_eq!(estimate_vram(&cfg, 8, 0, None), kv + (256 << 20));
+    }
+
+    #[test]
+    fn spec_adds_draft_weights_and_kv() {
+        let tcfg = dense_cfg();
+        let dcfg = dense_cfg();
+        let base = estimate_vram(&tcfg, 8, 1_000, None);
+        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)));
+        let dkv =
+            (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4) as u64;
+        assert_eq!(spec - base, 500 + dkv);
+    }
 }
