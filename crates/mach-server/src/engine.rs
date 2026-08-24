@@ -42,6 +42,8 @@ pub struct ServerEngine {
     spec: bool,
     /// Draft tokens per verify round in spec mode.
     spec_k: usize,
+    /// MoE offload (cpu backend): GPU-resident expert slots per layer; None = full.
+    offload_slots: Option<usize>,
     pending: Mutex<VecDeque<Request>>,
     cond: Condvar,
     txs: Mutex<HashMap<SeqId, DoneSender>>,
@@ -85,12 +87,36 @@ impl ServerEngine {
         Self::with_mode(capacity, capacity, true, k.max(1))
     }
 
+    /// Creates a continuous-batching engine in MoE offload mode (cpu backend) with
+    /// `expert_slots` GPU-resident expert slots per layer.
+    #[must_use]
+    pub fn with_offload(capacity: usize, prefill_rows: usize, expert_slots: usize) -> Arc<Self> {
+        Self::with_mode_offload(
+            capacity,
+            prefill_rows.max(capacity),
+            false,
+            0,
+            Some(expert_slots),
+        )
+    }
+
     fn with_mode(capacity: usize, prefill_rows: usize, spec: bool, spec_k: usize) -> Arc<Self> {
+        Self::with_mode_offload(capacity, prefill_rows, spec, spec_k, None)
+    }
+
+    fn with_mode_offload(
+        capacity: usize,
+        prefill_rows: usize,
+        spec: bool,
+        spec_k: usize,
+        offload_slots: Option<usize>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             capacity,
             prefill_rows,
             spec,
             spec_k,
+            offload_slots,
             pending: Mutex::new(VecDeque::new()),
             cond: Condvar::new(),
             txs: Mutex::new(HashMap::new()),
@@ -214,8 +240,18 @@ impl ServerEngine {
         cfg: Config,
         w: Weights,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
-        let mut model =
-            ContinuousModel::with_prefill_rows(hip, cfg, &w, self.capacity, self.prefill_rows)?;
+        let mut model = if let Some(slots) = self.offload_slots {
+            ContinuousModel::with_prefill_rows_offload(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                slots,
+            )?
+        } else {
+            ContinuousModel::with_prefill_rows(hip, cfg, &w, self.capacity, self.prefill_rows)?
+        };
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))
