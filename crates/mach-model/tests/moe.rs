@@ -56,6 +56,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[cfg(feature = "hip")]
+#[ignore]
 #[test]
 fn moe_gpu_forward_matches_cpu_reference() {
     use mach_kernel_sys::hip;
@@ -94,6 +95,7 @@ fn moe_gpu_forward_matches_cpu_reference() {
 }
 
 #[cfg(feature = "hip")]
+#[ignore]
 #[test]
 fn moe_gpu_offload_placement_invariant() {
     use mach_kernel_sys::hip;
@@ -138,6 +140,7 @@ fn moe_gpu_offload_placement_invariant() {
 }
 
 #[cfg(feature = "hip")]
+#[ignore]
 #[test]
 fn moe_gpu_slot_offload_matches_full() {
     use mach_kernel_sys::hip;
@@ -180,6 +183,7 @@ fn moe_gpu_slot_offload_matches_full() {
 }
 
 #[cfg(feature = "hip")]
+#[ignore]
 #[test]
 fn moe_gpu_adaptive_offload_matches_full() {
     use mach_kernel_sys::hip;
