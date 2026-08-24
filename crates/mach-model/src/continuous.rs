@@ -112,7 +112,6 @@ impl ContinuousModel {
         })
     }
 
-
     /// Builds a continuous-batching engine in MoE offload mode: experts stay in host
     /// RAM and the MoE layer is computed on the CPU (FreeToken `cpu` backend), so GPU
     /// memory is bounded by `expert_slots` regardless of the total expert count.
