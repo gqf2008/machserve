@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "MLA config")]
+    #[should_panic(expected = "requires qk_nope_head_dim")]
     fn config_rejects_mla_missing_dims() {
         parse_json(
             r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"kv_lora_rank":512}"#,
