@@ -556,15 +556,17 @@ impl BatchedModel {
                 self.gw = self.dalloc(cap * 4)?;
                 self.row_idx = self.dalloc(cap * 4)? as *mut i32;
                 self.h_acc = self.dalloc(b * d * 4)?;
-                self.gate_all = self.dalloc(cap * inter * 4)?;
-                self.up_all = self.dalloc(cap * inter * 4)?;
-                self.eh_all = self.dalloc(cap * inter * 4)?;
+                // Expert scratch must cover the wider of dense/MoE widths.
+                let moe_w = c.intermediate_size.max(c.expert_size());
+                self.gate_all = self.dalloc(cap * moe_w * 4)?;
+                self.up_all = self.dalloc(cap * moe_w * 4)?;
+                self.eh_all = self.dalloc(cap * moe_w * 4)?;
                 self.down_all = self.dalloc(cap * d * 4)?;
                 let ch = hip::host_malloc(self.k.hip(), ne * 4)?;
                 self.counts_host = ch as *mut i32;
                 self.host_pins.push(ch);
                 if c.dtype == ModelDType::F16 {
-                    let m = c.d_model.max(c.intermediate_size);
+                    let m = c.d_model.max(moe_w);
                     self.xh_moe = self.alloc_f16(cap * m)?;
                     self.yh_moe = self.alloc_f16(cap * m)?;
                 }
@@ -1269,6 +1271,10 @@ impl BatchedModel {
             if c.num_experts > 0 && !lw.moe_router.is_null() {
                 let ne = c.num_experts as i32;
                 let topk = c.num_experts_per_tok.min(c.num_experts) as i32;
+                // Routed-expert layers use the MoE expert width (Qwen-MoE:
+                // moe_intermediate_size), which may differ from the dense
+                // intermediate_size.
+                let einter = c.expert_size() as i32;
                 if topk > 0 {
                     // Router logits [B, ne] (shared input -> batched GEMM).
                     gemm(
@@ -1940,4 +1946,3 @@ impl Drop for BatchedModel {
         }
     }
 }
-
