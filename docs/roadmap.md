@@ -770,3 +770,14 @@
   - **结论:spec-decode 当前形态为净负收益,暂停投入**。正确性已多层验证,
     但草稿+验证每轮开销盖过收益;若未来在 batched/连续批处理形态重新评估,
     需先解决草稿相对目标不够便宜的问题。
+
+- **P3cg 真实 MoE 权重验证受阻于模型可用性(2026-08-24)**:
+  - 目标模型 `Qwen/Qwen2.5-MoE-A3B`(3B,64 专家/8 活跃,Qwen2Moe 张量布局,唯一能塞进
+    24GB 卡的小 MoE)经核实**在 HuggingFace 上不存在**(Qwen/QwenLM 各种变体均
+    "Repository not found",搜索无官方仓库),ModelScope 亦无(record not found),
+    无社区重传;网络已修复(系统代理 + 本机 HF token 可达 HF API),纯属模型下架。
+  - 缓解:loader 的 Qwen2Moe 键名(`mlp.gate.weight` + `mlp.experts.{e}.*`)已由
+    审查对照 vllm/candle/llama.cpp 交叉验证,真实权重验证的残余风险已大幅降低;
+    `tests/moe_real.rs`(PR #14)保持 skippable,模型文件到位即可跑。
+  - 若需完成:需从其他渠道获取该模型(或兼容 Qwen2Moe 布局的小模型),放入
+    `.models/qwen2.5-moe-a3b/`。
