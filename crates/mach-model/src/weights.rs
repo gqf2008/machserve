@@ -60,6 +60,50 @@ pub struct LayerWeights {
     pub moe_wd: Vec<f32>,
 }
 
+/// Q4 (storage-level int4) layer weights: GEMM tensors quantized, norms and
+/// biases kept as f32. Mirrors [`LayerWeights`].
+#[derive(Debug, Clone)]
+pub struct LayerWeightsQ4 {
+    pub wq: crate::q4::Q4Tensor,
+    pub wk: crate::q4::Q4Tensor,
+    pub wv: crate::q4::Q4Tensor,
+    pub wo: crate::q4::Q4Tensor,
+    pub rms_attn: Vec<f32>,
+    pub wg: crate::q4::Q4Tensor,
+    pub wu: crate::q4::Q4Tensor,
+    pub wd: crate::q4::Q4Tensor,
+    pub rms_mlp: Vec<f32>,
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub mla_q_a: crate::q4::Q4Tensor,
+    pub mla_q_a_norm: Vec<f32>,
+    pub mla_q_b: crate::q4::Q4Tensor,
+    pub mla_q_rope: crate::q4::Q4Tensor,
+    pub mla_kv_a: crate::q4::Q4Tensor,
+    pub mla_kv_a_norm: Vec<f32>,
+    pub mla_kv_b: crate::q4::Q4Tensor,
+    pub mla_o: crate::q4::Q4Tensor,
+    // Router is tiny and int4 error can flip critical expert selection, so it
+    // stays f32 (same reasoning as norms/biases).
+    pub moe_router: Vec<f32>,
+    pub moe_wg: crate::q4::Q4Tensor,
+    pub moe_wu: crate::q4::Q4Tensor,
+    pub moe_wd: crate::q4::Q4Tensor,
+}
+
+/// All model weights in storage-Q4 form (host memory ~4x smaller than f32 for
+/// the GEMM tensors; norms/biases stay f32).
+#[derive(Debug, Clone)]
+pub struct WeightsQ4 {
+    pub tok_emb: crate::q4::Q4Tensor,
+    pub rms_final: Vec<f32>,
+    pub lm_head: crate::q4::Q4Tensor,
+    pub layers: Vec<LayerWeightsQ4>,
+}
+
 /// All model weights.
 #[derive(Debug, Clone)]
 pub struct Weights {

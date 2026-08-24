@@ -5,7 +5,7 @@
 //! weights and (with the `hip` feature) that a GPU model built from the loaded
 //! weights decodes identically to the CPU reference.
 
-use mach_model::loader::{load_safetensors, load_safetensors_dir};
+use mach_model::loader::{load_safetensors, load_safetensors_dir, load_safetensors_q4};
 use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
@@ -62,26 +62,77 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
     ));
     for (i, lw) in w.layers.iter().enumerate() {
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        t.push((p("self_attn.q_proj.weight"), lw.wq.clone(), vec![nq, d]));
-        t.push((p("self_attn.k_proj.weight"), lw.wk.clone(), vec![nkv, d]));
-        t.push((p("self_attn.v_proj.weight"), lw.wv.clone(), vec![nkv, d]));
-        t.push((p("self_attn.o_proj.weight"), lw.wo.clone(), vec![d, nq]));
+        if cfg.kv_lora_rank > 0 {
+            // MLA (DeepSeek-V2 style) replaces q/k/v/o projections.
+            let nope = cfg.qk_nope_head_dim;
+            let rope = cfg.qk_rope_head_dim;
+            let v_hd = cfg.v_head_dim;
+            let heads = cfg.n_heads;
+            t.push((
+                p("self_attn.q_a_proj.weight"),
+                lw.mla_q_a.clone(),
+                vec![cfg.q_lora_rank, d],
+            ));
+            t.push((
+                p("self_attn.q_a_layernorm.weight"),
+                lw.mla_q_a_norm.clone(),
+                vec![cfg.q_lora_rank],
+            ));
+            t.push((
+                p("self_attn.q_b_proj.weight"),
+                lw.mla_q_b.clone(),
+                vec![heads * nope, cfg.q_lora_rank],
+            ));
+            t.push((
+                p("self_attn.q_rope_proj.weight"),
+                lw.mla_q_rope.clone(),
+                vec![heads * rope, d],
+            ));
+            t.push((
+                p("self_attn.kv_a_proj_with_mqa.weight"),
+                lw.mla_kv_a.clone(),
+                vec![cfg.kv_lora_rank + rope, d],
+            ));
+            t.push((
+                p("self_attn.kv_a_layernorm.weight"),
+                lw.mla_kv_a_norm.clone(),
+                vec![cfg.kv_lora_rank],
+            ));
+            t.push((
+                p("self_attn.kv_b_proj.weight"),
+                lw.mla_kv_b.clone(),
+                vec![heads * (nope + v_hd), cfg.kv_lora_rank],
+            ));
+            t.push((
+                p("self_attn.o_proj.weight"),
+                lw.mla_o.clone(),
+                vec![d, heads * v_hd],
+            ));
+        } else {
+            t.push((p("self_attn.q_proj.weight"), lw.wq.clone(), vec![nq, d]));
+            t.push((p("self_attn.k_proj.weight"), lw.wk.clone(), vec![nkv, d]));
+            t.push((p("self_attn.v_proj.weight"), lw.wv.clone(), vec![nkv, d]));
+            t.push((p("self_attn.o_proj.weight"), lw.wo.clone(), vec![d, nq]));
+        }
         t.push((p("input_layernorm.weight"), lw.rms_attn.clone(), vec![d]));
-        t.push((
-            p("mlp.gate_proj.weight"),
-            lw.wg.clone(),
-            vec![cfg.intermediate_size, d],
-        ));
-        t.push((
-            p("mlp.up_proj.weight"),
-            lw.wu.clone(),
-            vec![cfg.intermediate_size, d],
-        ));
-        t.push((
-            p("mlp.down_proj.weight"),
-            lw.wd.clone(),
-            vec![d, cfg.intermediate_size],
-        ));
+        if cfg.num_experts == 0 {
+            // MoE layers have no dense MLP tensors (expert tensors replace them).
+            t.push((
+                p("mlp.gate_proj.weight"),
+                lw.wg.clone(),
+                vec![cfg.intermediate_size, d],
+            ));
+            t.push((
+                p("mlp.up_proj.weight"),
+                lw.wu.clone(),
+                vec![cfg.intermediate_size, d],
+            ));
+            t.push((
+                p("mlp.down_proj.weight"),
+                lw.wd.clone(),
+                vec![d, cfg.intermediate_size],
+            ));
+        }
         t.push((
             p("post_attention_layernorm.weight"),
             lw.rms_mlp.clone(),
@@ -106,6 +157,7 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "max_abs_diff: length mismatch");
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
@@ -175,10 +227,10 @@ fn roundtrip_moe_load_matches_original_weights() {
         assert_eq!(max_abs_diff(&a.moe_wg, &b.moe_wg), 0.0, "layer {li} moe_wg");
         assert_eq!(max_abs_diff(&a.moe_wu, &b.moe_wu), 0.0, "layer {li} moe_wu");
         assert_eq!(max_abs_diff(&a.moe_wd, &b.moe_wd), 0.0, "layer {li} moe_wd");
-        // Dense fields must still round-trip under a MoE config (loader reads them too).
-        assert_eq!(max_abs_diff(&a.wg, &b.wg), 0.0, "layer {li} dense wg");
-        assert_eq!(max_abs_diff(&a.wu, &b.wu), 0.0, "layer {li} dense wu");
-        assert_eq!(max_abs_diff(&a.wd, &b.wd), 0.0, "layer {li} dense wd");
+        // MoE layers carry no dense MLP weights (expert tensors replace them).
+        assert!(a.wg.is_empty(), "layer {li} dense wg must be empty for MoE");
+        assert!(a.wu.is_empty(), "layer {li} dense wu must be empty for MoE");
+        assert!(a.wd.is_empty(), "layer {li} dense wd must be empty for MoE");
     }
     let _ = std::fs::remove_file(&path);
 }
@@ -274,4 +326,145 @@ fn sharded_load_matches_single_file() {
         assert_eq!(max_abs_diff(&a.rms_mlp, &b.rms_mlp), 0.0);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn q4_load_matches_f32_within_tolerance() {
+    let cfg = Config::tiny();
+    let path = tmp_path("q4");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let q4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+
+    // Norms/biases stay exact; quantized GEMM weights stay within ~half scale.
+    assert_eq!(q4.rms_final, original.rms_final);
+    assert_eq!(q4.layers[0].rms_attn, original.layers[0].rms_attn);
+    assert_eq!(q4.layers[0].rms_mlp, original.layers[0].rms_mlp);
+
+    // tiny random weights scale ~= 1/sqrt(d) ~ 0.09; int4 error <= scale/2.
+    let tol = 0.05;
+    assert!(
+        max_abs_diff(&q4.tok_emb.dequantize(), &original.tok_emb) < tol,
+        "tok_emb dequant must be close"
+    );
+    assert!(
+        max_abs_diff(&q4.lm_head.dequantize(), &original.lm_head) < tol,
+        "lm_head dequant must be close"
+    );
+    for (li, (a, b)) in q4.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.wq.dequantize(), &b.wq) < tol,
+            "layer {li} wq"
+        );
+        assert!(
+            max_abs_diff(&a.wk.dequantize(), &b.wk) < tol,
+            "layer {li} wk"
+        );
+        assert!(
+            max_abs_diff(&a.wv.dequantize(), &b.wv) < tol,
+            "layer {li} wv"
+        );
+        assert!(
+            max_abs_diff(&a.wo.dequantize(), &b.wo) < tol,
+            "layer {li} wo"
+        );
+        assert!(
+            max_abs_diff(&a.wg.dequantize(), &b.wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.wu.dequantize(), &b.wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.wd.dequantize(), &b.wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn q4_load_matches_f32_mla() {
+    let cfg = Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16);
+    let path = tmp_path("q4mla");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let q4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let tol = 0.05;
+    // MLA norms stay exact; quantized projections stay close.
+    assert_eq!(q4.layers[0].mla_q_a_norm, original.layers[0].mla_q_a_norm);
+    assert_eq!(q4.layers[0].mla_kv_a_norm, original.layers[0].mla_kv_a_norm);
+    for (li, (a, b)) in q4.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.mla_q_a.dequantize(), &b.mla_q_a) < tol,
+            "layer {li} q_a"
+        );
+        assert!(
+            max_abs_diff(&a.mla_q_b.dequantize(), &b.mla_q_b) < tol,
+            "layer {li} q_b"
+        );
+        assert!(
+            max_abs_diff(&a.mla_q_rope.dequantize(), &b.mla_q_rope) < tol,
+            "layer {li} q_rope"
+        );
+        assert!(
+            max_abs_diff(&a.mla_kv_a.dequantize(), &b.mla_kv_a) < tol,
+            "layer {li} kv_a"
+        );
+        assert!(
+            max_abs_diff(&a.mla_kv_b.dequantize(), &b.mla_kv_b) < tol,
+            "layer {li} kv_b"
+        );
+        assert!(
+            max_abs_diff(&a.mla_o.dequantize(), &b.mla_o) < tol,
+            "layer {li} o"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn q4_load_matches_f32_moe() {
+    let cfg = moe_cfg();
+    let path = tmp_path("q4moe");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let q4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let tol = 0.05;
+    // Router stays f32 (exact); expert GEMMs quantized within tolerance.
+    assert_eq!(q4.layers[0].moe_router, original.layers[0].moe_router);
+    for (li, (a, b)) in q4.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.moe_wg.dequantize(), &b.moe_wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.moe_wu.dequantize(), &b.moe_wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.moe_wd.dequantize(), &b.moe_wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }

@@ -197,3 +197,8 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg.qk_norm = v["use_qk_norm"].as_bool().unwrap_or(false);
     cfg
 }
+
+#[cfg(not(feature = "hip"))]
+fn main() {
+    eprintln!("moe_offload_bench requires the `hip` feature");
+}
