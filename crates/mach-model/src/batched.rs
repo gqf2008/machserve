@@ -171,6 +171,9 @@ pub struct BatchedModel {
     expert_slots: usize,
     /// Host weight copy for the CPU MoE compute (offload mode).
     host_w: Option<Arc<Weights>>,
+    /// Full-layer double-buffered prefill engine (dedicated prefetch stream +
+    /// ping-pong expert buffers). `Some` only in buffered-prefill mode.
+    prefetch: Option<crate::prefill_buffered::PrefetchEngine>,
 }
 
 impl BatchedModel {
@@ -203,6 +206,27 @@ impl BatchedModel {
         expert_slots: usize,
     ) -> Result<Self, Error> {
         let mut m = Self::build(hip, cfg, w, slots, rows, expert_slots)?;
+        m.host_w = Some(Arc::new(w.clone()));
+        Ok(m)
+    }
+
+    /// Builds a batched model in full-layer double-buffered prefill mode
+    /// (FreeToken-style): MoE expert weights stay in host RAM (pinned) and each
+    /// MoE layer's experts are prefetched host→device on a separate stream
+    /// while the previous layer is computed, overlapping the H2D with the
+    /// GEMMs. The grouped expert GEMMs then read the prefetched weights, so the
+    /// math is identical to the full-resident path; device memory holds only
+    /// two ping-pong expert pools. F32 only for now.
+    pub fn with_prefill_buffer(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::build(hip, cfg, w, slots, rows, 0)?;
+        let engine = crate::prefill_buffered::PrefetchEngine::new(Arc::clone(m.k.hip()), cfg, w)?;
+        m.prefetch = Some(engine);
         m.host_w = Some(Arc::new(w.clone()));
         Ok(m)
     }
@@ -292,6 +316,7 @@ impl BatchedModel {
             host_pins: Vec::new(),
             expert_slots,
             host_w: None,
+            prefetch: None,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -885,6 +910,9 @@ impl BatchedModel {
         let nq = (c.n_heads * c.head_dim) as i32;
         let nkv = (c.n_kv_heads * c.head_dim) as i32;
         let inter = c.intermediate_size as i32;
+        // MoE expert FFN width: `moe_intermediate_size` when set (Qwen-MoE
+        // checkpoints), else `intermediate_size` (single-size families).
+        let einter = c.expert_size() as i32;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
         let k = &self.k;
         let f16 = c.dtype == ModelDType::F16;
@@ -909,8 +937,17 @@ impl BatchedModel {
         } else {
             k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
         }
+        // Double-buffered prefill: start the first MoE layer's H2D prefetch so
+        // it overlaps the first layers' compute.
+        if let Some(pf) = &self.prefetch {
+            pf.begin()?;
+        }
         for (li, lw) in self.layers_dev.iter().enumerate() {
             let l16 = if f16 { Some(self.layers_f16[li]) } else { None };
+            // Issue the next MoE layer's prefetch before this layer computes.
+            if let Some(pf) = &self.prefetch {
+                pf.layer_begin(li)?;
+            }
             k.launch_rms_norm(self.x, lw.rms_attn, self.xn, b, d, c.rms_eps)?;
             if c.kv_lora_rank > 0 {
                 let heads = c.n_heads as i32;
@@ -1220,7 +1257,11 @@ impl BatchedModel {
                 k.launch_add(self.x, self.proj, b * d)?;
             }
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
-            if c.num_experts > 0 {
+            // Per-layer MoE dispatch: mixed checkpoints (Qwen3-MoE style) have
+            // dense layers with empty MoE tensors alongside routed-expert
+            // layers; a layer is MoE iff it carries a router (mirrors
+            // ref_model and the single-sequence path).
+            if c.num_experts > 0 && !lw.moe_router.is_null() {
                 let ne = c.num_experts as i32;
                 let topk = c.num_experts_per_tok.min(c.num_experts) as i32;
                 if topk > 0 {
@@ -1241,8 +1282,12 @@ impl BatchedModel {
                         topk,
                         b,
                     )?;
-                    if self.expert_slots < ne as usize {
-                        self.forward_moe_cpu_batched(li, ne, topk, b, d, inter)?;
+                    // Buffered prefill: run the grouped GEMMs from the
+                    // weights prefetched on the separate stream. Placement is a
+                    // numeric no-op, so output matches the full-resident path.
+                    let buffered = self.prefetch.is_some();
+                    if !buffered && self.expert_slots < ne as usize {
+                        self.forward_moe_cpu_batched(li, ne, topk, b, d, einter)?;
                     } else {
                         // Count routed (token, slot) pairs per expert on device.
                         unsafe {
@@ -1292,6 +1337,15 @@ impl BatchedModel {
                         )?;
                         // Make the async counts readback visible to the host loop.
                         self.k.sync()?;
+                        // Buffered prefill: the weights were prefetched on the
+                        // separate stream while this layer computed; wait for
+                        // them before the grouped GEMMs read them.
+                        if buffered {
+                            self.prefetch
+                                .as_ref()
+                                .expect("prefetch engine")
+                                .weights_ready(li, self.k.stream)?;
+                        }
                         let counts: Vec<i32> = (0..ne)
                             .map(|e| unsafe { *self.counts_host.add(e as usize) })
                             .collect();
@@ -1309,7 +1363,7 @@ impl BatchedModel {
                         // single D2H read; no per-expert sync). The running base
                         // mirrors the device prefix-sum output.
                         let d_usize = d as usize;
-                        let inter_usize = inter as usize;
+                        let einter_usize = einter as usize;
                         let mut base = 0usize;
                         for (e, &cnt) in counts.iter().enumerate() {
                             let base_e = base;
@@ -1320,15 +1374,24 @@ impl BatchedModel {
                             let base = base_e;
                             let xg_e = unsafe { self.xg.add(base * d_usize) };
                             let down_e = unsafe { self.down_all.add(base * d_usize) };
-                            let wg32 = unsafe { lw.moe_wg.add(e * inter_usize * d_usize) };
-                            let wu32 = unsafe { lw.moe_wu.add(e * inter_usize * d_usize) };
-                            let wd32 = unsafe { lw.moe_wd.add(e * d_usize * inter_usize) };
+                            let (wg_base, wu_base, wd_base) = if buffered {
+                                self.prefetch
+                                    .as_ref()
+                                    .expect("prefetch engine")
+                                    .weights(li)
+                                    .expect("buffered MoE layer")
+                            } else {
+                                (lw.moe_wg, lw.moe_wu, lw.moe_wd)
+                            };
+                            let wg32 = unsafe { wg_base.add(e * einter_usize * d_usize) };
+                            let wu32 = unsafe { wu_base.add(e * einter_usize * d_usize) };
+                            let wd32 = unsafe { wd_base.add(e * d_usize * einter_usize) };
                             let (wg16, wu16, wd16) = if f16 {
                                 let l = self.layers_f16[li];
                                 (
-                                    unsafe { l.moe_wg.add(e * inter_usize * d_usize) },
-                                    unsafe { l.moe_wu.add(e * inter_usize * d_usize) },
-                                    unsafe { l.moe_wd.add(e * d_usize * inter_usize) },
+                                    unsafe { l.moe_wg.add(e * einter_usize * d_usize) },
+                                    unsafe { l.moe_wu.add(e * einter_usize * d_usize) },
+                                    unsafe { l.moe_wd.add(e * d_usize * einter_usize) },
                                 )
                             } else {
                                 (
@@ -1359,15 +1422,15 @@ impl BatchedModel {
                                     k.gemm_batched(out, x, w32, cnt, n, kk)
                                 }
                             };
-                            gemm_e(self.gate_all, xg_e, wg32, wg16, inter, d)?;
-                            gemm_e(self.up_all, xg_e, wu32, wu16, inter, d)?;
+                            gemm_e(self.gate_all, xg_e, wg32, wg16, einter, d)?;
+                            gemm_e(self.up_all, xg_e, wu32, wu16, einter, d)?;
                             k.launch_silu_mul(
                                 self.up_all,
                                 self.gate_all,
                                 self.eh_all,
-                                cnt * inter,
+                                cnt * einter,
                             )?;
-                            gemm_e(down_e, self.eh_all, wd32, wd16, d, inter)?;
+                            gemm_e(down_e, self.eh_all, wd32, wd16, d, einter)?;
                             k.launch_moe_scatter_add(
                                 self.h_acc,
                                 unsafe { self.row_idx.add(base) },
@@ -1409,6 +1472,11 @@ impl BatchedModel {
                     inter,
                 )?;
                 k.launch_add(self.x, self.proj, b * d)?;
+            }
+            // The layer's compute is fully queued: let the prefetch engine know
+            // (its ping-pong slot is now free for the layer after next).
+            if let Some(pf) = &self.prefetch {
+                pf.layer_end(li, self.k.stream)?;
             }
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;

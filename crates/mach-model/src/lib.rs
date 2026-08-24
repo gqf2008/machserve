@@ -18,6 +18,7 @@ pub mod fp16;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
+pub mod prefill_buffered;
 pub mod q4;
 pub mod ref_model;
 #[cfg(feature = "hip")]
