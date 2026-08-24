@@ -199,6 +199,60 @@ fn batched_moe_small_config_matches_single_seq() {
         }
     }
 }
+#[test]
+fn batched_mixed_dense_moe_matches_single_seq() {
+    let Some(hip) = hip_ctx() else { return };
+    // Qwen3-MoE-style mixed checkpoint: layer 0 is dense (empty MoE tensors,
+    // keeps its dense MLP weights), layers 1..n are routed MoE, and the
+    // expert FFN width (`moe_intermediate_size`) differs from the dense MLP
+    // width (`intermediate_size`). The batched path must dispatch per layer
+    // (not on the config-level num_experts) and use expert_size() for the
+    // expert GEMMs, otherwise it reads the wrong weight layout.
+    let mut cfg = Config::tiny();
+    cfg.intermediate_size = 64;
+    cfg.moe_intermediate_size = 32;
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg.dtype = ModelDType::F32;
+    let mut w = Weights::random(&cfg, 123).unwrap();
+    w.layers[0].moe_router.clear();
+    w.layers[0].moe_wg.clear();
+    w.layers[0].moe_wu.clear();
+    w.layers[0].moe_wd.clear();
+
+    let batch = 4usize;
+    let mut batched = BatchedModel::new(hip.clone(), cfg, &w, batch).unwrap();
+    let mut singles: Vec<GpuModel> = (0..batch)
+        .map(|_| GpuModel::new(hip.clone(), cfg, &w).unwrap())
+        .collect();
+    let steps: Vec<Vec<u32>> = vec![vec![5, 9, 33, 7], vec![12, 3, 1, 200]];
+    for step_tokens in &steps {
+        let got = batched.decode_step(step_tokens).unwrap();
+        let got_logits = batched.read_logits().unwrap();
+        assert_eq!(got.len(), batch);
+        for s in 0..batch {
+            let want_logits = singles[s].decode_step(step_tokens[s]).unwrap();
+            let want = want_logits
+                .iter()
+                .enumerate()
+                .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
+            let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let max = row
+                .iter()
+                .zip(&want_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max <= 2e-3 + 2e-3 * scale,
+                "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
+            );
+        }
+    }
+}
 
 #[test]
 fn batched_sequences_are_independent() {

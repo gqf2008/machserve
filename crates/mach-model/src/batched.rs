@@ -885,6 +885,9 @@ impl BatchedModel {
         let nq = (c.n_heads * c.head_dim) as i32;
         let nkv = (c.n_kv_heads * c.head_dim) as i32;
         let inter = c.intermediate_size as i32;
+        // MoE expert FFN width: `moe_intermediate_size` when set (Qwen-MoE
+        // checkpoints), else `intermediate_size` (single-size families).
+        let einter = c.expert_size() as i32;
         let scale = 1.0 / (c.head_dim as f32).sqrt();
         let k = &self.k;
         let f16 = c.dtype == ModelDType::F16;
@@ -1220,7 +1223,11 @@ impl BatchedModel {
                 k.launch_add(self.x, self.proj, b * d)?;
             }
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
-            if c.num_experts > 0 {
+            // Per-layer MoE dispatch: mixed checkpoints (Qwen3-MoE style) have
+            // dense layers with empty MoE tensors alongside routed-expert
+            // layers; a layer is MoE iff it carries a router (mirrors
+            // ref_model and the single-sequence path).
+            if c.num_experts > 0 && !lw.moe_router.is_null() {
                 let ne = c.num_experts as i32;
                 let topk = c.num_experts_per_tok.min(c.num_experts) as i32;
                 if topk > 0 {
@@ -1242,7 +1249,7 @@ impl BatchedModel {
                         b,
                     )?;
                     if self.expert_slots < ne as usize {
-                        self.forward_moe_cpu_batched(li, ne, topk, b, d, inter)?;
+                        self.forward_moe_cpu_batched(li, ne, topk, b, d, einter)?;
                     } else {
                         // Count routed (token, slot) pairs per expert on device.
                         unsafe {
@@ -1309,7 +1316,7 @@ impl BatchedModel {
                         // single D2H read; no per-expert sync). The running base
                         // mirrors the device prefix-sum output.
                         let d_usize = d as usize;
-                        let inter_usize = inter as usize;
+                        let einter_usize = einter as usize;
                         let mut base = 0usize;
                         for (e, &cnt) in counts.iter().enumerate() {
                             let base_e = base;
@@ -1320,15 +1327,15 @@ impl BatchedModel {
                             let base = base_e;
                             let xg_e = unsafe { self.xg.add(base * d_usize) };
                             let down_e = unsafe { self.down_all.add(base * d_usize) };
-                            let wg32 = unsafe { lw.moe_wg.add(e * inter_usize * d_usize) };
-                            let wu32 = unsafe { lw.moe_wu.add(e * inter_usize * d_usize) };
-                            let wd32 = unsafe { lw.moe_wd.add(e * d_usize * inter_usize) };
+                            let wg32 = unsafe { lw.moe_wg.add(e * einter_usize * d_usize) };
+                            let wu32 = unsafe { lw.moe_wu.add(e * einter_usize * d_usize) };
+                            let wd32 = unsafe { lw.moe_wd.add(e * d_usize * einter_usize) };
                             let (wg16, wu16, wd16) = if f16 {
                                 let l = self.layers_f16[li];
                                 (
-                                    unsafe { l.moe_wg.add(e * inter_usize * d_usize) },
-                                    unsafe { l.moe_wu.add(e * inter_usize * d_usize) },
-                                    unsafe { l.moe_wd.add(e * d_usize * inter_usize) },
+                                    unsafe { l.moe_wg.add(e * einter_usize * d_usize) },
+                                    unsafe { l.moe_wu.add(e * einter_usize * d_usize) },
+                                    unsafe { l.moe_wd.add(e * d_usize * einter_usize) },
                                 )
                             } else {
                                 (
@@ -1359,15 +1366,15 @@ impl BatchedModel {
                                     k.gemm_batched(out, x, w32, cnt, n, kk)
                                 }
                             };
-                            gemm_e(self.gate_all, xg_e, wg32, wg16, inter, d)?;
-                            gemm_e(self.up_all, xg_e, wu32, wu16, inter, d)?;
+                            gemm_e(self.gate_all, xg_e, wg32, wg16, einter, d)?;
+                            gemm_e(self.up_all, xg_e, wu32, wu16, einter, d)?;
                             k.launch_silu_mul(
                                 self.up_all,
                                 self.gate_all,
                                 self.eh_all,
-                                cnt * inter,
+                                cnt * einter,
                             )?;
-                            gemm_e(down_e, self.eh_all, wd32, wd16, d, inter)?;
+                            gemm_e(down_e, self.eh_all, wd32, wd16, d, einter)?;
                             k.launch_moe_scatter_add(
                                 self.h_acc,
                                 unsafe { self.row_idx.add(base) },
