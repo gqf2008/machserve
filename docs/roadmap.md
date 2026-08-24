@@ -678,3 +678,106 @@
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 后续切片:彻底去 D2H 需自定义 grouped-GEMM 内核(设备端按专家分段调度),
     真实 Qwen2.5-MoE 验证(需下载权重)。
+
+- **P3ba Qwen3 QK-norm(2026-08-23,7900 XTX)**:
+  - `Config` 增 `qk_norm` 标志 + per-head RMSNorm 权重;`ref_model`/`GpuModel`/
+    `BatchedModel` 在 Q/K 投影后、RoPE 前逐 head 做 RMSNorm;
+  - 验证:`qwen3.rs` 增 QK-norm 权重形状 + GPU==CPU 对拍;全量 HIP 回归全绿,
+    clippy/fmt 干净。
+
+- **P3bb F16 路径只保留 fp16 权重驻留(2026-08-23,7900 XTX)**:
+  - `BatchedModel`/`GpuModel` 的 F16 路径不再同时保留 fp32 权重副本,仅驻留 fp16
+    权重以降低显存占用;
+  - 验证:`qwen3.rs` 增 F16 vs F32 argmax 对拍;全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3bc 多 shard safetensors loader + Qwen3 真实模型 smoke(2026-08-23)**:
+  - `load_safetensors` 支持多 shard checkpoint(按张量名聚合);新增 `qwen3_real`
+    smoke 测试(真实 Qwen3-8B 比例 + F16,下载 ~16GB,缺 checkpoint 自动 skip);
+  - 验证:`load_safetensors` 增 sharded 往返一致测试;全量 HIP 回归全绿,
+    clippy/fmt 干净。
+
+- **P3bd Qwen2-1.5B 真实模型 smoke(2026-08-23,7900 XTX)**:
+  - `qwen15_real.rs` 用已下载的 Qwen2-1.5B checkpoint(BF16、tie_word_embeddings、
+    GQA + rope_theta=1e6、F16 设备路径)做真实模型解码 smoke;
+  - 验证:真实模型解码有限且确定(本机 checkpoint 存在,回归中实际运行);
+    全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3ca MLA 地基(config/weights/loader/CPU 参考,2026-08-23)**:
+  - `Config` 增 MLA 字段(q_lora_rank / kv_lora_rank / qk_nope_head_dim /
+    qk_rope_head_dim / v_head_dim);`LayerWeights` 增低秩 Q 与压缩 KV 张量;
+    loader 读 DeepSeek-V2 风格 MLA 权重;`ref_model` 增 MLA 前向;
+  - 验证:`mla.rs` 增张量形状 + CPU 前向有限确定;全量 HIP 回归全绿,clippy/fmt 干净。
+
+- **P3cb MLA 单序列 GPU decode(expanded KV,2026-08-23,7900 XTX)**:
+  - `GpuModel` MLA 路径:q_lora/kv_lora 低秩投影 + RMSNorm + q_b/kv_b 展开 +
+    手写 MLA assemble/attn 内核,expanded per-head KV cache;
+  - 验证:`mla.rs` 增 `mla_gpu_matches_cpu_reference` 对拍;全量 HIP 回归全绿,
+    clippy/fmt 干净。
+
+- **P3cc MLA batched decode(expanded KV,2026-08-23,7900 XTX)**:
+  - `BatchedModel` MLA 分支(run_kernels 内,decode-only、f32):q_lora/kv_lora
+    投影 → RMSNorm → q_b/kv_b 展开 → 5 个 batched 内核(`mla_assemble_q_batched` /
+    `mla_extract_kv_lora` / `mla_extract_k_rope` / `mla_assemble_kv_batched` /
+    `mla_attn_decode_batched`)→ mla_o 投影;MLA KV 走独立 `mla_kv_cache`
+    (expanded per-head f32);
+  - 验证:`mla.rs` 增 `mla_batched_matches_cpu_reference`(2 序列逐 token 对拍);
+    全量 HIP 回归全绿,clippy/fmt 干净;
+  - 已知边界:仅 f32 + decode 步(ContinuousModel 槽位压缩/真实 MLA checkpoint
+    尚未接入);后续切片:MLA 连续批处理/服务集成 + 真实 DeepSeek MLA 权重验证。
+
+- **P3cd MLA 连续批处理/服务集成(2026-08-23)**:
+  - `BatchedModel::copy_seq_kv` 支持 MLA expanded per-head KV cache 的槽位搬移
+    (此前只搬 `kv_cache`,MLA 序列在槽位压缩后 KV 错位)——连续批处理槽位
+    复用/压缩的关键修复;
+  - `continuous.rs` 增 `engine_matches_single_model_mla`(连续批处理 vs 单序列
+    GpuModel 逐 token 一致)与 `slots_compact_keeps_mla_sequence_intact`
+    (A 先完成触发 B 槽位压缩,MLA KV 随槽位搬移后 B 输出不变);
+    `server.rs` 增 `completions_endpoint_mla_matches_direct_engine`
+    (MLA 配置 HTTP `/v1/completions` 与直接引擎一致);
+  - 验证:本地门禁全绿(rustfmt / cargo check / clippy / CPU 测试);
+    **HIP 验证已跑(2026-08-24)**:mla 4/4 + continuous 11/11 + server 15/15
+    + 全量 HIP 回归全绿;
+  - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
+
+- **P1 加载安全(2026-08-24,issue #7 / PR #8)**:
+  - hiprtc 编译:进程内编译缓存(key=arch+source),同一进程第 2 个模型起复用
+    已编译内核(实测 continuous 套件 225s→28s);`MACH_COMPILE_PROGRESS=1`
+    打印逐内核进度+总耗时;`HipKernelModule` 改 `Arc<ModuleHandle>` 引用计数,
+    最后一个引用(含缓存)drop 才 unload,修复共享句柄 use-after-unload;
+  - mach-server 启动预检:HIP 运行时/设备数/`hipMemGetInfo` 显存,估算=权重文件
+    +KV+256MiB(spec 含草稿),不足即可读错误退出;TCP 提前 bind 快速失败;
+  - `dalloc` 分配失败报字节数;部分分配失败由 Drop 释放(原已具备);
+  - 验证:mla 4/4 + continuous 9/9(带缓存,多次 建/drop/重载 无悬垂);
+    正向 server 起 qwen-0.5b 预检通过、负向 MACH_CAPACITY=4096 显存不足
+    快速失败;全量 HIP 回归全绿;clippy/fmt 干净。
+
+- **P3ce MLA F16 路径(2026-08-24)**:
+  - MLA 分支此前 f32-only;现对齐稠密 F16 路径(P3bb 语义):`LayerDevF16` 增 6 个
+    MLA 投影矩阵 fp16 权重;F16 模式不再驻留 MLA f32 副本;`run_kernels` MLA 分支
+    6 个投影 GEMM 改走共享 `gemm` 闭包(F16→`gemm_batched_f16`,F32→`gemm_batched`);
+  - 验证:`mla.rs` 增 `mla_batched_f16_matches_f32`(batched F16 vs F32 logits 差
+    < 0.1);本地门禁全绿;**HIP 对拍已实跑(2026-08-24)**:mla 套件 5/5 通过;
+  - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
+
+- **P3cf spec-decode 收益测量(2026-08-24)**:
+  - 首次 3 次运行触发系统级问题(双模型加载峰值提交内存 → os error 1453
+    ERROR_QUOTA_EXCEEDED / 终端退出);PR #13 轻量化 `spec_check`(基准后
+    drop 参考引擎、建完双引擎后 drop ~8GB 主机权重、`MACH_MAX_NEW`)后
+    峰值内存降 ~10GB,测量成功完成;
+  - **实测(0.5B 草稿→1.5B 目标,K=4,greedy,单序列)**:plain greedy
+    10.8 ms/tok vs spec-decode 37.6 ms/tok → **speedup 0.29x(慢 ~3.5 倍)**,
+    parity=MATCH(8/30 token 两次运行一致);
+  - **结论:spec-decode 当前形态为净负收益,暂停投入**。正确性已多层验证,
+    但草稿+验证每轮开销盖过收益;若未来在 batched/连续批处理形态重新评估,
+    需先解决草稿相对目标不够便宜的问题。
+
+- **P3cg 真实 MoE 权重验证受阻于模型可用性(2026-08-24)**:
+  - 目标模型 `Qwen/Qwen2.5-MoE-A3B`(3B,64 专家/8 活跃,Qwen2Moe 张量布局,唯一能塞进
+    24GB 卡的小 MoE)经核实**在 HuggingFace 上不存在**(Qwen/QwenLM 各种变体均
+    "Repository not found",搜索无官方仓库),ModelScope 亦无(record not found),
+    无社区重传;网络已修复(系统代理 + 本机 HF token 可达 HF API),纯属模型下架。
+  - 缓解:loader 的 Qwen2Moe 键名(`mlp.gate.weight` + `mlp.experts.{e}.*`)已由
+    审查对照 vllm/candle/llama.cpp 交叉验证,真实权重验证的残余风险已大幅降低;
+    `tests/moe_real.rs`(PR #14)保持 skippable,模型文件到位即可跑。
+  - 若需完成:需从其他渠道获取该模型(或兼容 Qwen2Moe 布局的小模型),放入
+    `.models/qwen2.5-moe-a3b/`。

@@ -17,7 +17,7 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |
 | **OpenAI API** | completions / chat / SSE / 采样全参数 / top_logprobs / stop / n / usage |
-| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16 双路径,head_dim 128) |
+| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、Qwen3 QK-norm、MLA(合成对拍,真实权重待验证) |
 
 > 测量口径:Qwen2.5-0.5B fp16、capacity 64,`lctx_bench`(不 reset、真长 context)。
 > 详细历史见 [docs/roadmap.md](docs/roadmap.md)。
@@ -55,8 +55,12 @@ thirdparty/        第三方参考代码(占位)
 - **SSE 流式**:`stream: true` → 逐 token delta + `[DONE]`,增量 UTF-8 跨 token 不分裂。
 - **对话模板**:Qwen chat template,`<|im_end|>` 停止。
 - **speculative decoding(实验)**:0.5B 草稿 + 1.5B 目标,argmax 验收,输出与纯贪心
-  逐 token 一致(单序列/批量/生命周期已多层验证);**吞吐收益待测**
+  逐 token 一致(单序列/批量/生命周期已多层验证);**实测吞吐 0.29x(慢 ~3.5x,
+  2026-08-24,0.5B 草稿→1.5B 目标 K=4),净负收益,暂停投入**
   (`spec_check` 示例,0.5B 对 1.5B)。
+- **MLA(DeepSeek-V2 风格,实验)**:低秩 Q + 压缩 KV,expanded per-head KV decode;
+  单序列/批量/连续批处理(含槽位压缩 KV 搬移)与 CPU 参考逐 token 对拍一致
+  (f32;真实 MLA checkpoint 验证待做)。
 - **正确性**:GPU vs 独立 fp64 numpy 参考(~1e-4)+ 真 transformers 模型(4e-5)。
 
 ## 性能优化地图(截至 2026-08-23)
@@ -71,8 +75,10 @@ thirdparty/        第三方参考代码(占位)
 | 内存布局 [slot][kv][pos][dim] | 证伪(0x) | 新布局计时 |
 | V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
 | QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
-| **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**收益待测** | GPU 测试全绿 |
-| **剩余正式 P3 项** | MoE / FP8 / MLA / spec-decode 引擎集成(大特性,需定方向) | — |
+| **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**实测 0.29x(净负,暂停)** | GPU 测试全绿 |
+| **MoE**(P3at-P3az) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP | 全回归绿;真实 Qwen2.5-MoE 待验证 |
+| **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
+| **FP8** | 关闭:gfx1100/ROCm6.2 hipBLAS 拒绝 fp8 | P3aq 探针 |
 
 ## 构建与运行
 

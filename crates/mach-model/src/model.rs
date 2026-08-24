@@ -250,7 +250,8 @@ impl GpuModel {
     }
 
     fn dalloc(&mut self, bytes: usize) -> Result<*mut f32, Error> {
-        let p = hip::malloc(self.k.hip(), bytes)?;
+        let p = hip::malloc(self.k.hip(), bytes)
+            .map_err(|e| Error::Model(format!("device alloc of {bytes} bytes failed: {e}")))?;
         self.allocs.push(p);
         Ok(p as *mut f32)
     }
@@ -299,11 +300,16 @@ impl GpuModel {
         self.yh = yh as *mut u16;
         self.allocs.push(yh);
 
-        let kv_bytes = c.max_seq_len * c.n_kv_heads * c.head_dim * 4;
-        for _ in 0..c.n_layers {
-            let kk = self.dalloc(kv_bytes)?;
-            let vv = self.dalloc(kv_bytes)?;
-            self.kv_cache.push((kk, vv));
+        // Dense KV cache: skipped on the MLA path (kv_lora_rank > 0), which
+        // keeps its expanded per-head KV in `mla_kv_cache`; allocating it here
+        // would waste VRAM (n_kv_heads = n_heads, head_dim = nope+rope).
+        if c.kv_lora_rank == 0 {
+            let kv_bytes = c.max_seq_len * c.n_kv_heads * c.head_dim * 4;
+            for _ in 0..c.n_layers {
+                let kk = self.dalloc(kv_bytes)?;
+                let vv = self.dalloc(kv_bytes)?;
+                self.kv_cache.push((kk, vv));
+            }
         }
         if c.kv_lora_rank > 0 {
             let qlr = c.q_lora_rank;

@@ -45,7 +45,74 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg.intermediate_size = inter;
     cfg.rms_eps = eps;
     cfg.rope_theta = theta;
+    // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace q/k/v/o.
+    cfg.q_lora_rank = v["q_lora_rank"].as_u64().unwrap_or(0) as usize;
+    cfg.kv_lora_rank = v["kv_lora_rank"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_nope_head_dim = v["qk_nope_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_rope_head_dim = v["qk_rope_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.v_head_dim = v["v_head_dim"].as_u64().unwrap_or(0) as usize;
+    if cfg.kv_lora_rank > 0 {
+        // MLA: per-head q is (nope + rope); the expanded KV cache is per-head
+        // f32. head_dim from hidden/heads would be too small and under-size the
+        // q scratch (mla_assemble_q_batched writes nope+rope per head).
+        if cfg.qk_nope_head_dim == 0 || cfg.qk_rope_head_dim == 0 || cfg.v_head_dim == 0 {
+            panic!(
+                "MLA config (kv_lora_rank={}) requires qk_nope_head_dim, qk_rope_head_dim and v_head_dim to be > 0",
+                cfg.kv_lora_rank
+            );
+        }
+        cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        cfg.n_kv_heads = cfg.n_heads;
+    }
+    // MoE (Qwen2.5-MoE style): num_experts / num_experts_per_tok.
+    cfg.num_experts = v["num_experts"].as_u64().unwrap_or(0) as usize;
+    cfg.num_experts_per_tok = v["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
+    // Qwen-MoE expert FFN width (moe_intermediate_size); 0 = use intermediate_size.
+    cfg.moe_intermediate_size = v["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
+    // Qwen3 QK-norm.
+    if let Some(qk) = v["qk_norm"].as_bool() {
+        cfg.qk_norm = qk;
+    }
     cfg
+}
+
+/// Rough device-memory estimate for the preflight: weight file + KV cache +
+/// 256MiB scratch margin (+ draft model in spec mode). MLA uses the expanded
+/// per-head KV cache (always f32); dense uses the GQA formula with the dtype's
+/// element size. Sharded weight files, hipBLAS workspace and compiled kernels
+/// are not counted; the margin covers today's scenarios.
+#[cfg(feature = "hip")]
+fn estimate_vram(
+    cfg: &Config,
+    capacity: usize,
+    model_file_bytes: u64,
+    draft: Option<(&Config, u64)>,
+) -> u64 {
+    let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
+    let kv = if cfg.kv_lora_rank > 0 {
+        capacity
+            * cfg.max_seq_len
+            * cfg.n_heads
+            * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
+            * 4
+    } else {
+        capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem * 2
+    };
+    let mut est = model_file_bytes + (kv * cfg.n_layers) as u64 + (256 << 20);
+    if let Some((dcfg, dfb)) = draft {
+        let dkv_elem = if dcfg.dtype == ModelDType::F16 { 2 } else { 4 };
+        let dkv = if dcfg.kv_lora_rank > 0 {
+            capacity
+                * dcfg.max_seq_len
+                * dcfg.n_heads
+                * (dcfg.qk_nope_head_dim + dcfg.qk_rope_head_dim + dcfg.v_head_dim)
+                * 4
+        } else {
+            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * dkv_elem * 2
+        };
+        est += dfb + (dkv * dcfg.n_layers) as u64;
+    }
+    est
 }
 
 #[cfg(feature = "hip")]
@@ -71,6 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
     let dtype = std::env::var("MACH_DTYPE").unwrap_or_else(|_| "f16".into());
+    let spec = std::env::var("MACH_SPEC").is_ok();
+    let spec_k = std::env::var("MACH_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let draft_name = std::env::var("MACH_DRAFT").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
+    let draft_config =
+        std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
 
     let root = PathBuf::from(root);
     let mut cfg = config_from_json(&root.join(&config_name));
@@ -79,14 +154,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "f16" => cfg.dtype = ModelDType::F16,
         other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
     }
+
+    // Preflight (before any heavy loading): HIP runtime + device + VRAM. A
+    // missing/busy device or grossly insufficient memory should fail fast with
+    // a readable error, not hang the host during the ~36 serial hiprtc kernel
+    // compiles that follow.
+    let hip = match hip::hip() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!(
+                "HIP runtime unavailable: {e}\n  set MACH_HIP_PATH to the ROCm bin dir if needed"
+            );
+            std::process::exit(1);
+        }
+    };
+    let devices = match hip::device_count() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("hipGetDeviceCount failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if devices <= 0 {
+        eprintln!("no HIP device found (device_count={devices}); refusing to load a model");
+        std::process::exit(1);
+    }
+    let (free, total) = match hip::mem_info() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("hipMemGetInfo failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    // NOTE: sharded weight files, hipBLAS workspace and compiled kernels are
+    // not counted; the 256MiB margin covers today's tiny/1.5B scenarios.
+    let file_bytes = std::fs::metadata(root.join(&model_name))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let draft_est = if spec {
+        let dfb = std::fs::metadata(root.join(&draft_name))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut dcfg = config_from_json(&root.join(&draft_config));
+        match dtype.as_str() {
+            "f32" => dcfg.dtype = ModelDType::F32,
+            _ => dcfg.dtype = ModelDType::F16,
+        }
+        Some((dcfg, dfb))
+    } else {
+        None
+    };
+    let estimate = estimate_vram(
+        &cfg,
+        capacity,
+        file_bytes,
+        draft_est.as_ref().map(|(c, b)| (c, *b)),
+    );
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    println!(
+        "GPU preflight: device_count={devices}, VRAM free {:.2}GiB / {:.2}GiB, estimated need {:.2}GiB",
+        gib(free as u64),
+        gib(total as u64),
+        gib(estimate)
+    );
+    if estimate > free as u64 {
+        eprintln!(
+            "insufficient VRAM: need ~{:.2}GiB but only {:.2}GiB free; lower MACH_CAPACITY / MACH_PREFILL_ROWS or use a smaller model",
+            gib(estimate),
+            gib(free as u64)
+        );
+        std::process::exit(1);
+    }
+
+    // Bind early: a port conflict fails here (before the multi-minute model
+    // load + kernel compile) instead of after.
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("bound http://{addr} (preflight passed)");
+
     let w: Weights = load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
     println!(
         "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
         cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
     );
-
-    let hip = hip::hip().expect("HIP runtime");
-    assert!(hip::device_count().expect("devices") > 0, "no HIP device");
 
     // Load the real tokenizer when available; fall back to naive bytes.
     let tok_path = root.join(&tokenizer_name);
@@ -105,16 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through a
     // draft + target engine (greedy-only; other params rejected).
-    let spec = std::env::var("MACH_SPEC").is_ok();
-    let spec_k = std::env::var("MACH_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
     let (engine, engine_handle) = if spec {
-        let draft_name =
-            std::env::var("MACH_DRAFT").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
-        let draft_config =
-            std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
         let mut dcfg = config_from_json(&root.join(&draft_config));
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
@@ -145,7 +285,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tok,
     };
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(
         "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{})",
         if spec { ", spec-decode" } else { "" },
@@ -170,8 +309,144 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("engine drained; exiting");
     Ok(())
 }
-
 #[cfg(not(feature = "hip"))]
 fn main() {
     eprintln!("mach-server requires the `hip` feature: cargo run -p mach-server --features hip");
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod tests {
+    use super::*;
+
+    fn dense_cfg() -> Config {
+        Config::llama(128, 2, 4, 2, 1024, 64)
+    }
+
+    fn mla_cfg() -> Config {
+        Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16)
+    }
+
+    #[test]
+    fn dense_estimate_includes_weights_kv_and_margin() {
+        let cfg = dense_cfg();
+        let est = estimate_vram(&cfg, 8, 1_000_000, None);
+        // KV (f32) = capacity*max_seq*kv_heads*head_dim*4 per layer.
+        let kv =
+            (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * 2 * cfg.n_layers) as u64;
+        assert_eq!(est, 1_000_000 + kv + (256 << 20));
+    }
+
+    #[test]
+    fn f16_dense_uses_two_byte_kv() {
+        let mut cfg = dense_cfg();
+        cfg.dtype = ModelDType::F16;
+        let f16 = estimate_vram(&cfg, 8, 0, None);
+        cfg.dtype = ModelDType::F32;
+        let f32 = estimate_vram(&cfg, 8, 0, None);
+        // KV diff = layers * capacity*max_seq*kv_heads*head_dim*(4-2).
+        let kv_diff =
+            (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
+        assert_eq!(
+            f32 - f16,
+            kv_diff,
+            "f32 KV must exceed f16 KV by the elem diff"
+        );
+    }
+
+    #[test]
+    fn mla_estimate_uses_expanded_per_head_kv() {
+        let cfg = mla_cfg();
+        // MLA KV/layer is f32: capacity*max_seq*heads*(nope+rope+v_hd)*4.
+        let kv = (8
+            * cfg.max_seq_len
+            * cfg.n_heads
+            * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
+            * 4
+            * cfg.n_layers) as u64;
+        assert_eq!(estimate_vram(&cfg, 8, 0, None), kv + (256 << 20));
+    }
+
+    #[test]
+    fn spec_adds_draft_weights_and_kv() {
+        let tcfg = dense_cfg();
+        let dcfg = dense_cfg();
+        let base = estimate_vram(&tcfg, 8, 1_000, None);
+        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)));
+        let dkv =
+            (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4 * 2) as u64;
+        assert_eq!(spec - base, 500 + dkv);
+    }
+
+    /// Removes the temp file on drop (also on test panic).
+    struct TempFile(std::path::PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn parse_json(json: &str) -> Config {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "machserve_cfg_test_{}_{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, json).unwrap();
+        let _guard = TempFile(path.clone());
+        config_from_json(&path)
+    }
+
+    #[test]
+    fn config_parses_dense_defaults() {
+        let cfg = parse_json(
+            r#"{"hidden_size":128,"num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,"vocab_size":1024,"intermediate_size":512,"max_position_embeddings":64}"#,
+        );
+        assert_eq!(cfg.kv_lora_rank, 0);
+        assert_eq!(cfg.q_lora_rank, 0);
+        assert_eq!(cfg.num_experts, 0);
+        assert_eq!(cfg.head_dim, 32, "dense head_dim = hidden/heads");
+        assert_eq!(cfg.n_kv_heads, 2);
+    }
+
+    #[test]
+    fn config_parses_mla_hyperparams() {
+        let cfg = parse_json(
+            r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"q_lora_rank":1536,"kv_lora_rank":512,"qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128}"#,
+        );
+        assert_eq!(cfg.kv_lora_rank, 512);
+        assert_eq!(cfg.q_lora_rank, 1536);
+        assert_eq!(
+            cfg.head_dim,
+            128 + 64,
+            "MLA head_dim must be qk_nope_head_dim + qk_rope_head_dim"
+        );
+        assert_eq!(cfg.n_kv_heads, 128, "MLA n_kv_heads == n_heads");
+        assert_eq!(cfg.num_experts, 0);
+    }
+
+    #[test]
+    fn config_parses_moe_hyperparams() {
+        let cfg = parse_json(
+            r#"{"hidden_size":1024,"num_hidden_layers":2,"num_attention_heads":8,"num_key_value_heads":2,"vocab_size":151936,"intermediate_size":512,"max_position_embeddings":2048,"num_experts":64,"num_experts_per_tok":8,"moe_intermediate_size":256}"#,
+        );
+        assert_eq!(cfg.num_experts, 64);
+        assert_eq!(cfg.num_experts_per_tok, 8);
+        assert_eq!(cfg.moe_intermediate_size, 256);
+        assert_eq!(
+            cfg.expert_size(),
+            256,
+            "Qwen-MoE experts use moe_intermediate_size"
+        );
+        assert_eq!(cfg.kv_lora_rank, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires qk_nope_head_dim")]
+    fn config_rejects_mla_missing_dims() {
+        parse_json(
+            r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"kv_lora_rank":512}"#,
+        );
+    }
 }

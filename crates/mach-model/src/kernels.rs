@@ -458,6 +458,147 @@ extern "C" __global__ void attn_decode_batched(
 }
 "#;
 
+/// MLA batched: merge q_nope / q_rope into q across `batch` rows.
+const MLA_ASSEMBLE_Q_BATCHED: &str = r#"
+extern "C" __global__ void mla_assemble_q_batched(
+    const float* __restrict__ q_nope, const float* __restrict__ q_rope,
+    float* __restrict__ q, int batch, int n_heads, int nope, int rope) {
+    int hd = nope + rope;
+    int total = batch * n_heads * hd;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / (n_heads * hd);
+        int rem = i % (n_heads * hd);
+        int h = rem / hd;
+        int dd = rem % hd;
+        q[i] = (dd < nope)
+            ? q_nope[(long long)s * n_heads * nope + h * nope + dd]
+            : q_rope[(long long)s * n_heads * rope + h * rope + (dd - nope)];
+    }
+}
+"#;
+
+/// MLA batched: extract the latent columns from kv_a `[batch, kv_lora+rope]`
+/// into a contiguous `[batch, kv_lora]` buffer (rms_norm needs contiguous rows;
+/// the latent is followed by the k_rope columns in kv_a).
+const MLA_EXTRACT_KV_LORA: &str = r#"
+extern "C" __global__ void mla_extract_kv_lora(const float* __restrict__ kv_a,
+                                               float* __restrict__ out,
+                                               int batch, int kv_lora_rank, int rope) {
+    int total = batch * kv_lora_rank;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / kv_lora_rank;
+        int dd = i % kv_lora_rank;
+        out[i] = kv_a[(long long)s * (kv_lora_rank + rope) + dd];
+    }
+}
+"#;
+
+/// MLA batched: extract the shared k_rope columns from kv_a
+/// `[batch, kv_lora + rope]` into a contiguous `[batch, rope]` buffer.
+const MLA_EXTRACT_K_ROPE: &str = r#"
+extern "C" __global__ void mla_extract_k_rope(const float* __restrict__ kv_a,
+                                              float* __restrict__ k_rope,
+                                              int batch, int kv_lora, int rope) {
+    int total = batch * rope;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / rope;
+        int dd = i % rope;
+        k_rope[i] = kv_a[(long long)s * (kv_lora + rope) + kv_lora + dd];
+    }
+}
+"#;
+
+/// MLA batched: expand kv + shared k_rope into per-head k/v caches at the
+/// per-row (slot, pos) position.
+const MLA_ASSEMBLE_KV_BATCHED: &str = r#"
+extern "C" __global__ void mla_assemble_kv_batched(
+    const float* __restrict__ kv, const float* __restrict__ k_rope,
+    float* __restrict__ kc, float* __restrict__ vc,
+    const int* __restrict__ pos_buf, const int* __restrict__ slots,
+    int batch, int max_seq, int n_heads, int nope, int rope, int v_hd) {
+    int hd = nope + rope;
+    int total = batch * n_heads * hd;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        int s = i / (n_heads * hd);
+        int rem = i % (n_heads * hd);
+        int h = rem / hd;
+        int dd = rem % hd;
+        int slot = slots[s];
+        int pos = pos_buf[s];
+        float val = (dd < nope)
+            ? kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + dd]
+            : k_rope[(long long)s * rope + (dd - nope)];
+        kc[((long long)slot * max_seq + pos) * n_heads * hd + h * hd + dd] = val;
+    }
+    int total_v = batch * n_heads * v_hd;
+    if (i < total_v) {
+        int s = i / (n_heads * v_hd);
+        int rem = i % (n_heads * v_hd);
+        int h = rem / v_hd;
+        int dd = rem % v_hd;
+        int slot = slots[s];
+        int pos = pos_buf[s];
+        vc[((long long)slot * max_seq + pos) * n_heads * v_hd + h * v_hd + dd] =
+            kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
+    }
+}
+"#;
+
+/// MLA batched decode attention over the expanded per-head k/v caches.
+const MLA_ATTN_DECODE_BATCHED: &str = r#"
+extern "C" __global__ void mla_attn_decode_batched(
+    const float* __restrict__ q, const float* __restrict__ kc,
+    const float* __restrict__ vc, float* __restrict__ out,
+    const int* __restrict__ pos_buf, const int* __restrict__ slots,
+    int batch, int n_heads, int k_hd, int v_hd, float scale, int max_seq) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_seq;
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int slot = slots[s];
+    int pos = pos_buf[s];
+    const float* qh = q + ((long long)s * n_heads + h) * k_hd;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        const float* kp = kc + ((long long)slot * max_seq + p) * n_heads * k_hd + h * k_hd;
+        float sc = 0.0f;
+        for (int dd = 0; dd < k_hd; dd++) sc += qh[dd] * kp[dd];
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+    for (int dd = threadIdx.x; dd < v_hd; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            float vp = vc[((long long)slot * max_seq + p) * n_heads * v_hd + h * v_hd + dd];
+            acc += __expf(scores[p] - m) * vp;
+        }
+        out[((long long)s * n_heads + h) * v_hd + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// Per-row argmax over a [batch, vocab] logits matrix.
 const ARGMAX_BATCHED: &str = r#"
 extern "C" __global__ void argmax_batched(const float* logits, int* out_tok,
@@ -1102,6 +1243,11 @@ pub struct HipKernels {
     mla_assemble_q: HipKernelModule,
     mla_assemble_kv: HipKernelModule,
     mla_attn_decode: HipKernelModule,
+    mla_assemble_q_batched: HipKernelModule,
+    mla_extract_kv_lora: HipKernelModule,
+    mla_extract_k_rope: HipKernelModule,
+    mla_assemble_kv_batched: HipKernelModule,
+    mla_attn_decode_batched: HipKernelModule,
     rope: HipKernelModule,
     embed_batched: HipKernelModule,
     rope_batched: HipKernelModule,
@@ -1129,72 +1275,134 @@ pub struct HipKernels {
 unsafe impl Send for HipKernels {}
 unsafe impl Sync for HipKernels {}
 
+/// A compiled kernel module shared across model loads. `HipKernelModule` is
+/// refcounted: the module unloads only when the last reference drops. The
+/// cache holds one reference for the process lifetime, so cached modules stay
+/// loaded; launches are per-stream, so sharing handles across threads is safe
+/// (same rationale as the `unsafe impl Send/Sync for HipKernels` below).
+#[derive(Clone)]
+struct CachedModule(HipKernelModule);
+
+// SAFETY: the wrapped module is refcounted via `HipKernelModule`'s internal
+// `Arc`; the cache keeps one reference alive and launches are per-stream.
+unsafe impl Send for CachedModule {}
+unsafe impl Sync for CachedModule {}
+
+/// In-process hiprtc compile cache, keyed by `(arch, source)`. Loading several
+/// models in one process (spec-decode draft+target, server, tests) previously
+/// recompiled every kernel per model (~36 serial hiprtc compiles each time);
+/// the cache makes the second and later model loads reuse the compiled modules.
+static KERNEL_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, &'static str), CachedModule>>,
+> = std::sync::OnceLock::new();
+
+/// Compiles `source` for `arch`, or returns a cached clone when this process
+/// already compiled the same source. Prints per-kernel progress to stderr when
+/// `MACH_COMPILE_PROGRESS` is set.
+fn compile_cached(arch: &str, source: &'static str, name: &str) -> Result<HipKernelModule, Error> {
+    let verbose = std::env::var_os("MACH_COMPILE_PROGRESS").is_some();
+    let cache =
+        KERNEL_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (arch.to_string(), source);
+    if let Some(m) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        if verbose {
+            eprintln!("[hiprtc] {name}: cache hit");
+        }
+        return Ok(m.0.clone());
+    }
+    if verbose {
+        eprintln!("[hiprtc] compiling {name} for {arch} ...");
+    }
+    let m = HipKernelModule::compile(arch, source, name)?;
+    if verbose {
+        eprintln!("[hiprtc] {name}: compiled");
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, CachedModule(m.clone()));
+    Ok(m)
+}
+
 impl HipKernels {
     /// Compiles all kernels and initializes hipBLAS on a fresh stream.
     pub fn new(hip: std::sync::Arc<Hip>) -> Result<Self, Error> {
         let arch = hip_arch();
+        let t0 = std::time::Instant::now();
         let mut stream = std::ptr::null_mut();
         unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut stream))? };
 
         let blas = mach_kernel_sys::hipblas::HipBlas::new(std::sync::Arc::clone(&hip))?;
         blas.set_stream(stream)?;
 
-        Ok(Self {
+        let self_ = Self {
             hip,
             stream,
             blas,
-            embed: HipKernelModule::compile(&arch, EMBED_GATHER, "embed_gather")?,
-            rms_norm: HipKernelModule::compile(&arch, RMS_NORM, "rms_norm")?,
-            qk_norm: HipKernelModule::compile(&arch, QK_NORM, "qk_norm")?,
-            silu_mul: HipKernelModule::compile(&arch, SILU_MUL, "silu_mul")?,
-            add: HipKernelModule::compile(&arch, ADD, "add")?,
-            add_bias: HipKernelModule::compile(&arch, ADD_BIAS, "add_bias")?,
-            kv_store: HipKernelModule::compile(&arch, KV_STORE, "kv_store")?,
-            attn_decode: HipKernelModule::compile(&arch, ATTN_DECODE, "attn_decode")?,
-            mla_assemble_q: HipKernelModule::compile(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
-            mla_assemble_kv: HipKernelModule::compile(&arch, MLA_ASSEMBLE_KV, "mla_assemble_kv")?,
-            mla_attn_decode: HipKernelModule::compile(&arch, MLA_ATTN_DECODE, "mla_attn_decode")?,
-            rope: HipKernelModule::compile(&arch, ROPE, "rope")?,
-            embed_batched: HipKernelModule::compile(&arch, EMBED_BATCHED, "embed_batched")?,
-            rope_batched: HipKernelModule::compile(&arch, ROPE_BATCHED, "rope_batched")?,
-            kv_store_batched: HipKernelModule::compile(
+            embed: compile_cached(&arch, EMBED_GATHER, "embed_gather")?,
+            rms_norm: compile_cached(&arch, RMS_NORM, "rms_norm")?,
+            qk_norm: compile_cached(&arch, QK_NORM, "qk_norm")?,
+            silu_mul: compile_cached(&arch, SILU_MUL, "silu_mul")?,
+            add: compile_cached(&arch, ADD, "add")?,
+            add_bias: compile_cached(&arch, ADD_BIAS, "add_bias")?,
+            kv_store: compile_cached(&arch, KV_STORE, "kv_store")?,
+            attn_decode: compile_cached(&arch, ATTN_DECODE, "attn_decode")?,
+            mla_assemble_q: compile_cached(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
+            mla_assemble_kv: compile_cached(&arch, MLA_ASSEMBLE_KV, "mla_assemble_kv")?,
+            mla_attn_decode: compile_cached(&arch, MLA_ATTN_DECODE, "mla_attn_decode")?,
+            mla_assemble_q_batched: compile_cached(
                 &arch,
-                KV_STORE_BATCHED,
-                "kv_store_batched",
+                MLA_ASSEMBLE_Q_BATCHED,
+                "mla_assemble_q_batched",
             )?,
-            attn_decode_batched: HipKernelModule::compile(
+            mla_extract_kv_lora: compile_cached(&arch, MLA_EXTRACT_KV_LORA, "mla_extract_kv_lora")?,
+            mla_extract_k_rope: compile_cached(&arch, MLA_EXTRACT_K_ROPE, "mla_extract_k_rope")?,
+            mla_assemble_kv_batched: compile_cached(
                 &arch,
-                ATTN_DECODE_BATCHED,
-                "attn_decode_batched",
+                MLA_ASSEMBLE_KV_BATCHED,
+                "mla_assemble_kv_batched",
             )?,
-            argmax_batched: HipKernelModule::compile(&arch, ARGMAX_BATCHED, "argmax_batched")?,
-            cast_f32_f16: HipKernelModule::compile(&arch, CAST_F32_F16, "cast_f32_f16")?,
-            cast_f16_f32: HipKernelModule::compile(&arch, CAST_F16_F32, "cast_f16_f32")?,
-            embed_f16: HipKernelModule::compile(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
-            kv_store_f16: HipKernelModule::compile(&arch, KV_F16, "kv_store_batched_f16")?,
-            attn_f16_gqa: HipKernelModule::compile(
+            mla_attn_decode_batched: compile_cached(
+                &arch,
+                MLA_ATTN_DECODE_BATCHED,
+                "mla_attn_decode_batched",
+            )?,
+            rope: compile_cached(&arch, ROPE, "rope")?,
+            embed_batched: compile_cached(&arch, EMBED_BATCHED, "embed_batched")?,
+            rope_batched: compile_cached(&arch, ROPE_BATCHED, "rope_batched")?,
+            kv_store_batched: compile_cached(&arch, KV_STORE_BATCHED, "kv_store_batched")?,
+            attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
+            argmax_batched: compile_cached(&arch, ARGMAX_BATCHED, "argmax_batched")?,
+            cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
+            cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
+            embed_f16: compile_cached(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
+            kv_store_f16: compile_cached(&arch, KV_F16, "kv_store_batched_f16")?,
+            attn_f16_gqa: compile_cached(
                 &arch,
                 ATTN_DECODE_BATCHED_F16_GQA,
                 "attn_decode_batched_f16_gqa",
             )?,
-            attn_prefill_f16: HipKernelModule::compile(
-                &arch,
-                ATTN_PREFILL_F16,
-                "attn_prefill_f16",
-            )?,
-            moe_router: HipKernelModule::compile(&arch, MOE_ROUTER, "moe_router")?,
-            moe_gather: HipKernelModule::compile(&arch, MOE_GATHER_WEIGHTS, "moe_gather_weights")?,
-            moe_accumulate: HipKernelModule::compile(&arch, MOE_ACCUMULATE, "moe_accumulate")?,
-            moe_router_batched: HipKernelModule::compile(
-                &arch,
-                MOE_ROUTER_BATCHED,
-                "moe_router_batched",
-            )?,
-            moe_count: HipKernelModule::compile(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
-            moe_gather_rows: HipKernelModule::compile(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
-            moe_scatter_add: HipKernelModule::compile(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
-            moe_prefix_sum: HipKernelModule::compile(&arch, MOE_PREFIX_SUM, "moe_prefix_sum")?,
-        })
+            attn_prefill_f16: compile_cached(&arch, ATTN_PREFILL_F16, "attn_prefill_f16")?,
+            moe_router: compile_cached(&arch, MOE_ROUTER, "moe_router")?,
+            moe_gather: compile_cached(&arch, MOE_GATHER_WEIGHTS, "moe_gather_weights")?,
+            moe_accumulate: compile_cached(&arch, MOE_ACCUMULATE, "moe_accumulate")?,
+            moe_router_batched: compile_cached(&arch, MOE_ROUTER_BATCHED, "moe_router_batched")?,
+            moe_count: compile_cached(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
+            moe_gather_rows: compile_cached(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
+            moe_scatter_add: compile_cached(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
+            moe_prefix_sum: compile_cached(&arch, MOE_PREFIX_SUM, "moe_prefix_sum")?,
+        };
+        if std::env::var_os("MACH_COMPILE_PROGRESS").is_some() {
+            let n = KERNEL_CACHE
+                .get()
+                .map(|c| c.lock().unwrap_or_else(|p| p.into_inner()).len())
+                .unwrap_or(0);
+            eprintln!(
+                "[hiprtc] {n} kernels cached, ready in {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Ok(self_)
     }
 
     /// The raw HIP runtime.
@@ -1514,6 +1722,179 @@ impl HipKernels {
             &mut p,
             self.stream,
             SHARED_FLOATS * 4,
+        )?)
+    }
+
+    /// MLA batched: merge q_nope / q_rope into q across rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_assemble_q_batched(
+        &self,
+        q_nope: *const f32,
+        q_rope: *const f32,
+        q: *mut f32,
+        batch: i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let qnp = q_nope;
+        let qrp = q_rope;
+        let qp = q;
+        let mut p = vec![
+            &qnp as *const *const f32 as *mut core::ffi::c_void,
+            &qrp as *const *const f32 as *mut core::ffi::c_void,
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads * (nope + rope)) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_q_batched
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched: extract the latent columns into a contiguous buffer.
+    pub fn launch_mla_extract_kv_lora(
+        &self,
+        kv_a: *const f32,
+        kv_lora: *mut f32,
+        batch: i32,
+        kv_lora_rank: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let kvap = kv_a;
+        let kvlp = kv_lora;
+        let mut p = vec![
+            &kvap as *const *const f32 as *mut core::ffi::c_void,
+            &kvlp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_lora_rank as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_lora_rank) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_extract_kv_lora
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched: extract shared k_rope columns into a contiguous buffer.
+    pub fn launch_mla_extract_k_rope(
+        &self,
+        kv_a: *const f32,
+        k_rope: *mut f32,
+        batch: i32,
+        kv_lora: i32,
+        rope: i32,
+    ) -> Result<(), Error> {
+        let kvap = kv_a;
+        let krp = k_rope;
+        let mut p = vec![
+            &kvap as *const *const f32 as *mut core::ffi::c_void,
+            &krp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_lora as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * rope) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_extract_k_rope
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched: expand kv + k_rope into per-head k/v caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_assemble_kv_batched(
+        &self,
+        kv: *const f32,
+        k_rope: *const f32,
+        kc: *mut f32,
+        vc: *mut f32,
+        pos: *const i32,
+        slots: *const i32,
+        batch: i32,
+        max_seq: i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+        v_hd: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let krp = k_rope;
+        let kcp = kc;
+        let vcp = vc;
+        let pp = pos;
+        let sp = slots;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &krp as *const *const f32 as *mut core::ffi::c_void,
+            &kcp as *const *mut f32 as *mut core::ffi::c_void,
+            &vcp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads * (nope + rope)).max(batch * n_heads * v_hd) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_kv_batched
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// MLA batched decode attention over expanded per-head k/v caches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_attn_decode_batched(
+        &self,
+        q: *const f32,
+        kc: *const f32,
+        vc: *const f32,
+        out: *mut f32,
+        pos: *const i32,
+        slots: *const i32,
+        batch: i32,
+        n_heads: i32,
+        k_hd: i32,
+        v_hd: i32,
+        scale: f32,
+        max_seq: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = kc;
+        let vp = vc;
+        let op = out;
+        let pp = pos;
+        let sp = slots;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &k_hd as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
+        ];
+        let grid = (batch * n_heads) as u32;
+        let shared = (max_seq as u32 + 256) * 4;
+        Ok(self.mla_attn_decode_batched.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
         )?)
     }
 
