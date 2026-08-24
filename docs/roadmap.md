@@ -750,3 +750,11 @@
   - 验证:mla 4/4 + continuous 9/9(带缓存,多次 建/drop/重载 无悬垂);
     正向 server 起 qwen-0.5b 预检通过、负向 MACH_CAPACITY=4096 显存不足
     快速失败;全量 HIP 回归全绿;clippy/fmt 干净。
+
+- **P3ce MLA F16 路径(2026-08-24)**:
+  - MLA 分支此前 f32-only;现对齐稠密 F16 路径(P3bb 语义):`LayerDevF16` 增 6 个
+    MLA 投影矩阵 fp16 权重;F16 模式不再驻留 MLA f32 副本;`run_kernels` MLA 分支
+    6 个投影 GEMM 改走共享 `gemm` 闭包(F16→`gemm_batched_f16`,F32→`gemm_batched`);
+  - 验证:`mla.rs` 增 `mla_batched_f16_matches_f32`(batched F16 vs F32 logits 差
+    < 0.1);本地门禁全绿;**HIP 对拍待 GPU 窗口实跑**;
+  - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
