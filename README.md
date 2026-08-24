@@ -55,8 +55,8 @@ thirdparty/        第三方参考代码(占位)
 - **SSE 流式**:`stream: true` → 逐 token delta + `[DONE]`,增量 UTF-8 跨 token 不分裂。
 - **对话模板**:Qwen chat template,`<|im_end|>` 停止。
 - **speculative decoding(实验)**:0.5B 草稿 + 1.5B 目标,argmax 验收,输出与纯贪心
-  逐 token 一致(单序列/批量/生命周期已多层验证);**吞吐收益未测(测量暂停:本机
-  双模型加载触发配额/卡死,见 docs/roadmap.md)**
+  逐 token 一致(单序列/批量/生命周期已多层验证);**实测吞吐 0.29x(慢 ~3.5x,
+  2026-08-24,0.5B 草稿→1.5B 目标 K=4),净负收益,暂停投入**
   (`spec_check` 示例,0.5B 对 1.5B)。
 - **MLA(DeepSeek-V2 风格,实验)**:低秩 Q + 压缩 KV,expanded per-head KV decode;
   单序列/批量/连续批处理(含槽位压缩 KV 搬移)与 CPU 参考逐 token 对拍一致
@@ -75,7 +75,7 @@ thirdparty/        第三方参考代码(占位)
 | 内存布局 [slot][kv][pos][dim] | 证伪(0x) | 新布局计时 |
 | V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
 | QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
-| **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**收益未测(测量暂停)** | GPU 测试全绿 |
+| **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**实测 0.29x(净负,暂停)** | GPU 测试全绿 |
 | **MoE**(P3at-P3az) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP | 全回归绿;真实 Qwen2.5-MoE 待验证 |
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
 | **FP8** | 关闭:gfx1100/ROCm6.2 hipBLAS 拒绝 fp8 | P3aq 探针 |

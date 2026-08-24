@@ -759,10 +759,14 @@
     < 0.1);本地门禁全绿;**HIP 对拍已实跑(2026-08-24)**:mla 套件 5/5 通过;
   - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
 
-- **P3cf spec-decode 收益测量暂停(2026-08-24)**:
-  - `spec_check`(0.5B 草稿 + 1.5B 目标)在本机连续 3 次触发系统级问题:双模型加载
-    峰值提交内存(页文件峰值 ~10.7GB)导致 os error 1453(ERROR_QUOTA_EXCEEDED)
-    与终端退出;前两次在 spec-decode 阶段被用户中止。
-  - 结论:spec-decode 正确性已多层验证(单/批量/生命周期/server);**吞吐收益未测**,
-    测量在本机环境暂停。如需测量需先轻量化(smaller K / max_new / 目标模型)或
-    在空闲资源窗口进行。
+- **P3cf spec-decode 收益测量(2026-08-24)**:
+  - 首次 3 次运行触发系统级问题(双模型加载峰值提交内存 → os error 1453
+    ERROR_QUOTA_EXCEEDED / 终端退出);PR #13 轻量化 `spec_check`(基准后
+    drop 参考引擎、建完双引擎后 drop ~8GB 主机权重、`MACH_MAX_NEW`)后
+    峰值内存降 ~10GB,测量成功完成;
+  - **实测(0.5B 草稿→1.5B 目标,K=4,greedy,单序列)**:plain greedy
+    10.8 ms/tok vs spec-decode 37.6 ms/tok → **speedup 0.29x(慢 ~3.5 倍)**,
+    parity=MATCH(8/30 token 两次运行一致);
+  - **结论:spec-decode 当前形态为净负收益,暂停投入**。正确性已多层验证,
+    但草稿+验证每轮开销盖过收益;若未来在 batched/连续批处理形态重新评估,
+    需先解决草稿相对目标不够便宜的问题。
