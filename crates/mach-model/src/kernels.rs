@@ -1275,14 +1275,16 @@ pub struct HipKernels {
 unsafe impl Send for HipKernels {}
 unsafe impl Sync for HipKernels {}
 
-/// A compiled kernel module shared across model loads. HIP modules are never
-/// unloaded and launches are per-stream, so sharing handles across threads is
-/// safe (same rationale as the `unsafe impl Send/Sync for HipKernels` below).
+/// A compiled kernel module shared across model loads. `HipKernelModule` is
+/// refcounted: the module unloads only when the last reference drops. The
+/// cache holds one reference for the process lifetime, so cached modules stay
+/// loaded; launches are per-stream, so sharing handles across threads is safe
+/// (same rationale as the `unsafe impl Send/Sync for HipKernels` below).
 #[derive(Clone)]
 struct CachedModule(HipKernelModule);
 
-// SAFETY: the wrapped module is only ever launched on this process's HIP
-// context; HIP module handles are context-wide and never unloaded here.
+// SAFETY: the wrapped module is refcounted via `HipKernelModule`'s internal
+// `Arc`; the cache keeps one reference alive and launches are per-stream.
 unsafe impl Send for CachedModule {}
 unsafe impl Sync for CachedModule {}
 
@@ -1302,7 +1304,7 @@ fn compile_cached(arch: &str, source: &'static str, name: &str) -> Result<HipKer
     let cache =
         KERNEL_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = (arch.to_string(), source);
-    if let Some(m) = cache.lock().unwrap().get(&key) {
+    if let Some(m) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         if verbose {
             eprintln!("[hiprtc] {name}: cache hit");
         }
@@ -1315,7 +1317,10 @@ fn compile_cached(arch: &str, source: &'static str, name: &str) -> Result<HipKer
     if verbose {
         eprintln!("[hiprtc] {name}: compiled");
     }
-    cache.lock().unwrap().insert(key, CachedModule(m.clone()));
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, CachedModule(m.clone()));
     Ok(m)
 }
 
@@ -1390,7 +1395,7 @@ impl HipKernels {
         if std::env::var_os("MACH_COMPILE_PROGRESS").is_some() {
             let n = KERNEL_CACHE
                 .get()
-                .map(|c| c.lock().unwrap().len())
+                .map(|c| c.lock().unwrap_or_else(|p| p.into_inner()).len())
                 .unwrap_or(0);
             eprintln!(
                 "[hiprtc] {n} kernels cached, ready in {:.2}s",

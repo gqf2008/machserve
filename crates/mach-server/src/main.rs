@@ -116,6 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // NOTE: the estimate uses the dense-GQA KV formula; MLA's expanded
+    // per-head KV cache (heads * (nope+rope+v_hd), f32) is larger and is not
+    // accounted for yet — revisit before serving real MLA checkpoints. Sharded
+    // weight files, hipBLAS workspace and compiled modules are also omitted;
+    // the 256MiB margin covers today's dense tiny/1.5B scenarios.
     let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
     let file_bytes = std::fs::metadata(root.join(&model_name))
         .map(|m| m.len())
@@ -155,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind early: a port conflict fails here (before the multi-minute model
     // load + kernel compile) instead of after.
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("listening on http://{addr} (preflight passed)");
+    println!("bound http://{addr} (preflight passed)");
 
     let w: Weights = load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
     println!(
