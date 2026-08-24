@@ -222,3 +222,55 @@ fn moe_gpu_adaptive_offload_matches_full() {
         "adaptive offload: max diff {max} (scale {scale})"
     );
 }
+
+#[cfg(feature = "hip")]
+#[ignore]
+#[test]
+fn batched_moe_cpu_offload_matches_full_resident() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+    use std::sync::Arc;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    // Small MoE config, F32 (tight parity), slots=1 < ne=4 -> cpu-backend offload.
+    let mut cfg = Config::tiny();
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg.intermediate_size = 64;
+    let w = Weights::random(&cfg, 7).unwrap();
+    let batch = 2usize;
+    let tokens = [5u32, 9];
+
+    let mut full = BatchedModel::new(Arc::clone(&hip), cfg, &w, batch).unwrap();
+    let mut off =
+        BatchedModel::with_expert_slots(Arc::clone(&hip), cfg, &w, batch, batch, 1).unwrap();
+
+    let _ = full.decode_step(&tokens).unwrap();
+    let _ = off.decode_step(&tokens).unwrap();
+    let lf = full.read_logits().unwrap();
+    let lo = off.read_logits().unwrap();
+
+    let max = lf
+        .iter()
+        .zip(&lo)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let scale = lf.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        max <= 2e-3 + 2e-3 * scale,
+        "batch cpu-backend offload vs full-resident logits max diff {max} (scale {scale})"
+    );
+}
