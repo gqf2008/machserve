@@ -735,5 +735,18 @@
     `server.rs` 增 `completions_endpoint_mla_matches_direct_engine`
     (MLA 配置 HTTP `/v1/completions` 与直接引擎一致);
   - 验证:本地门禁全绿(rustfmt / cargo check / clippy / CPU 测试);
-    **HIP 测试待 GPU 空闲窗口运行**(continuous + server + mla 套件 + 全量回归);
+    **HIP 验证已跑(2026-08-24)**:mla 4/4 + continuous 11/11 + server 15/15
+    + 全量 HIP 回归全绿;
   - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
+
+- **P1 加载安全(2026-08-24,issue #7 / PR #8)**:
+  - hiprtc 编译:进程内编译缓存(key=arch+source),同一进程第 2 个模型起复用
+    已编译内核(实测 continuous 套件 225s→28s);`MACH_COMPILE_PROGRESS=1`
+    打印逐内核进度+总耗时;`HipKernelModule` 改 `Arc<ModuleHandle>` 引用计数,
+    最后一个引用(含缓存)drop 才 unload,修复共享句柄 use-after-unload;
+  - mach-server 启动预检:HIP 运行时/设备数/`hipMemGetInfo` 显存,估算=权重文件
+    +KV+256MiB(spec 含草稿),不足即可读错误退出;TCP 提前 bind 快速失败;
+  - `dalloc` 分配失败报字节数;部分分配失败由 Drop 释放(原已具备);
+  - 验证:mla 4/4 + continuous 9/9(带缓存,多次 建/drop/重载 无悬垂);
+    正向 server 起 qwen-0.5b 预检通过、负向 MACH_CAPACITY=4096 显存不足
+    快速失败;全量 HIP 回归全绿;clippy/fmt 干净。
