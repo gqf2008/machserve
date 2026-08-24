@@ -756,5 +756,5 @@
     MLA 投影矩阵 fp16 权重;F16 模式不再驻留 MLA f32 副本;`run_kernels` MLA 分支
     6 个投影 GEMM 改走共享 `gemm` 闭包(F16→`gemm_batched_f16`,F32→`gemm_batched`);
   - 验证:`mla.rs` 增 `mla_batched_f16_matches_f32`(batched F16 vs F32 logits 差
-    < 0.1);本地门禁全绿;**HIP 对拍待 GPU 窗口实跑**;
+    < 0.1);本地门禁全绿;**HIP 对拍已实跑(2026-08-24)**:mla 套件 5/5 通过;
   - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
