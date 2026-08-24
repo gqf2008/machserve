@@ -33,6 +33,38 @@ pub(crate) fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
 }
 
+/// Computes the MoE layer residual for a batch of rows on the CPU (host weights),
+/// i.e. the `cpu`-backend MoE used by the batched path. `ids`/`weights` are the
+/// per-(token, topk) routed expert ids and their softmax weights (from the router);
+/// `xn2` is the per-row RMS-normed input `[b, d]`. Returns the per-row residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_batch_cpu_residual(
+    ids: &[i32],
+    weights: &[f32],
+    xn2: &[f32],
+    lw_h: &LayerWeights,
+    b: usize,
+    d: usize,
+    inter: usize,
+    topk: usize,
+) -> Vec<f32> {
+    let mut residual = vec![0.0f32; b * d];
+    for t in 0..b {
+        let row = &xn2[t * d..(t + 1) * d];
+        for j in 0..topk {
+            let e = ids[t * topk + j] as usize;
+            let w = weights[t * topk + j];
+            let wg = &lw_h.moe_wg[e * inter * d..(e + 1) * inter * d];
+            let wu = &lw_h.moe_wu[e * inter * d..(e + 1) * inter * d];
+            let wd = &lw_h.moe_wd[e * d * inter..(e + 1) * d * inter];
+            let down = expert_mlp(row, wg, wu, wd, inter, d);
+            for kk in 0..d {
+                residual[t * d + kk] += w * down[kk];
+            }
+        }
+    }
+    residual
+}
 /// Gate/up/down SwiGLU MLP for one expert, returning `[d]`.
 pub(crate) fn expert_mlp(
     xn: &[f32],
@@ -241,5 +273,63 @@ mod tests {
                 .any(|p| matches!(p, crate::moe_backend::Placement::Cpu)),
             "capacity 1 with topk>1 must overflow to CPU"
         );
+    }
+
+    #[test]
+    fn batch_cpu_residual_matches_per_row_reference() {
+        let cfg = moe_cfg();
+        let w = Weights::random(&cfg, 11).unwrap();
+        let lw = &w.layers[0];
+        let d = cfg.d_model;
+        let inter = cfg.intermediate_size;
+        let topk = cfg.num_experts_per_tok.min(cfg.num_experts);
+        let b = 2usize;
+        let xn2: Vec<f32> = (0..b * d).map(|i| (i as f32) * 0.01 - 1.0).collect();
+
+        // Derive routed ids/weights per row (same routing as reference()).
+        let mut ids = Vec::new();
+        let mut weights = Vec::new();
+        let mut refs = Vec::new();
+        for t in 0..b {
+            let row = &xn2[t * d..(t + 1) * d];
+            refs.push(reference(&cfg, lw, row));
+            let ne = cfg.num_experts;
+            let router = matvec_t(row, &lw.moe_router, ne);
+            let maxr = router.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut probs = vec![0.0; ne];
+            let mut sumr = 0.0;
+            for i in 0..ne {
+                probs[i] = (router[i] - maxr).exp();
+                sumr += probs[i];
+            }
+            for p in &mut probs {
+                *p /= sumr;
+            }
+            let mut idx: Vec<usize> = (0..ne).collect();
+            idx.sort_by(|&a, &b2| {
+                probs[b2]
+                    .partial_cmp(&probs[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b2))
+            });
+            let chosen: Vec<usize> = idx.into_iter().take(topk).collect();
+            let mut norm = 0.0;
+            for &e in &chosen {
+                norm += probs[e];
+            }
+            for &e in &chosen {
+                ids.push(e as i32);
+                weights.push(probs[e] / norm);
+            }
+        }
+
+        let residual = moe_batch_cpu_residual(&ids, &weights, &xn2, lw, b, d, inter, topk);
+        for t in 0..b {
+            assert_eq!(
+                &residual[t * d..(t + 1) * d],
+                refs[t].as_slice(),
+                "batch CPU residual row {t} must match single-row reference"
+            );
+        }
     }
 }

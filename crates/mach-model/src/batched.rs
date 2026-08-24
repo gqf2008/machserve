@@ -304,21 +304,9 @@ impl BatchedModel {
             .as_ref()
             .ok_or_else(|| Error::Model("cpu-backend offload requires host weights".into()))?;
         let lw_h = &host_w.layers[li];
-        let mut residual = vec![0.0f32; b_us * d_us];
-        for t in 0..b_us {
-            let row = &xn2[t * d_us..(t + 1) * d_us];
-            for j in 0..topk_us {
-                let e = ids[t * topk_us + j] as usize;
-                let w = weights[t * topk_us + j];
-                let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
-                let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
-                let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
-                let down = moe_offload::expert_mlp(row, wg, wu, wd, inter_us, d_us);
-                for kk in 0..d_us {
-                    residual[t * d_us + kk] += w * down[kk];
-                }
-            }
-        }
+        let residual = moe_offload::moe_batch_cpu_residual(
+            &ids, &weights, &xn2, lw_h, b_us, d_us, inter_us, topk_us,
+        );
         let mut x = vec![0.0f32; b_us * d_us];
         hip::memcpy(
             self.k.hip(),
