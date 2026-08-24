@@ -55,6 +55,12 @@ fn config_from_json(path: &std::path::Path) -> Config {
         // MLA: per-head q is (nope + rope); the expanded KV cache is per-head
         // f32. head_dim from hidden/heads would be too small and under-size the
         // q scratch (mla_assemble_q_batched writes nope+rope per head).
+        if cfg.qk_nope_head_dim == 0 || cfg.qk_rope_head_dim == 0 || cfg.v_head_dim == 0 {
+            panic!(
+                "MLA config (kv_lora_rank={}) requires qk_nope_head_dim, qk_rope_head_dim and v_head_dim to be > 0",
+                cfg.kv_lora_rank
+            );
+        }
         cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
         cfg.n_kv_heads = cfg.n_heads;
     }
@@ -357,6 +363,14 @@ mod tests {
         assert_eq!(spec - base, 500 + dkv);
     }
 
+    /// Removes the temp file on drop (also on test panic).
+    struct TempFile(std::path::PathBuf);
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     fn parse_json(json: &str) -> Config {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -366,9 +380,8 @@ mod tests {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, json).unwrap();
-        let cfg = config_from_json(&path);
-        let _ = std::fs::remove_file(&path);
-        cfg
+        let _guard = TempFile(path.clone());
+        config_from_json(&path)
     }
 
     #[test]
@@ -407,5 +420,13 @@ mod tests {
         assert_eq!(cfg.num_experts, 64);
         assert_eq!(cfg.num_experts_per_tok, 8);
         assert_eq!(cfg.kv_lora_rank, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "MLA config")]
+    fn config_rejects_mla_missing_dims() {
+        parse_json(
+            r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"kv_lora_rank":512}"#,
+        );
     }
 }
