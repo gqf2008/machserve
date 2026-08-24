@@ -475,13 +475,26 @@ pub fn load_safetensors_q4(
             if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
                 store_big(name, t, &data, cfg.vocab_size * d)?;
             } else if let Some(expected) =
-                expected_q4_size(name, cfg, d, nq, nkv, inter, einter, mla, ne)
+                expected_q4_size(name, cfg, d, nq, nkv, inter, einter, mla)
             {
                 store_big(name, t, &data, expected)?;
-            } else {
-                let expected = expected_small_size(name, cfg, d, nq, nkv, mla)
-                    .ok_or_else(|| Error::Model(format!("unexpected tensor {name}")))?;
+            } else if let Some(expected) = expected_small_size(name, cfg, d, nq, nkv, mla, ne) {
+                // q_norm/k_norm: accept both shared [head_dim] and per-head
+                // [n_heads*head_dim] / [n_kv_heads*head_dim] forms.
+                let n: usize = t.shape.iter().product();
+                let expected = if (name.contains("q_norm.weight") || name.contains("k_norm.weight"))
+                    && n != expected
+                    && (n == cfg.n_heads * cfg.head_dim || n == cfg.n_kv_heads * cfg.head_dim)
+                {
+                    n
+                } else {
+                    expected
+                };
                 store_small(name, t, &data, expected)?;
+            } else {
+                // Unknown auxiliary tensors (e.g. shared_expert.*) are skipped,
+                // matching the f32 loader's behavior.
+                eprintln!("q4 loader: skipping unknown tensor {name}");
             }
         }
         // Drop this shard's raw bytes before reading the next.
@@ -492,7 +505,7 @@ pub fn load_safetensors_q4(
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
-        let is_moe = ne > 0 && big.contains_key(&p("mlp.gate.weight"));
+        let is_moe = ne > 0 && small.contains_key(&p("mlp.gate.weight"));
         let mut lw = LayerWeightsQ4 {
             wq: if mla {
                 Q4Tensor::default()
@@ -550,22 +563,62 @@ pub fn load_safetensors_q4(
             k_norm: small
                 .remove(&p("self_attn.k_norm.weight"))
                 .unwrap_or_default(),
-            mla_q_a: Q4Tensor::default(),
-            mla_q_a_norm: Vec::new(),
-            mla_q_b: Q4Tensor::default(),
-            mla_q_rope: Q4Tensor::default(),
-            mla_kv_a: Q4Tensor::default(),
-            mla_kv_a_norm: Vec::new(),
-            mla_kv_b: Q4Tensor::default(),
-            mla_o: Q4Tensor::default(),
-            moe_router: Q4Tensor::default(),
+            mla_q_a: if mla {
+                big.remove(&p("self_attn.q_a_proj.weight"))
+                    .expect("mla q_a")
+            } else {
+                Q4Tensor::default()
+            },
+            mla_q_a_norm: if mla {
+                small
+                    .remove(&p("self_attn.q_a_layernorm.weight"))
+                    .expect("mla q_a_norm")
+            } else {
+                Vec::new()
+            },
+            mla_q_b: if mla {
+                big.remove(&p("self_attn.q_b_proj.weight"))
+                    .expect("mla q_b")
+            } else {
+                Q4Tensor::default()
+            },
+            mla_q_rope: if mla {
+                big.remove(&p("self_attn.q_rope_proj.weight"))
+                    .expect("mla q_rope")
+            } else {
+                Q4Tensor::default()
+            },
+            mla_kv_a: if mla {
+                big.remove(&p("self_attn.kv_a_proj_with_mqa.weight"))
+                    .expect("mla kv_a")
+            } else {
+                Q4Tensor::default()
+            },
+            mla_kv_a_norm: if mla {
+                small
+                    .remove(&p("self_attn.kv_a_layernorm.weight"))
+                    .expect("mla kv_a_norm")
+            } else {
+                Vec::new()
+            },
+            mla_kv_b: if mla {
+                big.remove(&p("self_attn.kv_b_proj.weight"))
+                    .expect("mla kv_b")
+            } else {
+                Q4Tensor::default()
+            },
+            mla_o: if mla {
+                big.remove(&p("self_attn.o_proj.weight")).expect("mla o")
+            } else {
+                Q4Tensor::default()
+            },
+            moe_router: small.remove(&p("mlp.gate.weight")).unwrap_or_default(),
             moe_wg: Q4Tensor::default(),
             moe_wu: Q4Tensor::default(),
             moe_wd: Q4Tensor::default(),
         };
         if is_moe {
             let ne_i = ne;
-            lw.moe_router = big.remove(&p("mlp.gate.weight")).expect("moe router");
             for e in 0..ne_i {
                 let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
                 // Concatenate per-expert tensors into one Q4 tensor each.
@@ -615,7 +668,6 @@ fn expected_q4_size(
     inter: usize,
     einter: usize,
     mla: bool,
-    ne: usize,
 ) -> Option<usize> {
     // Match against the same names build_weights uses. MLA's `o_proj` is a
     // different shape, so it must be matched before the dense `o_proj`.
@@ -648,8 +700,6 @@ fn expected_q4_size(
             || name.ends_with("down_proj.weight"))
     {
         Some(einter * d)
-    } else if name.contains("mlp.gate.weight") {
-        Some(ne * d)
     } else {
         None
     }
@@ -663,6 +713,7 @@ fn expected_small_size(
     nq: usize,
     nkv: usize,
     mla: bool,
+    ne: usize,
 ) -> Option<usize> {
     if name == "model.norm.weight"
         || name.contains("input_layernorm.weight")
@@ -673,6 +724,8 @@ fn expected_small_size(
         Some(nq)
     } else if name.ends_with("self_attn.k_proj.bias") || name.ends_with("self_attn.v_proj.bias") {
         Some(nkv)
+    } else if name.contains("mlp.gate.weight") {
+        Some(ne * d)
     } else if name.contains("self_attn.q_norm.weight") || name.contains("self_attn.k_norm.weight") {
         Some(cfg.head_dim)
     } else if mla && name.contains("self_attn.q_a_layernorm.weight") {

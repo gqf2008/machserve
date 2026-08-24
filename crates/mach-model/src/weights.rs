@@ -86,7 +86,9 @@ pub struct LayerWeightsQ4 {
     pub mla_kv_a_norm: Vec<f32>,
     pub mla_kv_b: crate::q4::Q4Tensor,
     pub mla_o: crate::q4::Q4Tensor,
-    pub moe_router: crate::q4::Q4Tensor,
+    // Router is tiny and int4 error can flip critical expert selection, so it
+    // stays f32 (same reasoning as norms/biases).
+    pub moe_router: Vec<f32>,
     pub moe_wg: crate::q4::Q4Tensor,
     pub moe_wu: crate::q4::Q4Tensor,
     pub moe_wd: crate::q4::Q4Tensor,
