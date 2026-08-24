@@ -5,7 +5,7 @@
 //!
 //!   cargo run -p mach-model --release --features hip --example spec_check
 //! Env: MACH_DRAFT / MACH_TARGET / MACH_CONFIG / MACH_K (default 4) /
-//!      MACH_PROMPT_LEN (default 26).
+//!      MACH_MAX_NEW (default 30) / MACH_PROMPT_LEN (default 26).
 #[cfg(feature = "hip")]
 fn main() {
     use mach_kernel_sys::hip;
@@ -27,6 +27,10 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
+    let max_new: usize = std::env::var("MACH_MAX_NEW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
 
     let parse_cfg = |path: &std::path::Path| -> Config {
         let v: serde_json::Value =
@@ -67,7 +71,6 @@ fn main() {
         151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 3838,
         374, 279, 6722, 315, 9625, 30, 151645, 198, 151644, 77091, 198,
     ];
-    let max_new = 30usize;
 
     // Plain greedy reference (target only).
     let mut t_ref = mach_model::batched::BatchedModel::new(hip.clone(), tcfg, &tw, 64).unwrap();
@@ -118,10 +121,18 @@ fn main() {
         "plain greedy: {ref_ms:.1} ms for {max_new} tokens ({:.1} ms/tok)",
         ref_ms / max_new as f64
     );
+    // Free the reference engine (its KV cache is the biggest GPU allocation
+    // besides the draft/target models) before building the spec engines, so
+    // peak device+commit memory is lower on memory-tight machines.
+    drop(t_ref);
 
     // Spec-decode.
     let draft = mach_model::batched::BatchedModel::new(hip.clone(), dcfg, &dw, 64).unwrap();
     let target = mach_model::batched::BatchedModel::new(hip.clone(), tcfg, &tw, 64).unwrap();
+    // Host weights are only needed for upload; drop the f32 copies (~8GB for
+    // 0.5B+1.5B) now that both engines hold device copies.
+    drop(dw);
+    drop(tw);
     let mut dec = SpeculativeDecoder::new(draft, target, k, &prompt).unwrap();
     let mut generated = Vec::new();
     let mut rounds = 0usize;
