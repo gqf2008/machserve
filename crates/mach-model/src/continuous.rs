@@ -112,6 +112,35 @@ impl ContinuousModel {
         })
     }
 
+
+    /// Builds a continuous-batching engine in MoE offload mode: experts stay in host
+    /// RAM and the MoE layer is computed on the CPU (FreeToken `cpu` backend), so GPU
+    /// memory is bounded by `expert_slots` regardless of the total expert count.
+    pub fn with_prefill_rows_offload(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        capacity: usize,
+        prefill_rows: usize,
+        expert_slots: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_expert_slots(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            expert_slots,
+        )?;
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+        })
+    }
     /// Maximum concurrent sequences.
     #[must_use]
     pub const fn capacity(&self) -> usize {
