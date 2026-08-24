@@ -34,10 +34,16 @@ cargo test -p mach-model --features hip --test moe -- --ignored --test-threads=1
 ## 验证状态
 
 - **CPU 已验证**（`cargo test -p mach-model --lib`，20 passed）：LRU 语义、放置无关性、批量 CPU 残差、q* 决策、实时 q* 节拍、tokenizer/fp16。
-- **GPU 已实测过**（之前机器稳定时）：`moe_gpu_offload_placement_invariant` / `moe_gpu_slot_offload_matches_full` / `moe_gpu_adaptive_offload_matches_full` —— 三种 offload 与全驻留一致。
-- **待稳定 GPU 验证**：批量 offload 对拍、批量 GPU 槽位快速路径（当前 cpu backend 是正确性第一版）、基准实跑（TTFT/TPOT）。
+- **GPU 已实测**（本机 7900 XTX 无头卡，2026-08-24）：`moe_gpu_offload_placement_invariant` / `moe_gpu_slot_offload_matches_full` / `moe_gpu_adaptive_offload_matches_full` / `batched_moe_cpu_offload_matches_full_resident` / `moe_gpu_forward_matches_cpu_reference` —— 单序列、批量、自适应三种 offload 与全驻留一致。
+- **真实 MoE checkpoint 已实跑**：`PrimeIntellect/qwen3-moe-tiny`（Qwen3-MoE，~670M）加载 + 三档基准（TTFT/TPOT），放置无关性成立（max logit diff ≤ 6e-6，argmax 一致）；结果见 `benchmark-results-moe-offload.md`。
+- **loader 新增 Qwen3-MoE 族支持**：`moe_intermediate_size`（专家 FFN 宽度）+ 混合 dense/MoE 层（`mlp_only_layers`，按 `mlp.gate.weight` 逐层判定）+ Qwen3 共享 qk-norm 权重（`[head_dim]`，loader 平铺为 per-head）。
+
+## 待办（非阻塞）
+
+- 批量 GPU 槽位快速路径（当前 cpu backend 是正确性第一版）：基准显示同步/D2H 是主要开销，是后续优化方向。
 
 ## 环境注意
 
-- 当前 7900 XTX + Windows ROCm 6.2 在**持续 GPU 负载下会触发驱动 TDR（Event 4101），可能整机硬锁**；GPU 测试已默认 `#[ignore]`，验证请换稳定机器/远程，并遵守 `-- --ignored` + `--test-threads=1` + 时间盒。
+- 本机 7900 XTX 现为**无头计算卡**（显示器已改接核显），GPU 计算可稳定运行；GPU 测试默认 `#[ignore]`，跑时用 `-- --ignored` + `--test-threads=1`。
+- 历史：显示器直连 7900 时，持续 GPU 负载会触发驱动 TDR（Event 4101），可能整机硬锁只能硬复位。
 

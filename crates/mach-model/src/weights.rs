@@ -98,9 +98,9 @@ impl Weights {
             let (moe_router, moe_wg, moe_wu, moe_wd) = if cfg.num_experts > 0 {
                 (
                     mat(&mut rng, cfg.num_experts, d, scale),
-                    mat(&mut rng, cfg.num_experts * cfg.intermediate_size, d, scale),
-                    mat(&mut rng, cfg.num_experts * cfg.intermediate_size, d, scale),
-                    mat(&mut rng, cfg.num_experts * d, cfg.intermediate_size, scale),
+                    mat(&mut rng, cfg.num_experts * cfg.expert_size(), d, scale),
+                    mat(&mut rng, cfg.num_experts * cfg.expert_size(), d, scale),
+                    mat(&mut rng, cfg.num_experts * d, cfg.expert_size(), scale),
                 )
             } else {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())

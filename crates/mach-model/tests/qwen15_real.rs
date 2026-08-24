@@ -46,6 +46,7 @@ fn qwen2_1_5b_cfg() -> Config {
         n_kv_heads: 2,
         head_dim: 128,
         intermediate_size: 8960,
+        moe_intermediate_size: 0,
         num_experts: 0,
         num_experts_per_tok: 0,
         max_seq_len: 2048,

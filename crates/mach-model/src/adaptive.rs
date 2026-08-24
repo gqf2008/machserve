@@ -80,7 +80,7 @@ impl BandwidthProbe {
 
         // CPU: time one expert_mlp on a small deterministic expert of the model shape.
         let d = cfg.d_model;
-        let inter = cfg.intermediate_size;
+        let inter = cfg.expert_size();
         let genv = |n: usize, seed: u64| -> Vec<f32> {
             let mut s = seed;
             (0..n)

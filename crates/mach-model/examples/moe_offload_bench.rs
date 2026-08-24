@@ -52,15 +52,35 @@ fn main() {
 
     let seq: Vec<u32> = (0..n).map(|i| i % 977).collect();
 
-    let full = run_mode(&hip, cfg, &w, Mode::Full, &seq);
-    let slot = run_mode(&hip, cfg, &w, Mode::Slots(slots), &seq);
-    let adapt = run_mode(&hip, cfg, &w, Mode::Adaptive(slots), &seq);
+    let (full, full_logits) = run_mode(&hip, cfg, &w, Mode::Full, &seq);
+    let (slot, slot_logits) = run_mode(&hip, cfg, &w, Mode::Slots(slots), &seq);
+    let (adapt, adapt_logits) = run_mode(&hip, cfg, &w, Mode::Adaptive(slots), &seq);
+
+    // Placement-invariance on the real checkpoint: offloaded modes must match
+    // the full-resident logits exactly (scheduling is a numeric no-op).
+    let argmax = |v: &[f32]| -> usize {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let max_diff = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
 
     println!();
     println!("=== MoE offload benchmark ===");
     println!(
-        "model: {model_name} | d_model={} layers={} experts={} topk={} | tokens={n}",
-        cfg.d_model, cfg.n_layers, cfg.num_experts, cfg.num_experts_per_tok
+        "model: {model_name} | d_model={} layers={} experts={} topk={} moe_inter={} | tokens={n}",
+        cfg.d_model,
+        cfg.n_layers,
+        cfg.num_experts,
+        cfg.num_experts_per_tok,
+        cfg.expert_size()
     );
     println!("mode           | TTFT(ms) | TPOT(ms/tok) | tok/s");
     println!(
@@ -83,6 +103,18 @@ fn main() {
     );
     println!("note: TTFT/TPOT include the offload path syncs/D2H; placement is");
     println!("      invariance-agnostic, so any diff vs full is scheduling, not accuracy.");
+    println!();
+    println!("placement invariance vs full | max|logit diff| | argmax match");
+    println!(
+        "slots={slots:<4}                   {:>14.6} | {}",
+        max_diff(&full_logits, &slot_logits),
+        argmax(&full_logits) == argmax(&slot_logits)
+    );
+    println!(
+        "adaptive                         {:>14.6} | {}",
+        max_diff(&full_logits, &adapt_logits),
+        argmax(&full_logits) == argmax(&adapt_logits)
+    );
 }
 
 #[cfg(feature = "hip")]
@@ -105,7 +137,7 @@ fn run_mode(
     w: &Weights,
     mode: Mode,
     seq: &[u32],
-) -> Meas {
+) -> (Meas, Vec<f32>) {
     use mach_model::model::GpuModel;
     let mut model = match mode {
         Mode::Full => GpuModel::new(Arc::clone(hip), cfg, w).unwrap(),
@@ -119,15 +151,15 @@ fn run_mode(
     model.reset_state().unwrap();
 
     let t0 = Instant::now();
-    model.decode_step(seq[0]).unwrap();
+    let mut last = model.decode_step(seq[0]).unwrap();
     let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let t1 = Instant::now();
     for &t in &seq[1..] {
-        model.decode_step(t).unwrap();
+        last = model.decode_step(t).unwrap();
     }
     let tpot_ms = t1.elapsed().as_secs_f64() * 1000.0 / (seq.len() - 1).max(1) as f64;
-    Meas { ttft_ms, tpot_ms }
+    (Meas { ttft_ms, tpot_ms }, last)
 }
 
 #[cfg(feature = "hip")]
@@ -161,5 +193,7 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg.rope_theta = theta;
     cfg.num_experts = ne;
     cfg.num_experts_per_tok = topk;
+    cfg.moe_intermediate_size = v["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_norm = v["use_qk_norm"].as_bool().unwrap_or(false);
     cfg
 }

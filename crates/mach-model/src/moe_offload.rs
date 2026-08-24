@@ -123,7 +123,7 @@ impl MoeOffload {
         let ne = cfg.num_experts;
         let topk = cfg.num_experts_per_tok.min(ne);
         let d = cfg.d_model;
-        let inter = cfg.intermediate_size;
+        let inter = cfg.expert_size();
 
         let router = matvec_t(xn, &lw.moe_router, ne);
         // Softmax over all experts (max-subtracted for stability).
@@ -194,7 +194,7 @@ mod tests {
         let ne = cfg.num_experts;
         let topk = cfg.num_experts_per_tok.min(ne);
         let d = cfg.d_model;
-        let inter = cfg.intermediate_size;
+        let inter = cfg.expert_size();
         let router = matvec_t(xn, &lw.moe_router, ne);
         let maxr = router.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut probs = vec![0.0; ne];
@@ -281,7 +281,7 @@ mod tests {
         let w = Weights::random(&cfg, 11).unwrap();
         let lw = &w.layers[0];
         let d = cfg.d_model;
-        let inter = cfg.intermediate_size;
+        let inter = cfg.expert_size();
         let topk = cfg.num_experts_per_tok.min(cfg.num_experts);
         let b = 2usize;
         let xn2: Vec<f32> = (0..b * d).map(|i| (i as f32) * 0.01 - 1.0).collect();
