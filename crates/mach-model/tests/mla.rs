@@ -158,3 +158,49 @@ fn mla_batched_matches_cpu_reference() {
         }
     }
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn mla_batched_f16_matches_f32() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+    use mach_model::config::ModelDType;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let mut cfg = mla_cfg();
+    cfg.dtype = ModelDType::F32;
+    let w = Weights::random(&cfg, 11).unwrap();
+    let batch = 2usize;
+    let mut b32 = BatchedModel::new(hip.clone(), cfg, &w, batch).unwrap();
+    cfg.dtype = ModelDType::F16;
+    let mut b16 = BatchedModel::new(hip, cfg, &w, batch).unwrap();
+
+    // Same-length token streams so every decode step advances all sequences.
+    let seqs: Vec<Vec<u32>> = vec![vec![5, 9, 3], vec![200, 7, 11]];
+    for step in 0..seqs[0].len() {
+        let tokens: Vec<u32> = seqs.iter().map(|s| s[step]).collect();
+        b32.decode_step(&tokens).unwrap();
+        b16.decode_step(&tokens).unwrap();
+        let l32 = b32.read_logits().unwrap();
+        let l16 = b16.read_logits().unwrap();
+        let max = max_abs_diff(&l32, &l16);
+        assert!(
+            max < 0.1,
+            "MLA batched fp16 vs fp32: max diff {max} at step {step}"
+        );
+    }
+    eprintln!("MLA batched fp16 vs fp32: logits agree within 0.1");
+}
