@@ -164,6 +164,11 @@ pub struct GpuModel {
     slot_w_dev: *mut f32,
     /// Bandwidth profile for adaptive (q*) placement; None = static placement.
     adaptive: Option<AdaptiveProfile>,
+    /// Auto re-probe cadence: every N decode steps, re-measure PCIe bandwidth and
+    /// fold it into the adaptive profile (0 = disabled). Enables real-time q*.
+    reprobe_every: usize,
+    /// Decode-step counter for the re-probe cadence.
+    step_counter: usize,
 }
 
 impl GpuModel {
@@ -236,6 +241,8 @@ impl GpuModel {
             slot_ids_dev: std::ptr::null_mut(),
             slot_w_dev: std::ptr::null_mut(),
             adaptive: None,
+            reprobe_every: 0,
+            step_counter: 0,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -1141,6 +1148,37 @@ impl GpuModel {
         Ok(m)
     }
 
+    /// Re-measures PCIe bandwidth + CPU expert cost and folds the sample into the
+    /// adaptive (q*) profile, so a contended bus shifts the per-miss decision to
+    /// CPU. Call periodically from the serving loop or via `set_reprobe_every`.
+    pub fn reprobe_bandwidth(&mut self) -> Result<(), Error> {
+        if let Some(prof) = &mut self.adaptive {
+            let a = BandwidthProbe::measure(self.k.hip(), &self.cfg)?.profile;
+            prof.observe(a.pcie_bytes_per_sec);
+        }
+        Ok(())
+    }
+    /// Sets the auto re-probe cadence: every `n` decode steps, re-measure PCIe
+    /// bandwidth and fold it into the adaptive profile. `0` disables.
+    pub fn set_reprobe_every(&mut self, n: usize) {
+        self.reprobe_every = n;
+    }
+
+    #[must_use]
+    fn should_reprobe(counter: usize, every: usize) -> bool {
+        every > 0 && counter > 0 && counter.is_multiple_of(every)
+    }
+
+    /// Advances the step counter and re-probes bandwidth on the cadence (if the
+    /// adaptive profile is present). Real-time q*: a contended bus shifts the
+    /// per-miss decision to CPU on the following steps.
+    fn maybe_reprobe(&mut self) -> Result<(), Error> {
+        self.step_counter += 1;
+        if Self::should_reprobe(self.step_counter, self.reprobe_every) {
+            self.reprobe_bandwidth()?;
+        }
+        Ok(())
+    }
     /// Places a step routed experts into GPU slots (bounded by `cap`), applying
     /// the adaptive q* choice when `adaptive` is provided. Returns (to_upload,
     /// slot_list, gpu_w, cpu): experts to copy into slots, slot indices for the GPU
@@ -1345,6 +1383,7 @@ impl GpuModel {
         self.update_inputs(token)?;
         self.run_kernels()?;
         let out = self.read_logits()?;
+        self.maybe_reprobe()?;
         self.pos += 1;
         Ok(out)
     }
@@ -1472,5 +1511,22 @@ impl Drop for GpuModel {
         for &p in &self.host_pins {
             let _ = hip::host_free(hip, p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reprobe_cadence() {
+        // Disabled (every == 0) never reprobes.
+        assert!(!GpuModel::should_reprobe(0, 0));
+        assert!(!GpuModel::should_reprobe(5, 0));
+        // Enabled: triggers exactly on multiples of `every`.
+        assert!(!GpuModel::should_reprobe(0, 10));
+        assert!(!GpuModel::should_reprobe(9, 10));
+        assert!(GpuModel::should_reprobe(10, 10));
+        assert!(GpuModel::should_reprobe(20, 10));
     }
 }
