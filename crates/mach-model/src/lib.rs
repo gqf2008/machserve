@@ -25,6 +25,7 @@ pub mod ref_model;
 pub mod sampling;
 #[cfg(feature = "hip")]
 pub mod speculative;
+pub mod state_reuse;
 pub mod tokenizer;
 pub mod weights;
 

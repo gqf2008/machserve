@@ -17,9 +17,19 @@ pub struct RefModel {
     mla_kv: Vec<(Vec<f32>, Vec<f32>)>,
     /// Number of tokens stored so far.
     pos: usize,
+    /// Hidden state of the most recently processed token (after the last
+    /// layer, before the final norm + lm_head). The anchor checkpoint data for
+    /// agentic state reuse ([`Self::save_anchor`]).
+    last_hidden: Vec<f32>,
 }
 
 impl RefModel {
+    /// Number of tokens processed so far (next position).
+    #[must_use]
+    pub const fn pos(&self) -> usize {
+        self.pos
+    }
+
     /// Builds a reference model from weights.
     #[must_use]
     pub fn new(cfg: Config, w: Weights) -> Self {
@@ -43,6 +53,7 @@ impl RefModel {
             kv,
             mla_kv,
             pos: 0,
+            last_hidden: Vec::new(),
         }
     }
 
@@ -57,6 +68,15 @@ impl RefModel {
 
     /// One decode step: `token` at position `self.pos`, returns `[vocab]` logits.
     pub fn decode_step(&mut self, token: u32) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        let x0 = self.w.tok_emb[token as usize * d..(token as usize + 1) * d].to_vec();
+        self.forward_from(x0)
+    }
+
+    /// Runs one transformer position starting from an input hidden state
+    /// (a token embedding, or a restored anchor's hidden), storing KV at the
+    /// current position and returning `[vocab]` logits.
+    fn forward_from(&mut self, mut x: Vec<f32>) -> Vec<f32> {
         let cfg = self.cfg;
         let d = cfg.d_model;
         let pos = self.pos;
@@ -64,8 +84,6 @@ impl RefModel {
             pos < cfg.max_seq_len,
             "sequence length exceeded max_seq_len"
         );
-
-        let mut x = self.w.tok_emb[token as usize * d..(token as usize + 1) * d].to_vec();
 
         for (li, lw) in self.w.layers.iter().enumerate() {
             let xn = rms_norm(&x, &lw.rms_attn, cfg.rms_eps);
@@ -174,10 +192,156 @@ impl RefModel {
             }
         }
 
+        self.last_hidden = x.clone();
         let xf = rms_norm(&x, &self.w.rms_final, cfg.rms_eps);
         self.pos += 1;
         matvec_t(&xf, &self.w.lm_head, cfg.vocab_size)
     }
+
+    /// Saves a lightweight token-boundary anchor at `token_idx`: the per-layer
+    /// KV prefix `[0..=token_idx]` plus the final hidden state at that
+    /// position. The model must have processed exactly `token_idx + 1` tokens
+    /// (the anchor lives at the current sequence end).
+    pub fn save_anchor(
+        &self,
+        tokens: &[u32],
+        token_idx: usize,
+    ) -> Result<crate::state_reuse::Anchor, crate::Error> {
+        use crate::state_reuse::{Anchor, KvSnapshot};
+        if tokens.len() != token_idx + 1 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "anchor token_idx {token_idx} does not match {} prefix tokens",
+                tokens.len()
+            )));
+        }
+        if self.pos != token_idx + 1 {
+            return Err(crate::Error::InvalidArgument(format!(
+                "anchor at token_idx {token_idx} requires {} processed positions, model has {}",
+                token_idx + 1,
+                self.pos
+            )));
+        }
+        if self.last_hidden.len() != self.cfg.d_model {
+            return Err(crate::Error::Model(
+                "no hidden state at anchor position (nothing processed yet)".into(),
+            ));
+        }
+        let cfg = self.cfg;
+        let row = cfg.n_kv_heads * cfg.head_dim;
+        let n = (token_idx + 1) * row;
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        if cfg.kv_lora_rank == 0 {
+            for (k, v) in &self.kv {
+                layers.push((f32s_to_bytes(&k[..n]), f32s_to_bytes(&v[..n])));
+            }
+        } else {
+            let heads = cfg.n_heads;
+            let hd = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+            let kn = (token_idx + 1) * heads * hd;
+            let vn = (token_idx + 1) * heads * cfg.v_head_dim;
+            for (k, v) in &self.mla_kv {
+                layers.push((f32s_to_bytes(&k[..kn]), f32s_to_bytes(&v[..vn])));
+            }
+        }
+        Ok(Anchor {
+            id: 0,
+            token_idx,
+            tokens: tokens.to_vec(),
+            kv: KvSnapshot { layers },
+            hidden: self.last_hidden.clone(),
+        })
+    }
+
+    /// Restores an anchor: copies the per-layer KV prefix into the (empty)
+    /// caches and resumes at `token_idx + 1` with the saved hidden state.
+    /// The next [`Self::decode_step`] processes the first delta token.
+    pub fn restore_anchor(
+        &mut self,
+        anchor: &crate::state_reuse::Anchor,
+    ) -> Result<(), crate::Error> {
+        let cfg = self.cfg;
+        if anchor.kv.layers.len() != cfg.n_layers {
+            return Err(crate::Error::InvalidArgument(format!(
+                "anchor layer count {} != model {}",
+                anchor.kv.layers.len(),
+                cfg.n_layers
+            )));
+        }
+        let prefix = anchor.token_idx + 1;
+        if prefix > cfg.max_seq_len {
+            return Err(crate::Error::InvalidArgument(format!(
+                "anchor prefix {prefix} exceeds max_seq_len {}",
+                cfg.max_seq_len
+            )));
+        }
+        if anchor.hidden.len() != cfg.d_model {
+            return Err(crate::Error::InvalidArgument(
+                "anchor hidden size does not match d_model".into(),
+            ));
+        }
+        if cfg.kv_lora_rank == 0 {
+            let row = cfg.n_kv_heads * cfg.head_dim;
+            let n = prefix * row;
+            for (li, (k, v)) in self.kv.iter_mut().enumerate() {
+                let (kb, vb) = &anchor.kv.layers[li];
+                if kb.len() != n * 4 || vb.len() != n * 4 {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "anchor kv size mismatch at layer {li} (expected {} bytes, got {} / {})",
+                        n * 4,
+                        kb.len(),
+                        vb.len()
+                    )));
+                }
+                k[..n].copy_from_slice(&bytes_to_f32s(kb));
+                v[..n].copy_from_slice(&bytes_to_f32s(vb));
+            }
+        } else {
+            let heads = cfg.n_heads;
+            let hd = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+            let kn = prefix * heads * hd;
+            let vn = prefix * heads * cfg.v_head_dim;
+            for (li, (k, v)) in self.mla_kv.iter_mut().enumerate() {
+                let (kb, vb) = &anchor.kv.layers[li];
+                if kb.len() != kn * 4 || vb.len() != vn * 4 {
+                    return Err(crate::Error::InvalidArgument(format!(
+                        "anchor MLA kv size mismatch at layer {li}"
+                    )));
+                }
+                k[..kn].copy_from_slice(&bytes_to_f32s(kb));
+                v[..vn].copy_from_slice(&bytes_to_f32s(vb));
+            }
+        }
+        self.pos = prefix;
+        self.last_hidden = anchor.hidden.clone();
+        Ok(())
+    }
+
+    /// Logits at the position right after the anchor, computed directly from
+    /// the saved hidden state (final norm + lm_head) — no forward pass. Equal
+    /// to what a full recompute produced at that position.
+    #[must_use]
+    pub fn logits_at_anchor(&self) -> Vec<f32> {
+        let cfg = self.cfg;
+        let xf = rms_norm(&self.last_hidden, &self.w.rms_final, cfg.rms_eps);
+        matvec_t(&xf, &self.w.lm_head, cfg.vocab_size)
+    }
+}
+
+/// Serializes f32 values to little-endian bytes (host anchor snapshot).
+fn f32s_to_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 4);
+    for &v in vals {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Deserializes little-endian bytes back to f32 values (anchor restore).
+fn bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Per-head RMSNorm (Qwen3 QK-norm): each head's `head_dim` slice is
