@@ -28,9 +28,20 @@ fn model_dir() -> Option<PathBuf> {
         PathBuf::from("../../.models/qwen2.5-moe-a3b"),
         PathBuf::from(".models/qwen2.5-moe-a3b"),
     ];
-    candidates
-        .into_iter()
-        .find(|p| p.join("config.json").exists())
+    // Require config.json AND at least one weight shard, so a half-downloaded
+    // checkpoint skips instead of hard-failing on load.
+    candidates.into_iter().find(|p| {
+        p.join("config.json").exists()
+            && std::fs::read_dir(p)
+                .map(|mut it| {
+                    it.any(|e| {
+                        e.as_ref().is_ok_and(|e| {
+                            e.file_name().to_string_lossy().ends_with(".safetensors")
+                        })
+                    })
+                })
+                .unwrap_or(false)
+    })
 }
 
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
@@ -49,7 +60,8 @@ fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
     }
 }
 
-/// Qwen2.5-MoE-A3B hyperparameters (from config.json).
+/// Qwen2.5-MoE-A3B hyperparameters (from config.json; max_seq_len is a test
+/// choice, the checkpoint supports 32768).
 fn moe_a3b_cfg() -> Config {
     Config {
         dtype: ModelDType::F32,
