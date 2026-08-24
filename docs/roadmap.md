@@ -758,3 +758,11 @@
   - 验证:`mla.rs` 增 `mla_batched_f16_matches_f32`(batched F16 vs F32 logits 差
     < 0.1);本地门禁全绿;**HIP 对拍已实跑(2026-08-24)**:mla 套件 5/5 通过;
   - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。
+
+- **P3cf spec-decode 收益测量暂停(2026-08-24)**:
+  - `spec_check`(0.5B 草稿 + 1.5B 目标)在本机连续 3 次触发系统级问题:双模型加载
+    峰值提交内存(页文件峰值 ~10.7GB)导致 os error 1453(ERROR_QUOTA_EXCEEDED)
+    与终端退出;前两次在 spec-decode 阶段被用户中止。
+  - 结论:spec-decode 正确性已多层验证(单/批量/生命周期/server);**吞吐收益未测**,
+    测量在本机环境暂停。如需测量需先轻量化(smaller K / max_new / 目标模型)或
+    在空闲资源窗口进行。
