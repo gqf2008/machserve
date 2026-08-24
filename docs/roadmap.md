@@ -724,3 +724,16 @@
     全量 HIP 回归全绿,clippy/fmt 干净;
   - 已知边界:仅 f32 + decode 步(ContinuousModel 槽位压缩/真实 MLA checkpoint
     尚未接入);后续切片:MLA 连续批处理/服务集成 + 真实 DeepSeek MLA 权重验证。
+
+- **P3cd MLA 连续批处理/服务集成(2026-08-23)**:
+  - `BatchedModel::copy_seq_kv` 支持 MLA expanded per-head KV cache 的槽位搬移
+    (此前只搬 `kv_cache`,MLA 序列在槽位压缩后 KV 错位)——连续批处理槽位
+    复用/压缩的关键修复;
+  - `continuous.rs` 增 `engine_matches_single_model_mla`(连续批处理 vs 单序列
+    GpuModel 逐 token 一致)与 `slots_compact_keeps_mla_sequence_intact`
+    (A 先完成触发 B 槽位压缩,MLA KV 随槽位搬移后 B 输出不变);
+    `server.rs` 增 `completions_endpoint_mla_matches_direct_engine`
+    (MLA 配置 HTTP `/v1/completions` 与直接引擎一致);
+  - 验证:本地门禁全绿(rustfmt / cargo check / clippy / CPU 测试);
+    **HIP 测试待 GPU 空闲窗口运行**(continuous + server + mla 套件 + 全量回归);
+  - 后续切片:真实 DeepSeek MLA checkpoint 数值对拍(需下载权重)。

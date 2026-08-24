@@ -424,3 +424,76 @@ fn prefill_rows_gives_identical_output() {
     assert!(!base.is_empty());
     assert_eq!(base, big, "prefill_rows must not change generated output");
 }
+
+/// MLA (DeepSeek-V2 style) config: low-rank Q + compressed KV.
+fn mla_cfg() -> Config {
+    Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16)
+}
+
+#[test]
+fn engine_matches_single_model_mla() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = mla_cfg();
+    let w = Weights::random(&cfg, 92).unwrap();
+    let jobs = vec![
+        (vec![5, 9, 3], 6usize, None),
+        (vec![1, 200, 7], 5usize, None),
+    ];
+    let engine_out = run_engine(&hip, cfg, &w, 4, &jobs);
+    for (i, (prompt, max_new, _)) in jobs.iter().enumerate() {
+        let want = gen_ref(&hip, cfg, &w, prompt, *max_new);
+        assert_eq!(
+            engine_out[i], want,
+            "MLA seq {i}: engine={:?} ref={:?}",
+            engine_out[i], want
+        );
+    }
+}
+
+#[test]
+fn slots_compact_keeps_mla_sequence_intact() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = mla_cfg();
+    let w = Weights::random(&cfg, 54).unwrap();
+    // A (short, slot 0) finishes first; B is compacted from slot 1 to
+    // slot 0 via copy_seq_kv. The MLA expanded KV must move with the slot,
+    // otherwise B's continued decode attends to stale KV and diverges.
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
+    let a = eng
+        .add(
+            &[3],
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    let b = eng
+        .add(
+            &[9, 7, 42],
+            6,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.is_done(a) {
+        eng.step().unwrap();
+    }
+    assert_eq!(eng.active(), 1, "B must stay active after A compacts");
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(a),
+        gen_ref(&hip, cfg, &w, &[3], 2),
+        "MLA seq A must match ref"
+    );
+    assert_eq!(
+        eng.generated(b),
+        gen_ref(&hip, cfg, &w, &[9, 7, 42], 6),
+        "MLA seq B must survive slot compaction"
+    );
+}
