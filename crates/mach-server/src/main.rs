@@ -53,6 +53,7 @@ fn config_from_json(path: &std::path::Path) -> Config {
 /// per-head KV cache (always f32); dense uses the GQA formula with the dtype's
 /// element size. Sharded weight files, hipBLAS workspace and compiled kernels
 /// are not counted; the margin covers today's scenarios.
+#[cfg(feature = "hip")]
 fn estimate_vram(
     cfg: &Config,
     capacity: usize,
@@ -67,7 +68,7 @@ fn estimate_vram(
             * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
             * 4
     } else {
-        capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem
+        capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem * 2
     };
     let mut est = model_file_bytes + (kv * cfg.n_layers) as u64 + (256 << 20);
     if let Some((dcfg, dfb)) = draft {
@@ -79,7 +80,7 @@ fn estimate_vram(
                 * (dcfg.qk_nope_head_dim + dcfg.qk_rope_head_dim + dcfg.v_head_dim)
                 * 4
         } else {
-            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * dkv_elem
+            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * dkv_elem * 2
         };
         est += dfb + (dkv * dcfg.n_layers) as u64;
     }
@@ -274,7 +275,6 @@ fn main() {
 }
 
 #[cfg(all(test, feature = "hip"))]
-#[cfg(all(test, feature = "hip"))]
 mod tests {
     use super::*;
 
@@ -291,7 +291,8 @@ mod tests {
         let cfg = dense_cfg();
         let est = estimate_vram(&cfg, 8, 1_000_000, None);
         // KV (f32) = capacity*max_seq*kv_heads*head_dim*4 per layer.
-        let kv = (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * cfg.n_layers) as u64;
+        let kv =
+            (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * 2 * cfg.n_layers) as u64;
         assert_eq!(est, 1_000_000 + kv + (256 << 20));
     }
 
@@ -304,7 +305,7 @@ mod tests {
         let f32 = estimate_vram(&cfg, 8, 0, None);
         // KV diff = layers * capacity*max_seq*kv_heads*head_dim*(4-2).
         let kv_diff =
-            (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2) as u64;
+            (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
         assert_eq!(
             f32 - f16,
             kv_diff,
@@ -332,7 +333,7 @@ mod tests {
         let base = estimate_vram(&tcfg, 8, 1_000, None);
         let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)));
         let dkv =
-            (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4) as u64;
+            (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4 * 2) as u64;
         assert_eq!(spec - base, 500 + dkv);
     }
 }
