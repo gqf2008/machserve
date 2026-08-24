@@ -165,6 +165,9 @@ pub struct BatchedModel {
     mla_kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
     /// Per-sequence lengths (host).
     lens: Vec<u32>,
+    /// Last row index each slot occupied in the most recent forward (for
+    /// reading that slot's hidden state back to host — e.g. anchor saving).
+    last_row_by_slot: Vec<usize>,
     allocs: Vec<*mut core::ffi::c_void>,
     host_pins: Vec<*mut core::ffi::c_void>,
     /// MoE offload: CPU-backend mode (experts stay in host RAM) when < num_experts.
@@ -312,6 +315,7 @@ impl BatchedModel {
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
+            last_row_by_slot: vec![0; slots],
             allocs: Vec::new(),
             host_pins: Vec::new(),
             expert_slots,
@@ -851,6 +855,7 @@ impl BatchedModel {
                 *self.tokens_host.add(i) = t as i32;
                 *self.pos_host.add(i) = l as i32;
                 *self.slots_host.add(i) = i as i32; // row == slot for decode
+                self.last_row_by_slot[i] = i;
             }
             hip::memcpy_async(
                 self.k.hip(),
@@ -1616,9 +1621,221 @@ impl BatchedModel {
                 )?;
             }
         }
+        for (r, &s) in slots.iter().enumerate() {
+            self.last_row_by_slot[s as usize] = r;
+        }
         self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
         self.sampler
             .sample_batched(self.logits, params, counts, bias, self.cfg.vocab_size)
+    }
+
+    /// Saves a lightweight token-boundary anchor for `slot`: the per-layer KV
+    /// prefix `[0..=token_idx]` plus the hidden state of the last token.
+    ///
+    /// Requires `tokens.len() == token_idx + 1` and that the slot's KV for
+    /// those positions is up to date (call after a step that processed the
+    /// sequence; the stream is synced inside). The hidden state is read from
+    /// the slot's last forward row (`last_row_by_slot`).
+    pub fn save_anchor(
+        &self,
+        slot: usize,
+        tokens: &[u32],
+        token_idx: usize,
+    ) -> Result<crate::state_reuse::Anchor, Error> {
+        use crate::state_reuse::{Anchor, KvSnapshot};
+        if slot >= self.batch {
+            return Err(Error::InvalidArgument(format!(
+                "slot {slot} out of range (batch {})",
+                self.batch
+            )));
+        }
+        if tokens.len() != token_idx + 1 {
+            return Err(Error::InvalidArgument(format!(
+                "anchor token_idx {token_idx} does not match {} prefix tokens",
+                tokens.len()
+            )));
+        }
+        self.k.sync()?;
+        let c = self.cfg;
+        let kv_elem = if c.dtype == ModelDType::F16 { 2 } else { 4 };
+        let row_bytes = c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
+        let copy = (token_idx + 1) * c.n_kv_heads * c.head_dim * kv_elem;
+        let mut layers = Vec::with_capacity(c.n_layers);
+        for (kc, vc) in &self.kv_cache {
+            let src_k = (*kc as usize + slot * row_bytes) as *const core::ffi::c_void;
+            let src_v = (*vc as usize + slot * row_bytes) as *const core::ffi::c_void;
+            let mut kb = vec![0u8; copy];
+            let mut vb = vec![0u8; copy];
+            hip::memcpy(
+                self.k.hip(),
+                kb.as_mut_ptr() as *mut core::ffi::c_void,
+                src_k,
+                copy,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            hip::memcpy(
+                self.k.hip(),
+                vb.as_mut_ptr() as *mut core::ffi::c_void,
+                src_v,
+                copy,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            layers.push((kb, vb));
+        }
+        if !self.mla_kv_cache.is_empty() {
+            let heads = c.n_heads;
+            let k_row = c.max_seq_len * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_row = c.max_seq_len * heads * c.v_head_dim * 4;
+            let k_bytes = (token_idx + 1) * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_bytes = (token_idx + 1) * heads * c.v_head_dim * 4;
+            for (kc, vc) in &self.mla_kv_cache {
+                let src_k = (*kc as usize + slot * k_row) as *const core::ffi::c_void;
+                let src_v = (*vc as usize + slot * v_row) as *const core::ffi::c_void;
+                let mut kb = vec![0u8; k_bytes];
+                let mut vb = vec![0u8; v_bytes];
+                hip::memcpy(
+                    self.k.hip(),
+                    kb.as_mut_ptr() as *mut core::ffi::c_void,
+                    src_k,
+                    k_bytes,
+                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                )?;
+                hip::memcpy(
+                    self.k.hip(),
+                    vb.as_mut_ptr() as *mut core::ffi::c_void,
+                    src_v,
+                    v_bytes,
+                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                )?;
+                layers.push((kb, vb));
+            }
+        }
+        let d = c.d_model;
+        let row = self.last_row_by_slot[slot];
+        let mut hidden = vec![0.0f32; d];
+        let src = (self.x as usize + row * d * 4) as *const core::ffi::c_void;
+        hip::memcpy(
+            self.k.hip(),
+            hidden.as_mut_ptr() as *mut core::ffi::c_void,
+            src,
+            d * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        Ok(Anchor {
+            id: 0,
+            token_idx,
+            tokens: tokens.to_vec(),
+            kv: KvSnapshot { layers },
+            hidden,
+        })
+    }
+
+    /// Restores an anchor into `slot`: copies the per-layer KV prefix into the
+    /// slot's cache, sets its length to `token_idx + 1`, and restores the
+    /// saved hidden state into `x[slot]`. The next decode/prefill continues at
+    /// position `token_idx + 1`, so only the delta needs computing.
+    pub fn restore_anchor(
+        &mut self,
+        slot: usize,
+        anchor: &crate::state_reuse::Anchor,
+    ) -> Result<(), Error> {
+        if slot >= self.batch {
+            return Err(Error::InvalidArgument(format!(
+                "slot {slot} out of range (batch {})",
+                self.batch
+            )));
+        }
+        let c = self.cfg;
+        if anchor.kv.layers.len() != c.n_layers {
+            return Err(Error::InvalidArgument(format!(
+                "anchor layer count {} != model {}",
+                anchor.kv.layers.len(),
+                c.n_layers
+            )));
+        }
+        let prefix = anchor.token_idx + 1;
+        if prefix > c.max_seq_len {
+            return Err(Error::InvalidArgument(format!(
+                "anchor prefix {prefix} exceeds max_seq_len {}",
+                c.max_seq_len
+            )));
+        }
+        let kv_elem = if c.dtype == ModelDType::F16 { 2 } else { 4 };
+        let row_bytes = c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
+        let copy = prefix * c.n_kv_heads * c.head_dim * kv_elem;
+        for (li, (kc, vc)) in self.kv_cache.iter().enumerate() {
+            let (kb, vb) = &anchor.kv.layers[li];
+            if kb.len() != copy || vb.len() != copy {
+                return Err(Error::InvalidArgument(format!(
+                    "anchor KV size mismatch at layer {li} (expected {copy} bytes, got {} / {})",
+                    kb.len(),
+                    vb.len()
+                )));
+            }
+            let dst_k = (*kc as usize + slot * row_bytes) as *mut core::ffi::c_void;
+            let dst_v = (*vc as usize + slot * row_bytes) as *mut core::ffi::c_void;
+            hip::memcpy(
+                self.k.hip(),
+                dst_k,
+                kb.as_ptr() as *const core::ffi::c_void,
+                copy,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
+            hip::memcpy(
+                self.k.hip(),
+                dst_v,
+                vb.as_ptr() as *const core::ffi::c_void,
+                copy,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
+        }
+        if !self.mla_kv_cache.is_empty() {
+            let heads = c.n_heads;
+            let k_row = c.max_seq_len * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_row = c.max_seq_len * heads * c.v_head_dim * 4;
+            let k_bytes = prefix * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * 4;
+            let v_bytes = prefix * heads * c.v_head_dim * 4;
+            for (li, (kc, vc)) in self.mla_kv_cache.iter().enumerate() {
+                let (kb, vb) = &anchor.kv.layers[li];
+                if kb.len() != k_bytes || vb.len() != v_bytes {
+                    return Err(Error::InvalidArgument(format!(
+                        "anchor MLA KV size mismatch at layer {li}"
+                    )));
+                }
+                let dst_k = (*kc as usize + slot * k_row) as *mut core::ffi::c_void;
+                let dst_v = (*vc as usize + slot * v_row) as *mut core::ffi::c_void;
+                hip::memcpy(
+                    self.k.hip(),
+                    dst_k,
+                    kb.as_ptr() as *const core::ffi::c_void,
+                    k_bytes,
+                    hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                )?;
+                hip::memcpy(
+                    self.k.hip(),
+                    dst_v,
+                    vb.as_ptr() as *const core::ffi::c_void,
+                    v_bytes,
+                    hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                )?;
+            }
+        }
+        self.lens[slot] = prefix as u32;
+        // Restore the hidden state into x[slot] so logits-at-anchor works if a
+        // caller wants it; decode steps overwrite x from embeddings regardless.
+        if anchor.hidden.len() == c.d_model {
+            let d = c.d_model;
+            let dst = (self.x as usize + slot * d * 4) as *mut core::ffi::c_void;
+            hip::memcpy(
+                self.k.hip(),
+                dst,
+                anchor.hidden.as_ptr() as *const core::ffi::c_void,
+                d * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
+            self.last_row_by_slot[slot] = slot;
+        }
+        Ok(())
     }
 
     /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the
@@ -1723,3 +1940,4 @@ impl Drop for BatchedModel {
         }
     }
 }
+
