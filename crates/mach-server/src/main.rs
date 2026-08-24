@@ -45,6 +45,26 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg.intermediate_size = inter;
     cfg.rms_eps = eps;
     cfg.rope_theta = theta;
+    // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace q/k/v/o.
+    cfg.q_lora_rank = v["q_lora_rank"].as_u64().unwrap_or(0) as usize;
+    cfg.kv_lora_rank = v["kv_lora_rank"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_nope_head_dim = v["qk_nope_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_rope_head_dim = v["qk_rope_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.v_head_dim = v["v_head_dim"].as_u64().unwrap_or(0) as usize;
+    if cfg.kv_lora_rank > 0 {
+        // MLA: per-head q is (nope + rope); the expanded KV cache is per-head
+        // f32. head_dim from hidden/heads would be too small and under-size the
+        // q scratch (mla_assemble_q_batched writes nope+rope per head).
+        cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        cfg.n_kv_heads = cfg.n_heads;
+    }
+    // MoE (Qwen2.5-MoE style): num_experts / num_experts_per_tok.
+    cfg.num_experts = v["num_experts"].as_u64().unwrap_or(0) as usize;
+    cfg.num_experts_per_tok = v["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
+    // Qwen3 QK-norm.
+    if let Some(qk) = v["qk_norm"].as_bool() {
+        cfg.qk_norm = qk;
+    }
     cfg
 }
 
@@ -335,5 +355,57 @@ mod tests {
         let dkv =
             (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4 * 2) as u64;
         assert_eq!(spec - base, 500 + dkv);
+    }
+
+    fn parse_json(json: &str) -> Config {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "machserve_cfg_test_{}_{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, json).unwrap();
+        let cfg = config_from_json(&path);
+        let _ = std::fs::remove_file(&path);
+        cfg
+    }
+
+    #[test]
+    fn config_parses_dense_defaults() {
+        let cfg = parse_json(
+            r#"{"hidden_size":128,"num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,"vocab_size":1024,"intermediate_size":512,"max_position_embeddings":64}"#,
+        );
+        assert_eq!(cfg.kv_lora_rank, 0);
+        assert_eq!(cfg.q_lora_rank, 0);
+        assert_eq!(cfg.num_experts, 0);
+        assert_eq!(cfg.head_dim, 32, "dense head_dim = hidden/heads");
+        assert_eq!(cfg.n_kv_heads, 2);
+    }
+
+    #[test]
+    fn config_parses_mla_hyperparams() {
+        let cfg = parse_json(
+            r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"q_lora_rank":1536,"kv_lora_rank":512,"qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128}"#,
+        );
+        assert_eq!(cfg.kv_lora_rank, 512);
+        assert_eq!(cfg.q_lora_rank, 1536);
+        assert_eq!(
+            cfg.head_dim,
+            128 + 64,
+            "MLA head_dim must be qk_nope_head_dim + qk_rope_head_dim"
+        );
+        assert_eq!(cfg.n_kv_heads, 128, "MLA n_kv_heads == n_heads");
+        assert_eq!(cfg.num_experts, 0);
+    }
+
+    #[test]
+    fn config_parses_moe_hyperparams() {
+        let cfg = parse_json(
+            r#"{"hidden_size":1024,"num_hidden_layers":2,"num_attention_heads":8,"num_key_value_heads":2,"vocab_size":151936,"intermediate_size":512,"max_position_embeddings":2048,"num_experts":64,"num_experts_per_tok":8}"#,
+        );
+        assert_eq!(cfg.num_experts, 64);
+        assert_eq!(cfg.num_experts_per_tok, 8);
+        assert_eq!(cfg.kv_lora_rank, 0);
     }
 }

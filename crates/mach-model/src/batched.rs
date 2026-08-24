@@ -376,12 +376,17 @@ impl BatchedModel {
 
         let kv_elem = if c.dtype == ModelDType::F16 { 2 } else { 4 };
         // KV caches are sized by the slot count, not the row capacity.
-        let kv_bytes = self.batch * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
-        for _ in 0..c.n_layers {
-            let kk = self.dalloc(kv_bytes)?;
-            let vv = self.dalloc(kv_bytes)?;
-            self.kv_cache
-                .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
+        // Dense KV cache: skipped on the MLA path (kv_lora_rank > 0), which
+        // keeps its expanded per-head KV in `mla_kv_cache`; allocating it here
+        // would waste VRAM (n_kv_heads = n_heads, head_dim = nope+rope).
+        if c.kv_lora_rank == 0 {
+            let kv_bytes = self.batch * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
+            for _ in 0..c.n_layers {
+                let kk = self.dalloc(kv_bytes)?;
+                let vv = self.dalloc(kv_bytes)?;
+                self.kv_cache
+                    .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
+            }
         }
         if c.kv_lora_rank > 0 {
             let qlr = c.q_lora_rank;
