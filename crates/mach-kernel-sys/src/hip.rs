@@ -55,6 +55,7 @@ pub struct HipApi {
     pub hip_get_device_count: unsafe extern "C" fn(*mut c_int) -> c_int,
     pub hip_set_device: unsafe extern "C" fn(c_int) -> c_int,
     pub hip_get_device_name: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int,
+    pub hip_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> c_int,
     pub hip_device_synchronize: unsafe extern "C" fn() -> c_int,
     pub hip_get_last_error: unsafe extern "C" fn() -> c_int,
     pub hip_get_error_string: unsafe extern "C" fn(c_int) -> *const c_char,
@@ -212,6 +213,7 @@ fn load() -> Result<Arc<Hip>, HipError> {
         hip_get_device_count: sym(&hip_lib, "hipGetDeviceCount")?,
         hip_set_device: sym(&hip_lib, "hipSetDevice")?,
         hip_get_device_name: sym(&hip_lib, "hipDeviceGetName")?,
+        hip_mem_get_info: sym(&hip_lib, "hipMemGetInfo")?,
         hip_device_synchronize: sym(&hip_lib, "hipDeviceSynchronize")?,
         hip_get_last_error: sym(&hip_lib, "hipGetLastError")?,
         hip_get_error_string: sym(&hip_lib, "hipGetErrorString")?,
@@ -365,6 +367,15 @@ pub fn device_count() -> Result<i32, HipError> {
     Ok(count)
 }
 
+/// Returns the current device's `(free, total)` memory in bytes.
+pub fn mem_info() -> Result<(usize, usize), HipError> {
+    let h = hip()?;
+    let mut free = 0usize;
+    let mut total = 0usize;
+    unsafe { check(&h, (h.api.hip_mem_get_info)(&mut free, &mut total))? };
+    Ok((free, total))
+}
+
 /// Returns the name of `device`.
 pub fn device_name(device: i32) -> Result<String, HipError> {
     let h = hip()?;
@@ -437,12 +448,48 @@ pub fn memcpy(
     unsafe { check(h, (h.api.hip_memcpy)(dst, src, bytes, kind)) }
 }
 
+/// Owns a loaded `hipModule`; unloads it when the last `Arc` reference drops.
+struct ModuleHandle {
+    module: HipModule,
+    _hip: Arc<Hip>,
+}
+
+// SAFETY: module handles are context-wide and only ever launched on this
+// process's HIP context (same rationale as `HipKernels`); unload happens only
+// when the last `Arc` reference drops.
+unsafe impl Send for ModuleHandle {}
+unsafe impl Sync for ModuleHandle {}
+
+impl Drop for ModuleHandle {
+    fn drop(&mut self) {
+        if !self.module.is_null() {
+            unsafe {
+                let _ = (self._hip.api.hip_module_unload)(self.module);
+            }
+        }
+    }
+}
+
 /// A runtime-compiled HIP kernel (hiprtc -> hipModule), with the launchable
 /// function resolved at compile time.
+///
+/// Clones share the underlying module via [`Arc`]; the module is unloaded only
+/// when the last reference drops (the in-process compile cache keeps one
+/// reference alive, so cached modules live until process exit).
 pub struct HipKernelModule {
-    handle: HipModule,
+    handle: Arc<ModuleHandle>,
     func: HipFunction,
     _hip: Arc<Hip>,
+}
+
+impl Clone for HipKernelModule {
+    fn clone(&self) -> Self {
+        Self {
+            handle: Arc::clone(&self.handle),
+            func: self.func,
+            _hip: Arc::clone(&self._hip),
+        }
+    }
 }
 
 impl HipKernelModule {
@@ -527,7 +574,10 @@ impl HipKernelModule {
         };
 
         Ok(Self {
-            handle: module,
+            handle: Arc::new(ModuleHandle {
+                module,
+                _hip: h.clone(),
+            }),
             func,
             _hip: h,
         })
@@ -575,16 +625,6 @@ impl HipKernelModule {
         stream: HipStream,
     ) -> Result<(), HipError> {
         self.launch_shmem(grid, block, params, stream, 0)
-    }
-}
-
-impl Drop for HipKernelModule {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                let _ = (self._hip.api.hip_module_unload)(self.handle);
-            }
-        }
     }
 }
 

@@ -201,7 +201,8 @@ impl GpuModel {
     }
 
     fn dalloc(&mut self, bytes: usize) -> Result<*mut f32, Error> {
-        let p = hip::malloc(self.k.hip(), bytes)?;
+        let p = hip::malloc(self.k.hip(), bytes)
+            .map_err(|e| Error::Model(format!("device alloc of {bytes} bytes failed: {e}")))?;
         self.allocs.push(p);
         Ok(p as *mut f32)
     }
