@@ -1369,6 +1369,11 @@ impl Drop for HipSampler {
 mod tests {
     use super::*;
 
+    // GPU-backed sampler tests are `#[ignore]`d: on AMD Windows ROCm,
+    // concurrent hiprtc compilation / pinned-host allocation across parallel
+    // test threads deadlocks the driver (serial execution is fine). Run them
+    // opt-in: `cargo test -p mach-model --features hip --lib -- --ignored
+    // --test-threads=1`.
     fn have_gpu() -> Option<Arc<Hip>> {
         match hip::hip() {
             Ok(h) => match hip::device_count() {
@@ -1426,6 +1431,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn argmax_matches_cpu() {
         run(1000, 1);
         run(256, 2);
@@ -1435,6 +1441,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn argmax_tie_breaks_to_first_index() {
         let h = have_gpu().expect("gpu");
         let vocab = 1024usize;
@@ -1523,6 +1530,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn greedy_matches_argmax() {
         let Some(h) = have_gpu() else { return };
         let vocab = 4096usize;
@@ -1539,6 +1547,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn batched_sampler_is_deterministic() {
         let Some(h) = have_gpu() else { return };
         let vocab = 8192usize;
@@ -1561,6 +1570,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn batched_sampler_matches_cpu_reference() {
         let Some(h) = have_gpu() else { return };
         // Peaked, well-separated logits: the top-p boundary and the RNG draw
@@ -1634,6 +1644,7 @@ mod tests {
         );
     }
     #[test]
+    #[ignore]
     fn sample_returns_logprobs() {
         let Some(h) = have_gpu() else { return };
         let vocab = 4096usize;
@@ -1692,6 +1703,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore]
     fn penalties_match_cpu_reference() {
         let Some(h) = have_gpu() else { return };
         let vocab = 2048usize;
@@ -1750,6 +1762,7 @@ mod tests {
         }
     }
     #[test]
+    #[ignore]
     fn logit_bias_matches_cpu_reference() {
         let Some(h) = have_gpu() else { return };
         let vocab = 2048usize;
@@ -1805,6 +1818,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn topk_matches_cpu_reference() {
         let Some(h) = have_gpu() else { return };
         let vocab = 4096usize;
