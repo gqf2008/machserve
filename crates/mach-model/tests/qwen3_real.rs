@@ -18,13 +18,7 @@ use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
 fn model_dir() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("../../.models/qwen3-8b"),
-        PathBuf::from(".models/qwen3-8b"),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.join("config.json").exists())
+    mach_model::real_test_model_path()
 }
 
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
@@ -46,7 +40,7 @@ fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
 #[test]
 fn qwen3_8b_decodes_finite_and_deterministic() {
     let Some(dir) = model_dir() else {
-        eprintln!("skipping qwen3_8b: .models/qwen3-8b not present (see doc comment)");
+        eprintln!("skipping qwen3_8b: set MACH_TEST_MODEL to the model dir");
         return;
     };
     let Some(hip) = hip_ctx() else { return };

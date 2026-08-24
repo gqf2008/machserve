@@ -18,17 +18,12 @@ use mach_model::loader::load_safetensors;
 use mach_model::model::GpuModel;
 use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
-use std::path::PathBuf;
 
 #[test]
 fn real_model_decodes_finite_and_deterministic() {
     // Cargo test runs from the crate dir; the model lives at the repo root.
-    let candidates = [
-        PathBuf::from("../../.models").join("tiny-llama.safetensors"),
-        PathBuf::from(".models").join("tiny-llama.safetensors"),
-    ];
-    let Some(model_path) = candidates.into_iter().find(|p| p.exists()) else {
-        eprintln!("skipping real_model: model not present (see doc comment)");
+    let Some(model_path) = mach_model::real_test_model_path() else {
+        eprintln!("skipping real_model: set MACH_TEST_MODEL to a .safetensors path");
         return;
     };
     let hip = match hip::hip() {
@@ -71,12 +66,8 @@ fn real_model_decodes_finite_and_deterministic() {
 
 #[test]
 fn real_model_samples_with_seed_deterministically() {
-    let candidates = [
-        PathBuf::from("../../.models").join("tiny-llama.safetensors"),
-        PathBuf::from(".models").join("tiny-llama.safetensors"),
-    ];
-    let Some(model_path) = candidates.into_iter().find(|p| p.exists()) else {
-        eprintln!("skipping real_model sampling: model not present (see doc comment)");
+    let Some(model_path) = mach_model::real_test_model_path() else {
+        eprintln!("skipping real_model: set MACH_TEST_MODEL to a .safetensors path");
         return;
     };
     let hip = match hip::hip() {
@@ -130,12 +121,8 @@ fn real_model_samples_with_seed_deterministically() {
 
 #[test]
 fn real_model_fp16_matches_fp32() {
-    let candidates = [
-        PathBuf::from("../../.models").join("tiny-llama.safetensors"),
-        PathBuf::from(".models").join("tiny-llama.safetensors"),
-    ];
-    let Some(model_path) = candidates.into_iter().find(|p| p.exists()) else {
-        eprintln!("skipping real_model fp16: model not present (see doc comment)");
+    let Some(model_path) = mach_model::real_test_model_path() else {
+        eprintln!("skipping real_model: set MACH_TEST_MODEL to a .safetensors path");
         return;
     };
     let hip = match hip::hip() {

@@ -193,6 +193,34 @@ pub fn load_safetensors_dir(
     build_weights(&tensors, &data, cfg, tie_embeddings)
 }
 
+/// Qwen3 QK-norm weight: real checkpoints store ONE `[head_dim]` vector
+/// shared across all heads; older test checkpoints may store per-head
+/// `[n_heads * head_dim]`. Accept both, tiling the shared form to per-head.
+fn load_qk_norm(
+    tensors: &HashMap<String, RawTensor>,
+    data: &[u8],
+    name: &str,
+    per_head: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>, Error> {
+    let Some(t) = tensors.get(name) else {
+        return Ok(Vec::new());
+    };
+    let n: usize = t.shape.iter().product();
+    if n == per_head {
+        return tensor_f32(data, t, per_head, name);
+    }
+    if n == head_dim {
+        let shared = tensor_f32(data, t, head_dim, name)?;
+        let mut v = Vec::with_capacity(per_head);
+        for _ in 0..(per_head / head_dim) {
+            v.extend_from_slice(&shared);
+        }
+        return Ok(v);
+    }
+    Err(Error::Model(format!("{name}: unexpected QK-norm size {n}")))
+}
+
 /// Builds [`Weights`] from a merged tensor map (single file or shards).
 fn build_weights(
     tensors: &HashMap<String, RawTensor>,
@@ -234,17 +262,22 @@ fn build_weights(
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
-        let (moe_router, moe_wg, moe_wu, moe_wd) = if cfg.num_experts > 0 {
+        // Per-layer MoE detection: Qwen-MoE checkpoints mix dense layers
+        // (`mlp_only_layers`, e.g. Qwen3-MoE) with routed-expert layers. A layer
+        // is MoE iff it carries a router tensor (`mlp.gate.weight`).
+        let is_moe = cfg.num_experts > 0 && tensors.contains_key(&p("mlp.gate.weight"));
+        let einter = cfg.expert_size();
+        let (moe_router, moe_wg, moe_wu, moe_wd) = if is_moe {
             let ne = cfg.num_experts;
             let router = get(&p("mlp.gate.weight"), ne * d)?;
-            let mut wg = Vec::with_capacity(ne * cfg.intermediate_size * d);
-            let mut wu = Vec::with_capacity(ne * cfg.intermediate_size * d);
-            let mut wd = Vec::with_capacity(ne * d * cfg.intermediate_size);
+            let mut wg = Vec::with_capacity(ne * einter * d);
+            let mut wu = Vec::with_capacity(ne * einter * d);
+            let mut wd = Vec::with_capacity(ne * d * einter);
             for e in 0..ne {
                 let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
-                wg.extend(get(&ep("gate_proj.weight"), cfg.intermediate_size * d)?);
-                wu.extend(get(&ep("up_proj.weight"), cfg.intermediate_size * d)?);
-                wd.extend(get(&ep("down_proj.weight"), d * cfg.intermediate_size)?);
+                wg.extend(get(&ep("gate_proj.weight"), einter * d)?);
+                wu.extend(get(&ep("up_proj.weight"), einter * d)?);
+                wd.extend(get(&ep("down_proj.weight"), d * einter)?);
             }
             (router, wg, wu, wd)
         } else {
@@ -314,9 +347,21 @@ fn build_weights(
                 get(&p("self_attn.o_proj.weight"), nq * d)?
             },
             rms_attn: get(&p("input_layernorm.weight"), d)?,
-            wg: get(&p("mlp.gate_proj.weight"), cfg.intermediate_size * d)?,
-            wu: get(&p("mlp.up_proj.weight"), cfg.intermediate_size * d)?,
-            wd: get(&p("mlp.down_proj.weight"), d * cfg.intermediate_size)?,
+            wg: if is_moe {
+                Vec::new()
+            } else {
+                get(&p("mlp.gate_proj.weight"), cfg.intermediate_size * d)?
+            },
+            wu: if is_moe {
+                Vec::new()
+            } else {
+                get(&p("mlp.up_proj.weight"), cfg.intermediate_size * d)?
+            },
+            wd: if is_moe {
+                Vec::new()
+            } else {
+                get(&p("mlp.down_proj.weight"), d * cfg.intermediate_size)?
+            },
             rms_mlp: get(&p("post_attention_layernorm.weight"), d)?,
             // Qwen2 checkpoints ship q/k/v biases (even with
             // `attention_bias: false`); default to empty (no bias) when absent.
@@ -324,8 +369,20 @@ fn build_weights(
             bk: get_opt(&p("self_attn.k_proj.bias"), nkv)?,
             bv: get_opt(&p("self_attn.v_proj.bias"), nkv)?,
             // Qwen3 QK-norm: per-head RMSNorm on q/k after projection.
-            q_norm: get_opt(&p("self_attn.q_norm.weight"), cfg.n_heads * cfg.head_dim)?,
-            k_norm: get_opt(&p("self_attn.k_norm.weight"), cfg.n_kv_heads * cfg.head_dim)?,
+            q_norm: load_qk_norm(
+                tensors,
+                data,
+                &p("self_attn.q_norm.weight"),
+                cfg.n_heads * cfg.head_dim,
+                cfg.head_dim,
+            )?,
+            k_norm: load_qk_norm(
+                tensors,
+                data,
+                &p("self_attn.k_norm.weight"),
+                cfg.n_kv_heads * cfg.head_dim,
+                cfg.head_dim,
+            )?,
             mla_q_a,
             mla_q_a_norm,
             mla_q_b,

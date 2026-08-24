@@ -29,6 +29,9 @@ pub struct Config {
     pub head_dim: usize,
     /// MLP intermediate size (gate/up width).
     pub intermediate_size: usize,
+    /// MoE expert FFN intermediate size (Qwen-MoE style); 0 = use
+    /// `intermediate_size` for experts (single-size families).
+    pub moe_intermediate_size: usize,
     /// Number of experts (0 = dense MLP, no MoE).
     pub num_experts: usize,
     /// Active experts per token (MoE routing; 0 = dense).
@@ -54,6 +57,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// Expert FFN width: `moe_intermediate_size` when set (Qwen-MoE
+    /// checkpoints), else `intermediate_size` (single-size families).
+    #[must_use]
+    pub fn expert_size(&self) -> usize {
+        if self.moe_intermediate_size > 0 {
+            self.moe_intermediate_size
+        } else {
+            self.intermediate_size
+        }
+    }
+
     /// Minimal config for tests: fast to run, exercises GQA + capture.
     #[must_use]
     pub fn tiny() -> Self {
@@ -66,6 +80,7 @@ impl Config {
             n_kv_heads: 2,
             head_dim: 32,
             intermediate_size: 512,
+            moe_intermediate_size: 0,
             num_experts: 0,
             num_experts_per_tok: 0,
             max_seq_len: 256,
@@ -99,6 +114,7 @@ impl Config {
             n_kv_heads,
             head_dim: hidden_size / n_heads,
             intermediate_size: 3 * hidden_size,
+            moe_intermediate_size: 0,
             num_experts: 0,
             num_experts_per_tok: 0,
             max_seq_len,
@@ -132,6 +148,7 @@ impl Config {
             n_kv_heads,
             head_dim: hidden_size / n_heads,
             intermediate_size: 4 * hidden_size,
+            moe_intermediate_size: 0,
             num_experts: 0,
             num_experts_per_tok: 0,
             max_seq_len,
@@ -158,6 +175,7 @@ impl Config {
             n_kv_heads: 4,
             head_dim: 64,
             intermediate_size: 2048,
+            moe_intermediate_size: 0,
             num_experts: 0,
             num_experts_per_tok: 0,
             max_seq_len: 1024,
@@ -196,6 +214,7 @@ impl Config {
             n_kv_heads: n_heads,
             head_dim: qk_nope_head_dim + qk_rope_head_dim,
             intermediate_size: 4 * hidden_size,
+            moe_intermediate_size: 0,
             num_experts: 0,
             num_experts_per_tok: 0,
             max_seq_len,

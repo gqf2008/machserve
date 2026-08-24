@@ -67,6 +67,8 @@ fn config_from_json(path: &std::path::Path) -> Config {
     // MoE (Qwen2.5-MoE style): num_experts / num_experts_per_tok.
     cfg.num_experts = v["num_experts"].as_u64().unwrap_or(0) as usize;
     cfg.num_experts_per_tok = v["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
+    // Qwen-MoE expert FFN width (moe_intermediate_size); 0 = use intermediate_size.
+    cfg.moe_intermediate_size = v["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
     // Qwen3 QK-norm.
     if let Some(qk) = v["qk_norm"].as_bool() {
         cfg.qk_norm = qk;
@@ -129,6 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
+    let moe_slots = std::env::var("MACH_MOE_SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok());
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -266,7 +271,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
         (eng, handle)
     } else {
-        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let eng = if let Some(slots) = moe_slots {
+            ServerEngine::with_offload(capacity, prefill_rows, slots)
+        } else {
+            ServerEngine::with_prefill_rows(capacity, prefill_rows)
+        };
         let handle = eng.clone().spawn(hip, cfg, w)?;
         (eng, handle)
     };
@@ -277,8 +286,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = router(state);
     println!(
-        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{})",
-        if spec { ", spec-decode" } else { "" }
+        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{})",
+        if spec { ", spec-decode" } else { "" },
+        if let Some(slots) = moe_slots {
+            format!(", moe-offload slots={slots}")
+        } else {
+            String::new()
+        }
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -415,10 +429,16 @@ mod tests {
     #[test]
     fn config_parses_moe_hyperparams() {
         let cfg = parse_json(
-            r#"{"hidden_size":1024,"num_hidden_layers":2,"num_attention_heads":8,"num_key_value_heads":2,"vocab_size":151936,"intermediate_size":512,"max_position_embeddings":2048,"num_experts":64,"num_experts_per_tok":8}"#,
+            r#"{"hidden_size":1024,"num_hidden_layers":2,"num_attention_heads":8,"num_key_value_heads":2,"vocab_size":151936,"intermediate_size":512,"max_position_embeddings":2048,"num_experts":64,"num_experts_per_tok":8,"moe_intermediate_size":256}"#,
         );
         assert_eq!(cfg.num_experts, 64);
         assert_eq!(cfg.num_experts_per_tok, 8);
+        assert_eq!(cfg.moe_intermediate_size, 256);
+        assert_eq!(
+            cfg.expert_size(),
+            256,
+            "Qwen-MoE experts use moe_intermediate_size"
+        );
         assert_eq!(cfg.kv_lora_rank, 0);
     }
 

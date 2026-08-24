@@ -11,14 +11,19 @@
 //! captured graph can serve every position: update the buffers between
 //! replays, then replay.
 
+use crate::adaptive::{AdaptiveProfile, BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
+use crate::moe_backend::LruExpertCache;
+use crate::moe_offload;
 use crate::sampling::HipSampler;
 use crate::{Config, Error, Weights};
 use mach_engine::graph::{GraphCapture, GraphHandle};
 use mach_engine::hip::HipGraphCapture;
 use mach_kernel_sys::hip::{self, Hip};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Per-layer device weight pointers.
@@ -69,6 +74,17 @@ struct LayerDevF16 {
 }
 
 /// The GPU transformer.
+/// Per-layer GPU-resident expert slot state (offload mode).
+struct MoeSlotCtx {
+    cap: usize,
+    wg: *mut f32,
+    wu: *mut f32,
+    wd: *mut f32,
+    /// slot_expert[slot] = expert id resident there, or -1 if empty.
+    slot_expert: Vec<i32>,
+    lru: LruExpertCache,
+}
+
 pub struct GpuModel {
     cfg: Config,
     k: Arc<HipKernels>,
@@ -135,11 +151,35 @@ pub struct GpuModel {
     host_pins: Vec<*mut core::ffi::c_void>,
     /// GPU-side greedy sampler (reads only the sampled token).
     sampler: HipSampler,
+    /// MoE offload: max routed experts computed on GPU (`usize::MAX` = full-resident).
+    gpu_budget: usize,
+    /// Host weight copy for the CPU fallback (set only in offload mode).
+    host_w: Option<Arc<Weights>>,
+    /// MoE offload: GPU-resident expert slots per layer (usize::MAX = full-resident).
+    expert_slots: usize,
+    /// Per-layer resident slot state (offload mode).
+    slot_ctx: Vec<RefCell<MoeSlotCtx>>,
+    /// Small device scratch for slot indices + reordered expert weights.
+    slot_ids_dev: *mut i32,
+    slot_w_dev: *mut f32,
+    /// Bandwidth profile for adaptive (q*) placement; None = static placement.
+    adaptive: Option<AdaptiveProfile>,
+    /// Auto re-probe cadence: every N decode steps, re-measure PCIe bandwidth and
+    /// fold it into the adaptive profile (0 = disabled). Enables real-time q*.
+    reprobe_every: usize,
+    /// Decode-step counter for the re-probe cadence.
+    step_counter: usize,
 }
 
 impl GpuModel {
     /// Builds a GPU model and uploads `w` to device memory.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights) -> Result<Self, Error> {
+        Self::build(hip, cfg, w, usize::MAX)
+    }
+
+    /// Builds a GPU model with expert_slots GPU-resident expert slots per MoE layer
+    /// (usize::MAX = full-resident, no offload).
+    fn build(hip: Arc<Hip>, cfg: Config, w: &Weights, expert_slots: usize) -> Result<Self, Error> {
         let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
         let sampler = HipSampler::new(Arc::clone(&hip), k.stream)?;
         let mut m = Self {
@@ -194,6 +234,15 @@ impl GpuModel {
             pos: 0,
             host_pins: Vec::new(),
             sampler,
+            gpu_budget: usize::MAX,
+            host_w: None,
+            expert_slots,
+            slot_ctx: Vec::new(),
+            slot_ids_dev: std::ptr::null_mut(),
+            slot_w_dev: std::ptr::null_mut(),
+            adaptive: None,
+            reprobe_every: 0,
+            step_counter: 0,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -287,21 +336,24 @@ impl GpuModel {
         if c.num_experts > 0 {
             let ne = c.num_experts;
             let topk = c.num_experts_per_tok.min(ne);
+            let einter = c.expert_size();
             if topk > 0 {
                 self.router = self.dalloc(ne * 4)?;
                 let ip = hip::malloc(self.k.hip(), topk * 4)?;
                 self.exp_ids = ip as *mut i32;
                 self.allocs.push(ip);
                 self.exp_w = self.dalloc(topk * 4)?;
-                let slot_g = topk * c.intermediate_size * d;
-                let slot_d = topk * d * c.intermediate_size;
+                let slot_g = topk * einter * d;
+                let slot_d = topk * d * einter;
                 self.wg_pack = self.dalloc(slot_g * 4)?;
                 self.wu_pack = self.dalloc(slot_g * 4)?;
                 self.wd_pack = self.dalloc(slot_d * 4)?;
-                self.gate_all = self.dalloc(topk * c.intermediate_size * 4)?;
-                self.up_all = self.dalloc(topk * c.intermediate_size * 4)?;
-                self.eh_all = self.dalloc(topk * c.intermediate_size * 4)?;
+                self.gate_all = self.dalloc(topk * einter * 4)?;
+                self.up_all = self.dalloc(topk * einter * 4)?;
+                self.eh_all = self.dalloc(topk * einter * 4)?;
                 self.down_all = self.dalloc(topk * d * 4)?;
+                self.slot_ids_dev = self.dalloc(topk * 4)? as *mut i32;
+                self.slot_w_dev = self.dalloc(topk * 4)?;
             }
         }
         Ok(())
@@ -476,6 +528,8 @@ impl GpuModel {
                 },
                 moe_wg: if lw.moe_wg.is_empty() {
                     std::ptr::null_mut()
+                } else if self.expert_slots < c.num_experts {
+                    self.dalloc(self.expert_slots * c.expert_size() * c.d_model * 4)?
                 } else {
                     let p = self.dalloc(lw.moe_wg.len() * 4)?;
                     self.upload(p, &lw.moe_wg)?;
@@ -483,6 +537,8 @@ impl GpuModel {
                 },
                 moe_wu: if lw.moe_wu.is_empty() {
                     std::ptr::null_mut()
+                } else if self.expert_slots < c.num_experts {
+                    self.dalloc(self.expert_slots * c.expert_size() * c.d_model * 4)?
                 } else {
                     let p = self.dalloc(lw.moe_wu.len() * 4)?;
                     self.upload(p, &lw.moe_wu)?;
@@ -490,6 +546,8 @@ impl GpuModel {
                 },
                 moe_wd: if lw.moe_wd.is_empty() {
                     std::ptr::null_mut()
+                } else if self.expert_slots < c.num_experts {
+                    self.dalloc(self.expert_slots * c.expert_size() * c.d_model * 4)?
                 } else {
                     let p = self.dalloc(lw.moe_wd.len() * 4)?;
                     self.upload(p, &lw.moe_wd)?;
@@ -499,6 +557,27 @@ impl GpuModel {
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
             let _ = (d, nq, nkv);
+            self.slot_ctx.push(RefCell::new(
+                if !lw.moe_wg.is_empty() && self.expert_slots < c.num_experts {
+                    MoeSlotCtx {
+                        cap: self.expert_slots,
+                        wg: l.moe_wg,
+                        wu: l.moe_wu,
+                        wd: l.moe_wd,
+                        slot_expert: vec![-1; self.expert_slots],
+                        lru: LruExpertCache::new(self.expert_slots),
+                    }
+                } else {
+                    MoeSlotCtx {
+                        cap: 0,
+                        wg: std::ptr::null_mut(),
+                        wu: std::ptr::null_mut(),
+                        wd: std::ptr::null_mut(),
+                        slot_expert: Vec::new(),
+                        lru: LruExpertCache::new(0),
+                    }
+                },
+            ));
             self.layers_dev.push(l);
             if c.dtype == ModelDType::F16 {
                 let l16 = LayerDevF16 {
@@ -773,46 +852,53 @@ impl GpuModel {
             }
 
             let inter = c.intermediate_size as i32;
+            let einter = c.expert_size() as i32;
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, 1, d, c.rms_eps)?;
-            if c.num_experts > 0 {
+            if !lw.moe_router.is_null() {
                 let ne = c.num_experts as i32;
                 let topk = c.num_experts_per_tok.min(c.num_experts) as i32;
                 if topk > 0 {
                     // Router logits [ne] = xn2 @ moe_router^T.
                     k.gemm(self.router, self.xn2, lw.moe_router, ne, d)?;
                     k.launch_moe_router(self.router, self.exp_ids, self.exp_w, ne, topk)?;
-                    // Pack the selected experts into contiguous scratch (f32 path;
-                    // fp16 MoE weights are a later slice).
-                    k.launch_moe_gather_weights(
-                        lw.moe_wg,
-                        lw.moe_wu,
-                        lw.moe_wd,
-                        self.exp_ids,
-                        self.wg_pack,
-                        self.wu_pack,
-                        self.wd_pack,
-                        ne,
-                        inter,
-                        d,
-                        topk,
-                    )?;
-                    // Concatenated per-expert gate/up GEMMs over the topk slots.
-                    k.gemm(self.gate_all, self.xn2, self.wg_pack, topk * inter, d)?;
-                    k.gemm(self.up_all, self.xn2, self.wu_pack, topk * inter, d)?;
-                    k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, topk * inter)?;
-                    // Per-slot down projections: each slot has its own hidden
-                    // state, so the concat-GEMM trick (shared input) does not
-                    // apply here — launch one small GEMM per selected expert.
-                    for slot in 0..topk {
-                        k.gemm(
-                            unsafe { self.down_all.add((slot * d) as usize) },
-                            unsafe { self.eh_all.add((slot * inter) as usize) },
-                            unsafe { self.wd_pack.add((slot * d * inter) as usize) },
+                    if self.expert_slots < ne as usize {
+                        self.forward_moe_slots(lw, li, ne, topk, d, einter)?;
+                    } else if self.gpu_budget < topk as usize {
+                        self.forward_moe_offload(lw, li, ne, topk, d, einter)?;
+                    } else {
+                        // Pack the selected experts into contiguous scratch (f32 path;
+                        // fp16 MoE weights are a later slice).
+                        k.launch_moe_gather_weights(
+                            lw.moe_wg,
+                            lw.moe_wu,
+                            lw.moe_wd,
+                            self.exp_ids,
+                            self.wg_pack,
+                            self.wu_pack,
+                            self.wd_pack,
+                            ne,
+                            einter,
                             d,
-                            inter,
+                            topk,
                         )?;
+                        // Concatenated per-expert gate/up GEMMs over the topk slots.
+                        k.gemm(self.gate_all, self.xn2, self.wg_pack, topk * einter, d)?;
+                        k.gemm(self.up_all, self.xn2, self.wu_pack, topk * einter, d)?;
+                        k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, topk * einter)?;
+                        // Per-slot down projections: each slot has its own hidden
+                        // state, so the concat-GEMM trick (shared input) does not
+                        // apply here — launch one small GEMM per selected expert.
+                        for slot in 0..topk {
+                            k.gemm(
+                                unsafe { self.down_all.add((slot * d) as usize) },
+                                unsafe { self.eh_all.add((slot * einter) as usize) },
+                                unsafe { self.wd_pack.add((slot * d * einter) as usize) },
+                                d,
+                                einter,
+                            )?;
+                        }
+                        k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, topk)?;
                     }
-                    k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, topk)?;
                 }
                 // topk == 0: MoE contributes nothing (matches ref_model).
             } else {
@@ -909,6 +995,395 @@ impl GpuModel {
     }
 
     /// One eager decode step for `token` at position `self.pos`.
+    /// Builds a GPU model with a MoE offload budget: at most `gpu_budget` of the
+    /// top-k routed experts are computed on the GPU per step; the rest fall back
+    /// to the CPU reference. Keeps a host weight copy for the CPU fallback.
+    pub fn with_gpu_budget(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        gpu_budget: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::new(hip, cfg, w)?;
+        m.gpu_budget = gpu_budget;
+        m.host_w = Some(Arc::new(w.clone()));
+        Ok(m)
+    }
+
+    /// Builds a GPU model with expert_slots GPU-resident expert slots per MoE layer;
+    /// experts beyond the slots are kept in host RAM and fetched on demand through
+    /// the LRU cache.
+    pub fn with_expert_slots(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        expert_slots: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
+        m.host_w = Some(Arc::new(w.clone()));
+        Ok(m)
+    }
+
+    /// MoE step with a GPU/CPU split: the first `gpu_budget` routed experts are
+    /// computed on GPU via the gather+GEMM path; the rest are computed on the CPU
+    /// reference and added back. The output is placement-invariant.
+    fn forward_moe_offload(
+        &self,
+        lw: &LayerDev,
+        li: usize,
+        ne: i32,
+        topk: i32,
+        d: i32,
+        inter: i32,
+    ) -> Result<(), Error> {
+        let k = self.k.clone();
+        let gpu_n = self.gpu_budget.min(topk as usize) as i32;
+        self.k.sync()?;
+
+        // Read the top-k ids + weights back to host (small).
+        let mut ids = vec![0i32; topk as usize];
+        let mut weights = vec![0.0f32; topk as usize];
+        hip::memcpy(
+            self.k.hip(),
+            ids.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_ids as *const core::ffi::c_void,
+            (topk as usize) * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        hip::memcpy(
+            self.k.hip(),
+            weights.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_w as *const core::ffi::c_void,
+            (topk as usize) * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+
+        // GPU-resident part: first gpu_n routed experts, existing gather+GEMM.
+        if gpu_n > 0 {
+            k.launch_moe_gather_weights(
+                lw.moe_wg,
+                lw.moe_wu,
+                lw.moe_wd,
+                self.exp_ids,
+                self.wg_pack,
+                self.wu_pack,
+                self.wd_pack,
+                ne,
+                inter,
+                d,
+                gpu_n,
+            )?;
+            k.gemm(self.gate_all, self.xn2, self.wg_pack, gpu_n * inter, d)?;
+            k.gemm(self.up_all, self.xn2, self.wu_pack, gpu_n * inter, d)?;
+            k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, gpu_n * inter)?;
+            for slot in 0..gpu_n {
+                k.gemm(
+                    unsafe { self.down_all.add((slot * d) as usize) },
+                    unsafe { self.eh_all.add((slot * inter) as usize) },
+                    unsafe { self.wd_pack.add((slot * d * inter) as usize) },
+                    d,
+                    inter,
+                )?;
+            }
+            k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, gpu_n)?;
+        }
+
+        self.k.sync()?;
+        // CPU fallback: routed experts beyond gpu_n.
+        let n_cpu = topk - gpu_n;
+        if n_cpu > 0 {
+            let host_w = self
+                .host_w
+                .as_ref()
+                .ok_or_else(|| Error::Model("offload CPU path requires host weights".into()))?;
+            let lw_h = &host_w.layers[li];
+
+            let mut xn2 = vec![0.0f32; d as usize];
+            hip::memcpy(
+                self.k.hip(),
+                xn2.as_mut_ptr() as *mut core::ffi::c_void,
+                self.xn2 as *const core::ffi::c_void,
+                (d as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+
+            let mut residual = vec![0.0f32; d as usize];
+            for i in (gpu_n as usize)..(topk as usize) {
+                let e = ids[i] as usize;
+                let w = weights[i];
+                let (inter_us, d_us) = (inter as usize, d as usize);
+                let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
+                let down = moe_offload::expert_mlp(&xn2, wg, wu, wd, inter_us, d_us);
+                for kk in 0..d_us {
+                    residual[kk] += w * down[kk];
+                }
+            }
+
+            let mut xh = vec![0.0f32; d as usize];
+            hip::memcpy(
+                self.k.hip(),
+                xh.as_mut_ptr() as *mut core::ffi::c_void,
+                self.x as *const core::ffi::c_void,
+                (d as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            for kk in 0..d as usize {
+                xh[kk] += residual[kk];
+            }
+            self.upload(self.x, &xh)?;
+        }
+        Ok(())
+    }
+    /// Builds a GPU model in adaptive (q*) mode: measures the machine PCIe
+    /// bandwidth and CPU expert cost at init, and per miss decides whether to
+    /// fetch an expert to a GPU slot or compute it on the CPU (the BandwidthProbe).
+    pub fn with_adaptive(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        expert_slots: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
+        m.host_w = Some(Arc::new(w.clone()));
+        let a = BandwidthProbe::measure(&hip, &cfg)?.profile;
+        m.adaptive = Some(AdaptiveProfile::new(
+            a.pcie_bytes_per_sec,
+            a.cpu_expert_sec,
+            0.9,
+        ));
+        Ok(m)
+    }
+
+    /// Re-measures PCIe bandwidth + CPU expert cost and folds the sample into the
+    /// adaptive (q*) profile, so a contended bus shifts the per-miss decision to
+    /// CPU. Call periodically from the serving loop or via `set_reprobe_every`.
+    pub fn reprobe_bandwidth(&mut self) -> Result<(), Error> {
+        if let Some(prof) = &mut self.adaptive {
+            let a = BandwidthProbe::measure(self.k.hip(), &self.cfg)?.profile;
+            prof.observe(a.pcie_bytes_per_sec);
+        }
+        Ok(())
+    }
+    /// Sets the auto re-probe cadence: every `n` decode steps, re-measure PCIe
+    /// bandwidth and fold it into the adaptive profile. `0` disables.
+    pub fn set_reprobe_every(&mut self, n: usize) {
+        self.reprobe_every = n;
+    }
+
+    #[must_use]
+    fn should_reprobe(counter: usize, every: usize) -> bool {
+        every > 0 && counter > 0 && counter.is_multiple_of(every)
+    }
+
+    /// Advances the step counter and re-probes bandwidth on the cadence (if the
+    /// adaptive profile is present). Real-time q*: a contended bus shifts the
+    /// per-miss decision to CPU on the following steps.
+    fn maybe_reprobe(&mut self) -> Result<(), Error> {
+        self.step_counter += 1;
+        if Self::should_reprobe(self.step_counter, self.reprobe_every) {
+            self.reprobe_bandwidth()?;
+        }
+        Ok(())
+    }
+    /// Places a step routed experts into GPU slots (bounded by `cap`), applying
+    /// the adaptive q* choice when `adaptive` is provided. Returns (to_upload,
+    /// slot_list, gpu_w, cpu): experts to copy into slots, slot indices for the GPU
+    /// gather (in routed order), their weights, and the CPU fallback.
+    #[allow(clippy::type_complexity)]
+    fn moe_slot_place(
+        &self,
+        li: usize,
+        ids: &[i32],
+        weights: &[f32],
+        adaptive: Option<BandwidthProfile>,
+        expert_bytes: usize,
+    ) -> (Vec<(usize, usize)>, Vec<i32>, Vec<f32>, Vec<(usize, f32)>) {
+        let mut to_upload: Vec<(usize, usize)> = Vec::new();
+        let mut slot_list: Vec<i32> = Vec::new();
+        let mut gpu_w: Vec<f32> = Vec::new();
+        let mut cpu: Vec<(usize, f32)> = Vec::new();
+        let mut ctx = self.slot_ctx[li].borrow_mut();
+        let cap = ctx.cap;
+        let routed_set: HashSet<u32> = ids.iter().map(|&e| e as u32).collect();
+        for (i, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let w = weights[i];
+            let id = e as u32;
+            if let Some(slot) = ctx.lru.get(id) {
+                slot_list.push(slot as i32);
+                gpu_w.push(w);
+            } else if adaptive
+                .is_some_and(|p| p.choose(expert_bytes) == crate::adaptive::FetchChoice::ComputeCpu)
+            {
+                cpu.push((e, w));
+            } else if ctx.lru.len() < cap || ctx.lru.evict_lru_not_in(&routed_set).is_some() {
+                let put = ctx.lru.put(id);
+                if ctx.slot_expert[put.slot] != e as i32 {
+                    ctx.slot_expert[put.slot] = e as i32;
+                    to_upload.push((put.slot, e));
+                }
+                slot_list.push(put.slot as i32);
+                gpu_w.push(w);
+            } else {
+                cpu.push((e, w));
+            }
+        }
+        (to_upload, slot_list, gpu_w, cpu)
+    }
+    /// MoE step with bounded GPU-resident expert slots: experts stay in host RAM
+    /// and are fetched on demand into a fixed set of per-layer slots via the LRU
+    /// cache (`plan_step`); misses beyond capacity are computed on the CPU. The
+    /// output is placement-invariant and the GPU-resident footprint is bounded by
+    /// `expert_slots` per layer, not by the total expert count.
+    fn forward_moe_slots(
+        &self,
+        _lw: &LayerDev,
+        li: usize,
+        _ne: i32,
+        topk: i32,
+        d: i32,
+        inter: i32,
+    ) -> Result<(), Error> {
+        let k = self.k.clone();
+        self.k.sync()?;
+
+        // Read the top-k ids + weights back to host (small).
+        let mut ids = vec![0i32; topk as usize];
+        let mut weights = vec![0.0f32; topk as usize];
+        hip::memcpy(
+            self.k.hip(),
+            ids.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_ids as *const core::ffi::c_void,
+            (topk as usize) * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        hip::memcpy(
+            self.k.hip(),
+            weights.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_w as *const core::ffi::c_void,
+            (topk as usize) * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+
+        let host_w = self
+            .host_w
+            .as_ref()
+            .ok_or_else(|| Error::Model("offload slots require host weights".into()))?;
+        let lw_h = &host_w.layers[li];
+        let (ctx_wg, ctx_wu, ctx_wd, cap) = {
+            let ctx = self.slot_ctx[li].borrow();
+            (ctx.wg, ctx.wu, ctx.wd, ctx.cap)
+        };
+
+        // Decide placement: fill free slots, overflow to CPU, no intra-step eviction;
+        // in adaptive mode a miss is computed on the CPU when it is cheaper than the
+        // PCIe fetch pull for this machine (q*).
+        let expert_bytes = 3 * inter as usize * d as usize * 4;
+        let (to_upload, slot_list, gpu_w, cpu) = self.moe_slot_place(
+            li,
+            &ids,
+            &weights,
+            self.adaptive.as_ref().map(|p| p.profile()),
+            expert_bytes,
+        );
+
+        // Upload experts that changed slots (on-demand fetch from host RAM).
+        if !to_upload.is_empty() {
+            let (inter_us, d_us) = (inter as usize, d as usize);
+            for (s, e) in &to_upload {
+                let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
+                self.upload(unsafe { ctx_wg.add(s * inter_us * d_us) }, wg)?;
+                self.upload(unsafe { ctx_wu.add(s * inter_us * d_us) }, wu)?;
+                self.upload(unsafe { ctx_wd.add(s * d_us * inter_us) }, wd)?;
+            }
+        }
+
+        // GPU-resident part: gather from the slot buffer by slot index.
+        let gpu_count = slot_list.len() as i32;
+        if gpu_count > 0 {
+            hip::memcpy(
+                self.k.hip(),
+                self.slot_ids_dev as *mut core::ffi::c_void,
+                slot_list.as_ptr() as *const core::ffi::c_void,
+                (gpu_count as usize) * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
+            hip::memcpy(
+                self.k.hip(),
+                self.slot_w_dev as *mut core::ffi::c_void,
+                gpu_w.as_ptr() as *const core::ffi::c_void,
+                (gpu_count as usize) * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
+            k.launch_moe_gather_weights(
+                ctx_wg,
+                ctx_wu,
+                ctx_wd,
+                self.slot_ids_dev,
+                self.wg_pack,
+                self.wu_pack,
+                self.wd_pack,
+                cap as i32,
+                inter,
+                d,
+                gpu_count,
+            )?;
+            k.gemm(self.gate_all, self.xn2, self.wg_pack, gpu_count * inter, d)?;
+            k.gemm(self.up_all, self.xn2, self.wu_pack, gpu_count * inter, d)?;
+            k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, gpu_count * inter)?;
+            for slot in 0..gpu_count {
+                k.gemm(
+                    unsafe { self.down_all.add((slot * d) as usize) },
+                    unsafe { self.eh_all.add((slot * inter) as usize) },
+                    unsafe { self.wd_pack.add((slot * d * inter) as usize) },
+                    d,
+                    inter,
+                )?;
+            }
+            k.launch_moe_accumulate(self.x, self.down_all, self.slot_w_dev, d, gpu_count)?;
+        }
+
+        // CPU fallback: routed experts that did not fit into a slot.
+        if !cpu.is_empty() {
+            self.k.sync()?;
+            let (inter_us, d_us) = (inter as usize, d as usize);
+            let mut xn2 = vec![0.0f32; d_us];
+            hip::memcpy(
+                self.k.hip(),
+                xn2.as_mut_ptr() as *mut core::ffi::c_void,
+                self.xn2 as *const core::ffi::c_void,
+                d_us * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            let mut residual = vec![0.0f32; d_us];
+            for (e, w) in &cpu {
+                let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
+                let down = moe_offload::expert_mlp(&xn2, wg, wu, wd, inter_us, d_us);
+                for kk in 0..d_us {
+                    residual[kk] += w * down[kk];
+                }
+            }
+            let mut xh = vec![0.0f32; d_us];
+            hip::memcpy(
+                self.k.hip(),
+                xh.as_mut_ptr() as *mut core::ffi::c_void,
+                self.x as *const core::ffi::c_void,
+                d_us * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            for kk in 0..d_us {
+                xh[kk] += residual[kk];
+            }
+            self.upload(self.x, &xh)?;
+        }
+        Ok(())
+    }
     pub fn decode_step(&mut self, token: u32) -> Result<Vec<f32>, Error> {
         if self.pos >= self.cfg.max_seq_len {
             return Err(Error::Model("sequence length exceeded".into()));
@@ -916,6 +1391,7 @@ impl GpuModel {
         self.update_inputs(token)?;
         self.run_kernels()?;
         let out = self.read_logits()?;
+        self.maybe_reprobe()?;
         self.pos += 1;
         Ok(out)
     }
@@ -1043,5 +1519,22 @@ impl Drop for GpuModel {
         for &p in &self.host_pins {
             let _ = hip::host_free(hip, p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reprobe_cadence() {
+        // Disabled (every == 0) never reprobes.
+        assert!(!GpuModel::should_reprobe(0, 0));
+        assert!(!GpuModel::should_reprobe(5, 0));
+        // Enabled: triggers exactly on multiples of `every`.
+        assert!(!GpuModel::should_reprobe(0, 10));
+        assert!(!GpuModel::should_reprobe(9, 10));
+        assert!(GpuModel::should_reprobe(10, 10));
+        assert!(GpuModel::should_reprobe(20, 10));
     }
 }

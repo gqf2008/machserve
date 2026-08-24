@@ -104,6 +104,7 @@ impl RefModel {
             }
 
             let inter = cfg.intermediate_size;
+            let einter = cfg.expert_size();
             let xn2 = rms_norm(&x, &lw.rms_mlp, cfg.rms_eps);
             let moe = cfg.num_experts > 0 && !lw.moe_router.is_empty();
             if moe {
@@ -140,13 +141,13 @@ impl RefModel {
                 let mut h = vec![0.0; d];
                 for &e in order.iter().take(topk) {
                     // Expert e: gate/up [inter, d], down [d, inter].
-                    let wg = &lw.moe_wg[e * inter * d..(e + 1) * inter * d];
-                    let wu = &lw.moe_wu[e * inter * d..(e + 1) * inter * d];
-                    let wd = &lw.moe_wd[e * d * inter..(e + 1) * d * inter];
-                    let gate = matvec_t(&xn2, wg, inter);
-                    let up = matvec_t(&xn2, wu, inter);
-                    let mut eh = vec![0.0; inter];
-                    for i in 0..inter {
+                    let wg = &lw.moe_wg[e * einter * d..(e + 1) * einter * d];
+                    let wu = &lw.moe_wu[e * einter * d..(e + 1) * einter * d];
+                    let wd = &lw.moe_wd[e * d * einter..(e + 1) * d * einter];
+                    let gate = matvec_t(&xn2, wg, einter);
+                    let up = matvec_t(&xn2, wu, einter);
+                    let mut eh = vec![0.0; einter];
+                    for i in 0..einter {
                         eh[i] = silu(gate[i]) * up[i];
                     }
                     let down = matvec_t(&eh, wd, d);
