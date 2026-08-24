@@ -64,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
+    let moe_slots = std::env::var("MACH_MOE_SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok());
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -128,7 +131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
         (eng, handle)
     } else {
-        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let eng = if let Some(slots) = moe_slots {
+            ServerEngine::with_offload(capacity, prefill_rows, slots)
+        } else {
+            ServerEngine::with_prefill_rows(capacity, prefill_rows)
+        };
         let handle = eng.clone().spawn(hip, cfg, w)?;
         (eng, handle)
     };
@@ -140,8 +147,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(
-        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{})",
-        if spec { ", spec-decode" } else { "" }
+        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{})",
+        if spec { ", spec-decode" } else { "" },
+        if let Some(slots) = moe_slots {
+            format!(", moe-offload slots={slots}")
+        } else {
+            String::new()
+        }
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
