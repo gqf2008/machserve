@@ -8,7 +8,7 @@
 
 use crate::Error;
 use crate::graph::{CaptureState, GraphCapture, GraphError, GraphHandle};
-use crate::memory::{Allocation, MemoryPool};
+use crate::memory::{Allocation, MemoryPool, Region, Tag, TaggedPool};
 use mach_kernel_sys::hip::{self, Hip, HipGraphExec, HipStream};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -72,6 +72,17 @@ pub struct HipMemoryPool {
 struct Inner {
     in_use: usize,
     pinned: HashSet<usize>,
+    /// Live tagged regions (each its own hipMalloc block).
+    regions: Vec<RegionEntry>,
+}
+
+/// A live tagged region: an independent device block so resizing never
+/// disturbs sibling regions (malloc new -> D2D copy -> free old).
+#[derive(Debug)]
+struct RegionEntry {
+    tag: Tag,
+    ptr: usize,
+    bytes: usize,
 }
 
 impl core::fmt::Debug for HipMemoryPool {
@@ -145,6 +156,119 @@ impl MemoryPool for HipMemoryPool {
 
     fn bytes_in_use(&self) -> usize {
         self.inner.lock().unwrap().in_use
+    }
+}
+
+impl TaggedPool for HipMemoryPool {
+    fn allocate_region(&self, tag: Tag, bytes: usize, _align: usize) -> Result<Region, Error> {
+        if bytes == 0 {
+            return Err(Error::InvalidArgument("zero-size region".into()));
+        }
+        // hipMalloc returns 256-byte aligned blocks; the alignment argument is
+        // accepted for interface parity with the CPU pool.
+        let ptr = hip::malloc(&self.hip, bytes)? as usize;
+        let mut inner = self.inner.lock().unwrap();
+        inner.in_use += bytes;
+        inner.regions.push(RegionEntry {
+            tag: tag.clone(),
+            ptr,
+            bytes,
+        });
+        Ok(Region {
+            pool_id: self.pool_id,
+            tag,
+            offset: 0,
+            bytes,
+            ptr,
+        })
+    }
+
+    fn resize_region(&self, region: Region, new_bytes: usize) -> Result<Region, Error> {
+        if region.pool_id != self.pool_id {
+            return Err(Error::InvalidArgument("region from another pool".into()));
+        }
+        if new_bytes == 0 {
+            return Err(Error::InvalidArgument("zero-size region".into()));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let idx = inner
+            .regions
+            .iter()
+            .position(|r| r.ptr == region.ptr)
+            .ok_or_else(|| Error::Memory("region is not live".into()))?;
+        let old = inner.regions[idx].bytes;
+        if new_bytes == old {
+            return Ok(region);
+        }
+        let tag = inner.regions[idx].tag.clone();
+        // Fresh block + D2D copy of the preserved prefix + free the old block:
+        // shrinking really releases VRAM (no caching-allocator slack).
+        let new_ptr = hip::malloc(&self.hip, new_bytes)? as usize;
+        let copy = old.min(new_bytes);
+        hip::memcpy(
+            &self.hip,
+            new_ptr as *mut core::ffi::c_void,
+            region.ptr as *const core::ffi::c_void,
+            copy,
+            hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+        )?;
+        hip::free(&self.hip, region.ptr as *mut core::ffi::c_void)?;
+        inner.regions[idx].ptr = new_ptr;
+        inner.regions[idx].bytes = new_bytes;
+        inner.in_use = inner.in_use - old + new_bytes;
+        Ok(Region {
+            pool_id: self.pool_id,
+            tag,
+            offset: 0,
+            bytes: new_bytes,
+            ptr: new_ptr,
+        })
+    }
+
+    fn free_region(&self, region: Region) -> Result<(), Error> {
+        if region.pool_id != self.pool_id {
+            return Err(Error::InvalidArgument("region from another pool".into()));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let idx = inner
+            .regions
+            .iter()
+            .position(|r| r.ptr == region.ptr)
+            .ok_or_else(|| Error::Memory("region is not live".into()))?;
+        let entry = inner.regions.remove(idx);
+        hip::free(&self.hip, entry.ptr as *mut core::ffi::c_void)?;
+        inner.in_use = inner.in_use.saturating_sub(entry.bytes);
+        Ok(())
+    }
+
+    fn shrink_to(&self, budget: usize) -> Result<usize, Error> {
+        let inner = self.inner.lock().unwrap();
+        let committed = inner.in_use;
+        if committed <= budget {
+            return Ok(0);
+        }
+        Err(Error::Memory(format!(
+            "pool uses {committed} live bytes > budget {budget} (shrink/free regions first)"
+        )))
+    }
+
+    fn committed_bytes(&self) -> usize {
+        self.inner.lock().unwrap().in_use
+    }
+
+    fn region_by_tag(&self, tag: &Tag) -> Option<Region> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .regions
+            .iter()
+            .find(|r| &r.tag == tag)
+            .map(|r| Region {
+                pool_id: self.pool_id,
+                tag: r.tag.clone(),
+                offset: 0,
+                bytes: r.bytes,
+                ptr: r.ptr,
+            })
     }
 }
 
@@ -510,5 +634,139 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let graph = cap.end().unwrap();
         drop(graph);
         cap.prepare().unwrap();
+    }
+
+    fn write_region(h: &hip::Hip, r: Region, data: &[u8]) {
+        assert!(data.len() <= r.bytes);
+        hip::memcpy(
+            h,
+            r.ptr as *mut core::ffi::c_void,
+            data.as_ptr() as *const core::ffi::c_void,
+            data.len(),
+            HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+    }
+
+    fn read_region(h: &hip::Hip, r: Region) -> Vec<u8> {
+        let mut out = vec![0u8; r.bytes];
+        hip::memcpy(
+            h,
+            out.as_mut_ptr() as *mut core::ffi::c_void,
+            r.ptr as *const core::ffi::c_void,
+            out.len(),
+            HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        out
+    }
+
+    fn pattern(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
+    /// HIP elastic memory: simulated VRAM crash (显存骤降). A background
+    /// renderer/game eats VRAM, the expert cache and KV regions shrink, and the
+    /// pool must never OOM — the service degrades smoothly and keeps serving.
+    #[ignore = "GPU (opt-in: -- --ignored --test-threads=1)"]
+    #[test]
+    fn hip_region_shrink_to_under_pressure_no_oom() {
+        let Some(c) = ctx() else { return };
+        let h = &c.hip;
+        let pool = HipMemoryPool::new(std::sync::Arc::clone(h));
+        let exp = pool
+            .allocate_region(Tag::expert_cache(), 1 << 20, 64)
+            .unwrap();
+        let kv = pool.allocate_region(Tag::kv(), 1 << 20, 64).unwrap();
+        let pe = pattern(7, 1 << 20);
+        let pk = pattern(9, 1 << 20);
+        write_region(h, exp.clone(), &pe);
+        write_region(h, kv.clone(), &pk);
+
+        // External pressure: a hard budget below the current 2 MiB footprint.
+        let budget = 512 << 10;
+        let err = pool.shrink_to(budget).unwrap_err();
+        assert!(
+            err.to_string().contains("live bytes"),
+            "shrink above live bytes must fail with a degradable error: {err}"
+        );
+
+        // Smooth degradation: evict experts to host + trim KV, then re-shrink.
+        let exp_s = pool.resize_region(exp.clone(), 256 << 10).unwrap();
+        let kv_s = pool.resize_region(kv.clone(), 256 << 10).unwrap();
+        let d = read_region(h, exp_s.clone());
+        assert_eq!(
+            &d[..256 << 10],
+            &pe[..256 << 10],
+            "evicted expert region keeps its resident prefix"
+        );
+        let d = read_region(h, kv_s.clone());
+        assert_eq!(
+            &d[..256 << 10],
+            &pk[..256 << 10],
+            "trimmed KV region keeps its resident prefix"
+        );
+
+        // HIP regions are independent blocks: the resize already released VRAM
+        // (fresh block + free old), so shrink_to is a budget check under budget.
+        let freed = pool.shrink_to(budget).unwrap();
+        assert!(
+            pool.committed_bytes() <= budget,
+            "committed must fit the budget"
+        );
+        assert_eq!(
+            freed, 0,
+            "HIP shrink_to under budget releases nothing further"
+        );
+        assert_eq!(pool.bytes_in_use(), 512 << 10);
+
+        // Regions survive via tag re-fetch; data prefix intact.
+        let exp_r = pool
+            .region_by_tag(&Tag::expert_cache())
+            .expect("expert live");
+        let kv_r = pool.region_by_tag(&Tag::kv()).expect("kv live");
+        let d = read_region(h, exp_r);
+        assert_eq!(&d[..256 << 10], &pe[..256 << 10]);
+        let d = read_region(h, kv_r);
+        assert_eq!(&d[..256 << 10], &pk[..256 << 10]);
+
+        // Service continues after the squeeze.
+        let scratch = pool.allocate(4096, 8).unwrap();
+        let extra = pool
+            .allocate_region(Tag::new("scratch"), 64 << 10, 8)
+            .unwrap();
+        assert_eq!(pool.bytes_in_use(), (512 << 10) + 4096 + (64 << 10));
+        let _ = (scratch, extra);
+    }
+
+    /// HIP elastic rebalancing: expert cache shrinks, KV grows; the pool hands
+    /// VRAM between the two regions without a restart.
+    #[ignore = "GPU (opt-in: -- --ignored --test-threads=1)"]
+    #[test]
+    fn hip_region_rebalance_hands_memory_to_kv() {
+        let Some(c) = ctx() else { return };
+        let h = &c.hip;
+        let pool = HipMemoryPool::new(std::sync::Arc::clone(h));
+        let exp = pool
+            .allocate_region(Tag::expert_cache(), 512 << 10, 64)
+            .unwrap();
+        let kv = pool.allocate_region(Tag::kv(), 256 << 10, 64).unwrap();
+        let pe = pattern(3, 512 << 10);
+        let pk = pattern(4, 256 << 10);
+        write_region(h, exp.clone(), &pe);
+        write_region(h, kv.clone(), &pk);
+
+        let budget = 768 << 10;
+        let exp2 = pool.resize_region(exp.clone(), 384 << 10).unwrap();
+        let kv2 = pool.resize_region(kv.clone(), 384 << 10).unwrap();
+        let d = read_region(h, exp2.clone());
+        assert_eq!(&d[..384 << 10], &pe[..384 << 10]);
+        let d = read_region(h, kv2.clone());
+        assert_eq!(&d[..256 << 10], &pk[..], "kv keeps its original prefix");
+
+        assert_eq!(pool.bytes_in_use(), budget);
+        pool.shrink_to(budget).unwrap();
+        assert!(pool.committed_bytes() <= budget);
+        let _ = (exp2, kv2);
     }
 }

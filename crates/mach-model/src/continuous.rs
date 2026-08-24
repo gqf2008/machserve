@@ -12,6 +12,7 @@
 
 use crate::batched::BatchedModel;
 use crate::sampling::SamplingParams;
+use crate::state_reuse::{ReuseStats, StateReuse};
 use crate::{Config, Error, Weights};
 use mach_kernel_sys::hip::Hip;
 use std::collections::{HashMap, VecDeque};
@@ -36,6 +37,8 @@ struct SeqState {
     prompt: VecDeque<u32>,
     /// Generated tokens so far.
     generated: Vec<u32>,
+    /// Full token stream (prompt + generated) for anchor saving.
+    all_tokens: Vec<u32>,
     /// Maximum generated tokens.
     max_new: usize,
     /// Per-sequence sampling configuration (seed advances every step).
@@ -81,6 +84,9 @@ pub struct ContinuousModel {
     /// Finished sequences' outputs, keyed by stable id.
     finished: Vec<FinishedSeq>,
     next_id: SeqId,
+    /// Agentic state reuse (opt-in): auto-saves anchors on finish and restores
+    /// matching prefixes on add (incremental prefill).
+    state_reuse: Option<StateReuse>,
 }
 
 unsafe impl Send for ContinuousModel {}
@@ -109,6 +115,7 @@ impl ContinuousModel {
             active: 0,
             finished: Vec::new(),
             next_id: 1,
+            state_reuse: None,
         })
     }
 
@@ -138,8 +145,26 @@ impl ContinuousModel {
             active: 0,
             finished: Vec::new(),
             next_id: 1,
+            state_reuse: None,
         })
     }
+
+    /// Builds a continuous-batching engine in agentic state-reuse mode: every
+    /// finished sequence leaves a token-boundary anchor, and a later sequence
+    /// sharing that prefix restores it and prefills only the delta (multi-turn
+    /// TTFT reduction). Existing constructors keep their exact behavior.
+    pub fn with_state_reuse(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        capacity: usize,
+        state_reuse: StateReuse,
+    ) -> Result<Self, Error> {
+        let mut m = Self::with_prefill_rows(hip, cfg, w, capacity, capacity)?;
+        m.state_reuse = Some(state_reuse);
+        Ok(m)
+    }
+
     /// Maximum concurrent sequences.
     #[must_use]
     pub const fn capacity(&self) -> usize {
@@ -150,6 +175,18 @@ impl ContinuousModel {
     #[must_use]
     pub const fn active(&self) -> usize {
         self.active
+    }
+
+    /// State-reuse statistics when reuse mode is enabled, else `None`.
+    #[must_use]
+    pub fn reuse_stats(&self) -> Option<ReuseStats> {
+        self.state_reuse.as_ref().map(StateReuse::stats)
+    }
+
+    /// Number of anchors currently held (reuse mode only).
+    #[must_use]
+    pub fn anchors_len(&self) -> Option<usize> {
+        self.state_reuse.as_ref().map(|sr| sr.store().len())
     }
 
     /// Adds a sequence; returns its stable id.
@@ -176,10 +213,28 @@ impl ContinuousModel {
         let id = self.next_id;
         self.next_id += 1;
         let slot = self.active;
+        // State reuse: restore the longest matching prefix anchor and prefill
+        // only the delta (incremental prefill).
+        let mut len = 0usize;
+        let mut pending: VecDeque<u32> = prompt.iter().copied().collect();
+        if let Some(sr) = &mut self.state_reuse
+            && let Some(reused) = sr.find_reusable(prompt)
+        {
+            let anchor = sr
+                .store()
+                .get(reused.anchor_id)
+                .expect("matched anchor must be present");
+            self.model
+                .restore_anchor(slot, anchor)
+                .map_err(|e| Error::Model(format!("state-reuse restore failed: {e}")))?;
+            len = reused.prefix_len;
+            pending = prompt[reused.prefix_len..].iter().copied().collect();
+        }
         self.seqs[slot] = Some(SeqState {
             id,
-            prompt: prompt.iter().copied().collect(),
+            prompt: pending,
             generated: Vec::new(),
+            all_tokens: prompt.to_vec(),
             max_new,
             eos,
             stop_seqs,
@@ -188,7 +243,7 @@ impl ContinuousModel {
             counts: HashMap::new(),
             logit_bias,
             params,
-            len: 0,
+            len,
             first_decode: None,
         });
         self.active += 1;
@@ -283,6 +338,7 @@ impl ContinuousModel {
                 s.len += count;
                 if s.prompt.is_empty() {
                     s.generated.push(last_out);
+                    s.all_tokens.push(last_out);
                     s.logprobs.push(logprobs[start + count - 1]);
                     s.top_logprobs.push(topk[start + count - 1].clone());
                     *s.counts.entry(last_out).or_insert(0) += 1;
@@ -298,6 +354,7 @@ impl ContinuousModel {
             } else {
                 let out = sampled[start];
                 s.generated.push(out);
+                s.all_tokens.push(out);
                 s.logprobs.push(logprobs[start]);
                 s.top_logprobs.push(topk[start].clone());
                 *s.counts.entry(out).or_insert(0) += 1;
@@ -396,6 +453,17 @@ impl ContinuousModel {
 
     fn finish(&mut self, slot: usize) {
         assert!(slot < self.active, "finish out of range");
+        // State-reuse mode: leave a token-boundary anchor at the sequence end
+        // so a later turn sharing this prefix skips it (incremental prefill).
+        if let Some(sr) = &mut self.state_reuse
+            && let Some(s) = self.seqs[slot].as_ref()
+            && !s.all_tokens.is_empty()
+            && let Ok(anchor) = self
+                .model
+                .save_anchor(slot, &s.all_tokens, s.all_tokens.len() - 1)
+        {
+            sr.insert_anchor(anchor);
+        }
         let (id, generated, logprobs, top_logprobs, stopped) = {
             let s = self.seqs[slot].as_ref().expect("active slot");
             let stopped = s.generated.last().is_some_and(|&t| s.eos == Some(t))
