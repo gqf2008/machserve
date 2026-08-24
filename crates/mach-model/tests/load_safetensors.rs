@@ -115,21 +115,24 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
             t.push((p("self_attn.o_proj.weight"), lw.wo.clone(), vec![d, nq]));
         }
         t.push((p("input_layernorm.weight"), lw.rms_attn.clone(), vec![d]));
-        t.push((
-            p("mlp.gate_proj.weight"),
-            lw.wg.clone(),
-            vec![cfg.intermediate_size, d],
-        ));
-        t.push((
-            p("mlp.up_proj.weight"),
-            lw.wu.clone(),
-            vec![cfg.intermediate_size, d],
-        ));
-        t.push((
-            p("mlp.down_proj.weight"),
-            lw.wd.clone(),
-            vec![d, cfg.intermediate_size],
-        ));
+        if cfg.num_experts == 0 {
+            // MoE layers have no dense MLP tensors (expert tensors replace them).
+            t.push((
+                p("mlp.gate_proj.weight"),
+                lw.wg.clone(),
+                vec![cfg.intermediate_size, d],
+            ));
+            t.push((
+                p("mlp.up_proj.weight"),
+                lw.wu.clone(),
+                vec![cfg.intermediate_size, d],
+            ));
+            t.push((
+                p("mlp.down_proj.weight"),
+                lw.wd.clone(),
+                vec![d, cfg.intermediate_size],
+            ));
+        }
         t.push((
             p("post_attention_layernorm.weight"),
             lw.rms_mlp.clone(),
@@ -154,6 +157,7 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "max_abs_diff: length mismatch");
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
@@ -223,10 +227,10 @@ fn roundtrip_moe_load_matches_original_weights() {
         assert_eq!(max_abs_diff(&a.moe_wg, &b.moe_wg), 0.0, "layer {li} moe_wg");
         assert_eq!(max_abs_diff(&a.moe_wu, &b.moe_wu), 0.0, "layer {li} moe_wu");
         assert_eq!(max_abs_diff(&a.moe_wd, &b.moe_wd), 0.0, "layer {li} moe_wd");
-        // Dense fields must still round-trip under a MoE config (loader reads them too).
-        assert_eq!(max_abs_diff(&a.wg, &b.wg), 0.0, "layer {li} dense wg");
-        assert_eq!(max_abs_diff(&a.wu, &b.wu), 0.0, "layer {li} dense wu");
-        assert_eq!(max_abs_diff(&a.wd, &b.wd), 0.0, "layer {li} dense wd");
+        // MoE layers carry no dense MLP weights (expert tensors replace them).
+        assert!(a.wg.is_empty(), "layer {li} dense wg must be empty for MoE");
+        assert!(a.wu.is_empty(), "layer {li} dense wu must be empty for MoE");
+        assert!(a.wd.is_empty(), "layer {li} dense wd must be empty for MoE");
     }
     let _ = std::fs::remove_file(&path);
 }
