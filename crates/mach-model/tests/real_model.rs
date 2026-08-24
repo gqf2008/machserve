@@ -18,7 +18,6 @@ use mach_model::loader::load_safetensors;
 use mach_model::model::GpuModel;
 use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
-use std::path::PathBuf;
 
 #[test]
 fn real_model_decodes_finite_and_deterministic() {

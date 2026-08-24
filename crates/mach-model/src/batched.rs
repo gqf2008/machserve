@@ -9,6 +9,7 @@
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
+use crate::moe_offload;
 use crate::sampling::{BatchedSampler, SampleOutput, SamplingParams};
 use crate::{Config, Error, Weights};
 use mach_kernel_sys::hip::{self, Hip};
@@ -136,6 +137,10 @@ pub struct BatchedModel {
     lens: Vec<u32>,
     allocs: Vec<*mut core::ffi::c_void>,
     host_pins: Vec<*mut core::ffi::c_void>,
+    /// MoE offload: CPU-backend mode (experts stay in host RAM) when < num_experts.
+    expert_slots: usize,
+    /// Host weight copy for the CPU MoE compute (offload mode).
+    host_w: Option<Arc<Weights>>,
 }
 
 impl BatchedModel {
@@ -152,6 +157,33 @@ impl BatchedModel {
         w: &Weights,
         slots: usize,
         rows: usize,
+    ) -> Result<Self, Error> {
+        Self::build(hip, cfg, w, slots, rows, usize::MAX)
+    }
+
+    /// Builds a batched model in MoE offload mode: experts stay in host RAM and the
+    /// MoE layer is computed on the CPU (FreeToken cpu backend), so GPU memory is
+    /// bounded regardless of the expert count. GPU-slot fast path is a follow-up.
+    pub fn with_expert_slots(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        slots: usize,
+        rows: usize,
+        expert_slots: usize,
+    ) -> Result<Self, Error> {
+        let mut m = Self::build(hip, cfg, w, slots, rows, expert_slots)?;
+        m.host_w = Some(Arc::new(w.clone()));
+        Ok(m)
+    }
+
+    fn build(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        slots: usize,
+        rows: usize,
+        expert_slots: usize,
     ) -> Result<Self, Error> {
         assert!(slots >= 1, "slots must be >= 1");
         assert!(rows >= slots, "rows must be >= slots");
@@ -217,12 +249,90 @@ impl BatchedModel {
             lens: vec![0; slots],
             allocs: Vec::new(),
             host_pins: Vec::new(),
+            expert_slots,
+            host_w: None,
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
         Ok(m)
     }
 
+    /// CPU-backend MoE offload for the batch: experts live in host RAM and the MoE
+    /// layer is computed on the CPU from the host weights (FreeToken `cpu` backend).
+    /// The router still runs on the GPU (moe_router is uploaded); the grouped-GEMM
+    /// path is bypassed, so GPU memory is bounded by the router, not the experts.
+    /// Pending stable-GPU parity; the GPU-slot fast path is a follow-up.
+    fn forward_moe_cpu_batched(
+        &self,
+        li: usize,
+        _ne: i32,
+        topk: i32,
+        b: i32,
+        d: i32,
+        inter: i32,
+    ) -> Result<(), Error> {
+        self.k.sync()?;
+        let n_entries = (b * topk) as usize;
+        let mut ids = vec![0i32; n_entries];
+        let mut weights = vec![0.0f32; n_entries];
+        hip::memcpy(
+            self.k.hip(),
+            ids.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_ids as *const core::ffi::c_void,
+            n_entries * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        hip::memcpy(
+            self.k.hip(),
+            weights.as_mut_ptr() as *mut core::ffi::c_void,
+            self.exp_w as *const core::ffi::c_void,
+            n_entries * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        let (b_us, d_us, inter_us, topk_us) =
+            (b as usize, d as usize, inter as usize, topk as usize);
+        let mut xn2 = vec![0.0f32; b_us * d_us];
+        hip::memcpy(
+            self.k.hip(),
+            xn2.as_mut_ptr() as *mut core::ffi::c_void,
+            self.xn2 as *const core::ffi::c_void,
+            xn2.len() * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        let host_w = self
+            .host_w
+            .as_ref()
+            .ok_or_else(|| Error::Model("cpu-backend offload requires host weights".into()))?;
+        let lw_h = &host_w.layers[li];
+        let mut residual = vec![0.0f32; b_us * d_us];
+        for t in 0..b_us {
+            let row = &xn2[t * d_us..(t + 1) * d_us];
+            for j in 0..topk_us {
+                let e = ids[t * topk_us + j] as usize;
+                let w = weights[t * topk_us + j];
+                let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
+                let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
+                let down = moe_offload::expert_mlp(row, wg, wu, wd, inter_us, d_us);
+                for kk in 0..d_us {
+                    residual[t * d_us + kk] += w * down[kk];
+                }
+            }
+        }
+        let mut x = vec![0.0f32; b_us * d_us];
+        hip::memcpy(
+            self.k.hip(),
+            x.as_mut_ptr() as *mut core::ffi::c_void,
+            self.x as *const core::ffi::c_void,
+            x.len() * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        for i in 0..x.len() {
+            x[i] += residual[i];
+        }
+        self.upload(self.x, &x)?;
+        Ok(())
+    }
     fn dalloc(&mut self, bytes: usize) -> Result<*mut f32, Error> {
         let p = hip::malloc(self.k.hip(), bytes)?;
         self.allocs.push(p);
@@ -442,21 +552,21 @@ impl BatchedModel {
                     self.upload(p, &lw.moe_router)?;
                     p
                 },
-                moe_wg: if lw.moe_wg.is_empty() {
+                moe_wg: if lw.moe_wg.is_empty() || self.expert_slots < c.num_experts {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.moe_wg.len() * 4)?;
                     self.upload(p, &lw.moe_wg)?;
                     p
                 },
-                moe_wu: if lw.moe_wu.is_empty() {
+                moe_wu: if lw.moe_wu.is_empty() || self.expert_slots < c.num_experts {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.moe_wu.len() * 4)?;
                     self.upload(p, &lw.moe_wu)?;
                     p
                 },
-                moe_wd: if lw.moe_wd.is_empty() {
+                moe_wd: if lw.moe_wd.is_empty() || self.expert_slots < c.num_experts {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.moe_wd.len() * 4)?;
@@ -478,9 +588,21 @@ impl BatchedModel {
                     wu: self.alloc_f16(lw.wu.len())?,
                     wd: self.alloc_f16(lw.wd.len())?,
                     moe_router: self.alloc_f16(lw.moe_router.len())?,
-                    moe_wg: self.alloc_f16(lw.moe_wg.len())?,
-                    moe_wu: self.alloc_f16(lw.moe_wu.len())?,
-                    moe_wd: self.alloc_f16(lw.moe_wd.len())?,
+                    moe_wg: if self.expert_slots < c.num_experts {
+                        std::ptr::null_mut()
+                    } else {
+                        self.alloc_f16(lw.moe_wg.len())?
+                    },
+                    moe_wu: if self.expert_slots < c.num_experts {
+                        std::ptr::null_mut()
+                    } else {
+                        self.alloc_f16(lw.moe_wu.len())?
+                    },
+                    moe_wd: if self.expert_slots < c.num_experts {
+                        std::ptr::null_mut()
+                    } else {
+                        self.alloc_f16(lw.moe_wd.len())?
+                    },
                 };
                 self.upload_f16(l16.wq, &lw.wq)?;
                 self.upload_f16(l16.wk, &lw.wk)?;
@@ -490,9 +612,11 @@ impl BatchedModel {
                 self.upload_f16(l16.wu, &lw.wu)?;
                 self.upload_f16(l16.wd, &lw.wd)?;
                 self.upload_f16(l16.moe_router, &lw.moe_router)?;
-                self.upload_f16(l16.moe_wg, &lw.moe_wg)?;
-                self.upload_f16(l16.moe_wu, &lw.moe_wu)?;
-                self.upload_f16(l16.moe_wd, &lw.moe_wd)?;
+                if self.expert_slots >= c.num_experts {
+                    self.upload_f16(l16.moe_wg, &lw.moe_wg)?;
+                    self.upload_f16(l16.moe_wu, &lw.moe_wu)?;
+                    self.upload_f16(l16.moe_wd, &lw.moe_wd)?;
+                }
                 self.layers_f16.push(l16);
             }
         }
@@ -826,135 +950,144 @@ impl BatchedModel {
                         topk,
                         b,
                     )?;
-                    // Count routed (token, slot) pairs per expert on device.
-                    unsafe {
-                        hip::check(
-                            self.k.hip(),
-                            (self.k.hip().api.hip_memset)(
-                                self.counts_dev as *mut _,
-                                0,
-                                (ne as usize) * 4,
-                            ),
-                        )?;
-                        hip::check(
-                            self.k.hip(),
-                            (self.k.hip().api.hip_memset)(
-                                self.moe_pos_dev as *mut _,
-                                0,
-                                (ne as usize) * 4,
-                            ),
-                        )?;
-                    }
-                    k.launch_moe_count_experts(self.exp_ids, self.counts_dev, b, topk)?;
-                    // GPU-side exclusive prefix sum -> gather offsets. The
-                    // per-expert counts are still read back once per layer for
-                    // the host GEMM loop (hipBLAS batch counts are host-side);
-                    // the gather itself no longer needs a host round-trip.
-                    k.launch_moe_prefix_sum(self.counts_dev, self.offsets_dev, ne)?;
-                    hip::memcpy_async(
-                        self.k.hip(),
-                        self.counts_host as *mut core::ffi::c_void,
-                        self.counts_dev as *const core::ffi::c_void,
-                        (ne as usize) * 4,
-                        hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                        self.k.stream,
-                    )?;
-                    k.launch_moe_gather_rows(
-                        self.xn2,
-                        self.exp_ids,
-                        self.exp_w,
-                        self.offsets_dev,
-                        self.moe_pos_dev,
-                        self.xg,
-                        self.gw,
-                        self.row_idx,
-                        b,
-                        topk,
-                        d,
-                    )?;
-                    // Make the async counts readback visible to the host loop.
-                    self.k.sync()?;
-                    let counts: Vec<i32> = (0..ne)
-                        .map(|e| unsafe { *self.counts_host.add(e as usize) })
-                        .collect();
-                    unsafe {
-                        hip::check(
-                            self.k.hip(),
-                            (self.k.hip().api.hip_memset)(
-                                self.h_acc as *mut _,
-                                0,
-                                (b as usize) * (d as usize) * 4,
-                            ),
-                        )?;
-                    }
-                    // Per-expert grouped GEMMs (counts known on host after the
-                    // single D2H read; no per-expert sync). The running base
-                    // mirrors the device prefix-sum output.
-                    let d_usize = d as usize;
-                    let inter_usize = inter as usize;
-                    let mut base = 0usize;
-                    for (e, &cnt) in counts.iter().enumerate() {
-                        let base_e = base;
-                        base += cnt as usize;
-                        if cnt <= 0 {
-                            continue;
+                    if self.expert_slots < ne as usize {
+                        self.forward_moe_cpu_batched(li, ne, topk, b, d, inter)?;
+                    } else {
+                        // Count routed (token, slot) pairs per expert on device.
+                        unsafe {
+                            hip::check(
+                                self.k.hip(),
+                                (self.k.hip().api.hip_memset)(
+                                    self.counts_dev as *mut _,
+                                    0,
+                                    (ne as usize) * 4,
+                                ),
+                            )?;
+                            hip::check(
+                                self.k.hip(),
+                                (self.k.hip().api.hip_memset)(
+                                    self.moe_pos_dev as *mut _,
+                                    0,
+                                    (ne as usize) * 4,
+                                ),
+                            )?;
                         }
-                        let base = base_e;
-                        let xg_e = unsafe { self.xg.add(base * d_usize) };
-                        let down_e = unsafe { self.down_all.add(base * d_usize) };
-                        let wg32 = unsafe { lw.moe_wg.add(e * inter_usize * d_usize) };
-                        let wu32 = unsafe { lw.moe_wu.add(e * inter_usize * d_usize) };
-                        let wd32 = unsafe { lw.moe_wd.add(e * d_usize * inter_usize) };
-                        let (wg16, wu16, wd16) = if f16 {
-                            let l = self.layers_f16[li];
-                            (
-                                unsafe { l.moe_wg.add(e * inter_usize * d_usize) },
-                                unsafe { l.moe_wu.add(e * inter_usize * d_usize) },
-                                unsafe { l.moe_wd.add(e * d_usize * inter_usize) },
-                            )
-                        } else {
-                            (
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                            )
-                        };
-                        let gemm_e = |out: *mut f32,
-                                      x: *const f32,
-                                      w32: *mut f32,
-                                      w16: *mut u16,
-                                      n: i32,
-                                      kk: i32|
-                         -> Result<(), Error> {
-                            if f16 {
-                                k.gemm_batched_f16(
-                                    out,
-                                    x,
-                                    w16,
-                                    cnt,
-                                    n,
-                                    kk,
-                                    self.xh_moe,
-                                    self.yh_moe,
-                                )
-                            } else {
-                                k.gemm_batched(out, x, w32, cnt, n, kk)
-                            }
-                        };
-                        gemm_e(self.gate_all, xg_e, wg32, wg16, inter, d)?;
-                        gemm_e(self.up_all, xg_e, wu32, wu16, inter, d)?;
-                        k.launch_silu_mul(self.up_all, self.gate_all, self.eh_all, cnt * inter)?;
-                        gemm_e(down_e, self.eh_all, wd32, wd16, d, inter)?;
-                        k.launch_moe_scatter_add(
-                            self.h_acc,
-                            unsafe { self.row_idx.add(base) },
-                            unsafe { self.gw.add(base) },
-                            down_e,
-                            cnt,
+                        k.launch_moe_count_experts(self.exp_ids, self.counts_dev, b, topk)?;
+                        // GPU-side exclusive prefix sum -> gather offsets. The
+                        // per-expert counts are still read back once per layer for
+                        // the host GEMM loop (hipBLAS batch counts are host-side);
+                        // the gather itself no longer needs a host round-trip.
+                        k.launch_moe_prefix_sum(self.counts_dev, self.offsets_dev, ne)?;
+                        hip::memcpy_async(
+                            self.k.hip(),
+                            self.counts_host as *mut core::ffi::c_void,
+                            self.counts_dev as *const core::ffi::c_void,
+                            (ne as usize) * 4,
+                            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                            self.k.stream,
+                        )?;
+                        k.launch_moe_gather_rows(
+                            self.xn2,
+                            self.exp_ids,
+                            self.exp_w,
+                            self.offsets_dev,
+                            self.moe_pos_dev,
+                            self.xg,
+                            self.gw,
+                            self.row_idx,
+                            b,
+                            topk,
                             d,
                         )?;
+                        // Make the async counts readback visible to the host loop.
+                        self.k.sync()?;
+                        let counts: Vec<i32> = (0..ne)
+                            .map(|e| unsafe { *self.counts_host.add(e as usize) })
+                            .collect();
+                        unsafe {
+                            hip::check(
+                                self.k.hip(),
+                                (self.k.hip().api.hip_memset)(
+                                    self.h_acc as *mut _,
+                                    0,
+                                    (b as usize) * (d as usize) * 4,
+                                ),
+                            )?;
+                        }
+                        // Per-expert grouped GEMMs (counts known on host after the
+                        // single D2H read; no per-expert sync). The running base
+                        // mirrors the device prefix-sum output.
+                        let d_usize = d as usize;
+                        let inter_usize = inter as usize;
+                        let mut base = 0usize;
+                        for (e, &cnt) in counts.iter().enumerate() {
+                            let base_e = base;
+                            base += cnt as usize;
+                            if cnt <= 0 {
+                                continue;
+                            }
+                            let base = base_e;
+                            let xg_e = unsafe { self.xg.add(base * d_usize) };
+                            let down_e = unsafe { self.down_all.add(base * d_usize) };
+                            let wg32 = unsafe { lw.moe_wg.add(e * inter_usize * d_usize) };
+                            let wu32 = unsafe { lw.moe_wu.add(e * inter_usize * d_usize) };
+                            let wd32 = unsafe { lw.moe_wd.add(e * d_usize * inter_usize) };
+                            let (wg16, wu16, wd16) = if f16 {
+                                let l = self.layers_f16[li];
+                                (
+                                    unsafe { l.moe_wg.add(e * inter_usize * d_usize) },
+                                    unsafe { l.moe_wu.add(e * inter_usize * d_usize) },
+                                    unsafe { l.moe_wd.add(e * d_usize * inter_usize) },
+                                )
+                            } else {
+                                (
+                                    std::ptr::null_mut(),
+                                    std::ptr::null_mut(),
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            let gemm_e = |out: *mut f32,
+                                          x: *const f32,
+                                          w32: *mut f32,
+                                          w16: *mut u16,
+                                          n: i32,
+                                          kk: i32|
+                             -> Result<(), Error> {
+                                if f16 {
+                                    k.gemm_batched_f16(
+                                        out,
+                                        x,
+                                        w16,
+                                        cnt,
+                                        n,
+                                        kk,
+                                        self.xh_moe,
+                                        self.yh_moe,
+                                    )
+                                } else {
+                                    k.gemm_batched(out, x, w32, cnt, n, kk)
+                                }
+                            };
+                            gemm_e(self.gate_all, xg_e, wg32, wg16, inter, d)?;
+                            gemm_e(self.up_all, xg_e, wu32, wu16, inter, d)?;
+                            k.launch_silu_mul(
+                                self.up_all,
+                                self.gate_all,
+                                self.eh_all,
+                                cnt * inter,
+                            )?;
+                            gemm_e(down_e, self.eh_all, wd32, wd16, d, inter)?;
+                            k.launch_moe_scatter_add(
+                                self.h_acc,
+                                unsafe { self.row_idx.add(base) },
+                                unsafe { self.gw.add(base) },
+                                down_e,
+                                cnt,
+                                d,
+                            )?;
+                        }
+                        k.launch_add(self.x, self.h_acc, b * d)?;
                     }
-                    k.launch_add(self.x, self.h_acc, b * d)?;
                 }
                 // topk == 0: MoE contributes nothing (matches ref_model).
             } else {
