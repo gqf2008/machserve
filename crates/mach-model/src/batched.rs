@@ -64,6 +64,13 @@ struct LayerDevF16 {
     moe_wg: *mut u16,
     moe_wu: *mut u16,
     moe_wd: *mut u16,
+    /// MLA fp16 (kv_lora_rank > 0): low-rank Q / compressed KV weights.
+    mla_q_a: *mut u16,
+    mla_q_b: *mut u16,
+    mla_q_rope: *mut u16,
+    mla_kv_a: *mut u16,
+    mla_kv_b: *mut u16,
+    mla_o: *mut u16,
 }
 
 /// Multi-sequence transformer on the GPU.
@@ -496,7 +503,7 @@ impl BatchedModel {
                     self.upload(p, &lw.k_norm)?;
                     p
                 },
-                mla_q_a: if lw.mla_q_a.is_empty() {
+                mla_q_a: if f16 || lw.mla_q_a.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.mla_q_a.len() * 4)?;
@@ -510,21 +517,21 @@ impl BatchedModel {
                     self.upload(p, &lw.mla_q_a_norm)?;
                     p
                 },
-                mla_q_b: if lw.mla_q_b.is_empty() {
+                mla_q_b: if f16 || lw.mla_q_b.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.mla_q_b.len() * 4)?;
                     self.upload(p, &lw.mla_q_b)?;
                     p
                 },
-                mla_q_rope: if lw.mla_q_rope.is_empty() {
+                mla_q_rope: if f16 || lw.mla_q_rope.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.mla_q_rope.len() * 4)?;
                     self.upload(p, &lw.mla_q_rope)?;
                     p
                 },
-                mla_kv_a: if lw.mla_kv_a.is_empty() {
+                mla_kv_a: if f16 || lw.mla_kv_a.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.mla_kv_a.len() * 4)?;
@@ -538,14 +545,14 @@ impl BatchedModel {
                     self.upload(p, &lw.mla_kv_a_norm)?;
                     p
                 },
-                mla_kv_b: if lw.mla_kv_b.is_empty() {
+                mla_kv_b: if f16 || lw.mla_kv_b.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.mla_kv_b.len() * 4)?;
                     self.upload(p, &lw.mla_kv_b)?;
                     p
                 },
-                mla_o: if lw.mla_o.is_empty() {
+                mla_o: if f16 || lw.mla_o.is_empty() {
                     std::ptr::null_mut()
                 } else {
                     let p = self.dalloc(lw.mla_o.len() * 4)?;
@@ -598,6 +605,12 @@ impl BatchedModel {
                     moe_wg: self.alloc_f16(lw.moe_wg.len())?,
                     moe_wu: self.alloc_f16(lw.moe_wu.len())?,
                     moe_wd: self.alloc_f16(lw.moe_wd.len())?,
+                    mla_q_a: self.alloc_f16(lw.mla_q_a.len())?,
+                    mla_q_b: self.alloc_f16(lw.mla_q_b.len())?,
+                    mla_q_rope: self.alloc_f16(lw.mla_q_rope.len())?,
+                    mla_kv_a: self.alloc_f16(lw.mla_kv_a.len())?,
+                    mla_kv_b: self.alloc_f16(lw.mla_kv_b.len())?,
+                    mla_o: self.alloc_f16(lw.mla_o.len())?,
                 };
                 self.upload_f16(l16.wq, &lw.wq)?;
                 self.upload_f16(l16.wk, &lw.wk)?;
@@ -610,6 +623,12 @@ impl BatchedModel {
                 self.upload_f16(l16.moe_wg, &lw.moe_wg)?;
                 self.upload_f16(l16.moe_wu, &lw.moe_wu)?;
                 self.upload_f16(l16.moe_wd, &lw.moe_wd)?;
+                self.upload_f16(l16.mla_q_a, &lw.mla_q_a)?;
+                self.upload_f16(l16.mla_q_b, &lw.mla_q_b)?;
+                self.upload_f16(l16.mla_q_rope, &lw.mla_q_rope)?;
+                self.upload_f16(l16.mla_kv_a, &lw.mla_kv_a)?;
+                self.upload_f16(l16.mla_kv_b, &lw.mla_kv_b)?;
+                self.upload_f16(l16.mla_o, &lw.mla_o)?;
                 self.layers_f16.push(l16);
             }
         }
@@ -785,7 +804,14 @@ impl BatchedModel {
                 let kvlr = c.kv_lora_rank as i32;
                 let max_seq = c.max_seq_len as i32;
                 // q_lora = q_a(xn); rms; q_nope = q_b(q_lora).
-                k.gemm_batched(self.mla_q_lora, self.xn, lw.mla_q_a, b, qlr, d)?;
+                gemm(
+                    self.mla_q_lora,
+                    self.xn,
+                    lw.mla_q_a,
+                    l16.map_or(std::ptr::null_mut(), |l| l.mla_q_a),
+                    qlr,
+                    d,
+                )?;
                 k.launch_rms_norm(
                     self.mla_q_lora,
                     lw.mla_q_a_norm,
@@ -794,16 +820,23 @@ impl BatchedModel {
                     qlr,
                     c.rms_eps,
                 )?;
-                k.gemm_batched(
+                gemm(
                     self.q_nope,
                     self.mla_q_lora_n,
                     lw.mla_q_b,
-                    b,
+                    l16.map_or(std::ptr::null_mut(), |l| l.mla_q_b),
                     heads * nope,
                     qlr,
                 )?;
                 // q_rope = q_rope_proj(xn) + RoPE (k_buf is scratch here).
-                k.gemm_batched(self.q_rope, self.xn, lw.mla_q_rope, b, heads * rope, d)?;
+                gemm(
+                    self.q_rope,
+                    self.xn,
+                    lw.mla_q_rope,
+                    l16.map_or(std::ptr::null_mut(), |l| l.mla_q_rope),
+                    heads * rope,
+                    d,
+                )?;
                 k.launch_rope_batched(
                     self.q_rope,
                     self.k_buf,
@@ -817,7 +850,14 @@ impl BatchedModel {
                 // compressed_kv = kv_a(xn); latent is followed by k_rope in
                 // kv_a, so extract it to a contiguous buffer before the RMSNorm
                 // (rms_norm assumes row stride == cols); shared k_rope + RoPE.
-                k.gemm_batched(self.mla_kv_a, self.xn, lw.mla_kv_a, b, kvlr + rope, d)?;
+                gemm(
+                    self.mla_kv_a,
+                    self.xn,
+                    lw.mla_kv_a,
+                    l16.map_or(std::ptr::null_mut(), |l| l.mla_kv_a),
+                    kvlr + rope,
+                    d,
+                )?;
                 k.launch_mla_extract_kv_lora(self.mla_kv_a, self.mla_kv_lora, b, kvlr, rope)?;
                 k.launch_rms_norm(
                     self.mla_kv_lora,
@@ -839,11 +879,11 @@ impl BatchedModel {
                     c.rope_theta,
                 )?;
                 // kv = kv_b_proj(latent): [batch, heads*(nope + v_hd)].
-                k.gemm_batched(
+                gemm(
                     self.mla_kv,
                     self.mla_kv_a_n,
                     lw.mla_kv_b,
-                    b,
+                    l16.map_or(std::ptr::null_mut(), |l| l.mla_kv_b),
                     heads * (nope + v_hd),
                     kvlr,
                 )?;
@@ -887,7 +927,14 @@ impl BatchedModel {
                     scale,
                     max_seq,
                 )?;
-                k.gemm_batched(self.proj, self.mla_attn, lw.mla_o, b, d, heads * v_hd)?;
+                gemm(
+                    self.proj,
+                    self.mla_attn,
+                    lw.mla_o,
+                    l16.map_or(std::ptr::null_mut(), |l| l.mla_o),
+                    d,
+                    heads * v_hd,
+                )?;
                 k.launch_add(self.x, self.proj, b * d)?;
             } else {
                 gemm(
