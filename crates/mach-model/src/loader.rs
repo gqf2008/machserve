@@ -5,6 +5,8 @@
 //! names onto the slice [`Weights`] layout. F32/F16/BF16 tensors are loaded
 //! and converted to f32.
 
+use crate::q4::Q4Tensor;
+use crate::weights::{LayerWeightsQ4, WeightsQ4};
 use crate::{Config, Error, LayerWeights, Weights};
 use std::collections::HashMap;
 use std::path::Path;
@@ -168,12 +170,17 @@ pub fn load_safetensors_dir(
     cfg: &Config,
     tie_embeddings: bool,
 ) -> Result<Weights, Error> {
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
-        .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
+    // Accept either a single .safetensors file or a directory of shards.
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
     files.sort();
     if files.is_empty() {
         return Err(Error::Model(format!("no .safetensors files in {path:?}")));
@@ -405,4 +412,282 @@ fn build_weights(
         lm_head,
         layers,
     })
+}
+
+/// Loads a checkpoint into storage-Q4 form, streaming shards one at a time so
+/// host memory stays ~= the packed Q4 weights + one shard of raw bytes (8B
+/// model: ~5GB instead of ~48GB for the f32 path).
+///
+/// Every GEMM weight is quantized to int4 as it is read and the raw shard
+/// bytes are dropped before the next shard. Norms and biases stay f32.
+pub fn load_safetensors_q4(
+    path: &Path,
+    cfg: &Config,
+    tie_embeddings: bool,
+) -> Result<WeightsQ4, Error> {
+    let d = cfg.d_model;
+    let nq = cfg.n_heads * cfg.head_dim;
+    let nkv = cfg.n_kv_heads * cfg.head_dim;
+    let inter = cfg.intermediate_size;
+    let einter = cfg.expert_size();
+    let mla = cfg.kv_lora_rank > 0;
+    let ne = cfg.num_experts;
+
+    // GEMM tensors are quantized; small tensors (norms/biases) stay f32.
+    let mut big: HashMap<String, Q4Tensor> = HashMap::new();
+    let mut small: HashMap<String, Vec<f32>> = HashMap::new();
+
+    // Accept either a single .safetensors file or a directory of shards.
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    files.sort();
+    if files.is_empty() {
+        return Err(Error::Model(format!("no .safetensors files in {path:?}")));
+    }
+
+    let mut store_big =
+        |name: &str, t: &RawTensor, data: &[u8], expected: usize| -> Result<(), Error> {
+            let f = tensor_f32(data, t, expected, name)?;
+            big.insert(name.to_string(), Q4Tensor::quantize(&f));
+            Ok(())
+        };
+    let mut store_small =
+        |name: &str, t: &RawTensor, data: &[u8], expected: usize| -> Result<(), Error> {
+            let f = tensor_f32(data, t, expected, name)?;
+            small.insert(name.to_string(), f);
+            Ok(())
+        };
+
+    for file in &files {
+        let (tensors, data) = parse_safetensors(file)?;
+        for (name, t) in &tensors {
+            // Embedding/lm_head are special (tied embeddings); GEMM weights
+            // quantize; anything else (norms/biases) stays f32. Big-vs-small is
+            // decided by whether the name maps to a known GEMM weight.
+            if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
+                store_big(name, t, &data, cfg.vocab_size * d)?;
+            } else if let Some(expected) =
+                expected_q4_size(name, cfg, d, nq, nkv, inter, einter, mla, ne)
+            {
+                store_big(name, t, &data, expected)?;
+            } else {
+                let expected = expected_small_size(name, cfg, d, nq, nkv, mla)
+                    .ok_or_else(|| Error::Model(format!("unexpected tensor {name}")))?;
+                store_small(name, t, &data, expected)?;
+            }
+        }
+        // Drop this shard's raw bytes before reading the next.
+        drop(data);
+    }
+
+    // Assemble per-layer Q4 weights.
+    let mut layers = Vec::with_capacity(cfg.n_layers);
+    for i in 0..cfg.n_layers {
+        let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
+        let is_moe = ne > 0 && big.contains_key(&p("mlp.gate.weight"));
+        let mut lw = LayerWeightsQ4 {
+            wq: if mla {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("self_attn.q_proj.weight")).expect("q_proj")
+            },
+            wk: if mla {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("self_attn.k_proj.weight")).expect("k_proj")
+            },
+            wv: if mla {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("self_attn.v_proj.weight")).expect("v_proj")
+            },
+            wo: if mla {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("self_attn.o_proj.weight")).expect("o_proj")
+            },
+            rms_attn: small
+                .remove(&p("input_layernorm.weight"))
+                .expect("input_layernorm"),
+            wg: if is_moe {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("mlp.gate_proj.weight")).expect("gate_proj")
+            },
+            wu: if is_moe {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("mlp.up_proj.weight")).expect("up_proj")
+            },
+            wd: if is_moe {
+                Q4Tensor::default()
+            } else {
+                big.remove(&p("mlp.down_proj.weight")).expect("down_proj")
+            },
+            rms_mlp: small
+                .remove(&p("post_attention_layernorm.weight"))
+                .expect("post_attention_layernorm"),
+            bq: small
+                .remove(&p("self_attn.q_proj.bias"))
+                .unwrap_or_default(),
+            bk: small
+                .remove(&p("self_attn.k_proj.bias"))
+                .unwrap_or_default(),
+            bv: small
+                .remove(&p("self_attn.v_proj.bias"))
+                .unwrap_or_default(),
+            q_norm: small
+                .remove(&p("self_attn.q_norm.weight"))
+                .unwrap_or_default(),
+            k_norm: small
+                .remove(&p("self_attn.k_norm.weight"))
+                .unwrap_or_default(),
+            mla_q_a: Q4Tensor::default(),
+            mla_q_a_norm: Vec::new(),
+            mla_q_b: Q4Tensor::default(),
+            mla_q_rope: Q4Tensor::default(),
+            mla_kv_a: Q4Tensor::default(),
+            mla_kv_a_norm: Vec::new(),
+            mla_kv_b: Q4Tensor::default(),
+            mla_o: Q4Tensor::default(),
+            moe_router: Q4Tensor::default(),
+            moe_wg: Q4Tensor::default(),
+            moe_wu: Q4Tensor::default(),
+            moe_wd: Q4Tensor::default(),
+        };
+        if is_moe {
+            let ne_i = ne;
+            lw.moe_router = big.remove(&p("mlp.gate.weight")).expect("moe router");
+            for e in 0..ne_i {
+                let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+                // Concatenate per-expert tensors into one Q4 tensor each.
+                lw.moe_wg = concat_q4(
+                    &lw.moe_wg,
+                    &big.remove(&ep("gate_proj.weight")).expect("exp gate"),
+                );
+                lw.moe_wu = concat_q4(
+                    &lw.moe_wu,
+                    &big.remove(&ep("up_proj.weight")).expect("exp up"),
+                );
+                lw.moe_wd = concat_q4(
+                    &lw.moe_wd,
+                    &big.remove(&ep("down_proj.weight")).expect("exp down"),
+                );
+            }
+        }
+        layers.push(lw);
+    }
+
+    let tok_emb = big.remove("model.embed_tokens.weight").expect("tok_emb");
+    let lm_head = match big.remove("lm_head.weight") {
+        Some(t) => t,
+        None if tie_embeddings => tok_emb.clone(),
+        None => {
+            return Err(Error::Model(
+                "lm_head.weight missing and tie_embeddings=false".into(),
+            ));
+        }
+    };
+    Ok(WeightsQ4 {
+        tok_emb,
+        rms_final: small.remove("model.norm.weight").expect("norm"),
+        lm_head,
+        layers,
+    })
+}
+
+/// Expected element count for a quantized (GEMM) weight tensor by name.
+#[allow(clippy::too_many_arguments)]
+fn expected_q4_size(
+    name: &str,
+    cfg: &Config,
+    d: usize,
+    nq: usize,
+    nkv: usize,
+    inter: usize,
+    einter: usize,
+    mla: bool,
+    ne: usize,
+) -> Option<usize> {
+    // Match against the same names build_weights uses. MLA's `o_proj` is a
+    // different shape, so it must be matched before the dense `o_proj`.
+    if mla && name.contains("self_attn.o_proj.weight") {
+        Some(d * cfg.n_heads * cfg.v_head_dim)
+    } else if mla && name.contains("self_attn.q_a_proj.weight") {
+        Some(cfg.q_lora_rank * d)
+    } else if mla && name.contains("self_attn.q_b_proj.weight") {
+        Some(cfg.n_heads * cfg.qk_nope_head_dim * cfg.q_lora_rank)
+    } else if mla && name.contains("self_attn.q_rope_proj.weight") {
+        Some(cfg.n_heads * cfg.qk_rope_head_dim * d)
+    } else if mla && name.contains("self_attn.kv_a_proj_with_mqa.weight") {
+        Some((cfg.kv_lora_rank + cfg.qk_rope_head_dim) * d)
+    } else if mla && name.contains("self_attn.kv_b_proj.weight") {
+        Some(cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim) * cfg.kv_lora_rank)
+    } else if name.contains("self_attn.q_proj.weight") {
+        Some(d * nq)
+    } else if name.contains("self_attn.k_proj.weight") || name.contains("self_attn.v_proj.weight") {
+        Some(d * nkv)
+    } else if name.contains("self_attn.o_proj.weight") {
+        Some(nq * d)
+    } else if name.contains("mlp.gate_proj.weight")
+        || name.contains("mlp.up_proj.weight")
+        || name.contains("mlp.down_proj.weight")
+    {
+        Some(inter * d)
+    } else if name.contains("mlp.experts.")
+        && (name.ends_with("gate_proj.weight")
+            || name.ends_with("up_proj.weight")
+            || name.ends_with("down_proj.weight"))
+    {
+        Some(einter * d)
+    } else if name.contains("mlp.gate.weight") {
+        Some(ne * d)
+    } else {
+        None
+    }
+}
+
+/// Expected element count for a small (f32) tensor by name.
+fn expected_small_size(
+    name: &str,
+    cfg: &Config,
+    d: usize,
+    nq: usize,
+    nkv: usize,
+    mla: bool,
+) -> Option<usize> {
+    if name == "model.norm.weight"
+        || name.contains("input_layernorm.weight")
+        || name.contains("post_attention_layernorm.weight")
+    {
+        Some(d)
+    } else if name.ends_with("self_attn.q_proj.bias") {
+        Some(nq)
+    } else if name.ends_with("self_attn.k_proj.bias") || name.ends_with("self_attn.v_proj.bias") {
+        Some(nkv)
+    } else if name.contains("self_attn.q_norm.weight") || name.contains("self_attn.k_norm.weight") {
+        Some(cfg.head_dim)
+    } else if mla && name.contains("self_attn.q_a_layernorm.weight") {
+        Some(cfg.q_lora_rank)
+    } else if mla && name.contains("self_attn.kv_a_layernorm.weight") {
+        Some(cfg.kv_lora_rank)
+    } else {
+        None
+    }
+}
+
+/// Concatenates two quantized tensors' dequantized values and re-quantizes
+/// (used for per-expert MoE tensors). Small/rare path; exact for our use.
+fn concat_q4(a: &Q4Tensor, b: &Q4Tensor) -> Q4Tensor {
+    let mut v = a.dequantize();
+    v.extend(b.dequantize());
+    Q4Tensor::quantize(&v)
 }

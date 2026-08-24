@@ -18,6 +18,7 @@ pub mod fp16;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
+pub mod q4;
 pub mod ref_model;
 #[cfg(feature = "hip")]
 pub mod sampling;
@@ -28,7 +29,7 @@ pub mod weights;
 
 pub use config::Config;
 use std::path::PathBuf;
-pub use weights::{LayerWeights, Weights};
+pub use weights::{LayerWeights, LayerWeightsQ4, Weights, WeightsQ4};
 
 /// Opt-in path for real-model integration tests. Returns the configured model
 /// path only when MACH_TEST_MODEL is set and exists; real-model tests skip

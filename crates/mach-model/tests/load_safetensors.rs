@@ -5,7 +5,7 @@
 //! weights and (with the `hip` feature) that a GPU model built from the loaded
 //! weights decodes identically to the CPU reference.
 
-use mach_model::loader::{load_safetensors, load_safetensors_dir};
+use mach_model::loader::{load_safetensors, load_safetensors_dir, load_safetensors_q4};
 use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
@@ -274,4 +274,65 @@ fn sharded_load_matches_single_file() {
         assert_eq!(max_abs_diff(&a.rms_mlp, &b.rms_mlp), 0.0);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn q4_load_matches_f32_within_tolerance() {
+    let cfg = Config::tiny();
+    let path = tmp_path("q4");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let q4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+
+    // Norms/biases stay exact; quantized GEMM weights stay within ~half scale.
+    assert_eq!(q4.rms_final, original.rms_final);
+    assert_eq!(q4.layers[0].rms_attn, original.layers[0].rms_attn);
+    assert_eq!(q4.layers[0].rms_mlp, original.layers[0].rms_mlp);
+
+    let tol = 0.5;
+    assert!(
+        max_abs_diff(&q4.tok_emb.dequantize(), &original.tok_emb) < tol,
+        "tok_emb dequant must be close"
+    );
+    assert!(
+        max_abs_diff(&q4.lm_head.dequantize(), &original.lm_head) < tol,
+        "lm_head dequant must be close"
+    );
+    for (li, (a, b)) in q4.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.wq.dequantize(), &b.wq) < tol,
+            "layer {li} wq"
+        );
+        assert!(
+            max_abs_diff(&a.wk.dequantize(), &b.wk) < tol,
+            "layer {li} wk"
+        );
+        assert!(
+            max_abs_diff(&a.wv.dequantize(), &b.wv) < tol,
+            "layer {li} wv"
+        );
+        assert!(
+            max_abs_diff(&a.wo.dequantize(), &b.wo) < tol,
+            "layer {li} wo"
+        );
+        assert!(
+            max_abs_diff(&a.wg.dequantize(), &b.wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.wu.dequantize(), &b.wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.wd.dequantize(), &b.wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }
