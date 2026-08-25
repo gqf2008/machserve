@@ -42,6 +42,12 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let eps = v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
     let theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
     let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);
+    // Some configs (e.g. Qwen3-30B-A3B) ship an explicit `head_dim` that
+    // differs from hidden/n_heads (q/o width = n_heads*head_dim is wider
+    // than hidden). Honor it, or the loader under-sizes q/o projections.
+    if let Some(hd) = v["head_dim"].as_u64() {
+        cfg.head_dim = hd as usize;
+    }
     cfg.intermediate_size = inter;
     cfg.rms_eps = eps;
     cfg.rope_theta = theta;
@@ -673,6 +679,20 @@ mod tests {
         );
         assert_eq!(cfg.n_kv_heads, 128, "MLA n_kv_heads == n_heads");
         assert_eq!(cfg.num_experts, 0);
+    }
+
+    #[test]
+    fn config_parses_explicit_head_dim() {
+        // Qwen3-30B-A3B-style: n_heads*head_dim (32*128=4096) is wider than
+        // hidden (2048); the explicit head_dim must win over hidden/n_heads.
+        let cfg = parse_json(
+            r#"{"hidden_size":2048,"num_hidden_layers":48,"num_attention_heads":32,"num_key_value_heads":4,"vocab_size":151936,"intermediate_size":6144,"moe_intermediate_size":768,"num_experts":128,"num_experts_per_tok":8,"head_dim":128,"max_position_embeddings":40960}"#,
+        );
+        assert_eq!(cfg.head_dim, 128, "explicit head_dim wins");
+        assert_eq!(cfg.n_heads * cfg.head_dim, 4096);
+        assert_eq!(cfg.n_kv_heads * cfg.head_dim, 512);
+        assert_eq!(cfg.num_experts, 128);
+        assert_eq!(cfg.expert_size(), 768);
     }
 
     #[test]
