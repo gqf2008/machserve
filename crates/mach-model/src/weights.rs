@@ -104,6 +104,49 @@ pub struct WeightsQ4 {
     pub layers: Vec<LayerWeightsQ4>,
 }
 
+/// FP8 (storage-level E4M3) layer weights: GEMM tensors quantized, norms and
+/// biases kept as f32. Mirrors [`LayerWeights`] / [`LayerWeightsQ4`].
+#[derive(Debug, Clone)]
+pub struct LayerWeightsFp8 {
+    pub wq: crate::fp8::Fp8Tensor,
+    pub wk: crate::fp8::Fp8Tensor,
+    pub wv: crate::fp8::Fp8Tensor,
+    pub wo: crate::fp8::Fp8Tensor,
+    pub rms_attn: Vec<f32>,
+    pub wg: crate::fp8::Fp8Tensor,
+    pub wu: crate::fp8::Fp8Tensor,
+    pub wd: crate::fp8::Fp8Tensor,
+    pub rms_mlp: Vec<f32>,
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub mla_q_a: crate::fp8::Fp8Tensor,
+    pub mla_q_a_norm: Vec<f32>,
+    pub mla_q_b: crate::fp8::Fp8Tensor,
+    pub mla_q_rope: crate::fp8::Fp8Tensor,
+    pub mla_kv_a: crate::fp8::Fp8Tensor,
+    pub mla_kv_a_norm: Vec<f32>,
+    pub mla_kv_b: crate::fp8::Fp8Tensor,
+    pub mla_o: crate::fp8::Fp8Tensor,
+    // Router is tiny and quantization error can flip critical expert
+    // selection, so it stays f32 (same reasoning as norms/biases).
+    pub moe_router: Vec<f32>,
+    pub moe_wg: crate::fp8::Fp8Tensor,
+    pub moe_wu: crate::fp8::Fp8Tensor,
+    pub moe_wd: crate::fp8::Fp8Tensor,
+}
+
+/// All model weights in storage-FP8 form (host memory ~2x smaller than f16 /
+/// ~4x smaller than f32 for the GEMM tensors; norms/biases stay f32).
+#[derive(Debug, Clone)]
+pub struct WeightsFp8 {
+    pub tok_emb: crate::fp8::Fp8Tensor,
+    pub rms_final: Vec<f32>,
+    pub lm_head: crate::fp8::Fp8Tensor,
+    pub layers: Vec<LayerWeightsFp8>,
+}
 /// All model weights.
 #[derive(Debug, Clone)]
 pub struct Weights {

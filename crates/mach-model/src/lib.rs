@@ -16,6 +16,7 @@ pub mod config;
 pub mod continuous;
 pub mod fp16;
 pub mod fp64_ref;
+pub mod fp8;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
@@ -32,7 +33,7 @@ pub mod weights;
 
 pub use config::Config;
 use std::path::PathBuf;
-pub use weights::{LayerWeights, LayerWeightsQ4, Weights, WeightsQ4};
+pub use weights::{LayerWeights, LayerWeightsFp8, LayerWeightsQ4, Weights, WeightsFp8, WeightsQ4};
 
 /// Opt-in path for real-model integration tests. Returns the configured model
 /// path only when MACH_TEST_MODEL is set and exists; real-model tests skip

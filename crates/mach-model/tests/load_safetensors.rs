@@ -6,7 +6,9 @@
 //! weights decodes identically to the CPU reference.
 
 use mach_model::config::ModelDType;
-use mach_model::loader::{load_safetensors, load_safetensors_dir, load_safetensors_q4};
+use mach_model::loader::{
+    load_safetensors, load_safetensors_dir, load_safetensors_fp8, load_safetensors_q4,
+};
 use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
@@ -392,6 +394,166 @@ fn q4_load_matches_f32_within_tolerance() {
 }
 
 #[test]
+fn fp8_load_matches_f32_within_tolerance() {
+    let cfg = Config::tiny();
+    let path = tmp_path("fp8");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let fp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+
+    // Norms/biases stay exact; quantized GEMM weights stay within E4M3's
+    // ~6% relative precision (per-tensor scale). tiny random weights scale
+    // ~= 1/sqrt(d) ~ 0.09, so max abs error ~= 0.09 * 2^-4 ~ 0.006.
+    assert_eq!(fp8.rms_final, original.rms_final);
+    assert_eq!(fp8.layers[0].rms_attn, original.layers[0].rms_attn);
+    assert_eq!(fp8.layers[0].rms_mlp, original.layers[0].rms_mlp);
+    let tol = 0.01;
+    assert!(
+        max_abs_diff(&fp8.tok_emb.dequantize(), &original.tok_emb) < tol,
+        "tok_emb dequant must be close"
+    );
+    assert!(
+        max_abs_diff(&fp8.lm_head.dequantize(), &original.lm_head) < tol,
+        "lm_head dequant must be close"
+    );
+    for (li, (a, b)) in fp8.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.wq.dequantize(), &b.wq) < tol,
+            "layer {li} wq"
+        );
+        assert!(
+            max_abs_diff(&a.wk.dequantize(), &b.wk) < tol,
+            "layer {li} wk"
+        );
+        assert!(
+            max_abs_diff(&a.wv.dequantize(), &b.wv) < tol,
+            "layer {li} wv"
+        );
+        assert!(
+            max_abs_diff(&a.wo.dequantize(), &b.wo) < tol,
+            "layer {li} wo"
+        );
+        assert!(
+            max_abs_diff(&a.wg.dequantize(), &b.wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.wu.dequantize(), &b.wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.wd.dequantize(), &b.wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn fp8_load_matches_f32_moe() {
+    let cfg = moe_cfg();
+    let path = tmp_path("fp8moe");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let fp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let tol = 0.01;
+    // Router stays f32 (exact); expert GEMMs quantized within tolerance and
+    // concatenated with per-expert scales (block = expert size).
+    assert_eq!(fp8.layers[0].moe_router, original.layers[0].moe_router);
+    let ne = cfg.num_experts;
+    let einter = cfg.expert_size();
+    let d = cfg.d_model;
+    assert_eq!(fp8.layers[0].moe_wg.block(), einter * d, "wg expert block");
+    assert_eq!(
+        fp8.layers[0].moe_wg.scales().len(),
+        ne,
+        "wg per-expert scales"
+    );
+    assert_eq!(fp8.layers[0].moe_wd.block(), d * einter, "wd expert block");
+    assert_eq!(
+        fp8.layers[0].moe_wd.scales().len(),
+        ne,
+        "wd per-expert scales"
+    );
+    for (li, (a, b)) in fp8.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.moe_wg.dequantize(), &b.moe_wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.moe_wu.dequantize(), &b.moe_wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.moe_wd.dequantize(), &b.moe_wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn fp8_load_matches_f32_mla() {
+    let cfg = Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16);
+    let path = tmp_path("fp8mla");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let fp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let tol = 0.01;
+    // MLA norms stay exact; quantized projections stay close.
+    assert_eq!(fp8.layers[0].mla_q_a_norm, original.layers[0].mla_q_a_norm);
+    assert_eq!(
+        fp8.layers[0].mla_kv_a_norm,
+        original.layers[0].mla_kv_a_norm
+    );
+    for (li, (a, b)) in fp8.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.mla_q_a.dequantize(), &b.mla_q_a) < tol,
+            "layer {li} q_a"
+        );
+        assert!(
+            max_abs_diff(&a.mla_q_b.dequantize(), &b.mla_q_b) < tol,
+            "layer {li} q_b"
+        );
+        assert!(
+            max_abs_diff(&a.mla_q_rope.dequantize(), &b.mla_q_rope) < tol,
+            "layer {li} q_rope"
+        );
+        assert!(
+            max_abs_diff(&a.mla_kv_a.dequantize(), &b.mla_kv_a) < tol,
+            "layer {li} kv_a"
+        );
+        assert!(
+            max_abs_diff(&a.mla_kv_b.dequantize(), &b.mla_kv_b) < tol,
+            "layer {li} kv_b"
+        );
+        assert!(
+            max_abs_diff(&a.mla_o.dequantize(), &b.mla_o) < tol,
+            "layer {li} o"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn q4_load_matches_f32_mla() {
     let cfg = Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16);
     let path = tmp_path("q4mla");
@@ -748,4 +910,288 @@ fn q4_batched_matches_dequantized_f16() {
         }
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// Batched FP8 vs batched f16 on synthetic weights: FP8 is a storage format,
+/// so dequantizing to f16 and running the same compute path stays within the
+/// E4M3 per-tensor-scale error plus fp16 rounding. Argmax may flip on
+/// near-uniform synthetic logits, so only the logits bound is asserted here;
+/// the greedy-token behavior on real weights is measured by `fp8_bench`.
+#[cfg(feature = "hip")]
+#[ignore]
+#[test]
+fn fp8_batched_gpu_matches_f16() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let path = tmp_path("fp8batched");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let w32 = load_safetensors(&path, &cfg, false).unwrap();
+    let wfp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+
+    let batch = 4usize;
+    let steps = [[3u32, 7, 1, 22], [9, 2, 200, 5], [4, 8, 15, 16]];
+
+    let mut m16 = BatchedModel::new(hip.clone(), cfg, &w32, batch).unwrap();
+    let mut mfp8 = BatchedModel::from_fp8(hip.clone(), cfg, &wfp8, batch).unwrap();
+    for (si, step_tokens) in steps.iter().enumerate() {
+        let _ = m16.decode_step(step_tokens).unwrap();
+        let _ = mfp8.decode_step(step_tokens).unwrap();
+        let l16 = m16.read_logits().unwrap();
+        let lfp8 = mfp8.read_logits().unwrap();
+        for s in 0..batch {
+            let row16 = &l16[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let rowfp8 = &lfp8[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let max = max_abs_diff(row16, rowfp8);
+            let scale = row16.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            eprintln!("fp8 batched vs f16: step {si} seq {s} max diff {max:.4} (scale {scale:.3})");
+            // E4M3 (3 mantissa bits) is ~2.7x more precise than int4 on this path, so the
+            // bound is tighter than the Q4 test.s 0.2 + 0.2*scale.
+            assert!(
+                max <= 0.1 + 0.1 * scale,
+                "step {si} seq {s}: fp8 batched vs f16 logits max diff {max} (scale {scale})"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Batched MoE FP8 vs f16: per-expert gate/up/down are quantized to E4M3 with
+/// per-expert scales, the router stays f32 (FP8 host layout) with the same f16
+/// device copy as the f16 path, so expert selection is identical. The logits
+/// bound is looser than the dense case: MoE routing composes per-expert
+/// quantization error across the active experts.
+#[cfg(feature = "hip")]
+#[ignore]
+#[test]
+fn fp8_batched_moe_gpu_matches_f16() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let path = tmp_path("fp8batchedmoe");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let w32 = load_safetensors(&path, &cfg, false).unwrap();
+    let wfp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let batch = 4usize;
+    let steps = [[3u32, 7, 1, 22], [9, 2, 200, 5], [4, 8, 15, 16]];
+
+    let mut m16 = BatchedModel::new(hip.clone(), cfg, &w32, batch).unwrap();
+    let mut mfp8 = BatchedModel::from_fp8(hip.clone(), cfg, &wfp8, batch).unwrap();
+    for (si, step_tokens) in steps.iter().enumerate() {
+        let _ = m16.decode_step(step_tokens).unwrap();
+        let _ = mfp8.decode_step(step_tokens).unwrap();
+        let l16 = m16.read_logits().unwrap();
+        let lfp8 = mfp8.read_logits().unwrap();
+        for s in 0..batch {
+            let row16 = &l16[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let rowfp8 = &lfp8[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let max = max_abs_diff(row16, rowfp8);
+            let scale = row16.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            eprintln!(
+                "fp8 batched MoE vs f16: step {si} seq {s} max diff {max:.4} (scale {scale:.3})"
+            );
+            assert!(
+                max <= 0.25 + 0.2 * scale,
+                "step {si} seq {s}: fp8 batched MoE vs f16 logits max diff {max} (scale {scale})"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The upload-path correctness gate: `BatchedModel::from_fp8` must produce the
+/// same device f16 bits as an f16 model built from the *dequantized* FP8
+/// weights (FP8 -> f16 -> identical compute path). This is bit-exact, so any
+/// diff above fp slack is a real bug in the FP8 upload, independent of how big
+/// the quantization error is vs the original f32 weights.
+#[cfg(feature = "hip")]
+#[ignore]
+#[test]
+fn fp8_batched_matches_dequantized_f16() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+    use mach_model::fp8::Fp8Tensor;
+    use mach_model::{LayerWeights, Weights};
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let to_f32 = |q: &Fp8Tensor| q.dequantize();
+    for (label, mut cfg) in [("dense", Config::tiny()), ("moe", moe_cfg())] {
+        cfg.dtype = ModelDType::F16;
+        let path = tmp_path(&format!("fp8deq{label}"));
+        let tensors = tensor_names(&cfg);
+        let flat: Vec<(&str, &[f32], &[usize])> = tensors
+            .iter()
+            .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+            .collect();
+        write_safetensors(&path, &flat);
+
+        let wfp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+        // Reference: f32 weights reconstructed from the FP8 storage (GEMM
+        // tensors dequantized; norms/biases/router copied exactly).
+        let wref = Weights {
+            tok_emb: to_f32(&wfp8.tok_emb),
+            rms_final: wfp8.rms_final.clone(),
+            lm_head: to_f32(&wfp8.lm_head),
+            layers: wfp8
+                .layers
+                .iter()
+                .map(|l| LayerWeights {
+                    wq: to_f32(&l.wq),
+                    wk: to_f32(&l.wk),
+                    wv: to_f32(&l.wv),
+                    wo: to_f32(&l.wo),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: to_f32(&l.wg),
+                    wu: to_f32(&l.wu),
+                    wd: to_f32(&l.wd),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: to_f32(&l.mla_q_a),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: to_f32(&l.mla_q_b),
+                    mla_q_rope: to_f32(&l.mla_q_rope),
+                    mla_kv_a: to_f32(&l.mla_kv_a),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: to_f32(&l.mla_kv_b),
+                    mla_o: to_f32(&l.mla_o),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: to_f32(&l.moe_wg),
+                    moe_wu: to_f32(&l.moe_wu),
+                    moe_wd: to_f32(&l.moe_wd),
+                })
+                .collect(),
+        };
+
+        let batch = 4usize;
+        let steps = [[3u32, 7, 1, 22], [9, 2, 200, 5], [4, 8, 15, 16]];
+        let mut mref = BatchedModel::new(hip.clone(), cfg, &wref, batch).unwrap();
+        let mut mfp8 = BatchedModel::from_fp8(hip.clone(), cfg, &wfp8, batch).unwrap();
+        for (si, step_tokens) in steps.iter().enumerate() {
+            let _ = mref.decode_step(step_tokens).unwrap();
+            let _ = mfp8.decode_step(step_tokens).unwrap();
+            let lref = mref.read_logits().unwrap();
+            let lfp8 = mfp8.read_logits().unwrap();
+            let max = max_abs_diff(&lref, &lfp8);
+            let scale = lref.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                max <= 1e-4 * (1.0 + scale),
+                "{label} step {si}: fp8 batched vs dequantized-f16 reference max diff {max} (scale {scale}) — upload path diverged"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Single-sequence `GpuModel::from_fp8` vs the f32-loaded GPU model on
+/// synthetic weights: FP8 is a storage format, so the logits stay within the
+/// E4M3 per-tensor-scale error. Ignored: GPU test, run serially.
+#[cfg(feature = "hip")]
+#[ignore]
+#[test]
+fn fp8_gpu_matches_f32() {
+    use mach_kernel_sys::hip;
+    use mach_model::model::GpuModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let path = tmp_path("fp8gpu");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let w32 = load_safetensors(&path, &cfg, false).unwrap();
+    let wfp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let tokens = [3u32, 7, 1, 22];
+
+    let mut m32 = GpuModel::new(hip.clone(), cfg, &w32).unwrap();
+    let mut mfp8 = GpuModel::from_fp8(hip, cfg, &wfp8).unwrap();
+    let l32 = m32.forward(&tokens).unwrap();
+    let lfp8 = mfp8.forward(&tokens).unwrap();
+
+    let max = max_abs_diff(&l32, &lfp8);
+    let scale = l32.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    eprintln!("fp8 GPU vs f32 GPU: max logit diff {max:.4} (scale {scale:.3})");
+    assert!(
+        max <= 0.1 + 0.1 * scale,
+        "fp8 GPU vs f32 GPU logits diverged: {max} vs scale {scale}"
+    );
+    let _ = std::fs::remove_file(&path);
 }

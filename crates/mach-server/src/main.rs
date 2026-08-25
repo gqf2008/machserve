@@ -7,19 +7,18 @@
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
-//! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 (storage-int4 weights:
-//! host RAM stays packed int4, dequantized to f16 on the device).
-
+//! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
+//! host weights: int4 or E4M3, dequantized to f16 on the device).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
-use mach_model::loader::{load_safetensors, load_safetensors_q4};
+use mach_model::loader::{load_safetensors, load_safetensors_fp8, load_safetensors_q4};
 #[cfg(feature = "hip")]
 use mach_model::tokenizer::Tokenizer;
 #[cfg(feature = "hip")]
-use mach_model::{Config, Weights, WeightsQ4};
+use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ServerEngine, router};
 #[cfg(feature = "hip")]
@@ -271,6 +270,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage-Q4 mode: weights stay packed int4 on the host (dequantized to
     // f16 per tensor on the device), cutting host RAM ~4x vs f32.
     let q4 = std::env::var("MACH_Q4").is_ok_and(|v| v != "0");
+    // Storage-FP8 mode: weights stay E4M3 on the host (dequantized to f16
+    // per tensor on the device), cutting host RAM ~2x vs f16 / ~4x vs f32.
+    let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -292,6 +294,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
     }
     if q4 {
+        if fp8 {
+            println!(
+                "storage FP8: host weights stay packed E4M3 (~2x smaller than f16); device still holds dequantized f16 weights"
+            );
+        }
         if cfg.dtype != ModelDType::F16 {
             eprintln!(
                 "MACH_Q4=1 requires dtype f16 (Q4 dequantizes to f16 on device); set MACH_DTYPE=f16 or drop MACH_Q4"
@@ -307,6 +314,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if moe_slots.is_some() {
             eprintln!(
                 "MACH_Q4=1 and MACH_MOE_SLOTS are mutually exclusive (cpu-backend offload needs f32 Weights)"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    if fp8 {
+        if q4 {
+            eprintln!("MACH_FP8=1 and MACH_Q4 are mutually exclusive; choose one storage format");
+            std::process::exit(1);
+        }
+        if cfg.dtype != ModelDType::F16 {
+            eprintln!(
+                "MACH_FP8=1 requires dtype f16 (FP8 dequantizes to f16 on device); set MACH_DTYPE=f16 or drop MACH_FP8"
+            );
+            std::process::exit(1);
+        }
+        if spec {
+            eprintln!(
+                "MACH_FP8=1 and MACH_SPEC are mutually exclusive (spec mode loads a second f32 model)"
+            );
+            std::process::exit(1);
+        }
+        if moe_slots.is_some() {
+            eprintln!(
+                "MACH_FP8=1 and MACH_MOE_SLOTS are mutually exclusive (cpu-backend offload needs f32 Weights)"
             );
             std::process::exit(1);
         }
@@ -375,6 +407,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gib(estimate)
     );
     if q4 {
+        if fp8 {
+            println!(
+                "storage FP8: host weights stay packed E4M3 (~2x smaller than f16); device still holds dequantized f16 weights"
+            );
+        }
         println!(
             "storage Q4: host weights stay packed int4 (~4x smaller than f32); device still holds dequantized f16 weights"
         );
@@ -419,6 +456,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
         let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
+        (eng, handle)
+    } else if fp8 {
+        let wfp8: WeightsFp8 =
+            load_safetensors_fp8(&root.join(&model_name), &cfg, true).expect("load fp8 weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage FP8; host weights stay packed E4M3, device dequantizes to f16)",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
+        );
+        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let handle = eng.clone().spawn_fp8(hip, cfg, wfp8)?;
         (eng, handle)
     } else if spec {
         let w: Weights =
@@ -467,7 +514,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(state);
     println!(
         "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{}{})",
-        if q4 { ", storage Q4" } else { "" },
+        if q4 {
+            ", storage Q4"
+        } else if fp8 {
+            ", storage FP8"
+        } else {
+            ""
+        },
         if spec { ", spec-decode" } else { "" },
         if let Some(slots) = moe_slots {
             format!(", moe-offload slots={slots}")
