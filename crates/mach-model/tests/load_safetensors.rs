@@ -5,6 +5,7 @@
 //! weights and (with the `hip` feature) that a GPU model built from the loaded
 //! weights decodes identically to the CPU reference.
 
+#[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 use mach_model::loader::{
     load_safetensors, load_safetensors_dir, load_safetensors_fp8, load_safetensors_q4,
@@ -329,6 +330,92 @@ fn sharded_load_matches_single_file() {
         assert_eq!(max_abs_diff(&a.rms_mlp, &b.rms_mlp), 0.0);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Multi-shard Q4 load must equal the single-file result bit-for-bit: 30B-class
+/// checkpoints (e.g. Qwen3-30B-A3B) ship as 16+ shards and `load_safetensors_q4`
+/// streams them, rebasing per-file offsets. Splitting the same tensors across
+/// shards is a pure layout change, so the packed Q4 output is identical.
+#[test]
+fn q4_sharded_load_matches_single_file() {
+    let cfg = Config::tiny();
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+
+    let single = tmp_path("q4shard-single");
+    write_safetensors(&single, &flat);
+    let q4_single = load_safetensors_q4(&single, &cfg, false).unwrap();
+
+    let dir = std::env::temp_dir().join("machserve-q4-shards");
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let n_shards = 4usize;
+    let per = tensors.len().div_ceil(n_shards);
+    for sh in 0..n_shards {
+        let lo = sh * per;
+        let hi = (lo + per).min(tensors.len());
+        if lo >= hi {
+            break;
+        }
+        let part: Vec<(&str, &[f32], &[usize])> = tensors[lo..hi]
+            .iter()
+            .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+            .collect();
+        let path = dir.join(format!(
+            "model-{:02}-of-{:02}.safetensors",
+            sh + 1,
+            n_shards
+        ));
+        write_safetensors(&path, &part);
+    }
+    let q4_shards = load_safetensors_q4(&dir, &cfg, false).unwrap();
+
+    // Same source values -> identical packed Q4 tensors (dequantize bit-equal).
+    assert_eq!(
+        q4_single.tok_emb.dequantize(),
+        q4_shards.tok_emb.dequantize(),
+        "tok_emb"
+    );
+    assert_eq!(q4_single.rms_final, q4_shards.rms_final, "rms_final");
+    assert_eq!(
+        q4_single.lm_head.dequantize(),
+        q4_shards.lm_head.dequantize(),
+        "lm_head"
+    );
+    for (li, (a, b)) in q4_single.layers.iter().zip(&q4_shards.layers).enumerate() {
+        assert_eq!(a.rms_attn, b.rms_attn, "layer {li} rms_attn");
+        assert_eq!(a.rms_mlp, b.rms_mlp, "layer {li} rms_mlp");
+        assert_eq!(a.wq.dequantize(), b.wq.dequantize(), "layer {li} wq");
+        assert_eq!(a.wk.dequantize(), b.wk.dequantize(), "layer {li} wk");
+        assert_eq!(a.wv.dequantize(), b.wv.dequantize(), "layer {li} wv");
+        assert_eq!(a.wo.dequantize(), b.wo.dequantize(), "layer {li} wo");
+        assert_eq!(a.wg.dequantize(), b.wg.dequantize(), "layer {li} wg");
+        assert_eq!(a.wu.dequantize(), b.wu.dequantize(), "layer {li} wu");
+        assert_eq!(a.wd.dequantize(), b.wd.dequantize(), "layer {li} wd");
+        assert_eq!(a.moe_router, b.moe_router, "layer {li} moe_router");
+        assert_eq!(
+            a.moe_wg.dequantize(),
+            b.moe_wg.dequantize(),
+            "layer {li} moe_wg"
+        );
+        assert_eq!(
+            a.moe_wu.dequantize(),
+            b.moe_wu.dequantize(),
+            "layer {li} moe_wu"
+        );
+        assert_eq!(
+            a.moe_wd.dequantize(),
+            b.moe_wd.dequantize(),
+            "layer {li} moe_wd"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&single);
 }
 
 #[test]

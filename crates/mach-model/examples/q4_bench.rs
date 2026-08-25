@@ -306,7 +306,7 @@ fn argmax(v: &[f32]) -> usize {
 }
 
 /// Current process host RAM (Windows working set / Linux VmRSS) in bytes.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "hip"))]
 fn host_ram_bytes() -> u64 {
     #[repr(C)]
     struct ProcessMemoryCounters {
@@ -345,7 +345,7 @@ fn host_ram_bytes() -> u64 {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), feature = "hip"))]
 fn host_ram_bytes() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
@@ -359,7 +359,10 @@ fn host_ram_bytes() -> u64 {
     0
 }
 
-#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+#[cfg(all(
+    not(any(windows, all(unix, not(target_os = "macos")))),
+    feature = "hip"
+))]
 fn host_ram_bytes() -> u64 {
     0
 }
