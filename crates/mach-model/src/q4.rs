@@ -72,12 +72,23 @@ impl Q4Tensor {
         out
     }
 
-    /// Dequantizes to f16 bit patterns (for direct device upload).
+    /// Dequantizes directly to f16 bit patterns (for device upload), without
+    #[allow(clippy::needless_range_loop)]
+    /// materializing the full f32 vector (transient = 2 bytes/element).
     pub fn dequantize_f16(&self) -> Vec<u16> {
-        self.dequantize()
-            .iter()
-            .map(|&v| crate::fp16::f32_to_f16(v))
-            .collect()
+        let mut out = Vec::with_capacity(self.n);
+        for i in 0..self.n {
+            let byte = self.q[i / 2];
+            let nib = if i % 2 == 0 {
+                byte & 0x0F
+            } else {
+                (byte >> 4) & 0x0F
+            };
+            let g = i / Q4_GROUP;
+            let v = signed_nibble(nib) as f32 * self.scales[g];
+            out.push(crate::fp16::f32_to_f16(v));
+        }
+        out
     }
 
     /// Number of stored elements.
