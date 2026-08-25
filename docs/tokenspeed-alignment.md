@@ -80,5 +80,7 @@
 - [x] CPU 参考路径：跨请求前缀共享（复用 logits == 全算，逐位一致；delta-only 计算）
 - [x] CPU 分页调度器：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
 - [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
-- [ ] 容量驱逐 + owning-ref 索引（`PrefixCacheIndex` 改持 `CacheBlockRef`），调度器接入
+- [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
+      释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
+      池满时 LRU 驱逐最冷页（索引 + 主机页 + 释放块），缓存有界
 - [ ] README/roadmap 同步（对齐状态表更新，不再把「静态 KV」当长期设计）

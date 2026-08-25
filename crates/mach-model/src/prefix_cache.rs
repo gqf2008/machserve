@@ -42,7 +42,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::kv_block_pool::CacheBlockLocation;
+use crate::kv_block_pool::{CacheBlockLocation, CacheBlockRef};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -190,13 +190,17 @@ pub struct CacheKey {
     pub page_offset: i32,
 }
 
-/// One cached page: its key, the canonical location holding its KV data, and
-/// the epoch of its most recent access (used for LRU eviction).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One cached page: its key, the canonical location holding its KV data, the
+/// epoch of its most recent access (used for LRU eviction), and an **owning**
+/// [`CacheBlockRef`] that pins the block while the entry is cached (upstream
+/// `prefix_index` semantics) — so a released request plan can never free a
+/// block another request still reuses.
+#[derive(Debug)]
 struct CacheEntry {
     key: CacheKey,
     location: CacheBlockLocation,
     last_access_epoch: u64,
+    block_ref: CacheBlockRef,
 }
 
 /// One cache group's prefix-reuse index: `CacheKey -> canonical CacheBlockLocation`.
@@ -236,23 +240,21 @@ impl PrefixCacheIndex {
         self.group_id
     }
 
-    /// Inserts `(key, location)`.
+    /// Inserts `(key, block)`, taking an owning clone of the block so the
+    /// page stays resident while cached.
     ///
-    /// Returns the canonical location the caller should keep:
-    /// - `None` when `key` was new, or was already canonical at `location`
-    ///   (the entry's recency is refreshed);
-    /// - `Some(previous)` when `key` already maps to a different canonical
-    ///   location, meaning `location` is a duplicate of the same content and
-    ///   should be released by the caller.
+    /// Returns `Some(previous_ref)` when `key` already maps to a different
+    /// canonical block — `block` is a duplicate of the same content and the
+    /// caller should release it (dropping it frees the slot). Returns `None`
+    /// when `key` was new or already canonical at the same block.
     ///
     /// Panics when `key` does not belong to this group, its content hash is
-    /// empty, or `location` is already registered under a different key.
-    pub fn insert(
-        &mut self,
-        key: CacheKey,
-        location: CacheBlockLocation,
-    ) -> Option<CacheBlockLocation> {
+    /// empty, or `block`'s location is already registered under a different key.
+    pub fn insert(&mut self, key: CacheKey, block: &CacheBlockRef) -> Option<CacheBlockRef> {
         self.validate_key(&key);
+        let location = block
+            .location()
+            .expect("index entries require a non-null block");
         if let Some(idx) = self.by_location.get(&location).copied() {
             assert!(
                 self.entries[idx].key == key,
@@ -263,7 +265,7 @@ impl PrefixCacheIndex {
             return None;
         }
         if let Some(idx) = self.by_key.get(&key).copied() {
-            let canonical = self.entries[idx].location;
+            let canonical = self.entries[idx].block_ref.clone();
             let epoch = self.next_epoch();
             self.entries[idx].last_access_epoch = epoch;
             return Some(canonical);
@@ -274,10 +276,19 @@ impl PrefixCacheIndex {
             key: key.clone(),
             location,
             last_access_epoch: epoch,
+            block_ref: block.clone(),
         });
         self.by_key.insert(key, idx);
         self.by_location.insert(location, idx);
         None
+    }
+
+    /// The owning block ref for `key`, if cached (clones the Rc so the caller
+    /// pins the block for the duration of its use).
+    #[must_use]
+    pub fn block_for(&self, key: &CacheKey) -> Option<CacheBlockRef> {
+        let idx = self.by_key.get(key).copied()?;
+        Some(self.entries[idx].block_ref.clone())
     }
 
     /// Removes the entry for `key`, returning its location.
@@ -439,6 +450,10 @@ impl PrefixMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::kv_block_pool::{BlockPool, BlockPoolHandle, CacheBlockLocation, CacheBlockRef};
 
     // -- PrefixHasher --------------------------------------------------------
 
@@ -541,92 +556,149 @@ mod tests {
         }
     }
 
-    fn loc(block: i32, slot: i32) -> CacheBlockLocation {
-        CacheBlockLocation {
-            lcm_block_id: block,
-            slot_index: slot,
-        }
-    }
-
     fn page_hash(tokens: &[i32]) -> String {
         hash_prefix_page(tokens, "", &[])
+    }
+
+    fn make_pool() -> BlockPoolHandle {
+        Rc::new(RefCell::new(BlockPool::new(64)))
+    }
+
+    /// Acquires one block in `group` and returns it (its actual location is
+    /// used by assertions below).
+    fn acquire(pool: &BlockPoolHandle, group: u32) -> CacheBlockRef {
+        pool.borrow_mut()
+            .acquire_block(pool, group, 1)
+            .expect("test pool has free blocks")
+    }
+
+    fn loc_of(b: &CacheBlockRef) -> CacheBlockLocation {
+        b.location().expect("non-null block")
     }
 
     #[test]
     fn insert_query_remove_round_trip() {
         let mut index = PrefixCacheIndex::new(1);
-        assert_eq!(index.insert(key(1, "h1", 0), loc(3, 0)), None);
+        let pool = make_pool();
+        let b = acquire(&pool, 1);
+        let l = loc_of(&b);
+        assert_eq!(index.insert(key(1, "h1", 0), &b), None);
         assert_eq!(index.num_entries(), 1);
         assert!(index.contains(&key(1, "h1", 0)));
-        assert!(index.contains_location(loc(3, 0)));
-        assert_eq!(index.key_for(loc(3, 0)), Some(&key(1, "h1", 0)));
-        assert_eq!(index.query(&key(1, "h1", 0)), Some(loc(3, 0)));
-        assert_eq!(index.remove(&key(1, "h1", 0)), Some(loc(3, 0)));
+        assert!(index.contains_location(l));
+        assert_eq!(index.key_for(l), Some(&key(1, "h1", 0)));
+        assert_eq!(index.query(&key(1, "h1", 0)), Some(l));
+        // The index pins the block: removing releases it back to the pool.
+        assert_eq!(index.remove(&key(1, "h1", 0)), Some(l));
         assert_eq!(index.num_entries(), 0);
         assert!(!index.contains(&key(1, "h1", 0)));
         assert!(index.query(&key(1, "h1", 0)).is_none());
+        drop(b);
+        assert_eq!(pool.borrow().num_occupied_slots(), 0, "block released");
     }
 
     #[test]
-    fn insert_same_key_keeps_canonical_location() {
+    fn index_pins_block_after_insert() {
         let mut index = PrefixCacheIndex::new(0);
-        assert_eq!(index.insert(key(0, "h", 0), loc(0, 0)), None);
+        let pool = make_pool();
+        let b = acquire(&pool, 0);
+        let l = loc_of(&b);
+        assert_eq!(index.insert(key(0, "pinned", 0), &b), None);
+        // Dropping the caller's ref must NOT free the slot: the index owns a
+        // clone, so the block stays resident until evicted/removed.
+        drop(b);
+        assert_eq!(
+            pool.borrow().num_occupied_slots(),
+            1,
+            "index pins the block"
+        );
+        assert_eq!(
+            index.block_for(&key(0, "pinned", 0)).unwrap().location(),
+            Some(l)
+        );
+        // Removing the entry drops the index's ref -> slot freed.
+        assert_eq!(index.remove(&key(0, "pinned", 0)), Some(l));
+        assert_eq!(
+            pool.borrow().num_occupied_slots(),
+            0,
+            "block freed on remove"
+        );
+    }
+
+    #[test]
+    fn insert_same_key_keeps_canonical_block() {
+        let mut index = PrefixCacheIndex::new(0);
+        let pool = make_pool();
+        let b1 = acquire(&pool, 0);
+        let l1 = loc_of(&b1);
+        assert_eq!(index.insert(key(0, "h", 0), &b1), None);
         // A duplicate page with the same content is reported as a duplicate:
-        // the caller releases it and keeps the canonical location.
-        assert_eq!(index.insert(key(0, "h", 0), loc(9, 9)), Some(loc(0, 0)));
+        // the caller releases it and keeps the canonical block.
+        let b2 = acquire(&pool, 0);
+        let l2 = loc_of(&b2);
+        let dup = index
+            .insert(key(0, "h", 0), &b2)
+            .expect("duplicate reported");
+        assert_eq!(dup.location(), Some(l1));
         assert_eq!(index.num_entries(), 1);
-        assert_eq!(index.query(&key(0, "h", 0)), Some(loc(0, 0)));
-        assert!(!index.contains_location(loc(9, 9)));
+        assert_eq!(index.query(&key(0, "h", 0)), Some(l1));
+        assert!(!index.contains_location(l2));
+        // Dropping the duplicate frees its slot; the canonical stays pinned.
+        drop(b2);
+        assert_eq!(pool.borrow().num_occupied_slots(), 1);
+        drop(b1);
     }
 
     #[test]
     #[should_panic(expected = "one cache block location cannot change cache key")]
     fn insert_same_location_different_key_panics() {
         let mut index = PrefixCacheIndex::new(0);
-        index.insert(key(0, "h1", 0), loc(0, 0));
-        index.insert(key(0, "h2", 0), loc(0, 0));
+        let pool = make_pool();
+        let b = acquire(&pool, 0);
+        index.insert(key(0, "h1", 0), &b);
+        index.insert(key(0, "h2", 0), &b);
     }
 
     #[test]
     fn remove_repairs_swap_remove_indices() {
         let mut index = PrefixCacheIndex::new(0);
+        let pool = make_pool();
+        let blocks: Vec<_> = (0..4).map(|_| acquire(&pool, 0)).collect();
+        let locs: Vec<_> = blocks.iter().map(loc_of).collect();
         for (i, h) in ["a", "b", "c", "d"].iter().enumerate() {
-            assert_eq!(index.insert(key(0, h, i as i32), loc(i as i32, 0)), None);
+            assert_eq!(index.insert(key(0, h, i as i32), &blocks[i]), None);
         }
         // Removing the first entry swaps "d" into slot 0; both secondary
         // indices must be repaired so every remaining key/location resolves.
-        assert_eq!(index.remove(&key(0, "a", 0)), Some(loc(0, 0)));
+        assert_eq!(index.remove(&key(0, "a", 0)), Some(locs[0]));
         assert_eq!(index.num_entries(), 3);
         for (i, h) in ["b", "c", "d"].iter().enumerate() {
             let idx = i + 1;
-            assert_eq!(
-                index.query(&key(0, h, idx as i32)),
-                Some(loc(idx as i32, 0))
-            );
-            assert_eq!(
-                index.key_for(loc(idx as i32, 0)),
-                Some(&key(0, h, idx as i32))
-            );
+            assert_eq!(index.query(&key(0, h, idx as i32)), Some(locs[idx]));
+            assert_eq!(index.key_for(locs[idx]), Some(&key(0, h, idx as i32)));
         }
         assert!(!index.contains(&key(0, "a", 0)));
-        assert!(!index.contains_location(loc(0, 0)));
+        assert!(!index.contains_location(locs[0]));
         // Removing the moved tail entry also works.
-        assert_eq!(index.remove_location(loc(3, 0)), Some(key(0, "d", 3)));
+        assert_eq!(index.remove_location(locs[3]), Some(key(0, "d", 3)));
         assert_eq!(index.num_entries(), 2);
     }
 
     #[test]
     fn evict_oldest_uses_last_access_epoch() {
         let mut index = PrefixCacheIndex::new(0);
-        index.insert(key(0, "a", 0), loc(1, 1));
-        index.insert(key(0, "b", 0), loc(2, 2));
-        index.insert(key(0, "c", 0), loc(3, 3));
+        let pool = make_pool();
+        let blocks: Vec<_> = (0..3).map(|_| acquire(&pool, 0)).collect();
+        let locs: Vec<_> = blocks.iter().map(loc_of).collect();
+        for (i, h) in ["a", "b", "c"].iter().enumerate() {
+            index.insert(key(0, h, 0), &blocks[i]);
+        }
         // Touch "a" so "b" becomes the coldest entry.
-        assert_eq!(index.query(&key(0, "a", 0)), Some(loc(1, 1)));
+        assert_eq!(index.query(&key(0, "a", 0)), Some(locs[0]));
         assert!(
             index.last_access_epoch(&key(0, "a", 0)) > index.last_access_epoch(&key(0, "b", 0))
         );
-        assert_eq!(index.evict_oldest(), Some((key(0, "b", 0), loc(2, 2))));
+        assert_eq!(index.evict_oldest(), Some((key(0, "b", 0), locs[1])));
         assert!(!index.contains(&key(0, "b", 0)));
         assert!(index.contains(&key(0, "a", 0)));
         assert!(index.contains(&key(0, "c", 0)));
@@ -637,8 +709,10 @@ mod tests {
     #[test]
     fn full_attn_probe_stops_at_first_miss() {
         let mut index = PrefixCacheIndex::new(0);
+        let pool = make_pool();
         for tokens in [[1], [2], [4], [5]] {
-            index.insert(key(0, &page_hash(&tokens), tokens[0]), loc(tokens[0], 0));
+            let b = acquire(&pool, 0);
+            index.insert(key(0, &page_hash(&tokens), tokens[0]), &b);
         }
         let keys = vec![
             key(0, &page_hash(&[1]), 1),
@@ -655,8 +729,10 @@ mod tests {
     #[test]
     fn full_attn_probe_respects_begin_and_max() {
         let mut index = PrefixCacheIndex::new(0);
+        let pool = make_pool();
         for tokens in [[1], [2], [3]] {
-            index.insert(key(0, &page_hash(&tokens), tokens[0]), loc(tokens[0], 0));
+            let b = acquire(&pool, 0);
+            index.insert(key(0, &page_hash(&tokens), tokens[0]), &b);
         }
         let keys = vec![
             key(0, &page_hash(&[1]), 1),
@@ -675,8 +751,9 @@ mod tests {
     #[test]
     fn full_attn_probe_treats_hole_as_miss() {
         let mut index = PrefixCacheIndex::new(0);
-        index.insert(key(0, &page_hash(&[1]), 1), loc(1, 0));
-        index.insert(key(0, &page_hash(&[3]), 3), loc(3, 0));
+        let pool = make_pool();
+        index.insert(key(0, &page_hash(&[1]), 1), &acquire(&pool, 0));
+        index.insert(key(0, &page_hash(&[3]), 3), &acquire(&pool, 0));
         let keys = vec![
             key(0, &page_hash(&[1]), 1),
             key(0, &page_hash(&[2]), 2),

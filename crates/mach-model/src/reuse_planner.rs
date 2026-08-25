@@ -13,38 +13,38 @@
 //! model. The KV layer later maps each [`PageRef`] to a real KV buffer (the
 //! reused pages need no recompute; fresh pages must be computed).
 //!
-//! # Lifecycle / ownership (important)
+//! # Lifecycle / ownership
 //!
-//! The prefix index stores **locations**, not owning refs, so a reused page
-//! stays valid only while the plan that owns its block is alive. Releasing a
-//! plan whose prefix another plan still reuses creates an index "hole" (the
-//! released key disappears while later chained keys remain), which
-//! [`ReusePlanner::plan`] detects and turns into a loud panic — never silent
-//! corruption. The scheduler wiring batch will remove this constraint by
-//! making [`crate::prefix_cache::PrefixCacheIndex`] hold owning
-//! `CacheBlockRef`s (as upstream TokenSpeed does), so reuse pins the block
-//! independently of the original request's lifetime.
+//! [`crate::prefix_cache::PrefixCacheIndex`] holds owning `CacheBlockRef`s
+//! (upstream TokenSpeed semantics), so a cached page pins its block
+//! independently of any request plan. Plans may be dropped as soon as their
+//! prefill finishes; releasing a plan only removes the keys **it** registered
+//! and frees blocks that no other plan or the index still references. A
+//! "hole" (a released key whose chained successors remain cached) is handled
+//! gracefully: the chained page dedup-reuses the canonical block.
 
 use crate::kv_block_pool::{BlockPoolHandle, CacheBlockLocation, CacheBlockRef};
 use crate::prefix_cache::{CacheKey, PrefixCacheIndex, PrefixMatcher, compute_prefix_hashes};
 
 /// One page of a request's token stream: either already resident (reused) or
-/// freshly acquired (must be computed and populated).
+/// freshly acquired (must be computed and populated). A reused page carries an
+/// owning [`CacheBlockRef`] clone so the block stays pinned even if the plan
+/// that originally cached it is released.
 #[derive(Debug, Clone)]
 pub enum PageRef {
-    /// The page's KV is already resident; reuse `location` without recompute.
-    Reused(CacheBlockLocation),
+    /// The page's KV is already resident; reuse this pinned block.
+    Reused(CacheBlockRef),
     /// The page was freshly acquired; compute its KV into `block`.
     Fresh(CacheBlockRef),
 }
 
 /// The result of planning one request's admission.
 ///
-/// **Ownership contract**: the plan owns its fresh [`CacheBlockRef`]s — the
-/// blocks stay allocated only while the plan (or another plan reusing them) is
-/// alive. When a request completes, call [`ReusePlanner::release`] to remove
-/// its fresh-page keys from the index and free its blocks; never drop a plan
-/// that other plans still reuse.
+/// **Ownership**: the plan holds [`CacheBlockRef`] clones; the prefix index
+/// also pins every cached page, so the plan can be dropped once its prefill
+/// finishes. When a request completes, call [`ReusePlanner::release`] to
+/// remove the keys **this plan registered** and release its block refs (blocks
+/// still referenced by the index or other plans stay alive).
 #[derive(Debug)]
 pub struct PrefixReusePlan {
     /// Ordered pages of the request (`reused_pages` reused + `fresh_pages` fresh).
@@ -99,6 +99,12 @@ impl ReusePlanner {
         self.index.num_entries()
     }
 
+    /// Whether `key` is currently advertised in the prefix index.
+    #[must_use]
+    pub fn index_contains(&self, key: &CacheKey) -> bool {
+        self.index.contains(key)
+    }
+
     /// Plan admission for `tokens`.
     ///
     /// Returns `None` when the block pool cannot satisfy the fresh demand
@@ -131,17 +137,19 @@ impl ReusePlanner {
             })
             .collect();
 
-        // Longest contiguous cached prefix (full attention).
+        // Longest contiguous cached prefix (full attention). Reused pages pin
+        // their blocks via the index's owning refs, so releasing the original
+        // plan never frees a block another request still reuses.
         let hits = PrefixMatcher.probe(&self.index, &keys, 0, keys.len());
         let reused_pages = hits.len();
         let reused_tokens = (reused_pages * self.tokens_per_page).min(total_tokens);
 
-        let reused_locations: Vec<CacheBlockLocation> = keys[..reused_pages]
+        let mut reused_blocks: Vec<CacheBlockRef> = keys[..reused_pages]
             .iter()
             .map(|k| {
                 self.index
-                    .query(k)
-                    .expect("matcher hit must resolve to a location")
+                    .block_for(k)
+                    .expect("matcher hit must resolve to a pinned block")
             })
             .collect();
 
@@ -157,26 +165,29 @@ impl ReusePlanner {
             return None; // pool cannot satisfy; nothing inserted
         }
 
-        // Record fresh blocks in the index so later requests reuse them. A
-        // duplicate insert (Some(previous)) means the key is already canonical
-        // elsewhere: that can only happen after a released plan left an index
-        // hole, i.e. the documented lifecycle was violated — panic loudly
-        // instead of corrupting the index.
-        let fresh_keys: Vec<CacheKey> = keys[reused_pages..].to_vec();
-        for (i, block) in fresh_blocks.iter().enumerate() {
+        // Record fresh blocks in the index (owning clones pin them). When the
+        // key is already canonical elsewhere (e.g. a released plan left a
+        // chain hole and this page's chained key is still cached), reuse the
+        // canonical block and release the duplicate. `fresh_keys` only records
+        // keys this plan actually registered (insert returned `None`) so
+        // `release` can never remove another plan's canonical entry.
+        let mut fresh_keys: Vec<CacheKey> = Vec::with_capacity(fresh_pages);
+        let mut pages_out: Vec<PageRef> = Vec::with_capacity(pages.len());
+        pages_out.extend(reused_blocks.drain(..).map(PageRef::Reused));
+        for (i, block) in fresh_blocks.into_iter().enumerate() {
             let key = &keys[reused_pages + i];
-            let location = block.location().expect("fresh block has a location");
-            assert!(
-                self.index.insert(key.clone(), location).is_none(),
-                "prefix-reuse index hole: releasing a plan still in use left \
-                 {key:?} canonical while its prefix is gone; keep plans alive \
-                 or use the owning-ref wiring"
-            );
+            match self.index.insert(key.clone(), &block) {
+                None => {
+                    fresh_keys.push(key.clone());
+                    pages_out.push(PageRef::Fresh(block));
+                }
+                Some(previous) => {
+                    // Duplicate content: keep the canonical block, free the new one.
+                    drop(block);
+                    pages_out.push(PageRef::Reused(previous));
+                }
+            }
         }
-
-        let mut pages_out = Vec::with_capacity(pages.len());
-        pages_out.extend(reused_locations.into_iter().map(PageRef::Reused));
-        pages_out.extend(fresh_blocks.into_iter().map(PageRef::Fresh));
 
         Some(PrefixReusePlan {
             pages: pages_out,
@@ -189,9 +200,16 @@ impl ReusePlanner {
         })
     }
 
-    /// Release a plan's fresh pages: removes their keys from the prefix index
-    /// and drops the plan (freeing its blocks back to the pool). Reused pages
-    /// are untouched — they belong to other plans that must outlive this one.
+    /// Evicts the coldest cached page (LRU), freeing its block. Returns the
+    /// evicted key and location, or `None` when the index is empty.
+    pub fn evict_oldest(&mut self) -> Option<(CacheKey, CacheBlockLocation)> {
+        self.index.evict_oldest()
+    }
+
+    /// Release a plan: removes the keys it registered from the prefix index
+    /// and drops the plan (releasing its block refs). Blocks still pinned by
+    /// the index or other plans stay alive; only orphaned blocks return to
+    /// the pool.
     pub fn release(&mut self, plan: PrefixReusePlan) {
         for key in &plan.fresh_keys {
             self.index.remove(key);
@@ -207,6 +225,22 @@ mod tests {
     use std::rc::Rc;
 
     use crate::kv_block_pool::BlockPool;
+    use crate::prefix_cache::compute_prefix_hashes;
+
+    fn keys_for(tokens: &[i32], page: usize) -> Vec<CacheKey> {
+        let pages: Vec<&[i32]> = tokens.chunks(page).collect();
+        let hashes = compute_prefix_hashes(&pages, "", &[]);
+        hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| CacheKey {
+                namespace_id: 7,
+                group_id: 0,
+                content_hash: h.clone(),
+                page_offset: (i * page) as i32,
+            })
+            .collect()
+    }
 
     fn planner() -> (ReusePlanner, BlockPoolHandle) {
         let p = ReusePlanner::new(0, 7, 4, 2);
@@ -329,16 +363,34 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "prefix-reuse index hole")]
-    fn releasing_reused_prefix_then_rescheduling_panics_loudly() {
+    fn releasing_reused_prefix_then_rescheduling_reuses_canonical() {
         let (mut p, pool) = planner();
         let plan_a = p.plan(&pool, &[1, 2, 3, 4]).expect("plan A");
         let plan_b = p.plan(&pool, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("plan B");
-        // B still reuses A's page 0; releasing A leaves a hole in the chain.
+        // Releasing A removes its key from the index, but B pinned page 0 via
+        // an owning ref, so the block stays valid.
         p.release(plan_a);
-        // Re-planning the same tokens must panic loudly, not corrupt the index.
-        let _ = p.plan(&pool, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("plan C");
-        drop(plan_b);
+        // Re-planning the same tokens: page 0 misses (key gone), page 1's
+        // chained key is still canonical (B cached it) -> dedup reuses it.
+        let plan_c = p.plan(&pool, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("plan C");
+        assert_eq!(plan_c.reused_pages, 0, "page 0 key was released");
+        assert_eq!(plan_c.fresh_pages, 2);
+        assert!(matches!(plan_c.pages[0], PageRef::Fresh(_)));
+        assert!(
+            matches!(plan_c.pages[1], PageRef::Reused(_)),
+            "page 1 dedup-reuses B's canonical block"
+        );
+        // Release must not remove B's canonical key: only keys C registered
+        // (just k0) are removed, so the index still holds B's k1.
+        p.release(plan_c);
+        assert_eq!(
+            p.cached_pages(),
+            1,
+            "release must not touch B's canonical k1"
+        );
+        let k1 = keys_for(&[1, 2, 3, 4, 5, 6, 7, 8], 4)[1].clone();
+        assert!(p.index_contains(&k1), "B's page-1 key still resolves");
+        p.release(plan_b);
     }
 
     #[test]
