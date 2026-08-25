@@ -378,10 +378,6 @@ impl BatchedModel {
         Ok(m)
     }
 
-    /// Builds a batched model from storage-Q4 weights (dense, F16): each GEMM
-    /// weight is dequantized to f16 on the host and uploaded directly, keeping
-    /// host memory ~= packed Q4 + one tensor's f16 buffer.
-    
     /// CPU-backend MoE offload for the batch: experts live in host RAM and the MoE
     /// layer is computed on the CPU from the host weights (FreeToken `cpu` backend).
     /// The router still runs on the GPU (moe_router is uploaded); the grouped-GEMM
@@ -476,7 +472,6 @@ impl BatchedModel {
         Ok(())
     }
 
-
     /// Uploads an optional f32 tensor (empty -> null device pointer).
     fn upload_opt(&mut self, v: &[f32]) -> Result<*mut f32, Error> {
         if v.is_empty() {
@@ -499,7 +494,6 @@ impl BatchedModel {
         )?;
         Ok(())
     }
-
 
     fn alloc_f16(&mut self, n: usize) -> Result<*mut u16, Error> {
         let p = hip::malloc(self.k.hip(), n * 2)?;
