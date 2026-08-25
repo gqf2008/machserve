@@ -24,6 +24,7 @@ pub mod prefill_buffered;
 pub mod prefix_cache;
 pub mod q4;
 pub mod ref_model;
+pub mod reuse_planner;
 #[cfg(feature = "hip")]
 pub mod sampling;
 pub mod scheduler_fsm;
