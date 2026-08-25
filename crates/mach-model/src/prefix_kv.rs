@@ -12,10 +12,12 @@
 //! The page KV lives on the host in [`PrefixKvCache::pages`] (keyed by content
 //! hash), so reused data stays valid regardless of block lifetimes. The block
 //! pool provides capacity accounting: admission is all-or-nothing, and the
-//! cache is bounded by pool capacity — a request that needs fresh blocks when
-//! the pool is full errors instead of over-committing. Plans are retained so
-//! their blocks (and the planner's index entries) stay consistent; eviction
-//! (bounded LRU + releasing completed plans) is the scheduler-wiring batch.
+//! cache is bounded by pool capacity. The prefix index holds **owning**
+//! `CacheBlockRef`s, so a request's plan can be dropped as soon as its prefill
+//! finishes — reused blocks stay pinned by the index until evicted. When the
+//! pool cannot satisfy fresh demand, [`PrefixKvCache`] evicts the coldest
+//! cached page (LRU) and retries; only a request that needs more pages than
+//! the entire pool can hold errors.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -61,8 +63,6 @@ pub struct PrefixKvCache {
     planner: ReusePlanner,
     pool: BlockPoolHandle,
     pages: HashMap<CacheKey, PageKv>,
-    /// Retained plans keep the planner's index and block allocations alive.
-    _plans: Vec<PrefixReusePlan>,
     tokens_per_page: usize,
 }
 
@@ -75,7 +75,6 @@ impl PrefixKvCache {
             planner: ReusePlanner::new(0, 1, tokens_per_page, 1),
             pool: Rc::new(RefCell::new(BlockPool::new(pool_blocks))),
             pages: HashMap::new(),
-            _plans: Vec::new(),
             tokens_per_page,
         }
     }
@@ -84,6 +83,15 @@ impl PrefixKvCache {
     #[must_use]
     pub fn cached_pages(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Evicts the coldest cached page (LRU): drops its index entry (freeing
+    /// the block) and its host KV data. Returns the evicted page key, or
+    /// `None` when the cache is empty.
+    pub fn evict_oldest(&mut self) -> Option<CacheKey> {
+        let (key, _location) = self.planner.evict_oldest()?;
+        self.pages.remove(&key);
+        Some(key)
     }
 
     /// Serves `tokens` through `model` (which must be fresh, at position 0),
@@ -102,11 +110,34 @@ impl PrefixKvCache {
             "prefix_kv serve requires a fresh model at position 0"
         );
         let itokens: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let plan = self.planner.plan(&self.pool, &itokens).ok_or_else(|| {
-            Error::Model(
-                "prefix KV cache full: block pool cannot satisfy the fresh-page demand".into(),
-            )
-        })?;
+        let mut plan = self.planner.plan(&self.pool, &itokens);
+        if plan.is_none() {
+            // Pool full: evict the coldest cached pages until the fresh demand
+            // fits, or until there is nothing left to evict.
+            while plan.is_none() {
+                if self.evict_oldest().is_none() {
+                    return Err(Error::Model(
+                        "prefix KV cache too small: fresh-page demand exceeds the whole pool"
+                            .into(),
+                    ));
+                }
+                plan = self.planner.plan(&self.pool, &itokens);
+            }
+        }
+        let plan = plan.expect("plan after eviction");
+        // The contiguous prefix (0..reused_pages) is restored via the anchor;
+        // every page after it must be freshly computed. A dedup-reused page
+        // beyond the prefix (only possible after a released plan left a chain
+        // hole) would need offset-KV restore this consumer cannot do — assert
+        // loudly instead of silently producing wrong logits. LRU eviction
+        // normally removes the hole's dependent chained keys first, so this is
+        // unreachable in the current flow.
+        assert!(
+            plan.pages[plan.reused_pages..]
+                .iter()
+                .all(|p| matches!(p, PageRef::Fresh(_))),
+            "non-prefix dedup-reused page reached the CPU consumer; add offset-KV restore"
+        );
         let reused_tokens = plan.reused_tokens;
 
         if reused_tokens > 0 {
@@ -139,14 +170,8 @@ impl PrefixKvCache {
         let fresh_pages = plan.fresh_pages;
         // A fully-reused request computed nothing: the final logits are the
         // anchor's (the last reused token's hidden through final norm+lm_head).
-        // Only plans that acquired fresh blocks need to be retained (their
-        // blocks and index entries stay alive); fully-reused plans hold no
-        // resources and are dropped.
         if computed_tokens == 0 && total_tokens > 0 {
             logits = model.logits_at_anchor();
-        }
-        if fresh_pages > 0 {
-            self._plans.push(plan);
         }
 
         let stats = PrefixReuseStats {
@@ -333,17 +358,38 @@ mod tests {
     }
 
     #[test]
-    fn pool_exhaustion_errors_for_new_disjoint_work() {
+    fn pool_full_evicts_coldest_for_new_work() {
         let cfg = Config::tiny();
         let w = Weights::random(&cfg, 11).expect("weights");
         // 1 block only: one 4-token page fills it.
         let mut cache = PrefixKvCache::new(1, 4);
         cache.serve(&mut model(&cfg, &w), &[1, 2, 3, 4]).expect("A");
-        // A disjoint request needs a fresh page but the pool is full.
-        assert!(cache.serve(&mut model(&cfg, &w), &[9, 10, 11, 12]).is_err());
-        // But an identical request is fully served from cache (no fresh demand).
-        let (_, stats) = cache.serve(&mut model(&cfg, &w), &[1, 2, 3, 4]).expect("B");
-        assert_eq!(stats.reused_tokens, 4);
-        assert_eq!(stats.computed_tokens, 0);
+        assert_eq!(cache.cached_pages(), 1);
+        // A disjoint request needs a fresh page; the pool evicts the coldest
+        // (the only) cached page and serves it.
+        let (_, stats) = cache
+            .serve(&mut model(&cfg, &w), &[9, 10, 11, 12])
+            .expect("B");
+        assert_eq!(stats.reused_tokens, 0);
+        assert_eq!(stats.computed_tokens, 4);
+        assert_eq!(cache.cached_pages(), 1, "cache stays bounded");
+        // The evicted page is recomputed, not reused.
+        let (_, stats) = cache.serve(&mut model(&cfg, &w), &[1, 2, 3, 4]).expect("C");
+        assert_eq!(stats.reused_tokens, 0, "page 1 was evicted");
+        assert_eq!(stats.computed_tokens, 4);
+    }
+
+    #[test]
+    fn request_larger_than_whole_pool_errors() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 13).expect("weights");
+        // Pool holds 1 block but a request needs 2 fresh pages (8 tokens).
+        let mut cache = PrefixKvCache::new(1, 4);
+        cache.serve(&mut model(&cfg, &w), &[1, 2, 3, 4]).expect("A");
+        assert!(
+            cache
+                .serve(&mut model(&cfg, &w), &[9, 10, 11, 12, 5, 6, 7, 8])
+                .is_err()
+        );
     }
 }
