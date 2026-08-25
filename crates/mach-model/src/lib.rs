@@ -22,6 +22,7 @@ pub mod moe_backend;
 pub mod moe_offload;
 pub mod prefill_buffered;
 pub mod prefix_cache;
+pub mod prefix_kv;
 pub mod q4;
 pub mod ref_model;
 pub mod reuse_planner;

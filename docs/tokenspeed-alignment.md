@@ -31,7 +31,7 @@
 | 连续批处理 / 请求生命周期 | `continuous.rs`（prefill/decode 混合、EOS、槽位压缩） | 🟡 功能对齐，无显式 FSM |
 | Agentic state reuse | `state_reuse.rs`（token 边界锚点 + 增量 prefill，dense/moe/mla 对拍） | 🟡 同会话多轮复用；**不跨请求** |
 | **分页 KV + 块表 + LCM 块池** | `kv_block_pool.rs` 已移植（LCM 放置 + 块表 + RAII）；静态槽位尚未替换 | ❌ **架构缺口（地基已备，待接入）** |
-| **全局前缀缓存（SHA-256 前缀哈希链 + matcher）** | `prefix_cache.rs` 已移植（framing 与上游逐字节一致）；未接入跨请求去重 | ❌ 缺口（地基已备，待接入） |
+| **全局前缀缓存（SHA-256 前缀哈希链 + matcher）** | `prefix_cache.rs` + `reuse_planner.rs` + `prefix_kv.rs`：CPU 参考路径已实现**跨请求前缀共享**（共享前缀的请求只算 delta，复用 logits 与全算逐位一致） | 🟡 已打通 CPU 路径；GPU（batched.rs）接线待做 |
 | **调度器 FSM（7 状态 + 事件 + Retracted/WriteBack/LoadBack）** | `scheduler_fsm.rs` 已移植（7 状态 + 12 事件，非法迁移 panic） | 🟡 已实现，未接入 `continuous.rs` |
 | KV 缓存事件（PD 跨节点） | 无（单节点） | ⏸ 单卡目标暂不需要 |
 | spec-decode | 已实现；实测 0.29x 净负，暂停 | ⏸ 需更便宜草稿/批量形态 |
@@ -48,6 +48,12 @@
    最后 owner drop 归还槽位），page 0 保留 null。✅ 已实现（19 单测）。
 3. **`prefix_cache.rs`**：SHA-256 前缀哈希链（framing 与上游逐字节一致，含黄金
    向量）+ 前缀索引 + Full-attention 连续命中 matcher。✅ 已实现（18 单测）。
+4. **`reuse_planner.rs`**：跨请求前缀复用准入规划器（组合 1–3，探测共享前缀 →
+   全有或全无分配尾部新块 → 维护索引）。✅ 已实现（10 单测）。
+5. **`prefix_kv.rs`**：CPU 参考路径的跨请求前缀共享——按 plan 用 Anchor 恢复
+   复用前缀的 KV、只算 delta 并逐页快照缓存。✅ 已实现（5 单测：
+   `shared_prefix_reuses_and_matches_full_recompute` 等；10-token 请求共享 8-token
+   前缀时只算 2 个 token，复用 logits 与全算逐位一致）。
 
 ### 接入计划（后续批次，非本分支）
 
@@ -66,5 +72,7 @@
       matcher 连续 run 语义
 - [ ] 三模块 CPU-only：`cargo test -p mach-model --lib` 全绿 + `clippy -D warnings`
       干净（不依赖 GPU）
-- [ ] 接入后：长上下文 + 前缀共享 + 容量驱逐的真机 A/B（TTFT/TPOT）有数字
+- [x] CPU 参考路径：跨请求前缀共享（复用 logits == 全算，逐位一致；delta-only 计算）
+- [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
+- [ ] 容量驱逐 + owning-ref 索引（`PrefixCacheIndex` 改持 `CacheBlockRef`），调度器接入
 - [ ] README/roadmap 同步（对齐状态表更新，不再把「静态 KV」当长期设计）
