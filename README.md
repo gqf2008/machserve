@@ -17,7 +17,7 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |
 | **OpenAI API** | completions / chat / SSE / 采样全参数 / top_logprobs / stop / n / usage |
-| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、Qwen3 QK-norm、MLA(合成对拍,真实权重待验证) |
+| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、Qwen3 QK-norm、MLA(合成对拍)、**Qwen3-8B(存储级 Q4 实测)** |
 
 > 测量口径:Qwen2.5-0.5B fp16、capacity 64,`lctx_bench`(不 reset、真长 context)。
 > 详细历史见 [docs/roadmap.md](docs/roadmap.md)。
@@ -61,6 +61,9 @@ thirdparty/        第三方参考代码(占位)
 - **MLA(DeepSeek-V2 风格,实验)**:低秩 Q + 压缩 KV,expanded per-head KV decode;
   单序列/批量/连续批处理(含槽位压缩 KV 搬移)与 CPU 参考逐 token 对拍一致
   (f32;真实 MLA checkpoint 验证待做)。
+- **存储级 Q4(int4)**:权重打包 int4 + 每 32 元素 f32 scale 存主机(8B 模型
+  ~5GB vs f32 32GB),`MACH_Q4=1` 加载/上传时反量化 f16 进显存;已在 7900 XTX
+  实跑 Qwen3-8B(16GB F16 显存,主机峰值 ~8GB)。
 - **正确性**:GPU vs 独立 fp64 numpy 参考(~1e-4)+ 真 transformers 模型(4e-5)。
 
 ## 性能优化地图(截至 2026-08-23)
@@ -78,7 +81,8 @@ thirdparty/        第三方参考代码(占位)
 | **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**实测 0.29x(净负,暂停)** | GPU 测试全绿 |
 | **MoE**(P3at-P3az) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP | 全回归绿;真实 Qwen2.5-MoE 待验证 |
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
-| **FP8** | 关闭:gfx1100/ROCm6.2 hipBLAS 拒绝 fp8 | P3aq 探针 |
+| **存储级 Q4**(#16/#20/#24/#25/#27/#30) | 8B 主机内存 48GB→~5GB,`MACH_Q4=1` 服务,加载 13x 加速 | Qwen3-8B 真机验证 + GPU 对拍 |
+| **FP8** | 计算级关闭(hipBLAS 拒绝 fp8);**存储级 E4M3→f16 路径在途(Issue #31)** | P3aq 探针 |
 
 ## 安装与排障（个人用户从这里开始）
 
