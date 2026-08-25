@@ -7,18 +7,19 @@
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
-//! MACH_ADDR (default "127.0.0.1:8080").
+//! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 (storage-int4 weights:
+//! host RAM stays packed int4, dequantized to f16 on the device).
 
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
-use mach_model::loader::load_safetensors;
+use mach_model::loader::{load_safetensors, load_safetensors_q4};
 #[cfg(feature = "hip")]
 use mach_model::tokenizer::Tokenizer;
 #[cfg(feature = "hip")]
-use mach_model::{Config, Weights};
+use mach_model::{Config, Weights, WeightsQ4};
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ServerEngine, router};
 #[cfg(feature = "hip")]
@@ -239,6 +240,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let moe_slots = std::env::var("MACH_MOE_SLOTS")
         .ok()
         .and_then(|s| s.parse().ok());
+    // Storage-Q4 mode: weights stay packed int4 on the host (dequantized to
+    // f16 per tensor on the device), cutting host RAM ~4x vs f32.
+    let q4 = std::env::var("MACH_Q4").is_ok_and(|v| v != "0");
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -258,6 +262,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "f32" => cfg.dtype = ModelDType::F32,
         "f16" => cfg.dtype = ModelDType::F16,
         other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
+    }
+    if q4 {
+        if cfg.dtype != ModelDType::F16 {
+            eprintln!(
+                "MACH_Q4=1 requires dtype f16 (Q4 dequantizes to f16 on device); set MACH_DTYPE=f16 or drop MACH_Q4"
+            );
+            std::process::exit(1);
+        }
+        if spec {
+            eprintln!(
+                "MACH_Q4=1 and MACH_SPEC are mutually exclusive (spec mode loads a second f32 model)"
+            );
+            std::process::exit(1);
+        }
+        if moe_slots.is_some() {
+            eprintln!(
+                "MACH_Q4=1 and MACH_MOE_SLOTS are mutually exclusive (cpu-backend offload needs f32 Weights)"
+            );
+            std::process::exit(1);
+        }
     }
 
     // Preflight (before any heavy loading): HIP runtime + device + VRAM. A
@@ -322,6 +346,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gib(total as u64),
         gib(estimate)
     );
+    if q4 {
+        println!(
+            "storage Q4: host weights stay packed int4 (~4x smaller than f32); device still holds dequantized f16 weights"
+        );
+    }
     if estimate > free as u64 {
         eprintln!(
             "insufficient VRAM: need ~{:.2}GiB but only {:.2}GiB free; lower MACH_CAPACITY / MACH_PREFILL_ROWS or use a smaller model",
@@ -335,12 +364,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // load + kernel compile) instead of after.
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("bound http://{addr} (preflight passed)");
-
-    let w: Weights = load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
-    println!(
-        "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
-        cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
-    );
 
     // Load the real tokenizer when available; fall back to naive bytes.
     let tok_path = root.join(&tokenizer_name);
@@ -357,9 +380,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through a
-    // draft + target engine (greedy-only; other params rejected).
-    let (engine, engine_handle) = if spec {
+    // Q4 mode loads packed int4 weights directly (host RAM stays small) and
+    // spawns the Q4 engine; f16/f32 and spec modes keep the f32 host load.
+    let (engine, engine_handle) = if q4 {
+        let wq4: WeightsQ4 =
+            load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load q4 weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage Q4; host weights stay packed int4, device dequantizes to f16)",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
+        );
+        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
+        (eng, handle)
+    } else if spec {
+        let w: Weights =
+            load_safetensors(&root.join(&model_name), &cfg, true).expect("load target weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
+        );
+        // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through
+        // a draft + target engine (greedy-only; other params rejected).
         let mut dcfg = config_from_json(&root.join(&draft_config));
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
@@ -376,6 +417,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
         (eng, handle)
     } else {
+        let w: Weights =
+            load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
+        );
         let eng = if let Some(slots) = moe_slots {
             ServerEngine::with_offload(capacity, prefill_rows, slots)
         } else {
@@ -391,7 +438,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = router(state);
     println!(
-        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{})",
+        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{}{})",
+        if q4 { ", storage Q4" } else { "" },
         if spec { ", spec-decode" } else { "" },
         if let Some(slots) = moe_slots {
             format!(", moe-offload slots={slots}")
