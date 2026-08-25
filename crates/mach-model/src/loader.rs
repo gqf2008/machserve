@@ -1158,6 +1158,14 @@ fn concat_q4(a: &Q4Tensor, b: &Q4Tensor) -> Q4Tensor {
     a.concat(b)
 }
 
+/// Concatenates two FP8 tensors (per-expert MoE tensors). Delegates to
+/// `Fp8Tensor::concat`: every expert is quantized with its own per-expert
+/// scale and `block = expert size`, so the packed bytes + scales append
+/// directly (exact, O(1) per expert).
+fn concat_fp8(a: &Fp8Tensor, b: &Fp8Tensor) -> Fp8Tensor {
+    a.concat(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,12 +1211,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Concatenates two FP8 tensors (per-expert MoE tensors). Delegates to
-/// `Fp8Tensor::concat`: every expert is quantized with its own per-expert
-/// scale and `block = expert size`, so the packed bytes + scales append
-/// directly (exact, O(1) per expert).
-fn concat_fp8(a: &Fp8Tensor, b: &Fp8Tensor) -> Fp8Tensor {
-    a.concat(b)
 }
