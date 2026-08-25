@@ -6,7 +6,9 @@
 //! weights decodes identically to the CPU reference.
 
 use mach_model::config::ModelDType;
-use mach_model::loader::{load_safetensors, load_safetensors_dir, load_safetensors_q4};
+use mach_model::loader::{
+    load_safetensors, load_safetensors_dir, load_safetensors_fp8, load_safetensors_q4,
+};
 use mach_model::{Config, Weights};
 use std::path::PathBuf;
 
@@ -386,6 +388,166 @@ fn q4_load_matches_f32_within_tolerance() {
         assert!(
             max_abs_diff(&a.wd.dequantize(), &b.wd) < tol,
             "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn fp8_load_matches_f32_within_tolerance() {
+    let cfg = Config::tiny();
+    let path = tmp_path("fp8");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let fp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+
+    // Norms/biases stay exact; quantized GEMM weights stay within E4M3's
+    // ~6% relative precision (per-tensor scale). tiny random weights scale
+    // ~= 1/sqrt(d) ~ 0.09, so max abs error ~= 0.09 * 2^-4 ~ 0.006.
+    assert_eq!(fp8.rms_final, original.rms_final);
+    assert_eq!(fp8.layers[0].rms_attn, original.layers[0].rms_attn);
+    assert_eq!(fp8.layers[0].rms_mlp, original.layers[0].rms_mlp);
+    let tol = 0.01;
+    assert!(
+        max_abs_diff(&fp8.tok_emb.dequantize(), &original.tok_emb) < tol,
+        "tok_emb dequant must be close"
+    );
+    assert!(
+        max_abs_diff(&fp8.lm_head.dequantize(), &original.lm_head) < tol,
+        "lm_head dequant must be close"
+    );
+    for (li, (a, b)) in fp8.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.wq.dequantize(), &b.wq) < tol,
+            "layer {li} wq"
+        );
+        assert!(
+            max_abs_diff(&a.wk.dequantize(), &b.wk) < tol,
+            "layer {li} wk"
+        );
+        assert!(
+            max_abs_diff(&a.wv.dequantize(), &b.wv) < tol,
+            "layer {li} wv"
+        );
+        assert!(
+            max_abs_diff(&a.wo.dequantize(), &b.wo) < tol,
+            "layer {li} wo"
+        );
+        assert!(
+            max_abs_diff(&a.wg.dequantize(), &b.wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.wu.dequantize(), &b.wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.wd.dequantize(), &b.wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn fp8_load_matches_f32_moe() {
+    let cfg = moe_cfg();
+    let path = tmp_path("fp8moe");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let fp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let tol = 0.01;
+    // Router stays f32 (exact); expert GEMMs quantized within tolerance and
+    // concatenated with per-expert scales (block = expert size).
+    assert_eq!(fp8.layers[0].moe_router, original.layers[0].moe_router);
+    let ne = cfg.num_experts;
+    let einter = cfg.expert_size();
+    let d = cfg.d_model;
+    assert_eq!(fp8.layers[0].moe_wg.block(), einter * d, "wg expert block");
+    assert_eq!(
+        fp8.layers[0].moe_wg.scales().len(),
+        ne,
+        "wg per-expert scales"
+    );
+    assert_eq!(fp8.layers[0].moe_wd.block(), d * einter, "wd expert block");
+    assert_eq!(
+        fp8.layers[0].moe_wd.scales().len(),
+        ne,
+        "wd per-expert scales"
+    );
+    for (li, (a, b)) in fp8.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.moe_wg.dequantize(), &b.moe_wg) < tol,
+            "layer {li} wg"
+        );
+        assert!(
+            max_abs_diff(&a.moe_wu.dequantize(), &b.moe_wu) < tol,
+            "layer {li} wu"
+        );
+        assert!(
+            max_abs_diff(&a.moe_wd.dequantize(), &b.moe_wd) < tol,
+            "layer {li} wd"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn fp8_load_matches_f32_mla() {
+    let cfg = Config::mla(128, 2, 4, 1024, 64, 32, 16, 16, 8, 16);
+    let path = tmp_path("fp8mla");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let fp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let tol = 0.01;
+    // MLA norms stay exact; quantized projections stay close.
+    assert_eq!(fp8.layers[0].mla_q_a_norm, original.layers[0].mla_q_a_norm);
+    assert_eq!(
+        fp8.layers[0].mla_kv_a_norm,
+        original.layers[0].mla_kv_a_norm
+    );
+    for (li, (a, b)) in fp8.layers.iter().zip(&original.layers).enumerate() {
+        assert!(
+            max_abs_diff(&a.mla_q_a.dequantize(), &b.mla_q_a) < tol,
+            "layer {li} q_a"
+        );
+        assert!(
+            max_abs_diff(&a.mla_q_b.dequantize(), &b.mla_q_b) < tol,
+            "layer {li} q_b"
+        );
+        assert!(
+            max_abs_diff(&a.mla_q_rope.dequantize(), &b.mla_q_rope) < tol,
+            "layer {li} q_rope"
+        );
+        assert!(
+            max_abs_diff(&a.mla_kv_a.dequantize(), &b.mla_kv_a) < tol,
+            "layer {li} kv_a"
+        );
+        assert!(
+            max_abs_diff(&a.mla_kv_b.dequantize(), &b.mla_kv_b) < tol,
+            "layer {li} kv_b"
+        );
+        assert!(
+            max_abs_diff(&a.mla_o.dequantize(), &b.mla_o) < tol,
+            "layer {li} o"
         );
     }
     let _ = std::fs::remove_file(&path);
