@@ -491,10 +491,6 @@ impl GpuModel {
     /// Uploads storage-Q4 weights as f16 (dense F16 path): norms/biases stay
     /// f32; GEMM matrices are dequantized per tensor and freed after upload.
     fn upload_weights_q4(&mut self, w: &WeightsQ4) -> Result<(), Error> {
-        let c = self.cfg;
-        let d = c.d_model;
-        let nq = c.n_heads * c.head_dim;
-        let nkv = c.n_kv_heads * c.head_dim;
         self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
         self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
         self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
@@ -552,7 +548,6 @@ impl GpuModel {
             self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
             self.layers_f16.push(l16);
         }
-        let _ = (d, nq, nkv);
         Ok(())
     }
 
