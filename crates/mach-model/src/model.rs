@@ -18,7 +18,7 @@ use crate::kernels::HipKernels;
 use crate::moe_backend::LruExpertCache;
 use crate::moe_offload;
 use crate::sampling::HipSampler;
-use crate::{Config, Error, Weights};
+use crate::{Config, Error, Weights, WeightsQ4};
 use mach_engine::graph::{GraphCapture, GraphHandle};
 use mach_engine::hip::HipGraphCapture;
 use mach_kernel_sys::hip::{self, Hip};
@@ -249,6 +249,89 @@ impl GpuModel {
         Ok(m)
     }
 
+    /// Builds a GPU model from storage-Q4 weights (dense, F16): each GEMM
+    /// weight is dequantized to f16 on the host and uploaded directly, so host
+    /// memory stays ~= the packed Q4 weights + one tensor's f16 buffer (8B
+    /// model: ~5GB instead of ~48GB).
+    pub fn from_q4(hip: Arc<Hip>, cfg: Config, w: &WeightsQ4) -> Result<Self, Error> {
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model(
+                "from_q4 requires dtype F16 (dequantize to f16 on device)".into(),
+            ));
+        }
+        if cfg.num_experts != 0 || cfg.kv_lora_rank != 0 {
+            return Err(Error::Model(
+                "GpuModel::from_q4 currently supports dense models only (no MoE/MLA)".into(),
+            ));
+        }
+        let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
+        let sampler = HipSampler::new(Arc::clone(&hip), k.stream)?;
+        let mut m = Self {
+            cfg,
+            k,
+            host_tok: std::ptr::null_mut(),
+            host_pos: std::ptr::null_mut(),
+            dev_tok: std::ptr::null_mut(),
+            dev_pos: std::ptr::null_mut(),
+            x: std::ptr::null_mut(),
+            xn: std::ptr::null_mut(),
+            xn2: std::ptr::null_mut(),
+            q: std::ptr::null_mut(),
+            k_buf: std::ptr::null_mut(),
+            v_buf: std::ptr::null_mut(),
+            attn: std::ptr::null_mut(),
+            proj: std::ptr::null_mut(),
+            gate: std::ptr::null_mut(),
+            up: std::ptr::null_mut(),
+            h: std::ptr::null_mut(),
+            logits: std::ptr::null_mut(),
+            emb_dev: std::ptr::null_mut(),
+            rms_final_dev: std::ptr::null_mut(),
+            lm_head_dev: std::ptr::null_mut(),
+            layers_dev: Vec::new(),
+            emb_f16: std::ptr::null_mut(),
+            lm_head_f16: std::ptr::null_mut(),
+            layers_f16: Vec::new(),
+            xh: std::ptr::null_mut(),
+            yh: std::ptr::null_mut(),
+            router: std::ptr::null_mut(),
+            exp_ids: std::ptr::null_mut(),
+            exp_w: std::ptr::null_mut(),
+            wg_pack: std::ptr::null_mut(),
+            wu_pack: std::ptr::null_mut(),
+            wd_pack: std::ptr::null_mut(),
+            gate_all: std::ptr::null_mut(),
+            up_all: std::ptr::null_mut(),
+            eh_all: std::ptr::null_mut(),
+            down_all: std::ptr::null_mut(),
+            mla_q_lora: std::ptr::null_mut(),
+            mla_q_lora_n: std::ptr::null_mut(),
+            q_nope: std::ptr::null_mut(),
+            q_rope: std::ptr::null_mut(),
+            mla_kv_a: std::ptr::null_mut(),
+            mla_kv_a_n: std::ptr::null_mut(),
+            mla_kv: std::ptr::null_mut(),
+            mla_attn: std::ptr::null_mut(),
+            kv_cache: Vec::new(),
+            mla_kv_cache: Vec::new(),
+            allocs: Vec::new(),
+            pos: 0,
+            host_pins: Vec::new(),
+            sampler,
+            gpu_budget: usize::MAX,
+            host_w: None,
+            expert_slots: usize::MAX,
+            slot_ctx: Vec::new(),
+            slot_ids_dev: std::ptr::null_mut(),
+            slot_w_dev: std::ptr::null_mut(),
+            adaptive: None,
+            reprobe_every: 0,
+            step_counter: 0,
+        };
+        m.alloc_buffers()?;
+        m.upload_weights_q4(w)?;
+        Ok(m)
+    }
     fn dalloc(&mut self, bytes: usize) -> Result<*mut f32, Error> {
         let p = hip::malloc(self.k.hip(), bytes)
             .map_err(|e| Error::Model(format!("device alloc of {bytes} bytes failed: {e}")))?;
@@ -379,6 +462,97 @@ impl GpuModel {
             buf.len() * 2,
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
         )?;
+        Ok(())
+    }
+
+    /// Uploads pre-encoded f16 bits directly (no f32 round trip).
+    fn upload_f16_bits(&self, dst: *mut u16, src: &[u16]) -> Result<(), Error> {
+        hip::memcpy(
+            self.k.hip(),
+            dst as *mut core::ffi::c_void,
+            src.as_ptr() as *const core::ffi::c_void,
+            src.len() * 2,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )?;
+        Ok(())
+    }
+
+    /// Uploads an optional f32 tensor (empty -> null device pointer).
+    fn upload_opt(&mut self, v: &[f32]) -> Result<*mut f32, Error> {
+        if v.is_empty() {
+            Ok(std::ptr::null_mut())
+        } else {
+            let p = self.dalloc(v.len() * 4)?;
+            self.upload(p, v)?;
+            Ok(p)
+        }
+    }
+
+    /// Uploads storage-Q4 weights as f16 (dense F16 path): norms/biases stay
+    /// f32; GEMM matrices are dequantized per tensor and freed after upload.
+    fn upload_weights_q4(&mut self, w: &WeightsQ4) -> Result<(), Error> {
+        let c = self.cfg;
+        let d = c.d_model;
+        let nq = c.n_heads * c.head_dim;
+        let nkv = c.n_kv_heads * c.head_dim;
+        self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
+        self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
+        self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
+        self.upload_f16_bits(self.lm_head_f16, &w.lm_head.dequantize_f16())?;
+        self.rms_final_dev = self.dalloc(w.rms_final.len() * 4)?;
+        self.upload(self.rms_final_dev, &w.rms_final)?;
+
+        for lw in &w.layers {
+            let l = LayerDev {
+                wq: std::ptr::null_mut(),
+                wk: std::ptr::null_mut(),
+                wv: std::ptr::null_mut(),
+                wo: std::ptr::null_mut(),
+                rms_attn: self.dalloc(lw.rms_attn.len() * 4)?,
+                wg: std::ptr::null_mut(),
+                wu: std::ptr::null_mut(),
+                wd: std::ptr::null_mut(),
+                rms_mlp: self.dalloc(lw.rms_mlp.len() * 4)?,
+                bq: self.upload_opt(&lw.bq)?,
+                bk: self.upload_opt(&lw.bk)?,
+                bv: self.upload_opt(&lw.bv)?,
+                q_norm: self.upload_opt(&lw.q_norm)?,
+                k_norm: self.upload_opt(&lw.k_norm)?,
+                mla_q_a: std::ptr::null_mut(),
+                mla_q_a_norm: std::ptr::null_mut(),
+                mla_q_b: std::ptr::null_mut(),
+                mla_q_rope: std::ptr::null_mut(),
+                mla_kv_a: std::ptr::null_mut(),
+                mla_kv_a_norm: std::ptr::null_mut(),
+                mla_kv_b: std::ptr::null_mut(),
+                mla_o: std::ptr::null_mut(),
+                moe_router: std::ptr::null_mut(),
+                moe_wg: std::ptr::null_mut(),
+                moe_wu: std::ptr::null_mut(),
+                moe_wd: std::ptr::null_mut(),
+            };
+            self.upload(l.rms_attn, &lw.rms_attn)?;
+            self.upload(l.rms_mlp, &lw.rms_mlp)?;
+            self.layers_dev.push(l);
+            let l16 = LayerDevF16 {
+                wq: self.alloc_f16(lw.wq.len())?,
+                wk: self.alloc_f16(lw.wk.len())?,
+                wv: self.alloc_f16(lw.wv.len())?,
+                wo: self.alloc_f16(lw.wo.len())?,
+                wg: self.alloc_f16(lw.wg.len())?,
+                wu: self.alloc_f16(lw.wu.len())?,
+                wd: self.alloc_f16(lw.wd.len())?,
+            };
+            self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
+            self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
+            self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
+            self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
+            self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
+            self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
+            self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
+            self.layers_f16.push(l16);
+        }
+        let _ = (d, nq, nkv);
         Ok(())
     }
 
