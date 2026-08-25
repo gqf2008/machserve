@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --features hip -- -D warnings
+
+  build:
+    name: check (hip on / off)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: check without hip (CPU-only surface)
+        run: cargo check --workspace --all-targets
+      - name: check with hip (type-check only, no GPU needed)
+        run: cargo check --workspace --all-targets --features hip
+
+  test:
+    name: CPU tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: workspace lib tests
+        run: cargo test --workspace --lib
+      - name: integration tests (CPU, model-gated GPU tests are ignored)
+        run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode
+
+  gpu:
+    name: GPU parity (opt-in, self-hosted AMD)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, amd, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: engine HIP memory-pool parity
+        run: cargo test -p mach-engine --features hip --lib -- --ignored --test-threads=1
+      - name: model GPU parity (ignored opt-in)
+        run: cargo test -p mach-model --features hip -- --test-threads=1
+      - name: server tests
+        run: cargo test -p mach-server --features hip

@@ -38,6 +38,7 @@ pub(crate) fn silu(v: f32) -> f32 {
 /// per-(token, topk) routed expert ids and their softmax weights (from the router);
 /// `xn2` is the per-row RMS-normed input `[b, d]`. Returns the per-row residual.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "hip", test))]
 pub(crate) fn moe_batch_cpu_residual(
     ids: &[i32],
     weights: &[f32],

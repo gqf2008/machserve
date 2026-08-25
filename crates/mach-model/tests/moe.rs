@@ -48,6 +48,7 @@ fn moe_ref_forward_is_finite_and_deterministic() {
     assert_eq!(l1, l2, "MoE forward must be deterministic");
 }
 
+#[cfg(feature = "hip")]
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
