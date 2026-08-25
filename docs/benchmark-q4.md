@@ -50,7 +50,10 @@ Env：`MACH_MODELS`（默认 `.models`）、`MACH_MODEL`（默认 `model.safeten
   一次性成本；已优化：`concat_q4` 组对齐直拼 packed bytes + scales（O(1)/专家，
   原来逐专家 dequant+requant O(n²)），且量化按张量并行 + 大张量按组范围跨线程
   （`Q4Tensor::quantize_par`，与 `quantize` 逐位一致）。历史：37 s → 13 s（concat）
-  → 4.6 s（张量级并行）→ 2.9 s（组内并行）。
+  → 4.6 s（张量级并行）→ 2.9 s（组内并行）。解码（BF16/F16→f32）再并行
+  （`tensor_f32_par`，逐位一致，有单测）：本机 ~3.0 s 已贴近 **I/O 地板**（1.34GB
+  文件读取+拷贝本身 ~1.5-1.9 s，f32 路径同样），CPU 解码不再是瓶颈；对快 NVMe + 慢
+  CPU、或多 shard 大模型的 CPU 受限场景仍有收益。
 - 同进程 A/B 里 Q4 leg 显示 0.68 GiB，是 f32 权重释放后留在工作集里的内存，非 Q4 真实占用。
 
 ### TTFT / TPOT（同一 f16 计算路径）

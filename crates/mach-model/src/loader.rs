@@ -124,6 +124,90 @@ fn tensor_f32(data: &[u8], t: &RawTensor, expected: usize, name: &str) -> Result
     Ok(out)
 }
 
+/// Parallel f32 conversion for large tensors: splits the element range across
+/// threads (each converts its byte slice to f32), concatenating in order.
+/// Bit-equal to [`tensor_f32`]. Falls back to the scalar path below ~1M
+/// elements (thread spawn overhead is not worth it for small tensors).
+fn tensor_f32_par(
+    data: &[u8],
+    t: &RawTensor,
+    expected: usize,
+    name: &str,
+) -> Result<Vec<f32>, Error> {
+    let n: usize = t.shape.iter().product();
+    if n != expected {
+        return Err(Error::Model(format!(
+            "{name}: shape {:?} has {n} elems, expected {expected}",
+            t.shape
+        )));
+    }
+    if n < (1 << 20) {
+        return tensor_f32(data, t, expected, name);
+    }
+    let elem = match t.dtype.as_str() {
+        "F32" => 4usize,
+        "F16" | "BF16" => 2usize,
+        other => return Err(Error::Model(format!("{name}: unsupported dtype {other}"))),
+    };
+    let span = t.end - t.start;
+    if span != n * elem {
+        return Err(Error::Model(format!("{name}: size mismatch")));
+    }
+    let bytes = data
+        .get(t.start..t.end)
+        .ok_or_else(|| Error::Model(format!("{name}: data range out of bounds")))?;
+    let n_threads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(4)
+        .min(16);
+    let chunk = n.div_ceil(n_threads);
+    let dtype = t.dtype.as_str();
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_threads);
+        for th in 0..n_threads {
+            let e0 = th * chunk;
+            let e1 = (e0 + chunk).min(n);
+            if e0 >= e1 {
+                continue;
+            }
+            handles.push(s.spawn(move || {
+                let mut local = Vec::with_capacity(e1 - e0);
+                match dtype {
+                    "F32" => {
+                        for i in e0..e1 {
+                            let off = i * 4;
+                            local.push(f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+                        }
+                    }
+                    "F16" => {
+                        for i in e0..e1 {
+                            let off = i * 2;
+                            let u = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+                            local.push(f16_to_f32(u));
+                        }
+                    }
+                    "BF16" => {
+                        for i in e0..e1 {
+                            let off = i * 2;
+                            let u = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+                            local.push(bf16_to_f32(u));
+                        }
+                    }
+                    other => {
+                        return Err(Error::Model(format!("{name}: unsupported dtype {other}")));
+                    }
+                }
+                Ok(local)
+            }));
+        }
+        let mut merged = Vec::with_capacity(n);
+        for h in handles {
+            merged.extend_from_slice(&h.join().unwrap()?);
+        }
+        Ok(merged)
+    })
+}
+
 /// Half-precision float to f32.
 fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
@@ -514,7 +598,7 @@ pub fn load_safetensors_q4(
                         let Some((name, expected)) = big_work.get(i) else {
                             break;
                         };
-                        match tensor_f32(&data, &tensors[name], *expected, name) {
+                        match tensor_f32_par(&data, &tensors[name], *expected, name) {
                             Ok(f) => {
                                 let q = Q4Tensor::quantize_par(&f);
                                 results.lock().unwrap().push((name.clone(), q));
@@ -783,4 +867,51 @@ fn expected_small_size(
 /// Q4 loading of MoE checkpoints ~30x slower than f32).
 fn concat_q4(a: &Q4Tensor, b: &Q4Tensor) -> Q4Tensor {
     a.concat(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic(dtype: &str, n: usize, seed: u64) -> (RawTensor, Vec<u8>) {
+        let elem = match dtype {
+            "F32" => 4usize,
+            _ => 2usize,
+        };
+        let mut data = Vec::with_capacity(n * elem);
+        let mut r = seed;
+        for i in 0..n {
+            r = r
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = (((r >> 33) as f64) / ((1u64 << 31) as f64)) as f32 * 3.0 - 1.5;
+            match dtype {
+                "F32" => data.extend_from_slice(&v.to_le_bytes()),
+                "F16" => data.extend_from_slice(&crate::fp16::f32_to_f16(v).to_le_bytes()),
+                "BF16" => data.extend_from_slice(&(((v.to_bits() >> 16) as u16).to_le_bytes())),
+                _ => unreachable!(),
+            }
+            let _ = i;
+        }
+        let t = RawTensor {
+            dtype: dtype.to_string(),
+            shape: vec![n],
+            start: 0,
+            end: n * elem,
+        };
+        (t, data)
+    }
+
+    #[test]
+    fn tensor_f32_par_matches_scalar_bitwise() {
+        for dtype in ["F32", "F16", "BF16"] {
+            // Large (parallel path) and small (fallback path).
+            for n in [2usize << 20, 1usize << 21, 1000usize] {
+                let (t, data) = synthetic(dtype, n, 42 + n as u64);
+                let a = tensor_f32(&data, &t, n, "w").unwrap();
+                let b = tensor_f32_par(&data, &t, n, "w").unwrap();
+                assert_eq!(a, b, "dtype={dtype} n={n}");
+            }
+        }
+    }
 }
