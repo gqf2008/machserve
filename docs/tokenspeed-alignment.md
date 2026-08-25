@@ -51,9 +51,14 @@
 4. **`reuse_planner.rs`**：跨请求前缀复用准入规划器（组合 1–3，探测共享前缀 →
    全有或全无分配尾部新块 → 维护索引）。✅ 已实现（10 单测）。
 5. **`prefix_kv.rs`**：CPU 参考路径的跨请求前缀共享——按 plan 用 Anchor 恢复
-   复用前缀的 KV、只算 delta 并逐页快照缓存。✅ 已实现（5 单测：
+   复用前缀的 KV、只算 delta 并逐页快照缓存。✅ 已实现（6 单测：
    `shared_prefix_reuses_and_matches_full_recompute` 等；10-token 请求共享 8-token
    前缀时只算 2 个 token，复用 logits 与全算逐位一致）。
+6. **`paged_scheduler.rs`**：CPU 侧分页调度器——FSM（Submitted→PrefillDone→
+   Decoding→Finished）+ 复用规划 + 前缀 KV 驱动参考模型的多请求调度。✅ 已实现
+   （2 单测：5 个共享 8-token 系统提示的请求，45 个 prompt token 复用 32 个、
+   只算 13 个——**节省 71%**，贪心解码与全算逐位一致；对标 FreeToken 多轮
+   TTFT -65..-80% 目标）。
 
 ### 接入计划（后续批次，非本分支）
 
@@ -73,6 +78,7 @@
 - [ ] 三模块 CPU-only：`cargo test -p mach-model --lib` 全绿 + `clippy -D warnings`
       干净（不依赖 GPU）
 - [x] CPU 参考路径：跨请求前缀共享（复用 logits == 全算，逐位一致；delta-only 计算）
+- [x] CPU 分页调度器：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
 - [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
 - [ ] 容量驱逐 + owning-ref 索引（`PrefixCacheIndex` 改持 `CacheBlockRef`），调度器接入
 - [ ] README/roadmap 同步（对齐状态表更新，不再把「静态 KV」当长期设计）

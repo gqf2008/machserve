@@ -781,3 +781,10 @@
     `tests/moe_real.rs`(PR #14)保持 skippable,模型文件到位即可跑。
   - 若需完成:需从其他渠道获取该模型(或兼容 Qwen2Moe 布局的小模型),放入
     `.models/qwen2.5-moe-a3b/`。
+
+- **TokenSpeed 对齐第一/二/三片(2026-08-25)**:scheduler_fsm(7 状态+12 事件) +
+  kv_block_pool(LCM 块池+RAII) + prefix_cache(SHA-256 前缀哈希链,黄金向量逐位一致)
+  + reuse_planner(跨请求复用准入) + prefix_kv(CPU 参考路径前缀共享,复用 logits==全算)
+  + paged_scheduler(FSM 多请求调度);5 请求共享系统提示 → prompt token 复用 71%。
+  剩余:GPU(batched.rs)接线 + 容量驱逐/owning-ref 索引 + 真机 A/B(见
+  docs/tokenspeed-alignment.md)。
