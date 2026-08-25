@@ -9,7 +9,6 @@
 #[cfg(feature = "hip")]
 pub mod adaptive;
 #[cfg(feature = "hip")]
-#[cfg(feature = "hip")]
 pub mod batched;
 pub mod config;
 #[cfg(feature = "hip")]
@@ -17,14 +16,17 @@ pub mod continuous;
 pub mod fp16;
 pub mod fp64_ref;
 pub mod fp8;
+pub mod kv_block_pool;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
 pub mod prefill_buffered;
+pub mod prefix_cache;
 pub mod q4;
 pub mod ref_model;
 #[cfg(feature = "hip")]
 pub mod sampling;
+pub mod scheduler_fsm;
 #[cfg(feature = "hip")]
 pub mod speculative;
 pub mod state_reuse;
