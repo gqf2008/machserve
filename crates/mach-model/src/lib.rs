@@ -20,6 +20,7 @@ pub mod kv_block_pool;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
+pub mod paged_scheduler;
 pub mod prefill_buffered;
 pub mod prefix_cache;
 pub mod prefix_kv;
