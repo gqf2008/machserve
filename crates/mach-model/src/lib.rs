@@ -15,6 +15,7 @@ pub mod config;
 #[cfg(feature = "hip")]
 pub mod continuous;
 pub mod fp16;
+pub mod fp64_ref;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
