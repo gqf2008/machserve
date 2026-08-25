@@ -36,28 +36,32 @@ function Get-Len([string]$url) {
 $results = $files | ForEach-Object -Parallel {
     $f = $_
     $OutDir = $using:OutDir; $ModelId = $using:ModelId; $MirrorOnly = $using:MirrorOnly
+    $dst = Join-Path $OutDir $f
     function Get-Len([string]$url) {
         try {
-            $r = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            $r = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
             return [long]$r.Headers['Content-Length']
         } catch { return -1L }
     }
-    $dst = Join-Path $OutDir $f
-    $urls = @()
-    if (-not $MirrorOnly) { $urls += "https://huggingface.co/$ModelId/resolve/main/$f" }
-    $urls += "https://hf-mirror.com/$ModelId/resolve/main/$f"
-    $expect = -1L
-    foreach ($u in $urls) { $e = Get-Len $u; if ($e -gt 0) { $expect = $e; break } }
-    if (Test-Path $dst) {
-        $cur = (Get-Item $dst).Length
-        if ($expect -gt 0 -and $cur -eq $expect) { return "OK(already):$f" }
+    $mirror = "https://hf-mirror.com/$ModelId/resolve/main/$f"
+    $primary = "https://huggingface.co/$ModelId/resolve/main/$f"
+    $expect = Get-Len $mirror
+    if ($expect -gt 0 -and (Test-Path $dst) -and (Get-Item $dst).Length -eq $expect) {
+        return "OK(already):$f"
     }
+    $urls = @()
+    if (-not $MirrorOnly) { $urls += $mirror }
+    $urls += $primary
     foreach ($u in $urls) {
-        for ($try = 1; $try -le 8; $try++) {
-            & curl.exe -L -C - --retry 5 --retry-all-errors --max-time 900 -sS -o $dst $u 2>$null
+        for ($try = 1; $try -le 20; $try++) {
+            & curl.exe -L -C - --retry 5 --retry-all-errors --max-time 1200 -sS -o $dst $u 2>$null
+            $code = $LASTEXITCODE
             $cur = if (Test-Path $dst) { (Get-Item $dst).Length } else { 0 }
-            if ($LASTEXITCODE -eq 0 -and $cur -gt 0 -and ($expect -le 0 -or $cur -eq $expect)) { return ("OK:{0}:{1}" -f $f, $cur) }
-            if ($try -lt 8) { Start-Sleep -Seconds 5 }
+            if ($code -eq 33 -and $cur -gt 0) { return ("OK(complete):{0}:{1}" -f $f, $cur) }
+            if ($code -eq 0 -and $cur -gt 0 -and ($expect -le 0 -or $cur -eq $expect)) {
+                return ("OK:{0}:{1}" -f $f, $cur)
+            }
+            if ($try -lt 20) { Start-Sleep -Seconds 3 }
         }
     }
     "FAIL:$f"
