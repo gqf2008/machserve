@@ -5,10 +5,12 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use mach_kernel_sys::hip;
+use mach_model::config::ModelDType;
 use mach_model::continuous::ContinuousModel;
+use mach_model::q4::Q4Tensor;
 use mach_model::sampling::SamplingParams;
 use mach_model::tokenizer::Tokenizer;
-use mach_model::{Config, Weights};
+use mach_model::{Config, LayerWeightsQ4, Weights, WeightsQ4};
 use mach_server::{AppState, ServerEngine, router};
 use tower::ServiceExt;
 
@@ -98,6 +100,49 @@ fn moe_cfg() -> Config {
     cfg
 }
 
+/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors
+/// copied) for the Q4 server-path test.
+fn to_q4(w: &Weights) -> WeightsQ4 {
+    let q = |v: &[f32]| Q4Tensor::quantize(v);
+    WeightsQ4 {
+        tok_emb: q(&w.tok_emb),
+        rms_final: w.rms_final.clone(),
+        lm_head: q(&w.lm_head),
+        layers: w
+            .layers
+            .iter()
+            .map(|l| LayerWeightsQ4 {
+                wq: q(&l.wq),
+                wk: q(&l.wk),
+                wv: q(&l.wv),
+                wo: q(&l.wo),
+                rms_attn: l.rms_attn.clone(),
+                wg: q(&l.wg),
+                wu: q(&l.wu),
+                wd: q(&l.wd),
+                rms_mlp: l.rms_mlp.clone(),
+                bq: l.bq.clone(),
+                bk: l.bk.clone(),
+                bv: l.bv.clone(),
+                q_norm: l.q_norm.clone(),
+                k_norm: l.k_norm.clone(),
+                mla_q_a: q(&l.mla_q_a),
+                mla_q_a_norm: l.mla_q_a_norm.clone(),
+                mla_q_b: q(&l.mla_q_b),
+                mla_q_rope: q(&l.mla_q_rope),
+                mla_kv_a: q(&l.mla_kv_a),
+                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                mla_kv_b: q(&l.mla_kv_b),
+                mla_o: q(&l.mla_o),
+                moe_router: l.moe_router.clone(),
+                moe_wg: q(&l.moe_wg),
+                moe_wu: q(&l.moe_wu),
+                moe_wd: q(&l.moe_wd),
+            })
+            .collect(),
+    }
+}
+
 #[tokio::test]
 async fn completions_endpoint_moe_matches_direct_engine() {
     let Some(hip) = hip_ctx() else { return };
@@ -160,6 +205,79 @@ async fn completions_endpoint_moe_matches_direct_engine() {
         .map(|v| v.as_u64().unwrap() as u32)
         .collect();
     assert_eq!(got, want, "server MoE output must equal direct engine run");
+}
+
+/// Server-path Q4: `ServerEngine::spawn_q4` (storage-int4 -> f16 on device)
+/// must serve HTTP completions identically to a direct Q4 engine run. MoE
+/// config exercises the per-expert Q4 upload. Ignored: GPU test, run serially
+/// with `-- --ignored --test-threads=1`.
+#[ignore]
+#[tokio::test]
+async fn completions_endpoint_q4_matches_direct_engine() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 91).unwrap();
+    let wq4 = to_q4(&w);
+    let prompt = vec![5u32, 9, 3];
+    let max_new = 4usize;
+
+    // Expected output from a direct Q4 engine run.
+    let mut cm = ContinuousModel::with_prefill_rows_q4(hip.clone(), cfg, &wq4, 4, 4).unwrap();
+    let id = cm
+        .add(
+            &prompt,
+            max_new,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.is_done(id) {
+        cm.step().unwrap();
+    }
+    let want = cm.generated(id);
+    assert!(!want.is_empty(), "Q4 engine must generate tokens");
+
+    // Server path (Q4 engine thread).
+    let engine = ServerEngine::new(4);
+    let _handle = engine.clone().spawn_q4(hip, cfg, wq4).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny-moe-q4".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let got: Vec<u32> = json["choices"][0]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert_eq!(
+        got, want,
+        "server Q4 output must equal direct Q4 engine run"
+    );
 }
 
 #[tokio::test]

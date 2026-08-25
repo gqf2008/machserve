@@ -197,6 +197,27 @@ impl BatchedModel {
         Self::build(hip, cfg, w, slots, rows, usize::MAX)
     }
 
+    /// Builds a batched model from storage-Q4 weights (dense + MoE, F16): each
+    /// GEMM tensor is dequantized to f16 on the host and uploaded directly, so
+    /// host memory stays ~= the packed Q4 weights + one tensor's f16 buffer.
+    /// Experts stay fully GPU-resident (the CPU-backend offload path needs f32
+    /// `Weights`, which the Q4 host layout does not provide).
+    pub fn from_q4(hip: Arc<Hip>, cfg: Config, w: &WeightsQ4, batch: usize) -> Result<Self, Error> {
+        Self::with_rows_q4(hip, cfg, w, batch, batch)
+    }
+
+    /// Q4 variant of [`with_rows`]: `slots` KV slots and `rows` row capacity
+    /// (prefill can pack more prompt positions per step).
+    pub fn with_rows_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        Self::build_q4(hip, cfg, w, slots, rows)
+    }
+
     /// Builds a batched model in MoE offload mode: experts stay in host RAM and the
     /// MoE layer is computed on the CPU (FreeToken cpu backend), so GPU memory is
     /// bounded regardless of the expert count. GPU-slot fast path is a follow-up.
@@ -241,6 +262,36 @@ impl BatchedModel {
         slots: usize,
         rows: usize,
         expert_slots: usize,
+    ) -> Result<Self, Error> {
+        Self::build_common(hip, cfg, slots, rows, expert_slots, |m| m.upload_weights(w))
+    }
+
+    /// Q4 (storage-int4) batched build: same device layout as the F16 path, but
+    /// each GEMM tensor is dequantized from packed Q4 to f16 during upload.
+    fn build_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model(
+                "from_q4 requires dtype F16 (dequantize to f16 on device)".into(),
+            ));
+        }
+        Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
+            m.upload_weights_q4(w)
+        })
+    }
+
+    fn build_common(
+        hip: Arc<Hip>,
+        cfg: Config,
+        slots: usize,
+        rows: usize,
+        expert_slots: usize,
+        upload: impl FnOnce(&mut Self) -> Result<(), Error>,
     ) -> Result<Self, Error> {
         assert!(slots >= 1, "slots must be >= 1");
         assert!(rows >= slots, "rows must be >= slots");
@@ -323,114 +374,10 @@ impl BatchedModel {
             prefetch: None,
         };
         m.alloc_buffers()?;
-        m.upload_weights(w)?;
+        upload(&mut m)?;
         Ok(m)
     }
 
-    /// Builds a batched model from storage-Q4 weights (dense, F16): each GEMM
-    /// weight is dequantized to f16 on the host and uploaded directly, keeping
-    /// host memory ~= packed Q4 + one tensor's f16 buffer.
-    pub fn from_q4(
-        hip: Arc<Hip>,
-        cfg: Config,
-        w: &WeightsQ4,
-        slots: usize,
-        rows: usize,
-    ) -> Result<Self, Error> {
-        assert!(slots >= 1, "slots must be >= 1");
-        assert!(rows >= slots, "rows must be >= slots");
-        if cfg.dtype != ModelDType::F16 {
-            return Err(Error::Model(
-                "from_q4 requires dtype F16 (dequantize to f16 on device)".into(),
-            ));
-        }
-        if cfg.num_experts != 0 || cfg.kv_lora_rank != 0 {
-            return Err(Error::Model(
-                "BatchedModel::from_q4 currently supports dense models only (no MoE/MLA)".into(),
-            ));
-        }
-        let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
-        let sampler = BatchedSampler::new(Arc::clone(&hip), k.stream, rows)?;
-        let mut m = Self {
-            cfg,
-            batch: slots,
-            rows,
-            k,
-            sampler,
-            tokens_dev: std::ptr::null_mut(),
-            pos_dev: std::ptr::null_mut(),
-            tokens_host: std::ptr::null_mut(),
-            pos_host: std::ptr::null_mut(),
-            slots_host: std::ptr::null_mut(),
-            slots_dev: std::ptr::null_mut(),
-            runs_host: std::ptr::null_mut(),
-            runs_dev: std::ptr::null_mut(),
-            run_mask_host: std::ptr::null_mut(),
-            run_mask_dev: std::ptr::null_mut(),
-            x: std::ptr::null_mut(),
-            xn: std::ptr::null_mut(),
-            xn2: std::ptr::null_mut(),
-            q: std::ptr::null_mut(),
-            k_buf: std::ptr::null_mut(),
-            v_buf: std::ptr::null_mut(),
-            attn: std::ptr::null_mut(),
-            proj: std::ptr::null_mut(),
-            gate: std::ptr::null_mut(),
-            up: std::ptr::null_mut(),
-            h: std::ptr::null_mut(),
-            logits: std::ptr::null_mut(),
-            out_tok_dev: std::ptr::null_mut(),
-            out_tok_host: std::ptr::null_mut(),
-            emb_dev: std::ptr::null_mut(),
-            rms_final_dev: std::ptr::null_mut(),
-            lm_head_dev: std::ptr::null_mut(),
-            layers_dev: Vec::new(),
-            emb_f16: std::ptr::null_mut(),
-            lm_head_f16: std::ptr::null_mut(),
-            layers_f16: Vec::new(),
-            xh: std::ptr::null_mut(),
-            yh: std::ptr::null_mut(),
-            router: std::ptr::null_mut(),
-            exp_ids: std::ptr::null_mut(),
-            exp_w: std::ptr::null_mut(),
-            counts_dev: std::ptr::null_mut(),
-            moe_pos_dev: std::ptr::null_mut(),
-            offsets_dev: std::ptr::null_mut(),
-            counts_host: std::ptr::null_mut(),
-            xg: std::ptr::null_mut(),
-            gw: std::ptr::null_mut(),
-            row_idx: std::ptr::null_mut(),
-            h_acc: std::ptr::null_mut(),
-            gate_all: std::ptr::null_mut(),
-            up_all: std::ptr::null_mut(),
-            eh_all: std::ptr::null_mut(),
-            down_all: std::ptr::null_mut(),
-            xh_moe: std::ptr::null_mut(),
-            yh_moe: std::ptr::null_mut(),
-            mla_q_lora: std::ptr::null_mut(),
-            mla_q_lora_n: std::ptr::null_mut(),
-            q_nope: std::ptr::null_mut(),
-            q_rope: std::ptr::null_mut(),
-            mla_kv_a: std::ptr::null_mut(),
-            mla_kv_a_n: std::ptr::null_mut(),
-            mla_kv_lora: std::ptr::null_mut(),
-            mla_kv: std::ptr::null_mut(),
-            mla_k_rope: std::ptr::null_mut(),
-            mla_attn: std::ptr::null_mut(),
-            kv_cache: Vec::new(),
-            mla_kv_cache: Vec::new(),
-            lens: vec![0; slots],
-            last_row_by_slot: vec![0; slots],
-            allocs: Vec::new(),
-            host_pins: Vec::new(),
-            expert_slots: usize::MAX,
-            host_w: None,
-            prefetch: None,
-        };
-        m.alloc_buffers()?;
-        m.upload_weights_q4(w)?;
-        Ok(m)
-    }
     /// CPU-backend MoE offload for the batch: experts live in host RAM and the MoE
     /// layer is computed on the CPU from the host weights (FreeToken `cpu` backend).
     /// The router still runs on the GPU (moe_router is uploaded); the grouped-GEMM
@@ -525,18 +472,6 @@ impl BatchedModel {
         Ok(())
     }
 
-    /// Uploads pre-encoded f16 bits directly (no f32 round trip).
-    fn upload_f16_bits(&self, dst: *mut u16, src: &[u16]) -> Result<(), Error> {
-        hip::memcpy(
-            self.k.hip(),
-            dst as *mut core::ffi::c_void,
-            src.as_ptr() as *const core::ffi::c_void,
-            src.len() * 2,
-            hip::HIP_MEMCPY_HOST_TO_DEVICE,
-        )?;
-        Ok(())
-    }
-
     /// Uploads an optional f32 tensor (empty -> null device pointer).
     fn upload_opt(&mut self, v: &[f32]) -> Result<*mut f32, Error> {
         if v.is_empty() {
@@ -548,76 +483,15 @@ impl BatchedModel {
         }
     }
 
-    /// Uploads storage-Q4 weights as f16 (dense F16 path): norms/biases stay
-    /// f32; GEMM matrices are dequantized per tensor and freed after upload.
-    fn upload_weights_q4(&mut self, w: &WeightsQ4) -> Result<(), Error> {
-        self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
-        self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
-        self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
-        self.upload_f16_bits(self.lm_head_f16, &w.lm_head.dequantize_f16())?;
-        self.rms_final_dev = self.dalloc(w.rms_final.len() * 4)?;
-        self.upload(self.rms_final_dev, &w.rms_final)?;
-
-        for lw in &w.layers {
-            let l = LayerDev {
-                wq: std::ptr::null_mut(),
-                wk: std::ptr::null_mut(),
-                wv: std::ptr::null_mut(),
-                wo: std::ptr::null_mut(),
-                rms_attn: self.dalloc(lw.rms_attn.len() * 4)?,
-                wg: std::ptr::null_mut(),
-                wu: std::ptr::null_mut(),
-                wd: std::ptr::null_mut(),
-                rms_mlp: self.dalloc(lw.rms_mlp.len() * 4)?,
-                bq: self.upload_opt(&lw.bq)?,
-                bk: self.upload_opt(&lw.bk)?,
-                bv: self.upload_opt(&lw.bv)?,
-                q_norm: self.upload_opt(&lw.q_norm)?,
-                k_norm: self.upload_opt(&lw.k_norm)?,
-                mla_q_a: std::ptr::null_mut(),
-                mla_q_a_norm: std::ptr::null_mut(),
-                mla_q_b: std::ptr::null_mut(),
-                mla_q_rope: std::ptr::null_mut(),
-                mla_kv_a: std::ptr::null_mut(),
-                mla_kv_a_norm: std::ptr::null_mut(),
-                mla_kv_b: std::ptr::null_mut(),
-                mla_o: std::ptr::null_mut(),
-                moe_router: std::ptr::null_mut(),
-                moe_wg: std::ptr::null_mut(),
-                moe_wu: std::ptr::null_mut(),
-                moe_wd: std::ptr::null_mut(),
-            };
-            self.upload(l.rms_attn, &lw.rms_attn)?;
-            self.upload(l.rms_mlp, &lw.rms_mlp)?;
-            self.layers_dev.push(l);
-            let l16 = LayerDevF16 {
-                wq: self.alloc_f16(lw.wq.len())?,
-                wk: self.alloc_f16(lw.wk.len())?,
-                wv: self.alloc_f16(lw.wv.len())?,
-                wo: self.alloc_f16(lw.wo.len())?,
-                wg: self.alloc_f16(lw.wg.len())?,
-                wu: self.alloc_f16(lw.wu.len())?,
-                wd: self.alloc_f16(lw.wd.len())?,
-                moe_router: std::ptr::null_mut(),
-                moe_wg: std::ptr::null_mut(),
-                moe_wu: std::ptr::null_mut(),
-                moe_wd: std::ptr::null_mut(),
-                mla_q_a: std::ptr::null_mut(),
-                mla_q_b: std::ptr::null_mut(),
-                mla_q_rope: std::ptr::null_mut(),
-                mla_kv_a: std::ptr::null_mut(),
-                mla_kv_b: std::ptr::null_mut(),
-                mla_o: std::ptr::null_mut(),
-            };
-            self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
-            self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
-            self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
-            self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
-            self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
-            self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
-            self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
-            self.layers_f16.push(l16);
-        }
+    /// Uploads pre-encoded f16 bits directly (no f32 round trip).
+    fn upload_f16_bits(&self, dst: *mut u16, src: &[u16]) -> Result<(), Error> {
+        hip::memcpy(
+            self.k.hip(),
+            dst as *mut core::ffi::c_void,
+            src.as_ptr() as *const core::ffi::c_void,
+            src.len() * 2,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )?;
         Ok(())
     }
 
@@ -979,6 +853,92 @@ impl BatchedModel {
                 self.upload_f16(l16.mla_o, &lw.mla_o)?;
                 self.layers_f16.push(l16);
             }
+        }
+        Ok(())
+    }
+
+    /// Uploads storage-Q4 weights as f16 (dense/MoE/MLA F16 path): norms and
+    /// biases stay f32; GEMM matrices are dequantized per tensor and the f16
+    /// buffer is freed after each upload. The router keeps its exact f32 copy
+    /// in `LayerDev` (Q4 does not quantize it) plus the usual f16 copy for the
+    /// fp16 GEMM path.
+    fn upload_weights_q4(&mut self, w: &WeightsQ4) -> Result<(), Error> {
+        self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
+        self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
+        self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
+        self.upload_f16_bits(self.lm_head_f16, &w.lm_head.dequantize_f16())?;
+        self.rms_final_dev = self.dalloc(w.rms_final.len() * 4)?;
+        self.upload(self.rms_final_dev, &w.rms_final)?;
+
+        for lw in &w.layers {
+            let l = LayerDev {
+                wq: std::ptr::null_mut(),
+                wk: std::ptr::null_mut(),
+                wv: std::ptr::null_mut(),
+                wo: std::ptr::null_mut(),
+                rms_attn: self.dalloc(lw.rms_attn.len() * 4)?,
+                wg: std::ptr::null_mut(),
+                wu: std::ptr::null_mut(),
+                wd: std::ptr::null_mut(),
+                rms_mlp: self.dalloc(lw.rms_mlp.len() * 4)?,
+                bq: self.upload_opt(&lw.bq)?,
+                bk: self.upload_opt(&lw.bk)?,
+                bv: self.upload_opt(&lw.bv)?,
+                q_norm: self.upload_opt(&lw.q_norm)?,
+                k_norm: self.upload_opt(&lw.k_norm)?,
+                mla_q_a: std::ptr::null_mut(),
+                mla_q_a_norm: self.upload_opt(&lw.mla_q_a_norm)?,
+                mla_q_b: std::ptr::null_mut(),
+                mla_q_rope: std::ptr::null_mut(),
+                mla_kv_a: std::ptr::null_mut(),
+                mla_kv_a_norm: self.upload_opt(&lw.mla_kv_a_norm)?,
+                mla_kv_b: std::ptr::null_mut(),
+                mla_o: std::ptr::null_mut(),
+                moe_router: self.upload_opt(&lw.moe_router)?,
+                moe_wg: std::ptr::null_mut(),
+                moe_wu: std::ptr::null_mut(),
+                moe_wd: std::ptr::null_mut(),
+            };
+            self.upload(l.rms_attn, &lw.rms_attn)?;
+            self.upload(l.rms_mlp, &lw.rms_mlp)?;
+            self.layers_dev.push(l);
+            let l16 = LayerDevF16 {
+                wq: self.alloc_f16(lw.wq.len())?,
+                wk: self.alloc_f16(lw.wk.len())?,
+                wv: self.alloc_f16(lw.wv.len())?,
+                wo: self.alloc_f16(lw.wo.len())?,
+                wg: self.alloc_f16(lw.wg.len())?,
+                wu: self.alloc_f16(lw.wu.len())?,
+                wd: self.alloc_f16(lw.wd.len())?,
+                moe_router: self.alloc_f16(lw.moe_router.len())?,
+                moe_wg: self.alloc_f16(lw.moe_wg.len())?,
+                moe_wu: self.alloc_f16(lw.moe_wu.len())?,
+                moe_wd: self.alloc_f16(lw.moe_wd.len())?,
+                mla_q_a: self.alloc_f16(lw.mla_q_a.len())?,
+                mla_q_b: self.alloc_f16(lw.mla_q_b.len())?,
+                mla_q_rope: self.alloc_f16(lw.mla_q_rope.len())?,
+                mla_kv_a: self.alloc_f16(lw.mla_kv_a.len())?,
+                mla_kv_b: self.alloc_f16(lw.mla_kv_b.len())?,
+                mla_o: self.alloc_f16(lw.mla_o.len())?,
+            };
+            self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
+            self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
+            self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
+            self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
+            self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
+            self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
+            self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
+            self.upload_f16(l16.moe_router, &lw.moe_router)?;
+            self.upload_f16_bits(l16.moe_wg, &lw.moe_wg.dequantize_f16())?;
+            self.upload_f16_bits(l16.moe_wu, &lw.moe_wu.dequantize_f16())?;
+            self.upload_f16_bits(l16.moe_wd, &lw.moe_wd.dequantize_f16())?;
+            self.upload_f16_bits(l16.mla_q_a, &lw.mla_q_a.dequantize_f16())?;
+            self.upload_f16_bits(l16.mla_q_b, &lw.mla_q_b.dequantize_f16())?;
+            self.upload_f16_bits(l16.mla_q_rope, &lw.mla_q_rope.dequantize_f16())?;
+            self.upload_f16_bits(l16.mla_kv_a, &lw.mla_kv_a.dequantize_f16())?;
+            self.upload_f16_bits(l16.mla_kv_b, &lw.mla_kv_b.dequantize_f16())?;
+            self.upload_f16_bits(l16.mla_o, &lw.mla_o.dequantize_f16())?;
+            self.layers_f16.push(l16);
         }
         Ok(())
     }
