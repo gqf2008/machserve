@@ -518,3 +518,54 @@ fn q4_gpu_matches_f32() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[cfg(feature = "hip")]
+#[test]
+fn q4_batched_gpu_matches_f32() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let path = tmp_path("q4batched");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let w32 = load_safetensors(&path, &cfg, false).unwrap();
+    let wq4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    let tokens = vec![3u32, 7];
+
+    let mut b32 = BatchedModel::new(hip.clone(), cfg, &w32, 2).unwrap();
+    let mut bq4 = BatchedModel::from_q4(hip, cfg, &wq4, 2, 2).unwrap();
+    b32.decode_step(&tokens).unwrap();
+    bq4.decode_step(&tokens).unwrap();
+    let l32 = b32.read_logits().unwrap();
+    let lq4 = bq4.read_logits().unwrap();
+
+    let max = max_abs_diff(&l32, &lq4);
+    let scale = l32.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    eprintln!("q4 batched GPU vs f32: max logit diff {max:.4} (scale {scale:.3})");
+    assert!(
+        max <= 0.2 + 0.2 * scale,
+        "q4 batched GPU vs f32 logits diverged: {max} vs scale {scale}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
