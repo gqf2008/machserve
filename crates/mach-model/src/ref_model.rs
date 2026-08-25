@@ -338,10 +338,8 @@ fn f32s_to_bytes(vals: &[f32]) -> Vec<u8> {
 
 /// Deserializes little-endian bytes back to f32 values (anchor restore).
 fn bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    let (chunks, _) = bytes.as_chunks::<4>();
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Per-head RMSNorm (Qwen3 QK-norm): each head's `head_dim` slice is
