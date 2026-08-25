@@ -188,6 +188,12 @@ fn config_from_json(path: &std::path::Path) -> Config {
         .or_else(|| v["top_k"].as_u64())
         .unwrap_or(0) as usize;
     let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);
+    // Some configs (e.g. Qwen3-30B-A3B) ship an explicit `head_dim` that
+    // differs from hidden/n_heads (q/o width = n_heads*head_dim is wider
+    // than hidden). Honor it, or the loader under-sizes q/o projections.
+    if let Some(hd) = v["head_dim"].as_u64() {
+        cfg.head_dim = hd as usize;
+    }
     cfg.intermediate_size = inter;
     cfg.rms_eps = eps;
     cfg.rope_theta = theta;
