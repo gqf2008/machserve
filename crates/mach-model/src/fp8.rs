@@ -210,10 +210,6 @@ impl Fp8Tensor {
 
     /// Dequantizes back to f32.
     pub fn dequantize(&self) -> Vec<f32> {
-        self.dequantize_f32_into()
-    }
-
-    fn dequantize_f32_into(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.n);
         for (i, &b) in self.q.iter().enumerate() {
             let s = self.scales[i / self.block.max(1)];
