@@ -13,7 +13,7 @@
 use crate::batched::BatchedModel;
 use crate::sampling::SamplingParams;
 use crate::state_reuse::{ReuseStats, StateReuse};
-use crate::{Config, Error, Weights, WeightsQ4};
+use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
 use mach_kernel_sys::hip::Hip;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -130,6 +130,28 @@ impl ContinuousModel {
         prefill_rows: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_rows_q4(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+        })
+    }
+
+    /// Builds a continuous-batching engine from storage-FP8 weights: each GEMM
+    /// tensor is dequantized to f16 during upload, so host RAM stays ~= the
+    /// packed FP8 weights (experts stay fully GPU-resident).
+    pub fn with_prefill_rows_fp8(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsFp8,
+        capacity: usize,
+        prefill_rows: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_rows_fp8(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
         Ok(Self {
             model,
             prefill_rows: prefill_rows.max(capacity),
