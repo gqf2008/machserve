@@ -14,11 +14,11 @@ use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
-use mach_model::loader::load_safetensors;
+use mach_model::loader::{load_safetensors, load_safetensors_q4};
 #[cfg(feature = "hip")]
 use mach_model::tokenizer::Tokenizer;
 #[cfg(feature = "hip")]
-use mach_model::{Config, Weights};
+use mach_model::{Config, Weights, WeightsQ4};
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ServerEngine, router};
 #[cfg(feature = "hip")]
@@ -257,7 +257,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match dtype.as_str() {
         "f32" => cfg.dtype = ModelDType::F32,
         "f16" => cfg.dtype = ModelDType::F16,
-        other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
+        // Storage-Q4: weights load quantized, dequantize to f16 on device.
+        "q4" => cfg.dtype = ModelDType::F16,
+        other => panic!("MACH_DTYPE must be f32, f16 or q4, got {other:?}"),
     }
 
     // Preflight (before any heavy loading): HIP runtime + device + VRAM. A
@@ -336,11 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("bound http://{addr} (preflight passed)");
 
-    let w: Weights = load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
-    println!(
-        "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
-        cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
-    );
+    let q4 = dtype == "q4";
 
     // Load the real tokenizer when available; fall back to naive bytes.
     let tok_path = root.join(&tokenizer_name);
@@ -360,6 +358,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through a
     // draft + target engine (greedy-only; other params rejected).
     let (engine, engine_handle) = if spec {
+        if q4 {
+            return Err("MACH_SPEC is not supported with MACH_DTYPE=q4".into());
+        }
+        let w: Weights =
+            load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
+        );
         let mut dcfg = config_from_json(&root.join(&draft_config));
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
@@ -375,7 +382,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let eng = ServerEngine::with_spec(capacity, spec_k);
         let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
         (eng, handle)
+    } else if q4 {
+        let w: WeightsQ4 =
+            load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load Q4 weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype=q4 (storage-Q4 -> f16)",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size
+        );
+        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let handle = eng.clone().spawn_q4(hip, cfg, w)?;
+        (eng, handle)
     } else {
+        let w: Weights =
+            load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
+        println!(
+            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
+            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
+        );
         let eng = if let Some(slots) = moe_slots {
             ServerEngine::with_offload(capacity, prefill_rows, slots)
         } else {

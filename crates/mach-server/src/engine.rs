@@ -7,7 +7,7 @@ use mach_model::batched::BatchedModel;
 use mach_model::continuous::{ContinuousModel, SeqId};
 use mach_model::sampling::SamplingParams;
 use mach_model::speculative::SpeculativeEngine;
-use mach_model::{Config, Weights};
+use mach_model::{Config, Weights, WeightsQ4};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -252,6 +252,22 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
+        Ok(std::thread::Builder::new()
+            .name("mach-engine".into())
+            .spawn(move || self.run(&mut model))
+            .expect("spawn engine thread"))
+    }
+
+    /// Spawns a storage-Q4 engine thread (dense F16; weights built via
+    /// `BatchedModel::from_q4`, so host memory stays ~= packed Q4).
+    pub fn spawn_q4(
+        self: Arc<Self>,
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: WeightsQ4,
+    ) -> Result<std::thread::JoinHandle<()>, EngineError> {
+        let mut model =
+            ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?;
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))

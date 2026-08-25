@@ -13,7 +13,7 @@
 use crate::batched::BatchedModel;
 use crate::sampling::SamplingParams;
 use crate::state_reuse::{ReuseStats, StateReuse};
-use crate::{Config, Error, Weights};
+use crate::{Config, Error, Weights, WeightsQ4};
 use mach_kernel_sys::hip::Hip;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -108,6 +108,26 @@ impl ContinuousModel {
         prefill_rows: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_rows(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+        })
+    }
+
+    /// Builds a continuous-batching engine from storage-Q4 weights (dense F16).
+    pub fn with_prefill_rows_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::from_q4(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
         Ok(Self {
             model,
             prefill_rows: prefill_rows.max(capacity),
