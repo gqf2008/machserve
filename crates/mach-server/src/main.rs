@@ -7,9 +7,8 @@
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
-//! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 (storage-int4 weights:
-//! host RAM stays packed int4, dequantized to f16 on the device),
-
+//! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
+//! host weights: int4 or E4M3, dequantized to f16 on the device).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
