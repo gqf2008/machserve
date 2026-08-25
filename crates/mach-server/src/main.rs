@@ -77,16 +77,41 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg
 }
 
+/// Total weight-payload size for the VRAM preflight: a single checkpoint file,
+/// or the sum of every `*.safetensors` shard when `path` is a directory of
+/// shards (Qwen-8B+ checkpoints ship as 5..65 files). A bare directory's
+/// `metadata().len()` is ~0 on Windows, so using it directly would let the
+/// preflight pass while the actual upload OOMs. Best-effort: unreadable shard
+/// entries are skipped, and a directory with no shards sums to 0.
+#[cfg(feature = "hip")]
+fn model_file_bytes(path: &std::path::Path) -> u64 {
+    if let Ok(entries) = std::fs::read_dir(path) {
+        // Directory of shards: sum every `*.safetensors`; non-shard files and
+        // unreadable entries are skipped (best-effort preflight estimate).
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    } else {
+        // Single checkpoint file (read_dir on a file path fails).
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+}
+
 /// Rough device-memory estimate for the preflight: weight file + KV cache +
 /// 256MiB scratch margin (+ draft model in spec mode). MLA uses the expanded
 /// per-head KV cache (always f32); dense uses the GQA formula with the dtype's
-/// element size. Sharded weight files, hipBLAS workspace and compiled kernels
-/// are not counted; the margin covers today's scenarios.
+/// element size. Sharded weight files are counted via [`model_file_bytes`];
+/// hipBLAS workspace and compiled kernels are not counted; the margin covers
+/// today's scenarios.
 #[cfg(feature = "hip")]
 fn estimate_vram(
     cfg: &Config,
     capacity: usize,
-    model_file_bytes: u64,
+    file_bytes: u64,
     draft: Option<(&Config, u64)>,
     q4: bool,
 ) -> u64 {
@@ -103,11 +128,7 @@ fn estimate_vram(
     // Q4 stores packed int4 on the host but the device holds dequantized f16
     // weights (~3.2x the packed size incl. scales); x4 is a conservative
     // over-estimate so the preflight cannot pass while the upload OOMs.
-    let weight = if q4 {
-        model_file_bytes * 4
-    } else {
-        model_file_bytes
-    };
+    let weight = if q4 { file_bytes * 4 } else { file_bytes };
     let mut est = weight + (kv * cfg.n_layers) as u64 + (256 << 20);
     if let Some((dcfg, dfb)) = draft {
         let dkv_elem = if dcfg.dtype == ModelDType::F16 { 2 } else { 4 };
@@ -202,9 +223,7 @@ fn run_doctor() {
     }))
     .ok();
     if let Some(cfg) = cfg {
-        let fb = std::fs::metadata(root.join(&model_name))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let fb = model_file_bytes(&root.join(&model_name));
         let cap = std::env::var("MACH_CAPACITY")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -324,15 +343,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    // NOTE: sharded weight files, hipBLAS workspace and compiled kernels are
-    // not counted; the 256MiB margin covers today's tiny/1.5B scenarios.
-    let file_bytes = std::fs::metadata(root.join(&model_name))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // NOTE: hipBLAS workspace and compiled kernels are not counted; the 256MiB
+    // margin covers today's tiny/1.5B scenarios.
+    let file_bytes = model_file_bytes(&root.join(&model_name));
     let draft_est = if spec {
-        let dfb = std::fs::metadata(root.join(&draft_name))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let dfb = model_file_bytes(&root.join(&draft_name));
         let mut dcfg = config_from_json(&root.join(&draft_config));
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
@@ -629,6 +644,40 @@ mod tests {
         parse_json(
             r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"kv_lora_rank":512}"#,
         );
+    }
+
+    #[test]
+    fn model_file_bytes_sums_shard_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("mach_preflight_shard_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A single checkpoint file: metadata length, not a dir sum.
+        let single = dir.join("model.safetensors");
+        std::fs::write(&single, vec![0u8; 1234]).unwrap();
+        assert_eq!(model_file_bytes(&single), 1234);
+        // A directory of shards: every *.safetensors counted, non-shards not.
+        std::fs::write(
+            dir.join("model-00001-of-00002.safetensors"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("model-00002-of-00002.safetensors"),
+            vec![0u8; 2000],
+        )
+        .unwrap();
+        std::fs::write(dir.join("config.json"), vec![0u8; 999]).unwrap();
+        assert_eq!(model_file_bytes(&dir), 4234); // 1234 single + 1000 + 2000 shards
+        // A directory with no shards sums to 0, not the dir's own size.
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(model_file_bytes(&empty), 0);
+        std::fs::write(empty.join("config.json"), vec![0u8; 64]).unwrap();
+        assert_eq!(model_file_bytes(&empty), 0);
+        // Missing path falls back to 0.
+        assert_eq!(model_file_bytes(&dir.join("nope.safetensors")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
