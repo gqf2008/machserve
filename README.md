@@ -80,10 +80,21 @@ thirdparty/        第三方参考代码(占位)
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
 | **FP8** | 关闭:gfx1100/ROCm6.2 hipBLAS 拒绝 fp8 | P3aq 探针 |
 
+## 安装与排障（个人用户从这里开始）
+
+- **一键安装（Windows + AMD ROCm）**：`powershell -ExecutionPolicy Bypass -File scripts/install.ps1` —— 环境自检（Rust/ROCm/显卡）→ release 构建 → 下载 starter MoE 模型（hf-mirror 回退）→ 冒烟基准。
+- **排障**：`cargo run -p mach-server --features hip -- doctor` —— 一次看清 GPU/VRAM/ROCm/MACH_* 环境/模型文件/估算占用；`--version` 查看版本。
+- **选模型**：见 [docs/support-matrix.md](docs/support-matrix.md)（实测数字 + 带宽估算方法学，说人话）。
+
 ## 构建与运行
 
 ```bash
 # 构建 + 测试(默认 / HIP)
+cargo build --workspace
+cargo test  --workspace
+cargo test  --workspace --features hip -- --test-threads 1   # 需 ROCm + GPU
+cargo clippy --workspace --all-targets --features hip
+cargo fmt --all --check
 cargo build --workspace
 cargo test  --workspace
 cargo test  --workspace --features hip -- --test-threads 1   # 需 ROCm + GPU

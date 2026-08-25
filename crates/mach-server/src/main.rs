@@ -115,9 +115,114 @@ fn estimate_vram(
     est
 }
 
+/// One-shot diagnostic report (`mach-server doctor`): OS/host, HIP/GPU/VRAM,
+/// MACH_* env, model files and a VRAM estimate. Exits 0 even when HIP is
+/// missing (the report explains what to fix). Reuses the preflight queries.
+#[cfg(feature = "hip")]
+fn run_doctor() {
+    let rev = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    println!("mach-server {}", env!("CARGO_PKG_VERSION"));
+    println!("git rev: {}", rev.as_deref().unwrap_or("n/a"));
+    println!("os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "host cpus: {}",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
+    );
+    println!(
+        "MACH_HIP_PATH: {:?}",
+        std::env::var("MACH_HIP_PATH").unwrap_or_default()
+    );
+    println!("MACH_* env:");
+    for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("MACH_")) {
+        println!("  {k}={v}");
+    }
+
+    match hip::hip() {
+        Err(e) => {
+            println!("HIP runtime: UNAVAILABLE ({e})");
+            println!("  -> install ROCm and/or set MACH_HIP_PATH to the ROCm bin dir");
+        }
+        Ok(h) => match hip::device_count() {
+            Err(e) => println!("device_count: ERROR ({e})"),
+            Ok(n) if n <= 0 => println!("device_count: 0 (no HIP device)"),
+            Ok(n) => {
+                println!("device_count: {n}");
+                for d in 0..n {
+                    let name = hip::device_name(d).unwrap_or_else(|e| format!("<{e}>"));
+                    println!("  gpu[{d}]: {name}");
+                }
+                match hip::mem_info() {
+                    Ok((free, total)) => {
+                        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                        println!(
+                            "vram: {:.2} GiB free / {:.2} GiB total",
+                            gib(free as u64),
+                            gib(total as u64)
+                        );
+                        let _ = (h, gib);
+                    }
+                    Err(e) => println!("vram: mem_info error ({e})"),
+                }
+            }
+        },
+    }
+
+    let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
+    let model_name = std::env::var("MACH_MODEL").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
+    let config_name = std::env::var("MACH_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
+    println!("models dir: {root}");
+    let root = std::path::PathBuf::from(root);
+    for (label, f) in [("model", &model_name), ("config", &config_name)] {
+        let path = root.join(f);
+        match std::fs::metadata(&path) {
+            Ok(m) => println!("  {label} {f}: {} bytes", m.len()),
+            Err(e) => println!("  {label} {f}: MISSING ({e})"),
+        }
+    }
+    // Best-effort VRAM estimate; the server preflight is authoritative.
+    let cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        config_from_json(&root.join(&config_name))
+    }))
+    .ok();
+    if let Some(cfg) = cfg {
+        let fb = std::fs::metadata(root.join(&model_name))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let cap = std::env::var("MACH_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let need = estimate_vram(&cfg, cap, fb, None);
+        let gib = need as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!(
+            "estimate: d_model={} layers={} experts={} need ~{:.2} GiB (capacity {cap})",
+            cfg.d_model, cfg.n_layers, cfg.num_experts, gib
+        );
+    }
+}
+
 #[cfg(feature = "hip")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `mach-server doctor` / `--version`: one-shot diagnostics, no model load.
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") | Some("-V") => {
+            println!("mach-server {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("doctor") | Some("--doctor") => {
+            run_doctor();
+            return Ok(());
+        }
+        _ => {}
+    }
     let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
     let model_name = std::env::var("MACH_MODEL").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
     let config_name = std::env::var("MACH_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
@@ -311,7 +416,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 #[cfg(not(feature = "hip"))]
 fn main() {
-    eprintln!("mach-server requires the `hip` feature: cargo run -p mach-server --features hip");
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") | Some("-V") => {
+            println!("mach-server {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some("doctor") | Some("--doctor") => {
+            println!("mach-server {}", env!("CARGO_PKG_VERSION"));
+            println!("os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+            println!("HIP: NOT COMPILED (build with --features hip)");
+            for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("MACH_")) {
+                println!("{k}={v}");
+            }
+        }
+        _ => eprintln!(
+            "mach-server requires the `hip` feature: cargo run -p mach-server --features hip"
+        ),
+    }
 }
 
 #[cfg(all(test, feature = "hip"))]

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/lightseekorg/machserve"
@@ -21,10 +21,10 @@ rust-version = "1.97"
 all = "warn"
 
 [workspace.dependencies]
-mach-engine = { path = "crates/mach-engine", version = "0.1.0" }
-mach-kernel = { path = "crates/mach-kernel", version = "0.1.0" }
-mach-kernel-sys = { path = "crates/mach-kernel-sys", version = "0.1.0" }
-mach-model = { path = "crates/mach-model", version = "0.1.0" }
+mach-engine = { path = "crates/mach-engine", version = "0.2.0" }
+mach-kernel = { path = "crates/mach-kernel", version = "0.2.0" }
+mach-kernel-sys = { path = "crates/mach-kernel-sys", version = "0.2.0" }
+mach-model = { path = "crates/mach-model", version = "0.2.0" }
 
 
 
