@@ -46,8 +46,11 @@ Env：`MACH_MODELS`（默认 `.models`）、`MACH_MODEL`（默认 `model.safeten
 | f32（f16 计算腿） | **2.50 GiB**（2682 MiB） | 1.0x |
 | Q4（packed int4） | **0.40 GiB**（433 MiB） | **6.2x 更小** |
 
-- f32 加载 ~1.2-1.4 s；Q4 加载+量化 ~37 s（一次性成本；MoE 专家张量的
-  `concat_q4` 是逐专家 dequant+requant，O(n²)，后续可优化）。
+- f32 加载 ~1.2-1.6 s；Q4 加载+量化 **~2.9 s**（qwen3-moe-tiny，7900 XTX，
+  一次性成本；已优化：`concat_q4` 组对齐直拼 packed bytes + scales（O(1)/专家，
+  原来逐专家 dequant+requant O(n²)），且量化按张量并行 + 大张量按组范围跨线程
+  （`Q4Tensor::quantize_par`，与 `quantize` 逐位一致）。历史：37 s → 13 s（concat）
+  → 4.6 s（张量级并行）→ 2.9 s（组内并行）。
 - 同进程 A/B 里 Q4 leg 显示 0.68 GiB，是 f32 权重释放后留在工作集里的内存，非 Q4 真实占用。
 
 ### TTFT / TPOT（同一 f16 计算路径）

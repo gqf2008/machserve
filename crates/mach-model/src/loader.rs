@@ -453,49 +453,89 @@ pub fn load_safetensors_q4(
         return Err(Error::Model(format!("no .safetensors files in {path:?}")));
     }
 
-    let mut store_big =
-        |name: &str, t: &RawTensor, data: &[u8], expected: usize| -> Result<(), Error> {
-            let f = tensor_f32(data, t, expected, name)?;
-            big.insert(name.to_string(), Q4Tensor::quantize(&f));
-            Ok(())
-        };
-    let mut store_small =
-        |name: &str, t: &RawTensor, data: &[u8], expected: usize| -> Result<(), Error> {
-            let f = tensor_f32(data, t, expected, name)?;
-            small.insert(name.to_string(), f);
-            Ok(())
-        };
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16);
 
     for file in &files {
         let (tensors, data) = parse_safetensors(file)?;
+
+        // Classify this shard's tensors: GEMM weights are quantized (parallel),
+        // norms/biases stay f32 (inline). Big-vs-small is decided by whether the
+        // name maps to a known GEMM weight.
+        let mut big_work: Vec<(String, usize)> = Vec::new();
         for (name, t) in &tensors {
-            // Embedding/lm_head are special (tied embeddings); GEMM weights
-            // quantize; anything else (norms/biases) stays f32. Big-vs-small is
-            // decided by whether the name maps to a known GEMM weight.
-            if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
-                store_big(name, t, &data, cfg.vocab_size * d)?;
-            } else if let Some(expected) =
-                expected_q4_size(name, cfg, d, nq, nkv, inter, einter, mla)
-            {
-                store_big(name, t, &data, expected)?;
-            } else if let Some(expected) = expected_small_size(name, cfg, d, nq, nkv, mla, ne) {
+            let n: usize = t.shape.iter().product();
+            let expected = if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
+                Some(cfg.vocab_size * d)
+            } else if let Some(e) = expected_q4_size(name, cfg, d, nq, nkv, inter, einter, mla) {
+                Some(e)
+            } else if let Some(e) = expected_small_size(name, cfg, d, nq, nkv, mla, ne) {
                 // q_norm/k_norm: accept both shared [head_dim] and per-head
                 // [n_heads*head_dim] / [n_kv_heads*head_dim] forms.
-                let n: usize = t.shape.iter().product();
-                let expected = if (name.contains("q_norm.weight") || name.contains("k_norm.weight"))
-                    && n != expected
+                let e = if (name.contains("q_norm.weight") || name.contains("k_norm.weight"))
+                    && n != e
                     && (n == cfg.n_heads * cfg.head_dim || n == cfg.n_kv_heads * cfg.head_dim)
                 {
                     n
                 } else {
-                    expected
+                    e
                 };
-                store_small(name, t, &data, expected)?;
+                small.insert(name.clone(), tensor_f32(&data, t, e, name)?);
+                None
             } else {
                 // Unknown auxiliary tensors (e.g. shared_expert.*) are skipped,
                 // matching the f32 loader's behavior.
                 eprintln!("q4 loader: skipping unknown tensor {name}");
+                None
+            };
+            if let Some(e) = expected {
+                big_work.push((name.clone(), e));
             }
+        }
+
+        // Decode + quantize the GEMM tensors in parallel: per-element CPU work
+        // dominates Q4 load, so the shard's tensors are split across threads
+        // (peak host RAM is one shard's decoded f32 tensors, then the shard's
+        // raw bytes are dropped before the next shard).
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: std::sync::Mutex<Vec<(String, Q4Tensor)>> =
+            std::sync::Mutex::new(Vec::with_capacity(big_work.len()));
+        let err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..n_threads {
+                s.spawn(|| {
+                    loop {
+                        if err.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((name, expected)) = big_work.get(i) else {
+                            break;
+                        };
+                        match tensor_f32(&data, &tensors[name], *expected, name) {
+                            Ok(f) => {
+                                let q = Q4Tensor::quantize_par(&f);
+                                results.lock().unwrap().push((name.clone(), q));
+                            }
+                            Err(e) => {
+                                let mut g = err.lock().unwrap();
+                                if g.is_none() {
+                                    *g = Some(e);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
+        }
+        for (name, q) in results.into_inner().unwrap() {
+            big.insert(name, q);
         }
         // Drop this shard's raw bytes before reading the next.
         drop(data);
@@ -737,10 +777,10 @@ fn expected_small_size(
     }
 }
 
-/// Concatenates two quantized tensors' dequantized values and re-quantizes
-/// (used for per-expert MoE tensors). Small/rare path; exact for our use.
+/// Concatenates two quantized tensors (per-expert MoE tensors). Delegates to
+/// `Q4Tensor::concat`: group-aligned tensors append packed int4 bytes + scales
+/// directly (O(1) per expert, fixing the old O(ne^2) dequant+requant that made
+/// Q4 loading of MoE checkpoints ~30x slower than f32).
 fn concat_q4(a: &Q4Tensor, b: &Q4Tensor) -> Q4Tensor {
-    let mut v = a.dequantize();
-    v.extend(b.dequantize());
-    Q4Tensor::quantize(&v)
+    a.concat(b)
 }
