@@ -316,6 +316,45 @@ impl RefModel {
         Ok(())
     }
 
+    /// Hidden state of the most recently processed token (after the last
+    /// layer, before the final norm + lm_head); empty until something runs.
+    #[must_use]
+    pub fn hidden(&self) -> &[f32] {
+        &self.last_hidden
+    }
+
+    /// Extracts per-layer KV bytes for positions `[start, end)` (same host
+    /// framing as [`Self::save_anchor`]). Used by the page-prefix cache to
+    /// store one page's KV independently of the rest of the prefix.
+    #[must_use]
+    pub fn kv_slice_bytes(&self, start: usize, end: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        assert!(
+            start < end && end <= self.pos,
+            "kv slice must be within processed positions"
+        );
+        let cfg = self.cfg;
+        if cfg.kv_lora_rank == 0 {
+            let row = cfg.n_kv_heads * cfg.head_dim;
+            let n0 = start * row;
+            let n1 = end * row;
+            self.kv
+                .iter()
+                .map(|(k, v)| (f32s_to_bytes(&k[n0..n1]), f32s_to_bytes(&v[n0..n1])))
+                .collect()
+        } else {
+            let heads = cfg.n_heads;
+            let hd = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+            let kn0 = start * heads * hd;
+            let kn1 = end * heads * hd;
+            let vn0 = start * heads * cfg.v_head_dim;
+            let vn1 = end * heads * cfg.v_head_dim;
+            self.mla_kv
+                .iter()
+                .map(|(k, v)| (f32s_to_bytes(&k[kn0..kn1]), f32s_to_bytes(&v[vn0..vn1])))
+                .collect()
+        }
+    }
+
     /// Logits at the position right after the anchor, computed directly from
     /// the saved hidden state (final norm + lm_head) — no forward pass. Equal
     /// to what a full recompute produced at that position.

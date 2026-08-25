@@ -59,6 +59,8 @@ pub struct PrefixReusePlan {
     pub total_tokens: usize,
     /// Content keys of this plan's fresh pages (for [`ReusePlanner::release`]).
     fresh_keys: Vec<CacheKey>,
+    /// Content keys of every page, in order (reused prefix then fresh tail).
+    pub page_keys: Vec<CacheKey>,
 }
 
 /// Admission planner for one cache group: computes page hashes, probes the
@@ -112,6 +114,7 @@ impl ReusePlanner {
                 reused_tokens: 0,
                 total_tokens: 0,
                 fresh_keys: Vec::new(),
+                page_keys: Vec::new(),
             });
         }
 
@@ -182,6 +185,7 @@ impl ReusePlanner {
             reused_tokens,
             total_tokens,
             fresh_keys,
+            page_keys: keys,
         })
     }
 
