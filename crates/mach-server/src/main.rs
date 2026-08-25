@@ -88,6 +88,7 @@ fn estimate_vram(
     capacity: usize,
     model_file_bytes: u64,
     draft: Option<(&Config, u64)>,
+    q4: bool,
 ) -> u64 {
     let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
     let kv = if cfg.kv_lora_rank > 0 {
@@ -99,7 +100,15 @@ fn estimate_vram(
     } else {
         capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem * 2
     };
-    let mut est = model_file_bytes + (kv * cfg.n_layers) as u64 + (256 << 20);
+    // Q4 stores packed int4 on the host but the device holds dequantized f16
+    // weights (~3.2x the packed size incl. scales); x4 is a conservative
+    // over-estimate so the preflight cannot pass while the upload OOMs.
+    let weight = if q4 {
+        model_file_bytes * 4
+    } else {
+        model_file_bytes
+    };
+    let mut est = weight + (kv * cfg.n_layers) as u64 + (256 << 20);
     if let Some((dcfg, dfb)) = draft {
         let dkv_elem = if dcfg.dtype == ModelDType::F16 { 2 } else { 4 };
         let dkv = if dcfg.kv_lora_rank > 0 {
@@ -200,7 +209,7 @@ fn run_doctor() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        let need = estimate_vram(&cfg, cap, fb, None);
+        let need = estimate_vram(&cfg, cap, fb, None, false);
         let gib = need as f64 / (1024.0 * 1024.0 * 1024.0);
         println!(
             "estimate: d_model={} layers={} experts={} need ~{:.2} GiB (capacity {cap})",
@@ -333,11 +342,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // In Q4 mode the device holds dequantized f16 weights (~4x the packed int4
+    // file size), so the preflight weight term must account for that or it can
+    // pass while the upload OOMs.
     let estimate = estimate_vram(
         &cfg,
         capacity,
         file_bytes,
         draft_est.as_ref().map(|(c, b)| (c, *b)),
+        q4,
     );
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     println!(
@@ -497,7 +510,7 @@ mod tests {
     #[test]
     fn dense_estimate_includes_weights_kv_and_margin() {
         let cfg = dense_cfg();
-        let est = estimate_vram(&cfg, 8, 1_000_000, None);
+        let est = estimate_vram(&cfg, 8, 1_000_000, None, false);
         // KV (f32) = capacity*max_seq*kv_heads*head_dim*4 per layer.
         let kv =
             (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * 2 * cfg.n_layers) as u64;
@@ -508,9 +521,9 @@ mod tests {
     fn f16_dense_uses_two_byte_kv() {
         let mut cfg = dense_cfg();
         cfg.dtype = ModelDType::F16;
-        let f16 = estimate_vram(&cfg, 8, 0, None);
+        let f16 = estimate_vram(&cfg, 8, 0, None, false);
         cfg.dtype = ModelDType::F32;
-        let f32 = estimate_vram(&cfg, 8, 0, None);
+        let f32 = estimate_vram(&cfg, 8, 0, None, false);
         // KV diff = layers * capacity*max_seq*kv_heads*head_dim*(4-2).
         let kv_diff =
             (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
@@ -531,15 +544,15 @@ mod tests {
             * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
             * 4
             * cfg.n_layers) as u64;
-        assert_eq!(estimate_vram(&cfg, 8, 0, None), kv + (256 << 20));
+        assert_eq!(estimate_vram(&cfg, 8, 0, None, false), kv + (256 << 20));
     }
 
     #[test]
     fn spec_adds_draft_weights_and_kv() {
         let tcfg = dense_cfg();
         let dcfg = dense_cfg();
-        let base = estimate_vram(&tcfg, 8, 1_000, None);
-        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)));
+        let base = estimate_vram(&tcfg, 8, 1_000, None, false);
+        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)), false);
         let dkv =
             (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4 * 2) as u64;
         assert_eq!(spec - base, 500 + dkv);
@@ -616,5 +629,14 @@ mod tests {
         parse_json(
             r#"{"hidden_size":5120,"num_hidden_layers":2,"num_attention_heads":128,"vocab_size":102400,"max_position_embeddings":4096,"kv_lora_rank":512}"#,
         );
+    }
+
+    #[test]
+    fn q4_scales_weight_term_by_four() {
+        let cfg = dense_cfg();
+        let base = estimate_vram(&cfg, 8, 1_000_000, None, false);
+        let q4 = estimate_vram(&cfg, 8, 1_000_000, None, true);
+        // Q4 adds 3x file_bytes (weight term x4 vs x1).
+        assert_eq!(q4 - base, 3_000_000);
     }
 }
