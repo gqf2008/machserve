@@ -36,6 +36,7 @@ cargo test -p mach-model --features hip --test moe -- --ignored --test-threads=1
 - **CPU 已验证**（`cargo test -p mach-model --lib`，20 passed）：LRU 语义、放置无关性、批量 CPU 残差、q* 决策、实时 q* 节拍、tokenizer/fp16。
 - **GPU 已实测**（本机 7900 XTX 无头卡，2026-08-24）：`moe_gpu_offload_placement_invariant` / `moe_gpu_slot_offload_matches_full` / `moe_gpu_adaptive_offload_matches_full` / `batched_moe_cpu_offload_matches_full_resident` / `moe_gpu_forward_matches_cpu_reference` —— 单序列、批量、自适应三种 offload 与全驻留一致。
 - **真实 MoE checkpoint 已实跑**：`PrimeIntellect/qwen3-moe-tiny`（Qwen3-MoE，~670M）加载 + 三档基准（TTFT/TPOT），放置无关性成立（max logit diff ≤ 6e-6，argmax 一致）；结果见 `benchmark-results-moe-offload.md`。
+- **fp64 三路对拍已绿（issue #22）**：独立 `fp64_ref` 参考（matvec/SwiGLU/router top-k/批量残差 + 完整 forward），GPU(f32) == CPU(f32) == fp64 误差在 f32 舍入量级（合成 ~1e-6，真实 qwen3-moe-tiny ~9.5e-6 绝对 / ~1.9e-6 相对），argmax 全一致，放置无关性在 fp64 下成立；数字见 `benchmark-fp64-parity.md`。
 - **loader 新增 Qwen3-MoE 族支持**：`moe_intermediate_size`（专家 FFN 宽度）+ 混合 dense/MoE 层（`mlp_only_layers`，按 `mlp.gate.weight` 逐层判定）+ Qwen3 共享 qk-norm 权重（`[head_dim]`，loader 平铺为 per-head）。
 
 ## 待办（非阻塞）
