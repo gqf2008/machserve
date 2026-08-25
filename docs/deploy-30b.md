@@ -19,14 +19,9 @@
 ## 3. 部署步骤（网络稳定的机器上执行）
 
 ```bash
-# 1) 下载 16 shards（hf-mirror 回退；脚本见 scripts/install.ps1 的下载段）
-mkdir -p .models/qwen3-30b-a3b
-for i in $(seq -w 1 16); do
-  curl -L --retry 5 --retry-all-errors -o .models/qwen3-30b-a3b/model-000$i-of-00016.safetensors \
-    https://hf-mirror.com/Qwen/Qwen3-30B-A3B/resolve/main/model-000$i-of-00016.safetensors
-done
-curl -L -o .models/qwen3-30b-a3b/config.json \
-  https://hf-mirror.com/Qwen/Qwen3-30B-A3B/resolve/main/config.json
+# 1) 下载 16 shards（一键，resume + 并行 4 + hf-mirror 回退 + 尺寸校验）
+pwsh -ExecutionPolicy Bypass -File scripts/download_model.ps1 \
+  -ModelId Qwen/Qwen3-30B-A3B -OutDir .models/qwen3-30b-a3b -Parallel 4
 
 # 2) Q4 流式加载（多 shard 已测：q4_sharded_load_matches_single_file）+ offload serve
 MACH_MODELS=.models/qwen3-30b-a3b MACH_MODEL=model-00001-of-00016.safetensors \
