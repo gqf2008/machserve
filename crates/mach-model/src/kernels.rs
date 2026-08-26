@@ -2903,9 +2903,15 @@ impl HipKernels {
         // lanes and a merge over [T*groups]: head_dim must divide 256, be at most
         // 256 (per=0 would spin), and groups <= 16 (fixed arrays). Fail loudly here
         // instead of silently corrupting smem on an unsupported geometry.
-        if head_dim <= 0 || 256 % head_dim != 0 || head_dim > 256 || groups <= 0 || groups > 16 {
+        if head_dim <= 0
+            || 256 % head_dim != 0
+            || head_dim > 256
+            || n_heads % n_kv_heads != 0
+            || groups <= 0
+            || groups > 16
+        {
             return Err(Error::InvalidArgument(format!(
-                "attn_decode_batched_f16_gqa unsupported geometry: head_dim={head_dim} groups={groups} (require 256 % head_dim == 0, head_dim <= 256, 1 <= groups <= 16)"
+                "attn_decode_batched_f16_gqa unsupported geometry: n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} groups={groups} (require 256 % head_dim == 0, head_dim <= 256, n_heads % n_kv_heads == 0, 1 <= groups <= 16)"
             )));
         }
         // scores [groups][256] + 3 merge arrays [256][groups], all floats.
@@ -2985,9 +2991,9 @@ impl HipKernels {
             &d as *const i32 as *mut core::ffi::c_void,
             &topk as *const i32 as *mut core::ffi::c_void,
         ];
-        let total = ((topk as i64) * (inter as i64) * (d as i64))
-            .max((topk as i64) * (d as i64) * (inter as i64));
-        if total > u32::MAX as i64 {
+        // u128 so the product cannot overflow before the u32 grid check.
+        let total = (topk as u128) * (inter as u128) * (d as u128);
+        if total > u32::MAX as u128 {
             return Err(Error::InvalidArgument(format!(
                 "moe_gather_weights grid {total} exceeds u32 capacity"
             )));

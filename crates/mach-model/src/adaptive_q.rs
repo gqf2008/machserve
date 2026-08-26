@@ -136,7 +136,10 @@ pub fn optimal_offload_ratio(cfg: AdaptiveConfig) -> f64 {
     // would make the ratio NaN; treat the model as unmeasured -> neutral.
     // (+INF bandwidth/expert bytes are meaningful extremes handled above:
     // transfer 0 -> all-GPU, transfer INF -> all-CPU.)
-    if !gpu_expert_sec.is_finite() || !cpu_expert_sec.is_finite() {
+    // A NaN transfer time (INF/INF, both unmeasured) would also poison the
+    // ratio; +INF transfer alone (huge experts on a finite bus) is a
+    // meaningful extreme (all-CPU) and stays.
+    if !gpu_expert_sec.is_finite() || !cpu_expert_sec.is_finite() || transfer_expert_sec.is_nan() {
         return 0.5;
     }
 
@@ -178,6 +181,18 @@ mod tests {
         let q = optimal_offload_ratio(cfg);
         assert!(q.is_finite(), "q must stay finite, got {q}");
         assert_eq!(q, 0.5, "non-finite input -> neutral default");
+    }
+
+    #[test]
+    fn inf_expert_and_bus_returns_neutral_default() {
+        // INF/INF transfer is NaN, which would poison the ratio; the guard
+        // must return the neutral default (regression).
+        let mut cfg = base();
+        cfg.expert_bytes = f64::INFINITY;
+        cfg.pcie_bw_gbps = f64::INFINITY;
+        let q = optimal_offload_ratio(cfg);
+        assert!(q.is_finite(), "q must stay finite, got {q}");
+        assert_eq!(q, 0.5, "NaN transfer -> neutral default");
     }
 
     #[test]

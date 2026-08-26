@@ -362,23 +362,34 @@ impl ContinuousModel {
             }
         }
 
-        let (sampled, logprobs, topk) = self.model.decode_step_explicit(
-            &tokens,
-            &lens,
-            &slots,
-            &mut params,
-            &row_counts,
-            &row_bias,
-        )?;
-        // The sampler advanced each row's seed one RNG step (rows of one
-        // sequence start from the same seed); the last row's value is the
-        // sequence's authoritative next seed.
-        for (i, &(start, count, _)) in rows.iter().enumerate() {
-            if count > 0 {
-                let p = params[start + count - 1];
-                self.seqs[i].as_mut().expect("active slot").params = p;
+        // Skip the batched forward when no row is produced this step (every
+        // active sequence is at the hard context limit or over budget): an
+        // empty batch would start gridDim=0 grids, which ROCm rejects
+        // (hipErrorInvalidConfiguration) and would panic the serving engine.
+        // The outputs loop below skips count==0 rows and the hard-stop loop
+        // finishes the over-limit sequences.
+        let (sampled, logprobs, topk) = if tokens.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let out = self.model.decode_step_explicit(
+                &tokens,
+                &lens,
+                &slots,
+                &mut params,
+                &row_counts,
+                &row_bias,
+            )?;
+            // The sampler advanced each row's seed one RNG step (rows of one
+            // sequence start from the same seed); the last row's value is the
+            // sequence's authoritative next seed.
+            for (i, &(start, count, _)) in rows.iter().enumerate() {
+                if count > 0 {
+                    let p = params[start + count - 1];
+                    self.seqs[i].as_mut().expect("active slot").params = p;
+                }
             }
-        }
+            out
+        };
 
         let mut done_slots = Vec::new();
         let mut outputs = Vec::new();
