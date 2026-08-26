@@ -1146,6 +1146,40 @@ mod tests {
     }
 
     #[test]
+    fn pagedref_mla_shared_prefix_delta_only_e2e() {
+        // MLA delta-only flow: B starts from A's shared prefix pages via
+        // start_with_shared_prefix and computes only its tail.
+        let cfg = Config::mla(128, 2, 4, 1024, 256, 8, 16, 64, 64, 64);
+        let w = Weights::random(&cfg, 93).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages of 4
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 16, 4);
+        let logits_a = pr.prefill(0, &a).expect("A");
+        let shared: Vec<u32> = (0..2)
+            .map(|i| pr.slot_table(0).expect("A table").get(i).unwrap())
+            .collect();
+        pr.start_with_shared_prefix(1, &shared, 8);
+        let logits_b = pr.prefill(1, &b[8..]).expect("B delta");
+
+        let mut ref_b = RefModel::new(cfg, w.clone());
+        assert_eq!(
+            max_abs_diff(&logits_b, &ref_b.forward(&b)),
+            0.0,
+            "MLA delta-only shared-prefix decode must equal full recompute"
+        );
+        let mut ref_a = RefModel::new(cfg, w);
+        assert_eq!(
+            max_abs_diff(&logits_a, &ref_a.forward(&a)),
+            0.0,
+            "A unchanged"
+        );
+    }
+
+    #[test]
     fn gpu_table_builder_shares_prefix_pages() {
         let system = [1i32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages of 4
         let mut b = GpuBlockTableBuilder::new(16, 4);
