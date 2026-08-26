@@ -15,6 +15,7 @@
 | MoE offload 自适应 q* | 同上 | ~18 tok/s |
 | 双缓冲 prefill（长 ctx） | qwen3-moe-tiny，ctx 2048 | buffered TTFT ≈ 全驻留（+2~4%），比非缓冲 CPU-offload 快 ~90x |
 | Agent 多轮复用 | 同上下文 + 新轮次 | 多轮 TTFT **-90~95%**（前缀 128/512） |
+| 前缀复用记账（CPU 参考） | N=8，共享 8-token 系统提示 | **77.8% savings**（reused 56 / computed 16；GPU 真机 A/B 后续批次） |
 
 ## 二、MoE offload 的带宽账（估算方法学，最诚实的部分）
 
