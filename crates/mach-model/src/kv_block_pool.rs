@@ -808,4 +808,89 @@ mod tests {
         let mut table = BlockTable::default();
         table.set_available_tokens(-1);
     }
+
+    // -- deterministic stress: random acquire/release preserves invariants --
+
+    struct Xs(u64);
+    impl Xs {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_add(0x9e37_79b9_7f4a_7c15))
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn check_pool_invariants(p: &Rc<RefCell<BlockPool>>, live: &[CacheBlockRef]) {
+        use std::collections::HashSet;
+        let pool = p.borrow();
+        let mut seen = HashSet::new();
+        for b in live {
+            let loc = b.location().expect("live block is non-null");
+            assert!(seen.insert(loc), "duplicate live location {loc:?}");
+            assert!(
+                pool.is_occupied(loc),
+                "live location {loc:?} must be occupied"
+            );
+        }
+        assert_eq!(
+            pool.num_occupied_slots() as usize,
+            live.len(),
+            "occupied slots must equal live blocks"
+        );
+        let occupied: HashSet<_> = (1..=pool.num_lcm_blocks())
+            .flat_map(|id| pool.occupied_locations(id))
+            .collect();
+        assert_eq!(
+            occupied.len(),
+            live.len(),
+            "pool-occupied == live locations"
+        );
+        for loc in &occupied {
+            assert!(seen.contains(loc), "pool-occupied {loc:?} not tracked live");
+        }
+    }
+
+    #[test]
+    fn random_acquire_release_preserves_pool_invariants() {
+        let p = pool(8);
+        let mut rng = Xs::new(0x5eed_1234);
+        let mut live: Vec<CacheBlockRef> = Vec::new();
+        for _ in 0..3000 {
+            match rng.below(10) {
+                0..=5 => {
+                    // Acquire 0..=3 blocks for a random group (all-or-nothing).
+                    let group = rng.below(3) as u32;
+                    let n = rng.below(4);
+                    let blocks = p.borrow_mut().acquire_blocks(&p, group, 3, n);
+                    assert!(blocks.is_empty() || blocks.len() == n, "all-or-nothing");
+                    live.extend(blocks);
+                }
+                6..=8 => {
+                    // Drop a random live block (release its slot).
+                    if !live.is_empty() {
+                        let idx = rng.below(live.len());
+                        live.swap_remove(idx);
+                    }
+                }
+                _ => {
+                    // Reset a random live block to null (also releases).
+                    if !live.is_empty() {
+                        let idx = rng.below(live.len());
+                        let mut b = live.swap_remove(idx);
+                        b.reset();
+                    }
+                }
+            }
+            check_pool_invariants(&p, &live);
+        }
+    }
 }
