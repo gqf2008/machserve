@@ -148,6 +148,12 @@ impl CpuEngine {
         &self.finished
     }
 
+    /// Takes and clears the completed records (bounds the engine's memory over
+    /// a long run; the GPU engine should do the same periodically).
+    pub fn drain_finished(&mut self) -> Vec<FinishedRequest> {
+        std::mem::take(&mut self.finished)
+    }
+
     /// Aggregate engine stats.
     #[must_use]
     pub fn stats(&self) -> &CpuEngineStats {
@@ -369,6 +375,19 @@ mod tests {
             eng.step().is_err(),
             "too-small pool surfaces as a step error"
         );
+    }
+
+    #[test]
+    fn drain_finished_clears_records() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 23).expect("weights");
+        let mut eng = CpuEngine::new(cfg, w, 2, 32, 4);
+        eng.add(&[1, 2, 3, 4], 1).expect("add");
+        eng.step_until_done().expect("run");
+        assert_eq!(eng.finished().len(), 1);
+        let drained = eng.drain_finished();
+        assert_eq!(drained.len(), 1);
+        assert!(eng.finished().is_empty(), "records cleared after drain");
     }
 
     #[test]

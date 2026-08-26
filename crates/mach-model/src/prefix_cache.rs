@@ -763,4 +763,94 @@ mod tests {
         // A hole at keys[1] cuts the run even though keys[2] is cached.
         assert_eq!(matcher.probe(&index, &keys, 0, 3), vec![1]);
     }
+
+    // -- deterministic stress: random insert/remove/evict keeps the index
+    //    consistent with the canonical-key truth table --
+
+    struct Xs(u64);
+    impl Xs {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_add(0x9e37_79b9_7f4a_7c15))
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn check_index_consistency(
+        index: &mut PrefixCacheIndex,
+        truth: &std::collections::HashMap<String, CacheBlockLocation>,
+    ) {
+        assert_eq!(index.num_entries(), truth.len(), "entry count == truth");
+        for (h, loc) in truth {
+            let k = key(0, h, 0);
+            assert!(index.contains(&k), "truth key {h} must be cached");
+            assert_eq!(index.query(&k), Some(*loc), "query({h}) == canonical");
+            assert_eq!(index.key_for(*loc), Some(&k), "key_for(canonical) == {h}");
+            assert!(index.contains_location(*loc), "canonical location cached");
+            assert_eq!(
+                index.block_for(&k).expect("pinned").location(),
+                Some(*loc),
+                "block_for({h}) pins the canonical block"
+            );
+        }
+    }
+
+    #[test]
+    fn random_index_ops_keep_by_key_by_location_consistent() {
+        let pool = make_pool();
+        let mut index = PrefixCacheIndex::new(0);
+        let mut truth: std::collections::HashMap<String, CacheBlockLocation> =
+            std::collections::HashMap::new();
+        let mut rng = Xs::new(0xabcd_5678);
+        for _ in 0..2000 {
+            let h = format!("h{}", rng.below(8)); // small key space -> dedup hits
+            let k = key(0, &h, 0);
+            match rng.below(11) {
+                0..=5 => {
+                    let b = acquire(&pool, 0);
+                    let loc = loc_of(&b);
+                    match index.insert(k, &b) {
+                        None => {
+                            assert!(
+                                truth.insert(h.clone(), loc).is_none(),
+                                "fresh block => key must be new"
+                            );
+                        }
+                        Some(prev) => {
+                            let canon = truth.get(&h).expect("dup => truth has the key");
+                            assert_eq!(prev.location(), Some(*canon), "canonical returned");
+                        }
+                    }
+                    drop(b); // None: index pins a clone; Some: frees the dup slot
+                }
+                6..=8 => {
+                    let k = key(0, &h, 0);
+                    if let Some(canon) = truth.remove(&h) {
+                        assert_eq!(index.remove(&k), Some(canon));
+                    } else {
+                        assert!(index.remove(&k).is_none());
+                    }
+                }
+                9 => {
+                    if let Some((ev, loc)) = index.evict_oldest() {
+                        assert_eq!(truth.remove(&ev.content_hash), Some(loc));
+                    }
+                }
+                _ => {
+                    // ~1/11 chance: query touch (hit or miss) for LRU.
+                    let _ = index.query(&key(0, &h, 0));
+                }
+            }
+            check_index_consistency(&mut index, &truth);
+        }
+    }
 }
