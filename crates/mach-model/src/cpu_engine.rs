@@ -472,6 +472,56 @@ mod tests {
     }
 
     #[test]
+    fn engine_mla_reuses_shared_prefix() {
+        let cfg = Config::mla(128, 2, 4, 1024, 256, 8, 16, 64, 64, 64);
+        let w = Weights::random(&cfg, 94).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+        let mut eng = CpuEngine::new(cfg, w.clone(), 4, 32, 4);
+        eng.add(&a, 2).expect("A");
+        eng.add(&b, 2).expect("B");
+        eng.step_until_done().expect("run");
+        assert!(eng.is_idle());
+        let f = eng.finished();
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[1].reused_tokens, 8, "MLA engine reuses the shared prefix");
+        assert_eq!(
+            f[1].computed_tokens, 1,
+            "MLA engine computes only the delta"
+        );
+        assert_eq!(f[0].generated, greedy(cfg, &w, &a, 2), "A decode");
+        assert_eq!(f[1].generated, greedy(cfg, &w, &b, 2), "B decode");
+    }
+
+    #[test]
+    fn engine_moe_reuses_shared_prefix() {
+        let mut cfg = Config::tiny();
+        cfg.intermediate_size = 64;
+        cfg.moe_intermediate_size = 48;
+        cfg.num_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        let w = Weights::random(&cfg, 95).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+        let mut eng = CpuEngine::new(cfg, w.clone(), 4, 32, 4);
+        eng.add(&a, 2).expect("A");
+        eng.add(&b, 2).expect("B");
+        eng.step_until_done().expect("run");
+        assert!(eng.is_idle());
+        let f = eng.finished();
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[1].reused_tokens, 8, "MoE engine reuses the shared prefix");
+        assert_eq!(f[0].generated, greedy(cfg, &w, &a, 2), "A decode");
+        assert_eq!(f[1].generated, greedy(cfg, &w, &b, 2), "B decode");
+    }
+
+    #[test]
     fn empty_prompt_is_rejected() {
         let cfg = Config::tiny();
         let w = Weights::random(&cfg, 1).expect("weights");
