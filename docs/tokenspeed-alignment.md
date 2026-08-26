@@ -59,6 +59,11 @@
    （2 单测：5 个共享 8-token 系统提示的请求，45 个 prompt token 复用 32 个、
    只算 13 个——**节省 71%**，贪心解码与全算逐位一致；对标 FreeToken 多轮
    TTFT -65..-80% 目标）。
+7. **`cpu_engine.rs`**：CPU 连续批处理引擎——队列 + 槽位复用 + 交错 prefill/decode
+   + 跨请求前缀复用 + FSM 生命周期（镜像 `continuous.rs` 的 serving 语义，
+   是 GPU 接线的硬件无关参考实现）。✅ 已实现（4 单测：5 请求共享系统提示交错
+   运行全部完成、贪心解码与全算逐位一致、prompt 复用 71%；容量 2 的引擎槽位
+   复用跑完 5 个排队请求）。
 
 ### 接入计划（后续批次，非本分支）
 
@@ -79,6 +84,7 @@
       干净（不依赖 GPU）
 - [x] CPU 参考路径：跨请求前缀共享（复用 logits == 全算，逐位一致；delta-only 计算）
 - [x] CPU 分页调度器：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
+- [x] CPU 连续批处理引擎：队列/槽位复用/交错 prefill+decode + 前缀复用（GPU 接线参考）
 - [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
 - [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
       释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
