@@ -231,6 +231,18 @@ impl BatchedModel {
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
             "tokens_per_page must divide max_seq_len for the static identity mapping"
         );
+        // The paged decode branch only dispatches dense F32 (see `decode_step`);
+        // f16/MLA would silently fall through to the contiguous kernels while
+        // still owning block tables. Reject them loudly at construction.
+        assert!(
+            cfg.dtype == ModelDType::F32,
+            "paged-KV mode supports dense F32 only (got {:?}); f16 paged kernels are follow-ups",
+            cfg.dtype
+        );
+        assert!(
+            cfg.kv_lora_rank == 0,
+            "paged-KV mode supports dense attention only (MLA paged kernels are follow-ups)"
+        );
         let mut m = Self::build(hip, cfg, w, slots, slots, usize::MAX)?;
         m.init_paged(tokens_per_page)?;
         Ok(m)
@@ -2367,6 +2379,12 @@ impl BatchedModel {
 
     /// Syncs the stream and copies the last step's logits (`[batch, vocab]`)
     /// back to host (debug / numeric validation).
+    ///
+    /// **Note**: when the last `decode_step_explicit` applied presence/frequency
+    /// penalties or logit_bias, the device logits buffer holds the
+    /// **post-penalty** values (the sampler and `top_logprobs` intentionally
+    /// operate on those, matching the sampled distribution). For the raw model
+    /// output, read before sampling (or use a penalty-free greedy step).
     pub fn read_logits(&self) -> Result<Vec<f32>, Error> {
         self.k.sync()?;
         let n = self.batch * self.cfg.vocab_size;

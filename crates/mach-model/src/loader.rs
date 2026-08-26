@@ -23,7 +23,7 @@ struct RawTensor {
 
 /// Reads a safetensors file and returns `(name -> raw tensor, data_bytes)`.
 fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>), Error> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Model(format!("read {path:?}: {e}")))?;
+    let mut bytes = std::fs::read(path).map_err(|e| Error::Model(format!("read {path:?}: {e}")))?;
     if bytes.len() < 8 {
         return Err(Error::Model("file too short".into()));
     }
@@ -33,7 +33,10 @@ fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>
     }
     let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])
         .map_err(|e| Error::Model(format!("bad JSON header: {e}")))?;
-    let data = bytes[8 + header_len..].to_vec();
+    // Move the data segment out of the file buffer instead of copying it:
+    // `bytes` keeps only the small header, so the whole file never lives twice
+    // during the tensor loop (multi-GB shards would double host RAM).
+    let data = bytes.split_off(8 + header_len);
 
     let mut tensors = HashMap::new();
     let obj = header
@@ -62,8 +65,26 @@ fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>
             .get("data_offsets")
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Model(format!("tensor {name}: missing data_offsets")))?;
-        let start = off[0].as_u64().unwrap_or(0) as usize;
-        let end = off[1].as_u64().unwrap_or(0) as usize;
+        if off.len() < 2 {
+            return Err(Error::Model(format!(
+                "tensor {name}: data_offsets must have 2 entries, got {}",
+                off.len()
+            )));
+        }
+        let start = off[0]
+            .as_u64()
+            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[0] not a u64")))?
+            as usize;
+        let end = off[1]
+            .as_u64()
+            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[1] not a u64")))?
+            as usize;
+        if start > end || end > data.len() {
+            return Err(Error::Model(format!(
+                "tensor {name}: data_offsets [{start}, {end}) out of bounds (data len {})",
+                data.len()
+            )));
+        }
         tensors.insert(
             name.clone(),
             RawTensor {

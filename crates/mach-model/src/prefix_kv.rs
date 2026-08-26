@@ -104,11 +104,14 @@ impl PrefixKvCache {
         tokens: &[u32],
     ) -> Result<(Vec<f32>, PrefixReuseStats), Error> {
         let total_tokens = tokens.len();
-        debug_assert_eq!(
-            model.pos(),
-            0,
-            "prefix_kv serve requires a fresh model at position 0"
-        );
+        // Runtime check (not debug-only): reusing a non-fresh model would
+        // silently produce wrong logits in release builds.
+        if model.pos() != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "prefix_kv serve requires a fresh model at position 0, got pos {}",
+                model.pos()
+            )));
+        }
         let itokens: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let mut plan = self.planner.plan(&self.pool, &itokens);
         if plan.is_none() {

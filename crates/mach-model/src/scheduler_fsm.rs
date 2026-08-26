@@ -53,6 +53,8 @@ pub struct Bootstrapping;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submitted {
     pub tokens: Vec<i32>,
+    /// Generated tokens already produced before an eviction (0 for fresh).
+    pub num_decoded_tokens: i32,
     pub max_new_tokens: i32,
 }
 
@@ -61,6 +63,7 @@ pub struct Submitted {
 pub struct Prefilling {
     pub tokens: Vec<i32>,
     pub num_prefill_tokens: i32,
+    pub num_decoded_tokens: i32,
     pub reserve_tokens: i32,
     pub max_new_tokens: i32,
 }
@@ -68,6 +71,7 @@ pub struct Prefilling {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefillDone {
     pub tokens: Vec<i32>,
+    pub num_decoded_tokens: i32,
     pub reserve_tokens: i32,
     pub max_new_tokens: i32,
 }
@@ -86,6 +90,7 @@ pub struct Decoding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Retracted {
     pub tokens: Vec<i32>,
+    pub num_decoded_tokens: i32,
     pub max_new_tokens: i32,
 }
 
@@ -160,11 +165,23 @@ impl FsmEvent {
     /// condition).
     #[must_use]
     pub fn apply(self, state: RequestState) -> RequestState {
+        self.apply_with_hook(state, &mut ())
+    }
+
+    /// Applies the event with a caller-provided transition hook (cache
+    /// side effects, e.g. releasing block tables on Finish/Abort/Retraction).
+    #[must_use]
+    pub fn apply_with_hook(
+        self,
+        state: RequestState,
+        hook: &mut dyn TransitionHook,
+    ) -> RequestState {
         let from = state.clone();
         let to = match self.clone() {
             FsmEvent::Bootstrapped => match state {
                 RequestState::Bootstrapping(Bootstrapping) => RequestState::Submitted(Submitted {
                     tokens: Vec::new(),
+                    num_decoded_tokens: 0,
                     max_new_tokens: 0,
                 }),
                 other => invalid_transition("Bootstrapped", other.state_name()),
@@ -174,6 +191,7 @@ impl FsmEvent {
                 RequestState::Retracted(s) => first_chunk(
                     Submitted {
                         tokens: s.tokens,
+                        num_decoded_tokens: s.num_decoded_tokens,
                         max_new_tokens: s.max_new_tokens,
                     },
                     ev,
@@ -187,6 +205,7 @@ impl FsmEvent {
                     if s.num_prefill_tokens >= s.tokens.len() as i32 {
                         RequestState::PrefillDone(PrefillDone {
                             tokens: s.tokens,
+                            num_decoded_tokens: s.num_decoded_tokens,
                             reserve_tokens: s.reserve_tokens,
                             max_new_tokens: s.max_new_tokens,
                         })
@@ -199,7 +218,10 @@ impl FsmEvent {
             FsmEvent::ScheduleDecode(ev) => match state {
                 RequestState::PrefillDone(s) => RequestState::Decoding(Decoding {
                     tokens: s.tokens,
-                    num_decoded_tokens: 0,
+                    // A resumed (previously retracted/retracted-to-queue)
+                    // request keeps its decoded count so the generation
+                    // budget `max_new - num_decoded` stays correct.
+                    num_decoded_tokens: s.num_decoded_tokens,
                     reserve_tokens: ev.reserve_tokens,
                     max_new_tokens: s.max_new_tokens,
                 }),
@@ -227,6 +249,7 @@ impl FsmEvent {
             FsmEvent::Retraction => match state {
                 RequestState::Decoding(s) => RequestState::Retracted(Retracted {
                     tokens: s.tokens,
+                    num_decoded_tokens: s.num_decoded_tokens,
                     max_new_tokens: s.max_new_tokens,
                 }),
                 other => invalid_transition("Retraction", other.state_name()),
@@ -237,10 +260,12 @@ impl FsmEvent {
                 // generation budget) survive.
                 RequestState::PrefillDone(s) => RequestState::Submitted(Submitted {
                     tokens: s.tokens,
+                    num_decoded_tokens: s.num_decoded_tokens,
                     max_new_tokens: s.max_new_tokens,
                 }),
                 RequestState::Decoding(s) => RequestState::Submitted(Submitted {
                     tokens: s.tokens,
+                    num_decoded_tokens: s.num_decoded_tokens,
                     max_new_tokens: s.max_new_tokens,
                 }),
                 other => invalid_transition("Retract", other.state_name()),
@@ -277,6 +302,7 @@ impl FsmEvent {
                     s.tokens.push(bootstrap_token);
                     RequestState::PrefillDone(PrefillDone {
                         tokens: s.tokens,
+                        num_decoded_tokens: s.num_decoded_tokens,
                         reserve_tokens: s.reserve_tokens,
                         max_new_tokens: s.max_new_tokens,
                     })
@@ -284,7 +310,6 @@ impl FsmEvent {
                 other => invalid_transition("RemotePrefillDone", other.state_name()),
             },
         };
-        let hook = &mut ();
         hook.on_transition(&self, &from, &to);
         to
     }
@@ -323,6 +348,7 @@ fn first_chunk(s: Submitted, ev: SchedulePrefillFirstChunk) -> RequestState {
     if chunk >= total {
         RequestState::PrefillDone(PrefillDone {
             tokens: s.tokens,
+            num_decoded_tokens: s.num_decoded_tokens,
             reserve_tokens: ev.reserve_tokens,
             max_new_tokens: s.max_new_tokens,
         })
@@ -330,6 +356,7 @@ fn first_chunk(s: Submitted, ev: SchedulePrefillFirstChunk) -> RequestState {
         RequestState::Prefilling(Prefilling {
             tokens: s.tokens,
             num_prefill_tokens: chunk,
+            num_decoded_tokens: s.num_decoded_tokens,
             reserve_tokens: ev.reserve_tokens,
             max_new_tokens: s.max_new_tokens,
         })
@@ -432,15 +459,85 @@ mod tests {
     fn retraction_evicts_to_retracted_and_resumes() {
         let s = bootstrapped(&[1, 2], 16);
         let done = first_chunk(s, 8, 0);
-        let decoding = to_decode(done, 4);
+        let mut decoding = to_decode(done, 4);
+        decoding = FsmEvent::ExtendResult(vec![9, 10]).apply(decoding);
         let retracted = FsmEvent::Retraction.apply(decoding);
         let RequestState::Retracted(r) = &retracted else {
             panic!("expected Retracted");
         };
         assert_eq!(r.max_new_tokens, 16);
-        // Resume via SchedulePrefillFirstChunk (prefix already computed).
+        assert_eq!(
+            r.num_decoded_tokens, 2,
+            "Retraction must preserve the decoded count for the remaining budget"
+        );
+        // Resume via SchedulePrefillFirstChunk (prefix already computed) and
+        // decode again: the decoded count must survive into Decoding.
         let resumed = first_chunk(retracted, 8, 4);
-        assert!(matches!(resumed, RequestState::PrefillDone(_)));
+        let RequestState::PrefillDone(d) = &resumed else {
+            panic!("expected PrefillDone");
+        };
+        assert_eq!(d.num_decoded_tokens, 2);
+        let redecoding = to_decode(resumed, 4);
+        let RequestState::Decoding(dd) = &redecoding else {
+            panic!("expected Decoding");
+        };
+        assert_eq!(
+            dd.num_decoded_tokens, 2,
+            "resumed decode must keep the pre-retraction decoded count"
+        );
+    }
+
+    #[test]
+    fn retract_to_queue_keeps_decoded_count() {
+        // Capacity eviction (Retract) also must not lose the decoded count:
+        // the request re-prefills its full stream and continues with the
+        // remaining budget `max_new - num_decoded`.
+        let s = bootstrapped(&[1, 2, 3, 4], 16);
+        let done = first_chunk(s, 8, 0);
+        let decoding = FsmEvent::ExtendResult(vec![9]).apply(to_decode(done, 4));
+        let RequestState::Submitted(sub) = FsmEvent::Retract.apply(decoding) else {
+            panic!("expected Submitted");
+        };
+        assert_eq!(sub.num_decoded_tokens, 1);
+        let redecoding = to_decode(first_chunk(RequestState::Submitted(sub), 8, 4), 4);
+        let RequestState::Decoding(d) = &redecoding else {
+            panic!("expected Decoding");
+        };
+        assert_eq!(d.num_decoded_tokens, 1);
+    }
+
+    #[test]
+    fn apply_with_hook_invokes_the_hook() {
+        // The transition hook must actually fire when supplied (regression:
+        // it was hard-wired to a no-op).
+        #[derive(Debug)]
+        struct Recorder {
+            events: Vec<String>,
+        }
+        impl TransitionHook for Recorder {
+            fn on_transition(
+                &mut self,
+                event: &FsmEvent,
+                _from: &RequestState,
+                _to: &RequestState,
+            ) {
+                self.events.push(format!("{event:?}"));
+            }
+        }
+        let mut rec = Recorder { events: Vec::new() };
+        let s = bootstrapped(&[1, 2], 16);
+        let done = FsmEvent::SchedulePrefillFirstChunk(SchedulePrefillFirstChunk {
+            chunk_size: 8,
+            reserve_tokens: 0,
+        })
+        .apply_with_hook(s, &mut rec);
+        assert!(
+            rec.events
+                .iter()
+                .any(|e| e.contains("SchedulePrefillFirstChunk")),
+            "hook must be invoked: {rec:?}"
+        );
+        let _ = done;
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// HIP success code.
 pub const HIP_SUCCESS: c_int = 0;
@@ -180,14 +180,26 @@ fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T, HipError> {
 
 /// Prepends the ROCm bin directory to `PATH` so `LoadLibrary` can resolve
 /// the HIP/hipBLAS DLLs and their dependencies (rocblas, etc.).
+/// Serializes the PATH prepend: concurrent first `load()` calls (the retrying
+/// `hip()` no longer funnels them through `OnceLock::get_or_init`) must not
+/// run `std::env::set_var` at the same time.
+static ROCM_PATH_GUARD: Mutex<()> = Mutex::new(());
+
 pub(crate) fn ensure_rocm_on_path() {
-    if let Some(bin) = rocm_bin() {
-        let bin_s = bin.to_string_lossy().into_owned();
-        let path = std::env::var("PATH").unwrap_or_default();
-        if !path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
-            // SAFETY: single-threaded at first DLL load; no other env reads race.
-            unsafe { std::env::set_var("PATH", format!("{bin_s};{path}")) };
-        }
+    let Some(bin) = rocm_bin() else {
+        return;
+    };
+    let bin_s = bin.to_string_lossy().into_owned();
+    let path = std::env::var("PATH").unwrap_or_default();
+    if path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
+        return;
+    }
+    let _guard = ROCM_PATH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-check under the lock: another thread may have already prepended it.
+    let path = std::env::var("PATH").unwrap_or_default();
+    if !path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
+        // SAFETY: serialized by ROCM_PATH_GUARD; no other env writes race.
+        unsafe { std::env::set_var("PATH", format!("{bin_s};{path}")) };
     }
 }
 
@@ -260,11 +272,21 @@ fn load() -> Result<Arc<Hip>, HipError> {
     }))
 }
 
-static HIP: OnceLock<Result<Arc<Hip>, HipError>> = OnceLock::new();
+static HIP: OnceLock<Arc<Hip>> = OnceLock::new();
 
 /// Returns the process-wide HIP runtime handle (loaded once).
+///
+/// Failures are **not** cached: a failed `load()` drops the already-loaded DLL
+/// handles (no leak) and a later call retries, so a ROCm install that appears
+/// after the first attempt can still be picked up. Concurrent first calls race
+/// benignly — the first success wins, the losers return their own copy.
 pub fn hip() -> Result<Arc<Hip>, HipError> {
-    HIP.get_or_init(load).clone()
+    if let Some(h) = HIP.get() {
+        return Ok(Arc::clone(h));
+    }
+    let h = load()?;
+    let _ = HIP.set(Arc::clone(&h));
+    Ok(h)
 }
 
 /// Maps a HIP error code to a message.
@@ -544,7 +566,14 @@ impl HipKernelModule {
         }
 
         let mut size = 0usize;
-        unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        let r = unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        if r != 0 || size == 0 {
+            unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
+            return Err(HipError::Rtc {
+                code: r,
+                msg: format!("{}; code size unavailable", rtc_msg(&h, r)),
+            });
+        }
         let mut code = vec![0u8; size];
         let r = unsafe { (h.api.hip_rtc_get_code)(prog, code.as_mut_ptr() as *mut c_char) };
         unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
@@ -555,6 +584,12 @@ impl HipKernelModule {
             });
         }
 
+        let kname = std::ffi::CString::new(kernel_name).map_err(|_| HipError::Rtc {
+            code: -1,
+            msg: "bad kernel name".into(),
+        })?;
+        // The name is resolved before the module loads so a name failure
+        // cannot leak a loaded module.
         let mut module: HipModule = std::ptr::null_mut();
         unsafe {
             check(
@@ -563,16 +598,16 @@ impl HipKernelModule {
             )?
         };
 
-        let kname = std::ffi::CString::new(kernel_name).map_err(|_| HipError::Rtc {
-            code: -1,
-            msg: "bad kernel name".into(),
-        })?;
         let mut func: HipFunction = std::ptr::null_mut();
         unsafe {
-            check(
+            if let Err(e) = check(
                 &h,
                 (h.api.hip_module_get_function)(&mut func, module, kname.as_ptr()),
-            )?
+            ) {
+                // Don't leak the loaded module on the failure path.
+                let _ = (h.api.hip_module_unload)(module);
+                return Err(e);
+            }
         };
 
         Ok(Self {
@@ -636,7 +671,14 @@ impl HipKernelModule {
             });
         }
         let mut size = 0usize;
-        unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        let r = unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        if r != 0 || size == 0 {
+            unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
+            return Err(HipError::Rtc {
+                code: r,
+                msg: format!("{}; code size unavailable", rtc_msg(&h, r)),
+            });
+        }
         let mut code = vec![0u8; size];
         let r = unsafe { (h.api.hip_rtc_get_code)(prog, code.as_mut_ptr() as *mut c_char) };
         unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };

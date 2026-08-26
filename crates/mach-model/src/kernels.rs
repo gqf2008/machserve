@@ -2644,48 +2644,6 @@ impl HipKernels {
         self.launch_cast_f16_f32(yh, out, (batch * n) as usize)
     }
 
-    /// Batched fp16 GEMM with fp32 output (lm_head: keeps fp32 logits for the
-    /// sampler). `xh` is fp16 scratch of `batch*k`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_batched_f16_logits(
-        &self,
-        out: *mut f32,
-        x: *const f32,
-        w16: *const u16,
-        batch: i32,
-        n: i32,
-        k: i32,
-        xh: *mut u16,
-    ) -> Result<(), Error> {
-        use mach_kernel_sys::hipblas::{
-            HIPBLAS_COMPUTE_32F, HIPBLAS_OP_N, HIPBLAS_OP_T, HIPBLAS_R_16F, HIPBLAS_R_32F,
-        };
-        self.launch_cast_f32_f16(x, xh, (batch * k) as usize)?;
-        self.blas
-            .gemm_ex(
-                HIPBLAS_OP_T,
-                HIPBLAS_OP_N,
-                n,
-                batch,
-                k,
-                HIPBLAS_R_16F,
-                w16 as *const core::ffi::c_void,
-                k,
-                HIPBLAS_R_16F,
-                xh as *const core::ffi::c_void,
-                k,
-                HIPBLAS_R_32F,
-                out as *mut core::ffi::c_void,
-                n,
-                HIPBLAS_COMPUTE_32F,
-            )
-            .map_err(|e| {
-                Error::Model(format!(
-                    "hipblas gemm_ex batched m={n} n={batch} k={k}: {e}"
-                ))
-            })
-    }
-
     /// Prefill attention for a run of `C` consecutive rows (same slot,
     /// positions `[base, base+C)`) with shared K/V reads. One block per head.
     #[allow(clippy::too_many_arguments)]
@@ -2705,6 +2663,14 @@ impl HipKernels {
         max_seq: i32,
         slot: i32,
     ) -> Result<(), Error> {
+        // The kernel hard-codes 64 query rows per run (r = tid/4, s_max[64])
+        // and 16 dim groups (qreg[16], D = head_dim/4): reject anything larger
+        // loudly instead of silently corrupting smem when this path is wired.
+        if c > 64 || head_dim > 64 {
+            return Err(Error::InvalidArgument(format!(
+                "attn_prefill_f16 unsupported geometry: run length C={c} (>64) or head_dim={head_dim} (>64)"
+            )));
+        }
         let qp = q;
         let kp = kc;
         let vp = vc;
