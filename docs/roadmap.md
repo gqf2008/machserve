@@ -788,3 +788,10 @@
   + paged_scheduler(FSM 多请求调度);5 请求共享系统提示 → prompt token 复用 71%。
   剩余:GPU(batched.rs)接线 + 容量驱逐/owning-ref 索引 + 真机 A/B(见
   docs/tokenspeed-alignment.md)。
+
+- **分页 KV GPU 接线(2026-08-26,#52-#60)**:离线 hiprtc 编译门禁(40 内核) +
+  分页地基(块表/页分配/attention) + PagedRef 参考变压器(==RefModel 逐位) +
+  分页内核真机对拍(7900 XTX vs 连续逐位一致) + batched.rs 分页 decode 接入
+  (`with_paged_kv`,GPU 对拍通过) + 共享前缀块表构造器 + f16 分页内核 +
+  cpu_engine 背压/有界记录。剩余:共享前缀页接入 decode + f16 分页接入 +
+  真机 A/B(TTFT/TPOT)(见 docs/tokenspeed-alignment.md)。

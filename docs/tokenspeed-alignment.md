@@ -92,7 +92,11 @@
     （38 内核离线门禁全过 + **7900 XTX 真机对拍逐位一致**）；
   - **batched.rs 已接入**（`BatchedModel::with_paged_kv`，稠密 F32 decode 走分页
     内核；静态恒等块表映射，GPU 上 70 token 跨 2 页与静态路径对拍通过）；
-    剩余：共享前缀页（reuse-planner 落地）+ f16/MLA/prefill 分页 + 真机 A/B
+  - **共享前缀已备**：`GpuBlockTableBuilder`（按内容哈希复用前缀物理页 + 块表
+    构造 + 压力测试）+ **f16 分页内核**（`kv_store_paged_f16`/`attn_decode_paged_f16_gqa`，
+    40 内核离线门禁）；
+    剩余：共享前缀页接入 decode（用 #57 块表替换静态恒等映射）+ f16/MLA/prefill
+    分页接入 + 真机 A/B（TTFT/TPOT）
 - [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
       释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
       池满时 LRU 驱逐最冷页（索引 + 主机页 + 释放块），缓存有界
