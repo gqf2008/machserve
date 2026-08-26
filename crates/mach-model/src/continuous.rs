@@ -246,6 +246,13 @@ impl ContinuousModel {
         if prompt.is_empty() {
             return Err(Error::Model("prompt must not be empty".into()));
         }
+        if prompt.len() > self.model.max_seq_len() {
+            return Err(Error::Model(format!(
+                "prompt of {} tokens exceeds max_seq_len {}",
+                prompt.len(),
+                self.model.max_seq_len()
+            )));
+        }
         if self.active >= self.capacity() {
             return Err(Error::Model("engine at capacity".into()));
         }
@@ -338,6 +345,12 @@ impl ContinuousModel {
                 rows.push((tokens.len() - take, take, true));
                 budget -= take;
             } else {
+                // Hard context limit: stop decoding this sequence without
+                // consuming a row (KV store would write past the cache).
+                if s.len >= self.model.max_seq_len() {
+                    rows.push((tokens.len(), 0, false));
+                    continue;
+                }
                 tokens.push(s.first_decode.expect("decode requires a prior token"));
                 lens.push(s.len as u32);
                 slots.push(i as u32);
@@ -411,6 +424,15 @@ impl ContinuousModel {
                     done_slots.push(i);
                 }
                 outputs.push((s.id, out));
+            }
+        }
+        // Sequences that hit the hard context limit mid-decode finish here
+        // (they produced no row this step, so the outputs loop skipped them).
+        for i in 0..self.active {
+            let s = self.seqs[i].as_ref().expect("active slot");
+            if s.prompt.is_empty() && s.len >= self.model.max_seq_len() && !done_slots.contains(&i)
+            {
+                done_slots.push(i);
             }
         }
         for &slot in done_slots.iter().rev() {

@@ -1984,6 +1984,12 @@ impl BatchedModel {
         self.rows
     }
 
+    /// Maximum KV positions per sequence (hard context limit).
+    #[must_use]
+    pub const fn max_seq_len(&self) -> usize {
+        self.cfg.max_seq_len
+    }
+
     pub fn decode_step_explicit(
         &mut self,
         tokens: &[u32],
@@ -1997,6 +2003,22 @@ impl BatchedModel {
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
         assert!(n <= self.rows, "active count exceeds row capacity");
+        // Positions and slots must stay inside the device buffers: an out-of-
+        // range length would make the KV store write past the cache (silent
+        // corruption). Guarded here for the explicit-entry API, which the
+        // continuous/speculative engines use directly.
+        if let Some(&l) = lens.iter().find(|&&l| l as usize >= self.cfg.max_seq_len) {
+            return Err(Error::Model(format!(
+                "row at position {l} exceeds max_seq_len {}",
+                self.cfg.max_seq_len
+            )));
+        }
+        if let Some(&s) = slots.iter().find(|&&s| s as usize >= self.batch) {
+            return Err(Error::Model(format!(
+                "row slot {s} out of batch range {}",
+                self.batch
+            )));
+        }
         // Prefill-attention runs are currently disabled: the naive shared-KV
         // kernel is occupancy-bound and slower than decode attention on this
         // GPU (see roadmap). All rows use decode attention (run_mask = 0).

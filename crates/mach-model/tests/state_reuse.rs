@@ -173,6 +173,23 @@ fn anchor_store_evicts_oldest_when_full() {
 }
 
 #[test]
+fn anchor_store_zero_capacity_stores_nothing() {
+    // max_anchors=0 must retain nothing; before the fix the pop_front guard
+    // no-op'd and the store grew unbounded.
+    let mut store = AnchorStore::new(0);
+    let cfg = cfg_dense();
+    let w = Weights::random(&cfg, 7).unwrap();
+    let mut m = RefModel::new(cfg, w);
+    m.decode_step(1);
+    let id = store.insert(m.save_anchor(&[1], 0).unwrap());
+    m.decode_step(2);
+    store.insert(m.save_anchor(&[1, 2], 1).unwrap());
+    assert_eq!(store.len(), 0, "zero-capacity store must stay empty");
+    assert!(store.get(id).is_none());
+    assert_eq!(store.bytes_held(), 0);
+}
+
+#[test]
 fn save_anchor_rejects_wrong_position() {
     let cfg = cfg_dense();
     let w = Weights::random(&cfg, 9).unwrap();

@@ -497,3 +497,72 @@ fn slots_compact_keeps_mla_sequence_intact() {
         "MLA seq B must survive slot compaction"
     );
 }
+
+#[test]
+fn add_rejects_prompt_over_max_seq_len() {
+    // A prompt longer than max_seq_len would write past the KV cache during
+    // prefill; the engine must reject it at admission (regression for the
+    // silent OOB-write path in the continuous engine).
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq_len = 1024
+    let w = Weights::random(&cfg, 41).expect("weights");
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
+    let long: Vec<u32> = (0..=1024).map(|i| i % 32000).collect(); // 1025 tokens
+    assert!(
+        eng.add(
+            &long,
+            1,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .is_err(),
+        "prompt longer than max_seq_len must be rejected"
+    );
+    // A prompt that exactly fits is still accepted.
+    let fits: Vec<u32> = (0..1024).map(|i| i % 32000).collect();
+    eng.add(
+        &fits,
+        1,
+        None,
+        Vec::new(),
+        Vec::new(),
+        SamplingParams::default(),
+    )
+    .expect("exactly max_seq_len fits");
+}
+
+#[test]
+fn decode_stops_at_max_seq_len_without_crashing() {
+    // Once a sequence fills the context, further decode rows would write past
+    // the KV cache; the engine must finish it instead of stepping out of
+    // bounds (regression for the hard-stop path).
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq_len = 1024
+    let w = Weights::random(&cfg, 43).expect("weights");
+    let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let full: Vec<u32> = (0..1024).map(|i| i % 32000).collect();
+    let id = eng
+        .add(
+            &full,
+            8,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .expect("full-context prompt admitted");
+    while !eng.is_done(id) {
+        eng.step().unwrap();
+    }
+    // The prefill-completion sample is emitted, but no token may be decoded at
+    // a position >= max_seq_len, so generation must stop after it.
+    let gens = eng.generated(id);
+    assert!(
+        gens.len() <= 1,
+        "decode must hard-stop at max_seq_len, got {} generated",
+        gens.len()
+    );
+    assert!(eng.all_done(), "over-length sequence must finish cleanly");
+}

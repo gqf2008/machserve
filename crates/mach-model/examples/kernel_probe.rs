@@ -259,6 +259,7 @@ fn main() {
             n_kv as i32,
             hd as i32,
             scale,
+            pos + 1, // smem scores capacity must cover positions 0..=pos
         )
         .unwrap();
         let mut y = vec![0.0f32; total_q];
