@@ -12,7 +12,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// HIP success code.
 pub const HIP_SUCCESS: c_int = 0;
@@ -180,14 +180,26 @@ fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T, HipError> {
 
 /// Prepends the ROCm bin directory to `PATH` so `LoadLibrary` can resolve
 /// the HIP/hipBLAS DLLs and their dependencies (rocblas, etc.).
+/// Serializes the PATH prepend: concurrent first `load()` calls (the retrying
+/// `hip()` no longer funnels them through `OnceLock::get_or_init`) must not
+/// run `std::env::set_var` at the same time.
+static ROCM_PATH_GUARD: Mutex<()> = Mutex::new(());
+
 pub(crate) fn ensure_rocm_on_path() {
-    if let Some(bin) = rocm_bin() {
-        let bin_s = bin.to_string_lossy().into_owned();
-        let path = std::env::var("PATH").unwrap_or_default();
-        if !path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
-            // SAFETY: single-threaded at first DLL load; no other env reads race.
-            unsafe { std::env::set_var("PATH", format!("{bin_s};{path}")) };
-        }
+    let Some(bin) = rocm_bin() else {
+        return;
+    };
+    let bin_s = bin.to_string_lossy().into_owned();
+    let path = std::env::var("PATH").unwrap_or_default();
+    if path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
+        return;
+    }
+    let _guard = ROCM_PATH_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-check under the lock: another thread may have already prepended it.
+    let path = std::env::var("PATH").unwrap_or_default();
+    if !path.split(';').any(|p| p.eq_ignore_ascii_case(&bin_s)) {
+        // SAFETY: serialized by ROCM_PATH_GUARD; no other env writes race.
+        unsafe { std::env::set_var("PATH", format!("{bin_s};{path}")) };
     }
 }
 
@@ -572,6 +584,12 @@ impl HipKernelModule {
             });
         }
 
+        let kname = std::ffi::CString::new(kernel_name).map_err(|_| HipError::Rtc {
+            code: -1,
+            msg: "bad kernel name".into(),
+        })?;
+        // The name is resolved before the module loads so a name failure
+        // cannot leak a loaded module.
         let mut module: HipModule = std::ptr::null_mut();
         unsafe {
             check(
@@ -580,10 +598,6 @@ impl HipKernelModule {
             )?
         };
 
-        let kname = std::ffi::CString::new(kernel_name).map_err(|_| HipError::Rtc {
-            code: -1,
-            msg: "bad kernel name".into(),
-        })?;
         let mut func: HipFunction = std::ptr::null_mut();
         unsafe {
             if let Err(e) = check(
