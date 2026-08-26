@@ -394,17 +394,75 @@ impl PagedRef {
                 x[i] += attn_proj[i];
             }
 
-            // Dense SwiGLU MLP (MoE/MLA paged variants are follow-ups).
+            // MLP: routed MoE (Qwen-MoE style) when configured, else dense
+            // SwiGLU. Mirrors ref_model::forward_from's MLP branch exactly;
+            // MLA paged variants are follow-ups.
             let xn2 = crate::ref_model::rms_norm(&x, &lw.rms_mlp, cfg.rms_eps);
-            let gate = crate::ref_model::matvec_t(&xn2, &lw.wg, cfg.intermediate_size);
-            let up = crate::ref_model::matvec_t(&xn2, &lw.wu, cfg.intermediate_size);
-            let mut h = vec![0.0; cfg.intermediate_size];
-            for i in 0..cfg.intermediate_size {
-                h[i] = crate::ref_model::silu(gate[i]) * up[i];
-            }
-            let down = crate::ref_model::matvec_t(&h, &lw.wd, d);
-            for i in 0..d {
-                x[i] += down[i];
+            if cfg.num_experts > 0 && !lw.moe_router.is_empty() {
+                // MoE: router softmax -> top-k experts -> weighted sum of
+                // per-expert SwiGLU MLPs.
+                let ne = cfg.num_experts;
+                let topk = cfg.num_experts_per_tok.min(ne);
+                let einter = cfg.expert_size();
+                let router = crate::ref_model::matvec_t(&xn2, &lw.moe_router, ne);
+                let mut probs = vec![0.0; ne];
+                let mut maxr = f32::NEG_INFINITY;
+                for r in &router {
+                    maxr = maxr.max(*r);
+                }
+                let mut sumr = 0.0f32;
+                for i in 0..ne {
+                    probs[i] = (router[i] - maxr).exp();
+                    sumr += probs[i];
+                }
+                for p in probs.iter_mut() {
+                    *p /= sumr;
+                }
+                // Top-k expert indices by probability (ties: lower index).
+                let mut order: Vec<usize> = (0..ne).collect();
+                order.sort_by(|&a, &b| {
+                    probs[b]
+                        .partial_cmp(&probs[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.cmp(&b))
+                });
+                let mut norm = 0.0f32;
+                for &e in order.iter().take(topk) {
+                    norm += probs[e];
+                }
+                let mut h = vec![0.0; d];
+                for &e in order.iter().take(topk) {
+                    // Expert e: gate/up [einter, d], down [d, einter].
+                    let wg = &lw.moe_wg[e * einter * d..(e + 1) * einter * d];
+                    let wu = &lw.moe_wu[e * einter * d..(e + 1) * einter * d];
+                    let wd = &lw.moe_wd[e * d * einter..(e + 1) * d * einter];
+                    let gate = crate::ref_model::matvec_t(&xn2, wg, einter);
+                    let up = crate::ref_model::matvec_t(&xn2, wu, einter);
+                    let mut eh = vec![0.0; einter];
+                    for i in 0..einter {
+                        eh[i] = crate::ref_model::silu(gate[i]) * up[i];
+                    }
+                    let down = crate::ref_model::matvec_t(&eh, wd, d);
+                    let w = probs[e] / norm;
+                    for i in 0..d {
+                        h[i] += w * down[i];
+                    }
+                }
+                for i in 0..d {
+                    x[i] += h[i];
+                }
+            } else {
+                // Dense SwiGLU.
+                let gate = crate::ref_model::matvec_t(&xn2, &lw.wg, cfg.intermediate_size);
+                let up = crate::ref_model::matvec_t(&xn2, &lw.wu, cfg.intermediate_size);
+                let mut h = vec![0.0; cfg.intermediate_size];
+                for i in 0..cfg.intermediate_size {
+                    h[i] = crate::ref_model::silu(gate[i]) * up[i];
+                }
+                let down = crate::ref_model::matvec_t(&h, &lw.wd, d);
+                for i in 0..d {
+                    x[i] += down[i];
+                }
             }
         }
 
@@ -684,6 +742,87 @@ mod tests {
         let (shared_page_b, _) = page_offsets(pr.slot_table(1).unwrap(), 0, 4).unwrap();
         assert_eq!(shared_page_a, shared_page_b, "both slots share page 0");
         let _ = off_a;
+        let n = cfg.n_kv_heads * cfg.head_dim;
+        let ka = &pr.k_pools[0][shared_page_a as usize * 4 * n..shared_page_a as usize * 4 * n + n];
+        let kb = &pr.k_pools[0][shared_page_b as usize * 4 * n..shared_page_b as usize * 4 * n + n];
+        assert_eq!(ka, kb, "shared page KV identical after both writes");
+    }
+
+    #[test]
+    fn paged_ref_moe_matches_ref_model_exact() {
+        // MoE config (mirrors tests/state_reuse.rs::cfg_moe): routed MLP with
+        // per-expert gate/up/down replaces the dense SwiGLU.
+        let mut cfg = Config::tiny();
+        cfg.intermediate_size = 64;
+        cfg.moe_intermediate_size = 48;
+        cfg.num_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        let w = Weights::random(&cfg, 61).expect("weights");
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // spans 3 pages of 4
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 8, 4);
+        let paged_logits = pr.prefill(0, &tokens).expect("prefill");
+        let mut ref_m = RefModel::new(cfg, w);
+        let ref_logits = ref_m.forward(&tokens);
+        let max = max_abs_diff(&paged_logits, &ref_logits);
+        assert_eq!(
+            max, 0.0,
+            "paged MoE ref must equal ref_model exactly (max {max})"
+        );
+    }
+
+    #[test]
+    fn paged_ref_moe_shared_prefix_pages_keep_correctness() {
+        // Same sharing scenario as the dense test, but with routed MoE MLPs so
+        // the shared physical pages are read back through top-k experts.
+        let mut cfg = Config::tiny();
+        cfg.intermediate_size = 64;
+        cfg.moe_intermediate_size = 48;
+        cfg.num_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        let w = Weights::random(&cfg, 62).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 16, 4);
+        let logits_a = pr.prefill(0, &a).expect("prefill A");
+        let table_a = pr.slot_table(0).expect("table A").pages().to_vec();
+        assert_eq!(table_a.len(), 3);
+
+        // B shares A's two system pages, then appends its own tail page.
+        pr.share_prefix(1, &table_a[..2]);
+        let logits_b = pr.prefill(1, &b).expect("prefill B");
+
+        // Correctness: B's logits equal a full recompute.
+        let mut ref_b = RefModel::new(cfg, w.clone());
+        let ref_logits_b = ref_b.forward(&b);
+        assert_eq!(
+            max_abs_diff(&logits_b, &ref_logits_b),
+            0.0,
+            "shared-prefix MoE decode must equal full recompute"
+        );
+        // A is unaffected by B's writes to the shared pages: continuing A with
+        // a fresh token after B's prefill must equal a full-recompute model
+        // continuing the same way (A's KV pages are intact).
+        let a_continue = pr.decode_step(0, 999).expect("continue A");
+        let mut ref_a = RefModel::new(cfg, w.clone());
+        ref_a.forward(&a);
+        let ref_continue = ref_a.decode_step(999);
+        assert_eq!(
+            max_abs_diff(&a_continue, &ref_continue),
+            0.0,
+            "A's MoE KV pages unchanged after B shared them"
+        );
+        // A's first-pass logits still equal full recompute.
+        let mut ref_a1 = RefModel::new(cfg, w);
+        let ref_logits_a = ref_a1.forward(&a);
+        assert_eq!(max_abs_diff(&logits_a, &ref_logits_a), 0.0, "A first pass");
+        // The shared physical page holds identical KV after both prefills.
+        let (shared_page_a, _) = page_offsets(pr.slot_table(0).unwrap(), 0, 4).unwrap();
+        let (shared_page_b, _) = page_offsets(pr.slot_table(1).unwrap(), 0, 4).unwrap();
+        assert_eq!(shared_page_a, shared_page_b, "both slots share page 0");
         let n = cfg.n_kv_heads * cfg.head_dim;
         let ka = &pr.k_pools[0][shared_page_a as usize * 4 * n..shared_page_a as usize * 4 * n + n];
         let kb = &pr.k_pools[0][shared_page_b as usize * 4 * n..shared_page_b as usize * 4 * n + n];
