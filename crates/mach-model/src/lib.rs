@@ -8,6 +8,7 @@
 
 #[cfg(feature = "hip")]
 pub mod adaptive;
+pub mod adaptive_q;
 #[cfg(feature = "hip")]
 pub mod batched;
 pub mod config;
