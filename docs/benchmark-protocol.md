@@ -90,6 +90,24 @@ fp32 输出以保采样精度)。关键发现:**rocBLAS 对瘦长形状(m >> n)�
 - **FP8**:hipBLAS 在 gfx1100/ROCm6.2 拒绝 fp8(探针证据),原生路径不可行;
 - **模型**:Qwen2.5-0.5B / 1.5B(F32+F16),head_dim 128 兼容。
 
+## CPU 前缀复用参考基准(#64, 2026-08-26)
+
+跨请求共享前缀时,KV 缓存只算增量:首个请求 prefill 整条 prompt,后续请求复用已缓存的
+8-token 系统提示、只计算各自尾部 delta(每请求仅 1 个差异 token)。这是 **CPU 参考数字**,
+用于在真机 A/B 之前把复用记账(reused / computed / savings)钉死;GPU 真机 A/B(TTFT/TPOT)
+为后续批次(当前不做真机)。
+
+- **目的**:验证「跨请求共享前缀只算 delta」的复用栈(CpuEngine:调度 FSM + 复用规划器 +
+  前缀 KV 缓存)端到端记账与理论一致;
+- **复现**:`cargo run -p mach-model --example prefix_reuse_bench`(CPU-only,无需 HIP/GPU)
+  - `MACH_BENCH_REQUESTS`(默认 8):共享前缀的请求数
+  - `MACH_BENCH_TOKENS`(默认 8):每请求 max_new decode token 数
+  - `MACH_SEED`(默认 42):权重与尾部 token 种子,固定默认保证可复现;
+- **指标口径**:`savings = prompt_tokens_reused / prompt_tokens_total`;
+- **结果**(N=8,共享 8-token 系统提示):prompt total **72** / reused **56** / computed **16** /
+  decoded **64**;savings **77.8%**,与理论值 `8*(N-1)/(9*N)=56/72` 一致;
+- **后续**:GPU 真机 A/B(TTFT/TPOT)为后续批次,本数字仅作 CPU 参考。
+
 ## 复现
 
 ```bash
@@ -97,6 +115,7 @@ fp32 输出以保采样精度)。关键发现:**rocBLAS 对瘦长形状(m >> n)�
 cargo run -p mach-model --release --features hip --example qwen_bench
 cargo run -p mach-model --release --features hip --example lctx_bench   # 长 context
 cargo run -p mach-model --release --features hip --example spec_check   # spec-decode 收益(需同意运行)
+cargo run -p mach-model --example prefix_reuse_bench    # CPU 前缀复用参考基准(#64)
 # llama.cpp
 llama-bench -m models/qwen2.5-0.5b-instruct-q8_0.gguf -p 512 -n 128 -b 1,16,128 -r 2
 ```
