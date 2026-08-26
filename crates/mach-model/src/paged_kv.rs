@@ -409,24 +409,31 @@ impl PagedRef {
     }
 
     /// Reuses `pages` as `slot`'s leading block table (a shared prefix). The
-    /// slot continues appending fresh pages beyond them. Call this only on a
-    /// slot that has not prefilled anything yet (replacing an in-use table
-    /// would leak its allocated pages), and the shared pages must already hold
-    /// KV for the exact same token sequence (written by the owner).
+    /// slot resumes **after** the shared pages (delta-only: position
+    /// `pages.len() * tokens_per_page`) and appends fresh pages beyond them.
+    /// Call this only on a slot that has not prefilled anything yet; sharing
+    /// into a used slot would silently leak its allocated pages and is
+    /// rejected with a panic. The shared pages must already hold KV for the
+    /// exact same token sequence (written by the owner).
     pub fn share_prefix(&mut self, slot: usize, pages: &[u32]) {
+        assert!(
+            self.slots[slot].is_none(),
+            "share_prefix on a used slot would leak its allocated pages"
+        );
         let mut table = BlockTable::new();
         for &p in pages {
             table.append(p);
         }
-        if self.slots[slot].is_none() {
-            self.slots[slot] = Some(PagedSlot {
-                table,
-                pos: 0,
-                last_hidden: Vec::new(),
-            });
-        } else {
-            self.slots[slot].as_mut().expect("slot").table = table;
-        }
+        self.slots[slot] = Some(PagedSlot {
+            table,
+            // Delta-only: the shared pages already hold KV for
+            // pages.len()*tokens_per_page tokens, so the slot resumes after
+            // them. (Starting at 0 would recompute and overwrite the shared
+            // pages, corrupting them for other slots unless the KV writes are
+            // bit-identical — which is not guaranteed across configs/quant.)
+            pos: pages.len() * self.tokens_per_page,
+            last_hidden: Vec::new(),
+        });
     }
 
     /// Current block table of `slot` (read-only view for tests/inspection).
@@ -896,9 +903,10 @@ mod tests {
         let table_a = pr.slot_table(0).expect("table A").pages().to_vec();
         assert_eq!(table_a.len(), 3);
 
-        // B shares A's two system pages, then appends its own tail page.
+        // B shares A's two system pages (8 tokens), then appends its own tail
+        // page delta-only (only the token past the shared prefix).
         pr.share_prefix(1, &table_a[..2]);
-        let logits_b = pr.prefill(1, &b).expect("prefill B");
+        let logits_b = pr.prefill(1, &b[8..]).expect("prefill B");
 
         // Correctness: B's logits equal a full recompute.
         let mut ref_b = RefModel::new(cfg, w.clone());
@@ -964,7 +972,7 @@ mod tests {
         let logits_a = pr.prefill(0, &a).expect("A");
         let pages = pr.slot_table(0).expect("A table").pages().to_vec();
         pr.share_prefix(1, &pages[..2]);
-        let logits_b = pr.prefill(1, &b).expect("B");
+        let logits_b = pr.prefill(1, &b[8..]).expect("B");
         let mut ref_b = RefModel::new(cfg, w.clone());
         let ref_logits_b = ref_b.forward(&b);
         assert_eq!(
@@ -1023,9 +1031,10 @@ mod tests {
         let table_a = pr.slot_table(0).expect("table A").pages().to_vec();
         assert_eq!(table_a.len(), 3);
 
-        // B shares A's two system pages, then appends its own tail page.
+        // B shares A's two system pages (8 tokens), then appends its own tail
+        // page delta-only (only the token past the shared prefix).
         pr.share_prefix(1, &table_a[..2]);
-        let logits_b = pr.prefill(1, &b).expect("prefill B");
+        let logits_b = pr.prefill(1, &b[8..]).expect("prefill B");
 
         // Correctness: B's logits equal a full recompute.
         let mut ref_b = RefModel::new(cfg, w.clone());
@@ -1072,18 +1081,40 @@ mod tests {
     }
 
     #[test]
-    fn paged_ref_share_prefix_on_used_slot_leaks_but_reports_nothing() {
+    fn share_prefix_on_used_slot_panics_instead_of_leaking() {
         let cfg = Config::tiny();
         let w = Weights::random(&cfg, 54).expect("weights");
-        // share_prefix contract: unused slots only. (Leak of the old table's
-        // pages is a documented blueprint limitation; this test pins that the
-        // data path still works when sharing on a fresh slot.)
+        // share_prefix contract: unused slots only. Replacing a used slot's
+        // table would silently leak its allocated pages, so it must panic.
         let mut pr = PagedRef::new(cfg, w, 2, 16, 4);
         pr.prefill(0, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("A");
         let pages = pr.slot_table(0).expect("A table").pages().to_vec();
+        pr.prefill(1, &[9, 10, 11, 12]).expect("B occupies slot 1");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pr.share_prefix(1, &pages[..1]);
+        }));
+        assert!(result.is_err(), "used-slot share_prefix must panic");
+    }
+
+    #[test]
+    fn share_prefix_fresh_slot_resumes_delta_only() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 56).expect("weights");
+        // Fresh slot shares one page (4 tokens) and decodes only the delta;
+        // the result must equal a full recompute (regression: pos was 0, which
+        // recomputed and overwrote the shared pages instead of resuming).
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 16, 4);
+        pr.prefill(0, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("A");
+        let pages = pr.slot_table(0).expect("A table").pages().to_vec();
         pr.share_prefix(1, &pages[..1]);
-        let b = pr.prefill(1, &[1, 2, 3, 4, 9]).expect("B shares A page0");
-        assert_eq!(b.len(), cfg.vocab_size);
+        let b = pr.prefill(1, &[9]).expect("B shares A page0 delta-only");
+        let mut ref_b = RefModel::new(cfg, w);
+        let want = ref_b.forward(&[1, 2, 3, 4, 9]);
+        assert_eq!(
+            max_abs_diff(&b, &want),
+            0.0,
+            "delta-only must match recompute"
+        );
     }
 
     #[test]

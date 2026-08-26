@@ -87,6 +87,11 @@ impl AnchorStore {
         let id = self.next_id;
         self.next_id += 1;
         anchor.id = id;
+        // Zero-capacity store: retain nothing (the pop_front guard below would
+        // otherwise no-op and the store would grow unbounded).
+        if self.max_anchors == 0 {
+            return id;
+        }
         if self.anchors.len() >= self.max_anchors
             && let Some(oldest) = self.order.pop_front()
         {

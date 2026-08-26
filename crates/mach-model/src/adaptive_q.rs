@@ -132,6 +132,17 @@ pub fn optimal_offload_ratio(cfg: AdaptiveConfig) -> f64 {
         return 0.0;
     }
 
+    // Non-finite per-expert compute (e.g. an unmeasured +INF flops value)
+    // would make the ratio NaN; treat the model as unmeasured -> neutral.
+    // (+INF bandwidth/expert bytes are meaningful extremes handled above:
+    // transfer 0 -> all-GPU, transfer INF -> all-CPU.)
+    // A NaN transfer time (INF/INF, both unmeasured) would also poison the
+    // ratio; +INF transfer alone (huge experts on a finite bus) is a
+    // meaningful extreme (all-CPU) and stays.
+    if !gpu_expert_sec.is_finite() || !cpu_expert_sec.is_finite() || transfer_expert_sec.is_nan() {
+        return 0.5;
+    }
+
     // Balance the bus against the CPU: q*E*W/BW == (1 - q)*E*F/C.
     let q = cpu_expert_sec / (cpu_expert_sec + transfer_expert_sec);
     q.clamp(0.0, 1.0)
@@ -159,6 +170,29 @@ mod tests {
         let mut cfg = base();
         cfg.pcie_bw_gbps = f64::INFINITY;
         assert_eq!(optimal_offload_ratio(cfg), 1.0);
+    }
+
+    #[test]
+    fn infinite_flops_returns_neutral_default() {
+        // INF flops would make cpu_expert_sec = INF and the ratio NaN; the
+        // guard must return the neutral default instead (regression).
+        let mut cfg = base();
+        cfg.flops_per_expert_token = f64::INFINITY;
+        let q = optimal_offload_ratio(cfg);
+        assert!(q.is_finite(), "q must stay finite, got {q}");
+        assert_eq!(q, 0.5, "non-finite input -> neutral default");
+    }
+
+    #[test]
+    fn inf_expert_and_bus_returns_neutral_default() {
+        // INF/INF transfer is NaN, which would poison the ratio; the guard
+        // must return the neutral default (regression).
+        let mut cfg = base();
+        cfg.expert_bytes = f64::INFINITY;
+        cfg.pcie_bw_gbps = f64::INFINITY;
+        let q = optimal_offload_ratio(cfg);
+        assert!(q.is_finite(), "q must stay finite, got {q}");
+        assert_eq!(q, 0.5, "NaN transfer -> neutral default");
     }
 
     #[test]

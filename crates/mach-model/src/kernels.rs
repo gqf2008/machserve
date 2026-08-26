@@ -176,11 +176,11 @@ extern "C" __global__ void attn_decode(
     const float* __restrict__ vc,
     float* __restrict__ out,
     const int* __restrict__ pos_buf,
-    int n_heads, int n_kv_heads, int head_dim, float scale) {
+    int n_heads, int n_kv_heads, int head_dim, float scale, int max_seq) {
 
     extern __shared__ float smem[];
-    float* scores = smem;          // [max_positions]
-    float* red = smem + 1024;      // [blockDim.x]
+    float* scores = smem;          // [max_seq]
+    float* red = smem + max_seq;   // [blockDim.x]
 
     int h = blockIdx.x;
     int groups = n_heads / n_kv_heads;
@@ -282,10 +282,10 @@ extern "C" __global__ void mla_attn_decode(
     const float* __restrict__ vc,
     float* __restrict__ out,
     const int* __restrict__ pos_buf,
-    int n_heads, int k_hd, int v_hd, float scale) {
+    int n_heads, int k_hd, int v_hd, float scale, int max_seq) {
     extern __shared__ float smem[];
     float* scores = smem;
-    float* red = smem + 1024;
+    float* red = smem + max_seq;   // [blockDim.x]
     int h = blockIdx.x;
     const float* qh = q + h * k_hd;
     int pos = *pos_buf;
@@ -1926,6 +1926,7 @@ impl HipKernels {
         n_kv_heads: i32,
         head_dim: i32,
         scale: f32,
+        max_seq: i32,
     ) -> Result<(), Error> {
         let qp = q;
         let kp = kc;
@@ -1942,15 +1943,23 @@ impl HipKernels {
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,
             &head_dim as *const i32 as *mut core::ffi::c_void,
             &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
-        // Dynamic shared memory: scores[1024] + red[256] floats.
-        const SHARED_FLOATS: u32 = 1024 + 256;
+        // Dynamic shared memory: scores[max_seq] + red[256] floats; sized by
+        // max_seq so a graph captured at pos 0 replays safely at later positions.
+        const MAX_SMEM_FLOATS: u32 = 16384; // gfx1100 64 KiB dynamic smem limit
+        let floats = max_seq as u32 + 256;
+        if floats > MAX_SMEM_FLOATS {
+            return Err(Error::InvalidArgument(format!(
+                "attn_decode shared memory {floats} floats exceeds the {MAX_SMEM_FLOATS}-float device limit (max_seq={max_seq})"
+            )));
+        }
         Ok(self.attn_decode.launch_shmem(
             [n_heads as u32, 1, 1],
             [256, 1, 1],
             &mut p,
             self.stream,
-            SHARED_FLOATS * 4,
+            floats * 4,
         )?)
     }
 
@@ -2032,6 +2041,7 @@ impl HipKernels {
         k_hd: i32,
         v_hd: i32,
         scale: f32,
+        max_seq: i32,
     ) -> Result<(), Error> {
         let qp = q;
         let kp = kc;
@@ -2048,14 +2058,23 @@ impl HipKernels {
             &k_hd as *const i32 as *mut core::ffi::c_void,
             &v_hd as *const i32 as *mut core::ffi::c_void,
             &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
-        const SHARED_FLOATS: u32 = 1024 + 256;
+        // Dynamic shared memory: scores[max_seq] + red[256] floats; sized by
+        // max_seq so a graph captured at pos 0 replays safely at later positions.
+        const MAX_SMEM_FLOATS: u32 = 16384; // gfx1100 64 KiB dynamic smem limit
+        let floats = max_seq as u32 + 256;
+        if floats > MAX_SMEM_FLOATS {
+            return Err(Error::InvalidArgument(format!(
+                "mla_attn_decode shared memory {floats} floats exceeds the {MAX_SMEM_FLOATS}-float device limit (max_seq={max_seq})"
+            )));
+        }
         Ok(self.mla_attn_decode.launch_shmem(
             [n_heads as u32, 1, 1],
             [256, 1, 1],
             &mut p,
             self.stream,
-            SHARED_FLOATS * 4,
+            floats * 4,
         )?)
     }
 
@@ -2880,6 +2899,21 @@ impl HipKernels {
         ];
         let grid = (batch * n_kv_heads) as u32;
         let groups = n_heads / n_kv_heads;
+        // The kernel hard-codes T=256 with m[16]/l[16]/acc[16]/dot[16] per-group
+        // lanes and a merge over [T*groups]: head_dim must divide 256, be at most
+        // 256 (per=0 would spin), and groups <= 16 (fixed arrays). Fail loudly here
+        // instead of silently corrupting smem on an unsupported geometry.
+        if head_dim <= 0
+            || 256 % head_dim != 0
+            || head_dim > 256
+            || n_heads % n_kv_heads != 0
+            || groups <= 0
+            || groups > 16
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attn_decode_batched_f16_gqa unsupported geometry: n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} groups={groups} (require 256 % head_dim == 0, head_dim <= 256, n_heads % n_kv_heads == 0, 1 <= groups <= 16)"
+            )));
+        }
         // scores [groups][256] + 3 merge arrays [256][groups], all floats.
         let shared = (groups * 256 + 3 * 256 * groups) as u32 * 4;
         Ok(self.attn_f16_gqa.launch_shmem(
@@ -2957,8 +2991,13 @@ impl HipKernels {
             &d as *const i32 as *mut core::ffi::c_void,
             &topk as *const i32 as *mut core::ffi::c_void,
         ];
-        let total = ((topk as i64) * (inter as i64) * (d as i64))
-            .max((topk as i64) * (d as i64) * (inter as i64));
+        // u128 so the product cannot overflow before the u32 grid check.
+        let total = (topk as u128) * (inter as u128) * (d as u128);
+        if total > u32::MAX as u128 {
+            return Err(Error::InvalidArgument(format!(
+                "moe_gather_weights grid {total} exceeds u32 capacity"
+            )));
+        }
         let blocks = (total as u32).div_ceil(256);
         Ok(self
             .moe_gather

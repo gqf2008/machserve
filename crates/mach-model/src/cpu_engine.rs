@@ -212,15 +212,29 @@ impl CpuEngine {
         self.stats.steps += 1;
 
         // Prefill the oldest not-yet-prefilled slot (delta-only via the cache).
+        // A prefill that cannot be satisfied (e.g. the KV pool is too small for
+        // the prompt's fresh-page demand) fails the request: the slot is freed
+        // so the engine never wedges retrying the same error every step.
+        let mut prefill_failed: Option<(usize, Error)> = None;
         let cache = &mut self.cache;
-        for slot in self.slots.iter_mut().flatten() {
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            let Some(slot) = slot else { continue };
             if !matches!(
                 slot.state,
                 RequestState::PrefillDone(_) | RequestState::Decoding(_)
             ) {
-                prefill_slot(cache, slot)?;
-                break;
+                match prefill_slot(cache, slot) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        prefill_failed = Some((idx, e));
+                        break;
+                    }
+                }
             }
+        }
+        if let Some((idx, e)) = prefill_failed {
+            self.slots[idx] = None;
+            return Err(e);
         }
 
         // Decode one token for every active slot; collect finishes.
@@ -228,6 +242,14 @@ impl CpuEngine {
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             let Some(slot) = slot else { continue };
             if !matches!(slot.state, RequestState::Decoding(_)) {
+                continue;
+            }
+            // Budget exhausted (including `max_new == 0`: the API contract is
+            // prefill-only, no decoded tokens).
+            if slot.generated.len() >= slot.max_new {
+                slot.state = FsmEvent::Succeeded.apply(slot.state.clone());
+                debug_assert!(matches!(slot.state, RequestState::Finished));
+                finished_now.push(idx);
                 continue;
             }
             let tok = argmax(&slot.next_logits);
@@ -412,6 +434,44 @@ mod tests {
         assert!(
             eng.step().is_err(),
             "too-small pool surfaces as a step error"
+        );
+        // The failing request is evicted, not retried forever: the next step
+        // reports no work instead of wedging on the same prefill error.
+        assert!(
+            !eng.step()
+                .expect("engine keeps stepping after a failed prefill"),
+            "a failed prefill must free the slot instead of stalling the engine"
+        );
+        assert!(eng.is_idle(), "evicted request leaves the engine idle");
+    }
+
+    #[test]
+    fn failed_prefill_does_not_starve_other_requests() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 29).expect("weights");
+        let mut eng = CpuEngine::new(cfg, w, 2, 1, 4);
+        // Oversized prompt that cannot fit the 1-block pool.
+        eng.add(&[1, 2, 3, 4, 5, 6, 7, 8], 1).expect("big");
+        // Small request that fits in one page.
+        eng.add(&[9, 10, 11, 12], 1).expect("small");
+        assert!(eng.step().is_err(), "big prefill fails and is evicted");
+        // The small request still completes on subsequent steps.
+        eng.step_until_done().expect("small completes");
+        assert_eq!(eng.finished().len(), 1);
+        assert_eq!(eng.finished()[0].generated.len(), 1);
+    }
+
+    #[test]
+    fn max_new_zero_prefills_without_decoding() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 31).expect("weights");
+        let mut eng = CpuEngine::new(cfg, w, 1, 32, 4);
+        eng.add(&[1, 2, 3, 4], 0).expect("add");
+        eng.step_until_done().expect("run");
+        assert_eq!(eng.finished().len(), 1);
+        assert!(
+            eng.finished()[0].generated.is_empty(),
+            "max_new=0 must finish with no decoded tokens (prefill-only)"
         );
     }
 

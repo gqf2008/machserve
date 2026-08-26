@@ -1066,6 +1066,7 @@ impl GpuModel {
                     nope + rope,
                     v_hd,
                     scale,
+                    c.max_seq_len as i32,
                 )?;
                 k.gemm(self.proj, self.mla_attn, lw.mla_o, d, heads * v_hd)?;
                 k.launch_add(self.x, self.proj, d)?;
@@ -1156,6 +1157,7 @@ impl GpuModel {
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
                     scale,
+                    c.max_seq_len as i32,
                 )?;
                 gemm(
                     self.proj,
