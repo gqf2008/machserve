@@ -66,6 +66,10 @@ pub fn append_hex_bytes(out: &mut String, bytes: &[u8]) {
 /// Accepts upper- and lowercase hex; an invalid digit panics. An odd trailing
 /// nibble is ignored, mirroring the upstream decoder.
 pub fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    debug_assert!(
+        hex.len().is_multiple_of(2),
+        "non-canonical odd-length hex prior: {hex}"
+    );
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let mut iter = hex.bytes();
     while let (Some(hi), Some(lo)) = (iter.next(), iter.next()) {
@@ -187,7 +191,7 @@ pub struct CacheKey {
     /// prefix, as produced by [`hash_prefix_page`].
     pub content_hash: String,
     /// Token offset of the page within the sequence.
-    pub page_offset: i32,
+    pub page_offset: usize,
 }
 
 /// One cached page: its key, the canonical location holding its KV data, the
@@ -547,7 +551,7 @@ mod tests {
 
     // -- PrefixCacheIndex ----------------------------------------------------
 
-    fn key(group: u32, hash: &str, offset: i32) -> CacheKey {
+    fn key(group: u32, hash: &str, offset: usize) -> CacheKey {
         CacheKey {
             namespace_id: 0,
             group_id: group,
@@ -666,7 +670,7 @@ mod tests {
         let blocks: Vec<_> = (0..4).map(|_| acquire(&pool, 0)).collect();
         let locs: Vec<_> = blocks.iter().map(loc_of).collect();
         for (i, h) in ["a", "b", "c", "d"].iter().enumerate() {
-            assert_eq!(index.insert(key(0, h, i as i32), &blocks[i]), None);
+            assert_eq!(index.insert(key(0, h, i), &blocks[i]), None);
         }
         // Removing the first entry swaps "d" into slot 0; both secondary
         // indices must be repaired so every remaining key/location resolves.
@@ -674,8 +678,8 @@ mod tests {
         assert_eq!(index.num_entries(), 3);
         for (i, h) in ["b", "c", "d"].iter().enumerate() {
             let idx = i + 1;
-            assert_eq!(index.query(&key(0, h, idx as i32)), Some(locs[idx]));
-            assert_eq!(index.key_for(locs[idx]), Some(&key(0, h, idx as i32)));
+            assert_eq!(index.query(&key(0, h, idx)), Some(locs[idx]));
+            assert_eq!(index.key_for(locs[idx]), Some(&key(0, h, idx)));
         }
         assert!(!index.contains(&key(0, "a", 0)));
         assert!(!index.contains_location(locs[0]));
@@ -712,7 +716,7 @@ mod tests {
         let pool = make_pool();
         for tokens in [[1], [2], [4], [5]] {
             let b = acquire(&pool, 0);
-            index.insert(key(0, &page_hash(&tokens), tokens[0]), &b);
+            index.insert(key(0, &page_hash(&tokens), tokens[0] as usize), &b);
         }
         let keys = vec![
             key(0, &page_hash(&[1]), 1),
@@ -732,7 +736,7 @@ mod tests {
         let pool = make_pool();
         for tokens in [[1], [2], [3]] {
             let b = acquire(&pool, 0);
-            index.insert(key(0, &page_hash(&tokens), tokens[0]), &b);
+            index.insert(key(0, &page_hash(&tokens), tokens[0] as usize), &b);
         }
         let keys = vec![
             key(0, &page_hash(&[1]), 1),

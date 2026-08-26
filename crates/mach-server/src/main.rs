@@ -308,14 +308,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match dtype.as_str() {
         "f32" => cfg.dtype = ModelDType::F32,
         "f16" => cfg.dtype = ModelDType::F16,
-        other => panic!("MACH_DTYPE must be f32 or f16, got {other:?}"),
+        other => {
+            eprintln!("MACH_DTYPE must be f32 or f16, got {other:?}");
+            std::process::exit(1);
+        }
     }
     if q4 {
-        if fp8 {
-            println!(
-                "storage FP8: host weights stay packed E4M3 (~2x smaller than f16); device still holds dequantized f16 weights"
-            );
-        }
         if cfg.dtype != ModelDType::F16 {
             eprintln!(
                 "MACH_Q4=1 requires dtype f16 (Q4 dequantizes to f16 on device); set MACH_DTYPE=f16 or drop MACH_Q4"
@@ -324,7 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if spec {
             eprintln!(
-                "MACH_Q4=1 and MACH_SPEC are mutually exclusive (spec mode loads a second f32 model)"
+                "MACH_Q4=1 and MACH_SPEC are mutually exclusive (spec mode loads a second model)"
             );
             std::process::exit(1);
         }
@@ -349,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if spec {
             eprintln!(
-                "MACH_FP8=1 and MACH_SPEC are mutually exclusive (spec mode loads a second f32 model)"
+                "MACH_FP8=1 and MACH_SPEC are mutually exclusive (spec mode loads a second model)"
             );
             std::process::exit(1);
         }
@@ -425,11 +423,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gib(estimate)
     );
     if q4 {
-        if fp8 {
-            println!(
-                "storage FP8: host weights stay packed E4M3 (~2x smaller than f16); device still holds dequantized f16 weights"
-            );
-        }
         println!(
             "storage Q4: host weights stay packed int4 (~4x smaller than f32); device still holds dequantized f16 weights"
         );
