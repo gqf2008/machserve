@@ -15,11 +15,11 @@ use crate::{Config, Error, Weights};
 
 /// Physical page id per logical page (`pages[logical] = physical`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BlockTable {
+pub struct PagedTable {
     pages: Vec<u32>,
 }
 
-impl BlockTable {
+impl PagedTable {
     /// An empty block table (no pages yet).
     #[must_use]
     pub fn new() -> Self {
@@ -66,7 +66,7 @@ impl BlockTable {
 /// is not mapped.
 #[must_use]
 pub fn page_offsets(
-    table: &BlockTable,
+    table: &PagedTable,
     pos: usize,
     tokens_per_page: usize,
 ) -> Option<(u32, usize)> {
@@ -88,7 +88,7 @@ pub fn paged_attention_decode(
     q: &[f32],
     k_pool: &[f32],
     v_pool: &[f32],
-    table: &BlockTable,
+    table: &PagedTable,
     pos: usize,
     n_heads: usize,
     n_kv_heads: usize,
@@ -212,7 +212,16 @@ impl PageAllocator {
     }
 
     /// Returns a page to the pool for reuse.
+    ///
+    /// Panics on an out-of-range id or a double-free while the page is still
+    /// on the free list (handing the same physical page to two tables would
+    /// silently corrupt both).
     pub fn free(&mut self, page: u32) {
+        assert!(
+            page < self.num_pages && !self.free.contains(&page),
+            "PageAllocator double-free or out-of-range page {page} (num_pages {})",
+            self.num_pages
+        );
         self.free.push(page);
     }
 }
@@ -247,7 +256,7 @@ fn paged_attention_decode_mla(
     qm: &[f32],
     k_pool: &[f32],
     v_pool: &[f32],
-    table: &BlockTable,
+    table: &PagedTable,
     pos: usize,
     heads: usize,
     hd: usize,
@@ -295,7 +304,7 @@ fn paged_attention_decode_mla(
 /// Per-slot state of a paged reference sequence.
 #[derive(Debug)]
 struct PagedSlot {
-    table: BlockTable,
+    table: PagedTable,
     pos: usize,
     /// Hidden state after the last token (reserved for prefix-boundary
     /// continuation / anchor-style restore in the GPU integration).
@@ -306,7 +315,7 @@ struct PagedSlot {
 /// Paged-KV reference transformer (GPU-wiring blueprint).
 ///
 /// Mirrors [`crate::ref_model::RefModel`]'s dense forward but stores K/V into a
-/// page pool referenced by per-slot [`BlockTable`]s — the exact layout
+/// page pool referenced by per-slot [`PagedTable`]s — the exact layout
 /// `attn_decode_paged` reads on the GPU. Parity with `RefModel` (exact) proves
 /// the paged store + block-table attention are correct through a full
 /// transformer, so the `batched.rs` GPU integration can mirror this structure
@@ -397,7 +406,7 @@ impl PagedRef {
             reused_tokens,
             "shared prefix must cover exactly reused_tokens on page boundaries"
         );
-        let mut table = BlockTable::new();
+        let mut table = PagedTable::new();
         for &p in shared_pages {
             table.append(p);
         }
@@ -420,7 +429,7 @@ impl PagedRef {
             self.slots[slot].is_none(),
             "share_prefix on a used slot would leak its allocated pages"
         );
-        let mut table = BlockTable::new();
+        let mut table = PagedTable::new();
         for &p in pages {
             table.append(p);
         }
@@ -438,7 +447,7 @@ impl PagedRef {
 
     /// Current block table of `slot` (read-only view for tests/inspection).
     #[must_use]
-    pub fn slot_table(&self, slot: usize) -> Option<&BlockTable> {
+    pub fn slot_table(&self, slot: usize) -> Option<&PagedTable> {
         self.slots
             .get(slot)
             .and_then(|s| s.as_ref())
@@ -452,7 +461,7 @@ impl PagedRef {
         let d = cfg.d_model;
         if self.slots[slot].is_none() {
             self.slots[slot] = Some(PagedSlot {
-                table: BlockTable::new(),
+                table: PagedTable::new(),
                 pos: 0,
                 last_hidden: Vec::new(),
             });
@@ -463,6 +472,12 @@ impl PagedRef {
                 "sequence length exceeded max_seq_len".into(),
             ));
         }
+        if token as usize >= cfg.vocab_size {
+            return Err(Error::InvalidArgument(format!(
+                "decode_step token {token} out of range (vocab {})",
+                cfg.vocab_size
+            )));
+        }
         // Ensure the page backing `pos` exists (allocate on page boundary).
         let logical = pos / self.tokens_per_page;
         if self.slots[slot].as_ref().expect("slot").table.len() <= logical {
@@ -472,7 +487,7 @@ impl PagedRef {
                 .ok_or_else(|| Error::Model("page pool exhausted".into()))?;
             self.slots[slot].as_mut().expect("slot").table.append(page);
         }
-        let table = self.slots[slot].as_ref().expect("slot").table.clone();
+        let table = &self.slots[slot].as_ref().expect("slot").table;
 
         let x0 = &self.w.tok_emb[token as usize * d..(token as usize + 1) * d];
         let mut x = x0.to_vec();
@@ -515,7 +530,7 @@ impl PagedRef {
                     vm[h * v_hd..(h + 1) * v_hd]
                         .copy_from_slice(&kv[base + nope..base + nope + v_hd]);
                 }
-                let (page, off) = page_offsets(&table, pos, tpp).expect("page mapped");
+                let (page, off) = page_offsets(table, pos, tpp).expect("page mapped");
                 store_row_paged_mla(&mut self.mla_k_pools[li], &km, page, off, heads, hd, tpp);
                 store_row_paged_mla(&mut self.mla_v_pools[li], &vm, page, off, heads, v_hd, tpp);
                 let scale = 1.0 / (hd as f32).sqrt();
@@ -523,7 +538,7 @@ impl PagedRef {
                     &qm,
                     &self.mla_k_pools[li],
                     &self.mla_v_pools[li],
-                    &table,
+                    table,
                     pos,
                     heads,
                     hd,
@@ -566,7 +581,7 @@ impl PagedRef {
                     pos,
                     cfg.rope_theta,
                 );
-                let (page, off) = page_offsets(&table, pos, tpp).expect("page mapped");
+                let (page, off) = page_offsets(table, pos, tpp).expect("page mapped");
                 store_row_paged(&mut self.k_pools[li], &k, page, off, cfg, tpp);
                 store_row_paged(&mut self.v_pools[li], &v, page, off, cfg, tpp);
                 let scale = 1.0 / (cfg.head_dim as f32).sqrt();
@@ -574,7 +589,7 @@ impl PagedRef {
                     &q,
                     &self.k_pools[li],
                     &self.v_pools[li],
-                    &table,
+                    table,
                     pos,
                     cfg.n_heads,
                     cfg.n_kv_heads,
@@ -675,14 +690,14 @@ impl PagedRef {
 /// `kv_store_paged` / `attn_decode_paged` consume. The hash chain makes the
 /// reused prefix exactly the leading run of cached pages; fresh pages after it
 /// are allocated and cached for future requests.
-pub struct GpuBlockTableBuilder {
+pub struct GpuPagedTableBuilder {
     tokens_per_page: usize,
     /// Content hash -> physical page id (shared-prefix cache).
     cache: std::collections::HashMap<String, u32>,
     allocator: PageAllocator,
 }
 
-impl GpuBlockTableBuilder {
+impl GpuPagedTableBuilder {
     /// A builder over a `num_pages`-page GPU pool.
     #[must_use]
     pub fn new(num_pages: u32, tokens_per_page: usize) -> Self {
@@ -703,10 +718,10 @@ impl GpuBlockTableBuilder {
     /// allocating fresh pages for the tail. Returns the table and the number of
     /// prompt tokens covered by the reused prefix (the delta starts there).
     /// Errors when the page pool cannot satisfy the fresh demand.
-    pub fn build_table(&mut self, tokens: &[i32]) -> Result<(BlockTable, usize), Error> {
+    pub fn build_table(&mut self, tokens: &[i32]) -> Result<(PagedTable, usize), Error> {
         let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
         let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
-        let mut table = BlockTable::new();
+        let mut table = PagedTable::new();
         let mut reused_pages = 0usize;
         let mut allocating = false;
         // Pages/hashes committed by THIS call, rolled back on pool exhaustion so
@@ -729,6 +744,14 @@ impl GpuBlockTableBuilder {
                 return Err(Error::Model("page pool exhausted".into()));
             };
             fresh_this_call.push((h.clone(), page));
+            // A chained tail page whose key is already cached means a previous
+            // request registered the same content+offset — inserting would
+            // silently orphan its page. Unreachable today (no eviction/delete
+            // can split a chain here); guard it anyway for future changes.
+            debug_assert!(
+                !self.cache.contains_key(h),
+                "fresh tail page unexpectedly already cached"
+            );
             self.cache.insert(h.clone(), page);
             table.append(page);
         }
@@ -761,7 +784,7 @@ mod tests {
 
     #[test]
     fn block_table_basics() {
-        let mut t = BlockTable::new();
+        let mut t = PagedTable::new();
         assert!(t.is_empty());
         t.append(7);
         t.append(3);
@@ -776,7 +799,7 @@ mod tests {
 
     #[test]
     fn page_offsets_map_positions() {
-        let mut t = BlockTable::new();
+        let mut t = PagedTable::new();
         t.append(10);
         t.append(20);
         assert_eq!(page_offsets(&t, 0, 4), Some((10, 0)));
@@ -806,7 +829,7 @@ mod tests {
 
         // Pack the same KV into a page pool with a sequential block table.
         let num_pages: usize = (max_pos + 1).div_ceil(tokens_per_page);
-        let mut table = BlockTable::new();
+        let mut table = PagedTable::new();
         for page in 0..num_pages as u32 {
             table.append(page);
         }
@@ -1119,7 +1142,7 @@ mod tests {
 
     #[test]
     fn pagedref_shared_prefix_e2e_via_table_builder() {
-        // End-to-end shared-prefix flow on CPU: GpuBlockTableBuilder allocates
+        // End-to-end shared-prefix flow on CPU: GpuPagedTableBuilder allocates
         // the shared prefix pages, PagedRef consumes them delta-only, and the
         // result equals a full recompute.
         let cfg = Config::tiny();
@@ -1133,7 +1156,7 @@ mod tests {
         let b_i32: Vec<i32> = b.iter().map(|&t| t as i32).collect();
 
         // 1) Table builder: B reuses A's two system pages.
-        let mut bld = GpuBlockTableBuilder::new(16, 4);
+        let mut bld = GpuPagedTableBuilder::new(16, 4);
         let (table_a, r_a) = bld.build_table(&a_i32).expect("A");
         let (table_b, r_b) = bld.build_table(&b_i32).expect("B");
         assert_eq!(r_a, 0);
@@ -1213,7 +1236,7 @@ mod tests {
     #[test]
     fn gpu_table_builder_shares_prefix_pages() {
         let system = [1i32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages of 4
-        let mut b = GpuBlockTableBuilder::new(16, 4);
+        let mut b = GpuPagedTableBuilder::new(16, 4);
         let mk = |tail: i32| {
             let mut t = system.to_vec();
             t.push(tail);
@@ -1240,7 +1263,7 @@ mod tests {
     #[test]
     fn gpu_table_builder_pool_exhaustion_rolls_back() {
         // Pool holds 2 pages; the first request needs 3 (system 2 + tail 1).
-        let mut b = GpuBlockTableBuilder::new(2, 4);
+        let mut b = GpuPagedTableBuilder::new(2, 4);
         assert!(b.build_table(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).is_err());
         // Rollback: no cache entry may point at an unwritten page.
         assert_eq!(b.cached_pages(), 0, "failed build must not cache pages");
@@ -1256,7 +1279,7 @@ mod tests {
 
     #[test]
     fn gpu_table_builder_disjoint_request_reuses_nothing() {
-        let mut b = GpuBlockTableBuilder::new(16, 4);
+        let mut b = GpuPagedTableBuilder::new(16, 4);
         let (t_a, _) = b.build_table(&[1, 2, 3, 4]).expect("A");
         let (t_b, r_b) = b.build_table(&[21, 22, 23, 24]).expect("B");
         assert_eq!(r_b, 0);
@@ -1266,10 +1289,10 @@ mod tests {
     #[test]
     fn shared_prefix_tables_read_same_pages() {
         // Two requests share the first page (physical 5) and diverge after.
-        let mut a = BlockTable::new();
+        let mut a = PagedTable::new();
         a.append(5);
         a.append(9);
-        let mut b = BlockTable::new();
+        let mut b = PagedTable::new();
         b.append(5); // shared prefix page
         b.append(11);
         assert_eq!(
@@ -1316,7 +1339,7 @@ mod tests {
             vec![0, 2, 4, 6, 1, 3, 5, 7, 2, 4],
             vec![3, 1, 4, 1, 5, 9],
         ];
-        let mut b = GpuBlockTableBuilder::new(NUM_PAGES, TPP);
+        let mut b = GpuPagedTableBuilder::new(NUM_PAGES, TPP);
         let mut rng = Xs::new(0x1234_5678);
         let mut successes = 0usize;
         let mut failures = 0usize;

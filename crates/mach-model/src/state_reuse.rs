@@ -217,13 +217,15 @@ impl StateReuse {
     /// prefills only `tokens[prefix_len..]`.
     pub fn find_reusable(&mut self, tokens: &[u32]) -> Option<ReusedPrefix> {
         self.stats.lookups += 1;
+        // Bounded by max_anchors; compare cost is O(prefix_len) per anchor.
+        // Check the length-vs-best gate before the slice compare so anchors
+        // that cannot beat the current best never pay the comparison.
         let mut best: Option<(u64, usize)> = None; // (anchor_id, prefix_len)
         for (&id, a) in &self.store.anchors {
             let prefix_len = a.token_idx + 1;
             if prefix_len < tokens.len()
-                && tokens.len() >= prefix_len
-                && tokens[..prefix_len] == a.tokens[..]
                 && best.is_none_or(|(_, bp)| prefix_len > bp)
+                && tokens[..prefix_len] == a.tokens[..]
             {
                 best = Some((id, prefix_len));
             }

@@ -92,7 +92,7 @@
     （38 内核离线门禁全过 + **7900 XTX 真机对拍逐位一致**）；
   - **batched.rs 已接入**（`BatchedModel::with_paged_kv`，稠密 F32 decode 走分页
     内核；静态恒等块表映射，GPU 上 70 token 跨 2 页与静态路径对拍通过）；
-  - **共享前缀已备**：`GpuBlockTableBuilder`（按内容哈希复用前缀物理页 + 块表
+  - **共享前缀已备**：`GpuPagedTableBuilder`（按内容哈希复用前缀物理页 + 块表
     构造 + 压力测试）+ **f16 分页内核**（`kv_store_paged_f16`/`attn_decode_paged_f16_gqa`，
     40 内核离线门禁）；
     剩余：共享前缀页接入 decode（用 #57 块表替换静态恒等映射）+ f16/MLA/prefill

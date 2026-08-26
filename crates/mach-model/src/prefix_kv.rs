@@ -130,11 +130,16 @@ impl PrefixKvCache {
         let plan = plan.expect("plan after eviction");
         // The contiguous prefix (0..reused_pages) is restored via the anchor;
         // every page after it must be freshly computed. A dedup-reused page
-        // beyond the prefix (only possible after a released plan left a chain
-        // hole) would need offset-KV restore this consumer cannot do — assert
-        // loudly instead of silently producing wrong logits. LRU eviction
-        // normally removes the hole's dependent chained keys first, so this is
-        // unreachable in the current flow.
+        // beyond the prefix (a chain hole left by eviction/release) would need
+        // offset-KV restore this consumer cannot do — assert loudly instead of
+        // silently producing wrong logits.
+        //
+        // Why this is unreachable today: `PrefixKvCache` never releases plans,
+        // and an eviction-triggering request always ends with a full pool, so
+        // any later request must evict again (removing the hole's chained
+        // survivors) before it can plan. A future consumer that calls
+        // `ReusePlanner::release` or reuses plans must add offset-KV restore
+        // (or route such pages as fresh) before hitting this assert.
         assert!(
             plan.pages[plan.reused_pages..]
                 .iter()
@@ -394,5 +399,43 @@ mod tests {
                 .serve(&mut model(&cfg, &w), &[9, 10, 11, 12, 5, 6, 7, 8])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn heavy_eviction_recompute_stays_bit_exact() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 11).expect("weights");
+        // Pool = 4 pages. A and B share a 2-page system prefix; C's disjoint
+        // 3-page request forces eviction that frees the prefix head but leaves
+        // B's chained tail page cached (a chain hole).
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages
+        let mut a = system.to_vec();
+        a.extend([100, 101]);
+        let b = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let c: Vec<u32> = (21..=32).collect();
+
+        let mut cache = PrefixKvCache::new(4, 4);
+        // A caches 3 pages (2 system prefix + its tail); B reuses the 2-page
+        // prefix and adds a fresh tail page -> pool (4) is full.
+        cache.serve(&mut model(&cfg, &w), &a).expect("serve A");
+        let (_, stats_b) = cache.serve(&mut model(&cfg, &w), &b).expect("serve B");
+        assert_eq!(stats_b.reused_pages, 2);
+        assert_eq!(stats_b.fresh_pages, 1);
+        // C's disjoint 3-page request needs 3 fresh pages -> evicts the three
+        // coldest pages (A's prefix + A's tail) but leaves B's tail cached:
+        // a chain hole for B's prefix.
+        let (_, stats_c) = cache.serve(&mut model(&cfg, &w), &c).expect("serve C");
+        assert_eq!(stats_c.fresh_pages, 3);
+
+        // Re-request B: the prefix head pages are evicted; the re-request's
+        // fresh demand forces another eviction that clears the hole's chained
+        // survivors, so the plan ends fully fresh. Logits must stay bit-exact
+        // vs full recompute (regression: no panic, no stale reuse).
+        let (logits, stats) = cache.serve(&mut model(&cfg, &w), &b).expect("serve D");
+        assert_eq!(stats.reused_pages, 0);
+        assert_eq!(stats.fresh_pages, 3);
+        let mut full = model(&cfg, &w);
+        let full_logits = full.forward(&b);
+        assert_eq!(max_abs_diff(&logits, &full_logits), 0.0);
     }
 }

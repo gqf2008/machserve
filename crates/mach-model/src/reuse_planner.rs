@@ -133,7 +133,7 @@ impl ReusePlanner {
                 namespace_id: self.namespace_id,
                 group_id: self.group_id,
                 content_hash: h.clone(),
-                page_offset: (i * self.tokens_per_page) as i32,
+                page_offset: i * self.tokens_per_page,
             })
             .collect();
 
@@ -250,7 +250,7 @@ mod tests {
                 namespace_id: 7,
                 group_id: 0,
                 content_hash: h.clone(),
-                page_offset: (i * page) as i32,
+                page_offset: i * page,
             })
             .collect()
     }

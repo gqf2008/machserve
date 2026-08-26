@@ -907,7 +907,8 @@ impl BatchedSampler {
     /// Optional per-row top-`k` log-probs (OpenAI `top_logprobs`), computed on
     /// device from the post-penalty/bias logits. Rows with
     /// `params[i].top_logprobs == 0` get an empty list. `k` is clamped to
-    /// [`MAX_TOPK`].
+    /// [`MAX_TOPK`] (the OpenAI layer already rejects `top_logprobs > 20` with
+    /// a 400; this clamp is the defensive fallback for non-server callers).
     fn sample_topk(
         &self,
         logits: *const f32,

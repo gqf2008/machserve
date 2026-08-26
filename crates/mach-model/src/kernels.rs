@@ -1602,8 +1602,12 @@ pub struct HipKernels {
     moe_prefix_sum: HipKernelModule,
 }
 
-// SAFETY: a HipKernels instance is used by one model on one thread; the raw
-// stream handle is only touched there, and the loaded runtimes are Send+Sync.
+// SAFETY: a HipKernels instance is confined to one engine thread by its
+// owners (`GpuModel`/`BatchedModel`); the raw stream handle is only
+// dereferenced on that thread, and the loaded runtimes/modules are Send+Sync
+// (the compile cache is Arc-shared across threads, which is safe because
+// launches are per-stream and the module handles are refcounted). Sharing a
+// HipKernels across threads would need per-stream serialization.
 unsafe impl Send for HipKernels {}
 unsafe impl Sync for HipKernels {}
 
@@ -2872,12 +2876,13 @@ impl HipKernels {
         if head_dim <= 0
             || 256 % head_dim != 0
             || head_dim > 256
+            || head_dim % 8 != 0
             || n_heads % n_kv_heads != 0
             || groups <= 0
             || groups > 16
         {
             return Err(Error::InvalidArgument(format!(
-                "attn_decode_batched_f16_gqa unsupported geometry: n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} groups={groups} (require 256 % head_dim == 0, head_dim <= 256, n_heads % n_kv_heads == 0, 1 <= groups <= 16)"
+                "attn_decode_batched_f16_gqa unsupported geometry: n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} groups={groups} (require 256 % head_dim == 0, head_dim <= 256, head_dim % 8 == 0, n_heads % n_kv_heads == 0, 1 <= groups <= 16)"
             )));
         }
         // scores [groups][256] + 3 merge arrays [256][groups], all floats.
