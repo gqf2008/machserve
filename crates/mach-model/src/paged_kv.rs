@@ -472,6 +472,12 @@ impl PagedRef {
                 "sequence length exceeded max_seq_len".into(),
             ));
         }
+        if token as usize >= cfg.vocab_size {
+            return Err(Error::InvalidArgument(format!(
+                "decode_step token {token} out of range (vocab {})",
+                cfg.vocab_size
+            )));
+        }
         // Ensure the page backing `pos` exists (allocate on page boundary).
         let logical = pos / self.tokens_per_page;
         if self.slots[slot].as_ref().expect("slot").table.len() <= logical {
@@ -483,12 +489,6 @@ impl PagedRef {
         }
         let table = &self.slots[slot].as_ref().expect("slot").table;
 
-        if token as usize >= cfg.vocab_size {
-            return Err(Error::InvalidArgument(format!(
-                "decode_step token {token} out of range (vocab {})",
-                cfg.vocab_size
-            )));
-        }
         let x0 = &self.w.tok_emb[token as usize * d..(token as usize + 1) * d];
         let mut x = x0.to_vec();
         let tpp = self.tokens_per_page;

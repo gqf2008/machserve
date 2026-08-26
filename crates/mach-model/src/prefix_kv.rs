@@ -427,10 +427,10 @@ mod tests {
         let (_, stats_c) = cache.serve(&mut model(&cfg, &w), &c).expect("serve C");
         assert_eq!(stats_c.fresh_pages, 3);
 
-        // Re-request B: the prefix head pages are evicted but the chained tail
-        // page is still cached -> a dedup-reused page beyond the prefix. The
-        // CPU consumer must recompute fresh instead of panicking, and logits
-        // must stay bit-exact vs full recompute.
+        // Re-request B: the prefix head pages are evicted; the re-request's
+        // fresh demand forces another eviction that clears the hole's chained
+        // survivors, so the plan ends fully fresh. Logits must stay bit-exact
+        // vs full recompute (regression: no panic, no stale reuse).
         let (logits, stats) = cache.serve(&mut model(&cfg, &w), &b).expect("serve D");
         assert_eq!(stats.reused_pages, 0);
         assert_eq!(stats.fresh_pages, 3);
