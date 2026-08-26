@@ -675,6 +675,119 @@ extern "C" __global__ void attn_decode_paged_f16_gqa(
 }
 "#;
 
+/// Paged MLA KV store: writes one token's per-head K/V rows — k
+/// `[heads, hd]` (hd = qk_nope + qk_rope) and v `[heads, v_head_dim]` — into
+/// the MLA page pools at `(page, off)` resolved via the block table, in the
+/// per-head layout `[num_pages, tokens_per_page, heads, dim]` read back by
+/// `attn_decode_paged_mla` (mirrors `store_row_paged_mla` in `paged_kv.rs`).
+/// Same addressing/style as `kv_store_paged`, but per-head MLA layout and both
+/// K/V rows written in one launch.
+#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
+const KV_STORE_PAGED_MLA: &str = r#"
+extern "C" __global__ void kv_store_paged_mla(
+    const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ k_pool, float* __restrict__ v_pool,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    const int* __restrict__ block_tables,
+    int batch, int heads, int hd, int v_hd,
+    int tokens_per_page) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_k = batch * heads * hd;
+    if (idx < total_k) {
+        int s = idx / (heads * hd);
+        int i = idx % (heads * hd);
+        int p = pos_buf[s];
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = block_tables[table_offsets[s] + logical];
+        k_pool[((long long)page * tokens_per_page + off) * heads * hd + i] =
+            k[(long long)s * heads * hd + i];
+    }
+    int total_v = batch * heads * v_hd;
+    if (idx < total_v) {
+        int s = idx / (heads * v_hd);
+        int i = idx % (heads * v_hd);
+        int p = pos_buf[s];
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = block_tables[table_offsets[s] + logical];
+        v_pool[((long long)page * tokens_per_page + off) * heads * v_hd + i] =
+            v[(long long)s * heads * v_hd + i];
+    }
+}
+"#;
+
+/// Paged MLA decode attention: per-head (no GQA grouping) reads the KV prefix
+/// `0..=pos` through the block table from the per-head MLA page pools
+/// (`[num_pages, tokens_per_page, heads, hd]` k / `[num_pages,
+/// tokens_per_page, heads, v_head_dim]` v), mirroring
+/// `paged_attention_decode_mla` in `paged_kv.rs` with the softmax structure of
+/// `mla_attn_decode_batched` / `attn_decode_paged`. One block per head, the
+/// assembled q row is `[heads, hd]`.
+#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
+const ATTN_DECODE_PAGED_MLA: &str = r#"
+extern "C" __global__ void attn_decode_paged_mla(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    int pos, int heads, int nope, int rope, int v_hd,
+    float scale, int tokens_per_page, int max_pages) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_pages * tokens_per_page;
+
+    int hd = nope + rope;
+    int h = blockIdx.x;
+    const float* qh = q + (long long)h * hd;
+
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = block_tables[logical];
+        const float* kp = k_pool + ((long long)page * tokens_per_page + off) * heads * hd + h * hd;
+        float sc = 0.0f;
+        for (int dd = 0; dd < hd; dd++) sc += qh[dd] * kp[dd];
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+
+    for (int dd = threadIdx.x; dd < v_hd; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = block_tables[logical];
+            const float* vp = v_pool + ((long long)page * tokens_per_page + off) * heads * v_hd + h * v_hd + dd;
+            acc += __expf(scores[p] - m) * (*vp);
+        }
+        out[(long long)h * v_hd + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// MLA batched: merge q_nope / q_rope into q across `batch` rows.
 const MLA_ASSEMBLE_Q_BATCHED: &str = r#"
 extern "C" __global__ void mla_assemble_q_batched(
@@ -3104,6 +3217,8 @@ mod offline_tests {
         ATTN_DECODE_PAGED,
         KV_STORE_PAGED_F16,
         ATTN_DECODE_PAGED_F16_GQA,
+        KV_STORE_PAGED_MLA,
+        ATTN_DECODE_PAGED_MLA,
     ];
 
     #[test]
