@@ -383,7 +383,7 @@ fn bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
 
 /// Per-head RMSNorm (Qwen3 QK-norm): each head's `head_dim` slice is
 /// normalized independently, scaled by that head's weight vector.
-fn qk_norm(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+pub(crate) fn qk_norm(x: &mut [f32], w: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
     for h in 0..n_heads {
         let s = h * head_dim;
         let mut ss = 0.0;
@@ -487,7 +487,7 @@ fn decode_step_mla(
     }
 }
 
-fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
+pub(crate) fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
     let half = head_dim / 2;
     for h in 0..n_heads {
         for d in 0..half {
@@ -548,7 +548,7 @@ fn attention_decode(q: &[f32], kc: &[f32], vc: &[f32], pos: usize, cfg: Config) 
     out
 }
 
-fn matvec_t(x: &[f32], w: &[f32], out_dim: usize) -> Vec<f32> {
+pub(crate) fn matvec_t(x: &[f32], w: &[f32], out_dim: usize) -> Vec<f32> {
     let in_dim = x.len();
     let mut out = vec![0.0; out_dim];
     for o in 0..out_dim {
@@ -561,7 +561,7 @@ fn matvec_t(x: &[f32], w: &[f32], out_dim: usize) -> Vec<f32> {
     out
 }
 
-fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+pub(crate) fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
     let mut ss = 0.0;
     for &v in x {
@@ -571,6 +571,6 @@ fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     (0..n).map(|i| x[i] * inv * w[i]).collect()
 }
 
-fn silu(v: f32) -> f32 {
+pub(crate) fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
 }

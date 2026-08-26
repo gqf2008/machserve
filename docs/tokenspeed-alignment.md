@@ -86,9 +86,11 @@
 - [x] CPU 分页调度器：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
 - [x] CPU 连续批处理引擎：队列/槽位复用/交错 prefill+decode + 前缀复用（GPU 接线参考）
 - [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
-  - 地基已备：`paged_kv.rs`（块表 + 分页 attention CPU 参考，与连续参考逐位一致）、
-    `ATTN_DECODE_PAGED` 内核（已进离线 hiprtc 编译门禁，37 内核全过）；
-    剩余：接入 batched.rs + 数值对拍 + 真机 A/B
+  - 地基已备：`paged_kv.rs`（块表 + 页分配器 + 分页 attention + **分页参考变压器
+    `PagedRef`**：全 transformer 分页 KV == RefModel 逐位一致；共享前缀物理页下
+    结果正确、共享页 KV 逐位一致）、`ATTN_DECODE_PAGED` 内核（已进离线 hiprtc
+    编译门禁，37 内核全过）；剩余：batched.rs 按 `PagedRef` 蓝图接内核 + 数值
+    对拍 + 真机 A/B
 - [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
       释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
       池满时 LRU 驱逐最冷页（索引 + 主机页 + 释放块），缓存有界

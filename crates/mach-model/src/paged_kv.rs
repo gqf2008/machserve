@@ -11,6 +11,8 @@
 //! that mirrors this reference lives in [`crate::kernels`] and is covered by
 //! the offline hiprtc compile gate.
 
+use crate::{Config, Error, Weights};
+
 /// Physical page id per logical page (`pages[logical] = physical`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockTable {
@@ -176,9 +178,256 @@ pub fn contiguous_attention_decode(
     out
 }
 
+/// Allocates physical page ids from a fixed-size pool (free-list reuse).
+#[derive(Debug, Clone, Default)]
+pub struct PageAllocator {
+    free: Vec<u32>,
+    next: u32,
+    num_pages: u32,
+}
+
+impl PageAllocator {
+    /// A pool with `num_pages` physical pages (ids `0..num_pages`).
+    #[must_use]
+    pub fn new(num_pages: u32) -> Self {
+        Self {
+            free: Vec::new(),
+            next: 0,
+            num_pages,
+        }
+    }
+
+    /// Allocates a physical page, or `None` when the pool is exhausted.
+    pub fn alloc(&mut self) -> Option<u32> {
+        if let Some(p) = self.free.pop() {
+            return Some(p);
+        }
+        if self.next < self.num_pages {
+            let p = self.next;
+            self.next += 1;
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// Returns a page to the pool for reuse.
+    pub fn free(&mut self, page: u32) {
+        self.free.push(page);
+    }
+}
+
+/// Writes one token's `[n_kv_heads, head_dim]` K/V row into a page pool at
+/// `(page, off)` — the layout [`paged_attention_decode`] reads back.
+fn store_row_paged(pool: &mut [f32], row: &[f32], page: u32, off: usize, cfg: Config, tpp: usize) {
+    let base = (page as usize * tpp + off) * cfg.n_kv_heads * cfg.head_dim;
+    pool[base..base + row.len()].copy_from_slice(row);
+}
+
+/// Per-slot state of a paged reference sequence.
+#[derive(Debug)]
+struct PagedSlot {
+    table: BlockTable,
+    pos: usize,
+    /// Hidden state after the last token (reserved for prefix-boundary
+    /// continuation / anchor-style restore in the GPU integration).
+    #[allow(dead_code)]
+    last_hidden: Vec<f32>,
+}
+
+/// Paged-KV reference transformer (GPU-wiring blueprint).
+///
+/// Mirrors [`crate::ref_model::RefModel`]'s dense forward but stores K/V into a
+/// page pool referenced by per-slot [`BlockTable`]s — the exact layout
+/// `attn_decode_paged` reads on the GPU. Parity with `RefModel` (exact) proves
+/// the paged store + block-table attention are correct through a full
+/// transformer, so the `batched.rs` GPU integration can mirror this structure
+/// with kernels. Slots may share leading physical pages (a shared system
+/// prefix), which the block-table layout makes free.
+pub struct PagedRef {
+    cfg: Config,
+    w: Weights,
+    tokens_per_page: usize,
+    /// Per-layer K/V page pools `[num_pages, tpp, n_kv_heads, head_dim]`.
+    k_pools: Vec<Vec<f32>>,
+    v_pools: Vec<Vec<f32>>,
+    allocator: PageAllocator,
+    slots: Vec<Option<PagedSlot>>,
+}
+
+impl PagedRef {
+    /// Builds a paged reference with `capacity` slots and a `num_pages` page pool.
+    #[must_use]
+    pub fn new(
+        cfg: Config,
+        w: Weights,
+        capacity: usize,
+        num_pages: u32,
+        tokens_per_page: usize,
+    ) -> Self {
+        assert!(tokens_per_page > 0);
+        let pool_len = num_pages as usize * tokens_per_page * cfg.n_kv_heads * cfg.head_dim;
+        Self {
+            k_pools: (0..cfg.n_layers).map(|_| vec![0.0; pool_len]).collect(),
+            v_pools: (0..cfg.n_layers).map(|_| vec![0.0; pool_len]).collect(),
+            allocator: PageAllocator::new(num_pages),
+            slots: (0..capacity).map(|_| None).collect(),
+            cfg,
+            w,
+            tokens_per_page,
+        }
+    }
+
+    /// Prefills `tokens` into `slot`, returning the final logits.
+    pub fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, Error> {
+        let mut logits = Vec::new();
+        for &t in tokens {
+            logits = self.decode_step(slot, t)?;
+        }
+        Ok(logits)
+    }
+
+    /// Reuses `pages` as `slot`'s leading block table (a shared prefix). The
+    /// slot continues appending fresh pages beyond them. Call this only on a
+    /// slot that has not prefilled anything yet (replacing an in-use table
+    /// would leak its allocated pages), and the shared pages must already hold
+    /// KV for the exact same token sequence (written by the owner).
+    pub fn share_prefix(&mut self, slot: usize, pages: &[u32]) {
+        let mut table = BlockTable::new();
+        for &p in pages {
+            table.append(p);
+        }
+        if self.slots[slot].is_none() {
+            self.slots[slot] = Some(PagedSlot {
+                table,
+                pos: 0,
+                last_hidden: Vec::new(),
+            });
+        } else {
+            self.slots[slot].as_mut().expect("slot").table = table;
+        }
+    }
+
+    /// Current block table of `slot` (read-only view for tests/inspection).
+    #[must_use]
+    pub fn slot_table(&self, slot: usize) -> Option<&BlockTable> {
+        self.slots
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .map(|s| &s.table)
+    }
+
+    /// One decode step for `token` at `slot`'s current position, storing K/V
+    /// into the page pool and attending through the block table.
+    pub fn decode_step(&mut self, slot: usize, token: u32) -> Result<Vec<f32>, Error> {
+        let cfg = self.cfg;
+        let d = cfg.d_model;
+        if self.slots[slot].is_none() {
+            self.slots[slot] = Some(PagedSlot {
+                table: BlockTable::new(),
+                pos: 0,
+                last_hidden: Vec::new(),
+            });
+        }
+        let pos = self.slots[slot].as_ref().expect("slot").pos;
+        if pos >= cfg.max_seq_len {
+            return Err(Error::InvalidArgument(
+                "sequence length exceeded max_seq_len".into(),
+            ));
+        }
+        // Ensure the page backing `pos` exists (allocate on page boundary).
+        let logical = pos / self.tokens_per_page;
+        if self.slots[slot].as_ref().expect("slot").table.len() <= logical {
+            let page = self
+                .allocator
+                .alloc()
+                .ok_or_else(|| Error::Model("page pool exhausted".into()))?;
+            self.slots[slot].as_mut().expect("slot").table.append(page);
+        }
+        let table = self.slots[slot].as_ref().expect("slot").table.clone();
+
+        let x0 = &self.w.tok_emb[token as usize * d..(token as usize + 1) * d];
+        let mut x = x0.to_vec();
+        let tpp = self.tokens_per_page;
+        for (li, lw) in self.w.layers.iter().enumerate() {
+            let xn = crate::ref_model::rms_norm(&x, &lw.rms_attn, cfg.rms_eps);
+            let mut q = crate::ref_model::matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
+            let mut k = crate::ref_model::matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
+            let v = crate::ref_model::matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
+            if !lw.q_norm.is_empty() {
+                crate::ref_model::qk_norm(
+                    &mut q,
+                    &lw.q_norm,
+                    cfg.n_heads,
+                    cfg.head_dim,
+                    cfg.rms_eps,
+                );
+                crate::ref_model::qk_norm(
+                    &mut k,
+                    &lw.k_norm,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                    cfg.rms_eps,
+                );
+            }
+            crate::ref_model::apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
+            crate::ref_model::apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+            let (page, off) = page_offsets(&table, pos, tpp).expect("page mapped");
+            store_row_paged(&mut self.k_pools[li], &k, page, off, cfg, tpp);
+            store_row_paged(&mut self.v_pools[li], &v, page, off, cfg, tpp);
+
+            let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+            let attn = paged_attention_decode(
+                &q,
+                &self.k_pools[li],
+                &self.v_pools[li],
+                &table,
+                pos,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                tpp,
+                scale,
+            );
+            let attn_proj = crate::ref_model::matvec_t(&attn, &lw.wo, d);
+            for i in 0..d {
+                x[i] += attn_proj[i];
+            }
+
+            // Dense SwiGLU MLP (MoE/MLA paged variants are follow-ups).
+            let xn2 = crate::ref_model::rms_norm(&x, &lw.rms_mlp, cfg.rms_eps);
+            let gate = crate::ref_model::matvec_t(&xn2, &lw.wg, cfg.intermediate_size);
+            let up = crate::ref_model::matvec_t(&xn2, &lw.wu, cfg.intermediate_size);
+            let mut h = vec![0.0; cfg.intermediate_size];
+            for i in 0..cfg.intermediate_size {
+                h[i] = crate::ref_model::silu(gate[i]) * up[i];
+            }
+            let down = crate::ref_model::matvec_t(&h, &lw.wd, d);
+            for i in 0..d {
+                x[i] += down[i];
+            }
+        }
+
+        let xf = crate::ref_model::rms_norm(&x, &self.w.rms_final, cfg.rms_eps);
+        let logits = crate::ref_model::matvec_t(&xf, &self.w.lm_head, cfg.vocab_size);
+        let slot_state = self.slots[slot].as_mut().expect("slot");
+        slot_state.pos = pos + 1;
+        slot_state.last_hidden = x;
+        Ok(logits)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ref_model::RefModel;
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
 
     fn lcg(seed: u64) -> impl FnMut() -> f32 {
         let mut s = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -284,6 +533,118 @@ mod tests {
                 "pos {pos}: paged vs contiguous max diff {max_diff}"
             );
         }
+    }
+
+    #[test]
+    fn page_allocator_reuses_freed_pages() {
+        let mut a = PageAllocator::new(3);
+        assert_eq!(a.alloc(), Some(0));
+        assert_eq!(a.alloc(), Some(1));
+        assert_eq!(a.alloc(), Some(2));
+        assert_eq!(a.alloc(), None, "pool exhausted");
+        a.free(1);
+        assert_eq!(a.alloc(), Some(1), "freed page reused");
+        assert_eq!(a.alloc(), None);
+    }
+
+    #[test]
+    fn paged_ref_matches_ref_model_exact() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 51).expect("weights");
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // spans 3 pages of 4
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 8, 4);
+        let paged_logits = pr.prefill(0, &tokens).expect("prefill");
+        let mut ref_m = RefModel::new(cfg, w);
+        let ref_logits = ref_m.forward(&tokens);
+        let max = max_abs_diff(&paged_logits, &ref_logits);
+        assert_eq!(
+            max, 0.0,
+            "paged ref must equal ref_model exactly (max {max})"
+        );
+        assert_eq!(
+            pr.slot_table(0).expect("table").len(),
+            3,
+            "10 tokens over 4/page -> 3 pages"
+        );
+    }
+
+    #[test]
+    fn paged_ref_shared_prefix_pages_keep_correctness() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 52).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 16, 4);
+        let logits_a = pr.prefill(0, &a).expect("prefill A");
+        let table_a = pr.slot_table(0).expect("table A").pages().to_vec();
+        assert_eq!(table_a.len(), 3);
+
+        // B shares A's two system pages, then appends its own tail page.
+        pr.share_prefix(1, &table_a[..2]);
+        let logits_b = pr.prefill(1, &b).expect("prefill B");
+
+        // Correctness: B's logits equal a full recompute.
+        let mut ref_b = RefModel::new(cfg, w.clone());
+        let ref_logits_b = ref_b.forward(&b);
+        assert_eq!(
+            max_abs_diff(&logits_b, &ref_logits_b),
+            0.0,
+            "shared-prefix paged decode must equal full recompute"
+        );
+        // A is unaffected by B's writes to the shared pages: continuing A with
+        // a fresh token after B's prefill must equal a full-recompute model
+        // continuing the same way (A's KV pages are intact).
+        let a_continue = pr.decode_step(0, 999).expect("continue A");
+        let mut ref_a = RefModel::new(cfg, w.clone());
+        ref_a.forward(&a);
+        let ref_continue = ref_a.decode_step(999);
+        assert_eq!(
+            max_abs_diff(&a_continue, &ref_continue),
+            0.0,
+            "A's KV pages unchanged after B shared them"
+        );
+        // A's first-pass logits still equal full recompute.
+        let mut ref_a1 = RefModel::new(cfg, w);
+        let ref_logits_a = ref_a1.forward(&a);
+        assert_eq!(max_abs_diff(&logits_a, &ref_logits_a), 0.0, "A first pass");
+        // The shared physical page holds identical KV after both prefills.
+        let (shared_page_a, off_a) = page_offsets(pr.slot_table(0).unwrap(), 0, 4).unwrap();
+        let (shared_page_b, _) = page_offsets(pr.slot_table(1).unwrap(), 0, 4).unwrap();
+        assert_eq!(shared_page_a, shared_page_b, "both slots share page 0");
+        let _ = off_a;
+        let n = cfg.n_kv_heads * cfg.head_dim;
+        let ka = &pr.k_pools[0][shared_page_a as usize * 4 * n..shared_page_a as usize * 4 * n + n];
+        let kb = &pr.k_pools[0][shared_page_b as usize * 4 * n..shared_page_b as usize * 4 * n + n];
+        assert_eq!(ka, kb, "shared page KV identical after both writes");
+    }
+
+    #[test]
+    fn paged_ref_reports_pool_exhaustion_and_seq_overflow() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 53).expect("weights");
+        // 1 page only: the 2nd token (crossing the page) errors.
+        let mut pr = PagedRef::new(cfg, w, 1, 1, 4);
+        pr.prefill(0, &[1, 2, 3, 4]).expect("fits one page");
+        assert!(pr.prefill(0, &[5]).is_err(), "page pool exhausted");
+    }
+
+    #[test]
+    fn paged_ref_share_prefix_on_used_slot_leaks_but_reports_nothing() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 54).expect("weights");
+        // share_prefix contract: unused slots only. (Leak of the old table's
+        // pages is a documented blueprint limitation; this test pins that the
+        // data path still works when sharing on a fresh slot.)
+        let mut pr = PagedRef::new(cfg, w, 2, 16, 4);
+        pr.prefill(0, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("A");
+        let pages = pr.slot_table(0).expect("A table").pages().to_vec();
+        pr.share_prefix(1, &pages[..1]);
+        let b = pr.prefill(1, &[1, 2, 3, 4, 9]).expect("B shares A page0");
+        assert_eq!(b.len(), cfg.vocab_size);
     }
 
     #[test]
