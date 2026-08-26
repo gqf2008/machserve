@@ -1282,3 +1282,43 @@ fn fp8_gpu_matches_f32() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Malformed safetensors headers must surface as `Err`, never panic (a
+/// truncated/oversized `data_offsets` used to index out of bounds).
+#[test]
+fn malformed_data_offsets_return_error_not_panic() {
+    let cfg = Config::tiny();
+    let d = cfg.d_model;
+
+    // A header whose data_offsets has a single entry (spec requires two).
+    let short = format!(r#"{{"w": {{"dtype": "F32", "shape": [{d}], "data_offsets": [0]}}}}"#);
+    let p1 = tmp_path("malformed_short");
+    let mut out1 = Vec::new();
+    out1.extend_from_slice(&(short.len() as u64).to_le_bytes());
+    out1.extend_from_slice(short.as_bytes());
+    out1.extend_from_slice(&vec![0u8; d * 4]);
+    std::fs::write(&p1, out1).unwrap();
+    assert!(
+        load_safetensors(&p1, &cfg, false).is_err(),
+        "short data_offsets must be rejected"
+    );
+
+    // Out-of-bounds data_offsets beyond the data segment.
+    let oob = format!(
+        r#"{{"w": {{"dtype": "F32", "shape": [{d}], "data_offsets": [0, {}]}}}}"#,
+        d * 4 + 64
+    );
+    let p2 = tmp_path("malformed_oob");
+    let mut out2 = Vec::new();
+    out2.extend_from_slice(&(oob.len() as u64).to_le_bytes());
+    out2.extend_from_slice(oob.as_bytes());
+    out2.extend_from_slice(&vec![0u8; d * 4]);
+    std::fs::write(&p2, out2).unwrap();
+    assert!(
+        load_safetensors(&p2, &cfg, false).is_err(),
+        "out-of-bounds data_offsets must be rejected"
+    );
+
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+}

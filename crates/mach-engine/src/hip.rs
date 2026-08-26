@@ -205,13 +205,18 @@ impl TaggedPool for HipMemoryPool {
         // shrinking really releases VRAM (no caching-allocator slack).
         let new_ptr = hip::malloc(&self.hip, new_bytes)? as usize;
         let copy = old.min(new_bytes);
-        hip::memcpy(
+        if let Err(e) = hip::memcpy(
             &self.hip,
             new_ptr as *mut core::ffi::c_void,
             region.ptr as *const core::ffi::c_void,
             copy,
             hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
-        )?;
+        ) {
+            // Do not leak the fresh block on the failure path; the old region
+            // is untouched and stays live.
+            let _ = hip::free(&self.hip, new_ptr as *mut core::ffi::c_void);
+            return Err(e.into());
+        }
         hip::free(&self.hip, region.ptr as *mut core::ffi::c_void)?;
         inner.regions[idx].ptr = new_ptr;
         inner.regions[idx].bytes = new_bytes;
@@ -372,6 +377,9 @@ impl GraphCapture for HipGraphCapture {
         let mut graph = std::ptr::null_mut();
         let r = unsafe { (self.hip.api.hip_stream_end_capture)(self.stream.0, &mut graph) };
         if r != hip::HIP_SUCCESS {
+            // A failed end_capture leaves the stream in capture mode with no
+            // public abort; the instance's stream is unusable afterwards and
+            // the caller should drop this capture backend.
             return Err(GraphError::Driver(format!(
                 "hipStreamEndCapture: {r} {}",
                 hip::error_string(&self.hip, r)

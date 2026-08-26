@@ -260,11 +260,21 @@ fn load() -> Result<Arc<Hip>, HipError> {
     }))
 }
 
-static HIP: OnceLock<Result<Arc<Hip>, HipError>> = OnceLock::new();
+static HIP: OnceLock<Arc<Hip>> = OnceLock::new();
 
 /// Returns the process-wide HIP runtime handle (loaded once).
+///
+/// Failures are **not** cached: a failed `load()` drops the already-loaded DLL
+/// handles (no leak) and a later call retries, so a ROCm install that appears
+/// after the first attempt can still be picked up. Concurrent first calls race
+/// benignly — the first success wins, the losers return their own copy.
 pub fn hip() -> Result<Arc<Hip>, HipError> {
-    HIP.get_or_init(load).clone()
+    if let Some(h) = HIP.get() {
+        return Ok(Arc::clone(h));
+    }
+    let h = load()?;
+    let _ = HIP.set(Arc::clone(&h));
+    Ok(h)
 }
 
 /// Maps a HIP error code to a message.
@@ -544,7 +554,14 @@ impl HipKernelModule {
         }
 
         let mut size = 0usize;
-        unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        let r = unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        if r != 0 || size == 0 {
+            unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
+            return Err(HipError::Rtc {
+                code: r,
+                msg: format!("{}; code size unavailable", rtc_msg(&h, r)),
+            });
+        }
         let mut code = vec![0u8; size];
         let r = unsafe { (h.api.hip_rtc_get_code)(prog, code.as_mut_ptr() as *mut c_char) };
         unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
@@ -569,10 +586,14 @@ impl HipKernelModule {
         })?;
         let mut func: HipFunction = std::ptr::null_mut();
         unsafe {
-            check(
+            if let Err(e) = check(
                 &h,
                 (h.api.hip_module_get_function)(&mut func, module, kname.as_ptr()),
-            )?
+            ) {
+                // Don't leak the loaded module on the failure path.
+                let _ = (h.api.hip_module_unload)(module);
+                return Err(e);
+            }
         };
 
         Ok(Self {
@@ -636,7 +657,14 @@ impl HipKernelModule {
             });
         }
         let mut size = 0usize;
-        unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        let r = unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        if r != 0 || size == 0 {
+            unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
+            return Err(HipError::Rtc {
+                code: r,
+                msg: format!("{}; code size unavailable", rtc_msg(&h, r)),
+            });
+        }
         let mut code = vec![0u8; size];
         let r = unsafe { (h.api.hip_rtc_get_code)(prog, code.as_mut_ptr() as *mut c_char) };
         unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
