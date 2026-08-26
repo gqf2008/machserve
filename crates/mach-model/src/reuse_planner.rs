@@ -144,6 +144,12 @@ impl ReusePlanner {
         let reused_pages = hits.len();
         let reused_tokens = (reused_pages * self.tokens_per_page).min(total_tokens);
 
+        // LRU touch: every reused page refreshes its access epoch so
+        // `evict_oldest` prefers genuinely cold pages over hot shared prefixes.
+        for key in keys.iter().take(reused_pages) {
+            self.index.query(key);
+        }
+
         let mut reused_blocks: Vec<CacheBlockRef> = keys[..reused_pages]
             .iter()
             .map(|k| {
@@ -154,14 +160,14 @@ impl ReusePlanner {
             .collect();
 
         // Acquire the tail fresh blocks (all-or-nothing).
-        let fresh_pages = pages.len() - reused_pages;
+        let need_fresh = pages.len() - reused_pages;
         let fresh_blocks = pool.borrow_mut().acquire_blocks(
             pool,
             self.group_id,
             self.cache_blocks_per_lcm_block,
-            fresh_pages,
+            need_fresh,
         );
-        if fresh_blocks.len() != fresh_pages {
+        if fresh_blocks.len() != need_fresh {
             return None; // pool cannot satisfy; nothing inserted
         }
 
@@ -171,7 +177,7 @@ impl ReusePlanner {
         // canonical block and release the duplicate. `fresh_keys` only records
         // keys this plan actually registered (insert returned `None`) so
         // `release` can never remove another plan's canonical entry.
-        let mut fresh_keys: Vec<CacheKey> = Vec::with_capacity(fresh_pages);
+        let mut fresh_keys: Vec<CacheKey> = Vec::with_capacity(need_fresh);
         let mut pages_out: Vec<PageRef> = Vec::with_capacity(pages.len());
         pages_out.extend(reused_blocks.drain(..).map(PageRef::Reused));
         for (i, block) in fresh_blocks.into_iter().enumerate() {
@@ -189,6 +195,13 @@ impl ReusePlanner {
             }
         }
 
+        // Recompute the plan's fresh count from the actual refs: a page whose
+        // content is already canonical (dedup) resolves to `PageRef::Reused`,
+        // so `need_fresh` would over-report pages that must be computed.
+        let fresh_pages = pages_out
+            .iter()
+            .filter(|p| matches!(p, PageRef::Fresh(_)))
+            .count();
         Some(PrefixReusePlan {
             pages: pages_out,
             reused_pages,
@@ -374,7 +387,10 @@ mod tests {
         // chained key is still canonical (B cached it) -> dedup reuses it.
         let plan_c = p.plan(&pool, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("plan C");
         assert_eq!(plan_c.reused_pages, 0, "page 0 key was released");
-        assert_eq!(plan_c.fresh_pages, 2);
+        assert_eq!(
+            plan_c.fresh_pages, 1,
+            "fresh_pages must count only pages that are actually computed; page 1 dedup-reuses B's canonical block"
+        );
         assert!(matches!(plan_c.pages[0], PageRef::Fresh(_)));
         assert!(
             matches!(plan_c.pages[1], PageRef::Reused(_)),
@@ -415,5 +431,30 @@ mod tests {
         assert_eq!(plan.fresh_pages, 0);
         assert_eq!(plan.pages.len(), 0);
         p.release(plan);
+    }
+
+    #[test]
+    fn reuse_refreshes_lru_epoch() {
+        let (mut p, pool) = planner();
+        let plan_a = p.plan(&pool, &[1, 2, 3, 4, 5, 6, 7, 8]).expect("plan A");
+        let k0 = plan_a.page_keys[0].clone();
+        let k1 = plan_a.page_keys[1].clone();
+        let e0_before = p.index.last_access_epoch(&k0).expect("page 0 cached");
+        let e1_before = p.index.last_access_epoch(&k1).expect("page 1 cached");
+        // B reuses page 0 (shared prefix); the reused key must be touched so
+        // eviction prefers genuinely cold pages (regression: LRU was FIFO).
+        let plan_b = p.plan(&pool, &[1, 2, 3, 4, 9, 10, 11, 12]).expect("plan B");
+        assert_eq!(plan_b.reused_pages, 1);
+        assert!(
+            p.index.last_access_epoch(&k0).expect("page 0 cached") > e0_before,
+            "reuse must refresh the reused page's LRU epoch"
+        );
+        assert_eq!(
+            p.index.last_access_epoch(&k1).expect("page 1 cached"),
+            e1_before,
+            "a non-reused page's epoch must stay unchanged"
+        );
+        p.release(plan_b);
+        p.release(plan_a);
     }
 }
