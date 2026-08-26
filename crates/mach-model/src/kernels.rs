@@ -458,6 +458,80 @@ extern "C" __global__ void attn_decode_batched(
 }
 "#;
 
+/// Paged decode attention: reads the KV prefix `0..=pos` through per-request
+/// block tables from a page pool (`[num_pages, tokens_per_page, kv_heads,
+/// head_dim]`), enabling cross-request prefix sharing. Mirrors the CPU
+/// reference in `paged_kv.rs`; covered by the offline hiprtc compile gate.
+/// Not yet wired into `batched.rs` (the paged-KV integration batch), so it is
+#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
+const ATTN_DECODE_PAGED: &str = r#"
+extern "C" __global__ void attn_decode_paged(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page, int max_pages) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_pages * tokens_per_page;
+
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int groups = n_heads / n_kv_heads;
+    int kv = h / groups;
+    int pos = pos_buf[s];
+    const int* table = block_tables + table_offsets[s];
+    const float* qh = q + ((long long)s * n_heads + h) * head_dim;
+
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = table[logical];
+        const float* kp = k_pool + ((long long)page * tokens_per_page + off) * n_kv_heads * head_dim + kv * head_dim;
+        float sc = 0.0f;
+        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * kp[dd];
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+
+    for (int dd = threadIdx.x; dd < head_dim; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = table[logical];
+            const float* vp = v_pool + ((long long)page * tokens_per_page + off) * n_kv_heads * head_dim + kv * head_dim + dd;
+            acc += __expf(scores[p] - m) * (*vp);
+        }
+        out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// MLA batched: merge q_nope / q_rope into q across `batch` rows.
 const MLA_ASSEMBLE_Q_BATCHED: &str = r#"
 extern "C" __global__ void mla_assemble_q_batched(
@@ -2788,6 +2862,7 @@ mod offline_tests {
         MOE_GATHER_ROWS,
         MOE_SCATTER_ADD,
         MOE_PREFIX_SUM,
+        ATTN_DECODE_PAGED,
     ];
 
     #[test]
