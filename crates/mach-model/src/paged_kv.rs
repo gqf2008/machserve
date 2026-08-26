@@ -417,6 +417,74 @@ impl PagedRef {
     }
 }
 
+/// GPU block-table builder: allocates physical page ids in a shared page pool,
+/// reusing pages already cached under the same content hash (a shared system
+/// prompt), and produces per-request logical->physical block tables that
+/// `kv_store_paged` / `attn_decode_paged` consume. The hash chain makes the
+/// reused prefix exactly the leading run of cached pages; fresh pages after it
+/// are allocated and cached for future requests.
+pub struct GpuBlockTableBuilder {
+    tokens_per_page: usize,
+    /// Content hash -> physical page id (shared-prefix cache).
+    cache: std::collections::HashMap<String, u32>,
+    allocator: PageAllocator,
+}
+
+impl GpuBlockTableBuilder {
+    /// A builder over a `num_pages`-page GPU pool.
+    #[must_use]
+    pub fn new(num_pages: u32, tokens_per_page: usize) -> Self {
+        Self {
+            tokens_per_page,
+            cache: std::collections::HashMap::new(),
+            allocator: PageAllocator::new(num_pages),
+        }
+    }
+
+    /// Number of distinct physical pages currently cached.
+    #[must_use]
+    pub fn cached_pages(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Builds the block table for one request, reusing cached prefix pages and
+    /// allocating fresh pages for the tail. Returns the table and the number of
+    /// prompt tokens covered by the reused prefix (the delta starts there).
+    /// Errors when the page pool cannot satisfy the fresh demand.
+    pub fn build_table(&mut self, tokens: &[i32]) -> Result<(BlockTable, usize), Error> {
+        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
+        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        let mut table = BlockTable::new();
+        let mut reused_pages = 0usize;
+        let mut allocating = false;
+        // Pages/hashes committed by THIS call, rolled back on pool exhaustion so
+        // a failed build never leaves cache entries pointing at unwritten pages.
+        let mut fresh_this_call: Vec<(String, u32)> = Vec::new();
+        for h in &hashes {
+            if !allocating {
+                if let Some(&page) = self.cache.get(h) {
+                    table.append(page);
+                    reused_pages += 1;
+                    continue;
+                }
+                allocating = true;
+            }
+            let Some(page) = self.allocator.alloc() else {
+                for (hash, page) in fresh_this_call {
+                    self.cache.remove(&hash);
+                    self.allocator.free(page);
+                }
+                return Err(Error::Model("page pool exhausted".into()));
+            };
+            fresh_this_call.push((h.clone(), page));
+            self.cache.insert(h.clone(), page);
+            table.append(page);
+        }
+        let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
+        Ok((table, reused_tokens))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,6 +713,59 @@ mod tests {
         pr.share_prefix(1, &pages[..1]);
         let b = pr.prefill(1, &[1, 2, 3, 4, 9]).expect("B shares A page0");
         assert_eq!(b.len(), cfg.vocab_size);
+    }
+
+    #[test]
+    fn gpu_table_builder_shares_prefix_pages() {
+        let system = [1i32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages of 4
+        let mut b = GpuBlockTableBuilder::new(16, 4);
+        let mk = |tail: i32| {
+            let mut t = system.to_vec();
+            t.push(tail);
+            t
+        };
+        let (t_a, r_a) = b.build_table(&mk(100)).expect("A");
+        let (t_b, r_b) = b.build_table(&mk(200)).expect("B");
+        let (t_c, r_c) = b.build_table(&mk(300)).expect("C");
+        // First request: everything fresh.
+        assert_eq!(r_a, 0);
+        assert_eq!(t_a.len(), 3);
+        // B and C share A's two system pages, then append their own tails.
+        assert_eq!(r_b, 8, "B reuses the 8-token system prefix");
+        assert_eq!(r_c, 8, "C reuses the 8-token system prefix");
+        assert_eq!(t_b.get(0), t_a.get(0), "B shares page 0");
+        assert_eq!(t_b.get(1), t_a.get(1), "B shares page 1");
+        assert_eq!(t_c.get(0), t_a.get(0), "C shares page 0");
+        assert_eq!(t_c.get(1), t_a.get(1), "C shares page 1");
+        assert_ne!(t_a.get(2), t_b.get(2), "tails differ");
+        assert_ne!(t_b.get(2), t_c.get(2), "tails differ");
+        assert_eq!(b.cached_pages(), 5, "2 system + 3 tail pages");
+    }
+
+    #[test]
+    fn gpu_table_builder_pool_exhaustion_rolls_back() {
+        // Pool holds 2 pages; the first request needs 3 (system 2 + tail 1).
+        let mut b = GpuBlockTableBuilder::new(2, 4);
+        assert!(b.build_table(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).is_err());
+        // Rollback: no cache entry may point at an unwritten page.
+        assert_eq!(b.cached_pages(), 0, "failed build must not cache pages");
+        // Rollback freed the pages: a 2-page request now succeeds and commits
+        // freshly allocated pages (it must NOT "reuse" the unwritten 0/1).
+        let (t, r) = b
+            .build_table(&[1, 2, 3, 4, 5, 6, 7, 8])
+            .expect("2 pages fit after rollback");
+        assert_eq!(r, 0, "no unwritten page reused");
+        assert_eq!(t.len(), 2);
+        assert_eq!(b.cached_pages(), 2, "fresh pages committed");
+    }
+
+    #[test]
+    fn gpu_table_builder_disjoint_request_reuses_nothing() {
+        let mut b = GpuBlockTableBuilder::new(16, 4);
+        let (t_a, _) = b.build_table(&[1, 2, 3, 4]).expect("A");
+        let (t_b, r_b) = b.build_table(&[21, 22, 23, 24]).expect("B");
+        assert_eq!(r_b, 0);
+        assert_ne!(t_a.get(0), t_b.get(0), "disjoint pages");
     }
 
     #[test]
