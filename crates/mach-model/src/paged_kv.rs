@@ -224,6 +224,74 @@ fn store_row_paged(pool: &mut [f32], row: &[f32], page: u32, off: usize, cfg: Co
     pool[base..base + row.len()].copy_from_slice(row);
 }
 
+/// Writes one token's per-head `[heads, dim]` row into an MLA page pool at
+/// `(page, off)` — the layout [`paged_attention_decode_mla`] reads back.
+fn store_row_paged_mla(
+    pool: &mut [f32],
+    row: &[f32],
+    page: u32,
+    off: usize,
+    heads: usize,
+    dim: usize,
+    tokens_per_page: usize,
+) {
+    let base = (page as usize * tokens_per_page + off) * heads * dim;
+    pool[base..base + row.len()].copy_from_slice(row);
+}
+
+/// Paged MLA decode attention (CPU reference): per-head expanded q/k/v stored
+/// in per-head page pools, read through the block table. Mirrors
+/// `ref_model::decode_step_mla`'s attention with the paged layout.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn paged_attention_decode_mla(
+    qm: &[f32],
+    k_pool: &[f32],
+    v_pool: &[f32],
+    table: &BlockTable,
+    pos: usize,
+    heads: usize,
+    hd: usize,
+    v_hd: usize,
+    tokens_per_page: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let tpp = tokens_per_page;
+    let k_row = heads * hd;
+    let v_row = heads * v_hd;
+    let mut attn = vec![0.0f32; heads * v_hd];
+    for h in 0..heads {
+        let qh = &qm[h * hd..(h + 1) * hd];
+        let mut scores = vec![0.0f32; pos + 1];
+        let mut maxv = f32::NEG_INFINITY;
+        for pp in 0..=pos {
+            let (page, off) = page_offsets(table, pp, tpp).expect("page mapped");
+            let base = (page as usize * tpp + off) * k_row + h * hd;
+            let mut s = 0.0f32;
+            for dd in 0..hd {
+                s += qh[dd] * k_pool[base + dd];
+            }
+            s *= scale;
+            scores[pp] = s;
+            maxv = maxv.max(s);
+        }
+        let mut sum = 0.0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - maxv).exp();
+            sum += *s;
+        }
+        for dd in 0..v_hd {
+            let mut acc = 0.0f32;
+            for pp in 0..=pos {
+                let (page, off) = page_offsets(table, pp, tpp).expect("page mapped");
+                let base = (page as usize * tpp + off) * v_row + h * v_hd + dd;
+                acc += scores[pp] * v_pool[base];
+            }
+            attn[h * v_hd + dd] = acc / sum;
+        }
+    }
+    attn
+}
+
 /// Per-slot state of a paged reference sequence.
 #[derive(Debug)]
 struct PagedSlot {
@@ -251,6 +319,10 @@ pub struct PagedRef {
     /// Per-layer K/V page pools `[num_pages, tpp, n_kv_heads, head_dim]`.
     k_pools: Vec<Vec<f32>>,
     v_pools: Vec<Vec<f32>>,
+    /// MLA (kv_lora_rank > 0): per-head expanded K/V page pools
+    /// `[num_pages, tpp, n_heads, qk_nope+qk_rope]` / `[num_pages, tpp, n_heads, v_head_dim]`.
+    mla_k_pools: Vec<Vec<f32>>,
+    mla_v_pools: Vec<Vec<f32>>,
     allocator: PageAllocator,
     slots: Vec<Option<PagedSlot>>,
 }
@@ -267,9 +339,25 @@ impl PagedRef {
     ) -> Self {
         assert!(tokens_per_page > 0);
         let pool_len = num_pages as usize * tokens_per_page * cfg.n_kv_heads * cfg.head_dim;
+        let mla = cfg.kv_lora_rank > 0;
+        let mla_k_len = if mla {
+            num_pages as usize
+                * tokens_per_page
+                * cfg.n_heads
+                * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim)
+        } else {
+            0
+        };
+        let mla_v_len = if mla {
+            num_pages as usize * tokens_per_page * cfg.n_heads * cfg.v_head_dim
+        } else {
+            0
+        };
         Self {
             k_pools: (0..cfg.n_layers).map(|_| vec![0.0; pool_len]).collect(),
             v_pools: (0..cfg.n_layers).map(|_| vec![0.0; pool_len]).collect(),
+            mla_k_pools: (0..cfg.n_layers).map(|_| vec![0.0; mla_k_len]).collect(),
+            mla_v_pools: (0..cfg.n_layers).map(|_| vec![0.0; mla_v_len]).collect(),
             allocator: PageAllocator::new(num_pages),
             slots: (0..capacity).map(|_| None).collect(),
             cfg,
@@ -384,45 +472,111 @@ impl PagedRef {
         let tpp = self.tokens_per_page;
         for (li, lw) in self.w.layers.iter().enumerate() {
             let xn = crate::ref_model::rms_norm(&x, &lw.rms_attn, cfg.rms_eps);
-            let mut q = crate::ref_model::matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
-            let mut k = crate::ref_model::matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
-            let v = crate::ref_model::matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
-            if !lw.q_norm.is_empty() {
-                crate::ref_model::qk_norm(
+            let attn_proj = if cfg.kv_lora_rank > 0 {
+                // MLA (DeepSeek-V2 style): low-rank Q + compressed KV, expanded
+                // per-head, stored in the per-head MLA page pools.
+                let heads = cfg.n_heads;
+                let nope = cfg.qk_nope_head_dim;
+                let rope_hd = cfg.qk_rope_head_dim;
+                let v_hd = cfg.v_head_dim;
+                let hd = nope + rope_hd;
+                let q_lora = crate::ref_model::matvec_t(&xn, &lw.mla_q_a, cfg.q_lora_rank);
+                let q_lora = crate::ref_model::rms_norm(&q_lora, &lw.mla_q_a_norm, cfg.rms_eps);
+                let q_nope = crate::ref_model::matvec_t(&q_lora, &lw.mla_q_b, heads * nope);
+                let mut q_rope = crate::ref_model::matvec_t(&xn, &lw.mla_q_rope, heads * rope_hd);
+                crate::ref_model::apply_rope(&mut q_rope, heads, rope_hd, pos, cfg.rope_theta);
+                let kv_a =
+                    crate::ref_model::matvec_t(&xn, &lw.mla_kv_a, cfg.kv_lora_rank + rope_hd);
+                let kv_lora = crate::ref_model::rms_norm(
+                    &kv_a[..cfg.kv_lora_rank],
+                    &lw.mla_kv_a_norm,
+                    cfg.rms_eps,
+                );
+                let mut k_rope = kv_a[cfg.kv_lora_rank..].to_vec();
+                crate::ref_model::apply_rope(&mut k_rope, 1, rope_hd, pos, cfg.rope_theta);
+                let kv = crate::ref_model::matvec_t(&kv_lora, &lw.mla_kv_b, heads * (nope + v_hd));
+                let mut qm = vec![0.0f32; heads * hd];
+                let mut km = vec![0.0f32; heads * hd];
+                let mut vm = vec![0.0f32; heads * v_hd];
+                for h in 0..heads {
+                    let base = h * (nope + v_hd);
+                    qm[h * hd..h * hd + nope].copy_from_slice(&q_nope[h * nope..(h + 1) * nope]);
+                    qm[h * hd + nope..(h + 1) * hd]
+                        .copy_from_slice(&q_rope[h * rope_hd..(h + 1) * rope_hd]);
+                    km[h * hd..h * hd + nope].copy_from_slice(&kv[base..base + nope]);
+                    km[h * hd + nope..(h + 1) * hd].copy_from_slice(&k_rope);
+                    vm[h * v_hd..(h + 1) * v_hd]
+                        .copy_from_slice(&kv[base + nope..base + nope + v_hd]);
+                }
+                let (page, off) = page_offsets(&table, pos, tpp).expect("page mapped");
+                store_row_paged_mla(&mut self.mla_k_pools[li], &km, page, off, heads, hd, tpp);
+                store_row_paged_mla(&mut self.mla_v_pools[li], &vm, page, off, heads, v_hd, tpp);
+                let scale = 1.0 / (hd as f32).sqrt();
+                let attn = paged_attention_decode_mla(
+                    &qm,
+                    &self.mla_k_pools[li],
+                    &self.mla_v_pools[li],
+                    &table,
+                    pos,
+                    heads,
+                    hd,
+                    v_hd,
+                    tpp,
+                    scale,
+                );
+                crate::ref_model::matvec_t(&attn, &lw.mla_o, d)
+            } else {
+                let mut q = crate::ref_model::matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
+                let mut k = crate::ref_model::matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
+                let v = crate::ref_model::matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
+                if !lw.q_norm.is_empty() {
+                    crate::ref_model::qk_norm(
+                        &mut q,
+                        &lw.q_norm,
+                        cfg.n_heads,
+                        cfg.head_dim,
+                        cfg.rms_eps,
+                    );
+                    crate::ref_model::qk_norm(
+                        &mut k,
+                        &lw.k_norm,
+                        cfg.n_kv_heads,
+                        cfg.head_dim,
+                        cfg.rms_eps,
+                    );
+                }
+                crate::ref_model::apply_rope(
                     &mut q,
-                    &lw.q_norm,
                     cfg.n_heads,
                     cfg.head_dim,
-                    cfg.rms_eps,
+                    pos,
+                    cfg.rope_theta,
                 );
-                crate::ref_model::qk_norm(
+                crate::ref_model::apply_rope(
                     &mut k,
-                    &lw.k_norm,
                     cfg.n_kv_heads,
                     cfg.head_dim,
-                    cfg.rms_eps,
+                    pos,
+                    cfg.rope_theta,
                 );
-            }
-            crate::ref_model::apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
-            crate::ref_model::apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
-            let (page, off) = page_offsets(&table, pos, tpp).expect("page mapped");
-            store_row_paged(&mut self.k_pools[li], &k, page, off, cfg, tpp);
-            store_row_paged(&mut self.v_pools[li], &v, page, off, cfg, tpp);
-
-            let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-            let attn = paged_attention_decode(
-                &q,
-                &self.k_pools[li],
-                &self.v_pools[li],
-                &table,
-                pos,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-                tpp,
-                scale,
-            );
-            let attn_proj = crate::ref_model::matvec_t(&attn, &lw.wo, d);
+                let (page, off) = page_offsets(&table, pos, tpp).expect("page mapped");
+                store_row_paged(&mut self.k_pools[li], &k, page, off, cfg, tpp);
+                store_row_paged(&mut self.v_pools[li], &v, page, off, cfg, tpp);
+                let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                let attn = paged_attention_decode(
+                    &q,
+                    &self.k_pools[li],
+                    &self.v_pools[li],
+                    &table,
+                    pos,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                    tpp,
+                    scale,
+                );
+                crate::ref_model::matvec_t(&attn, &lw.wo, d)
+            };
             for i in 0..d {
                 x[i] += attn_proj[i];
             }
@@ -779,6 +933,51 @@ mod tests {
         let ka = &pr.k_pools[0][shared_page_a as usize * 4 * n..shared_page_a as usize * 4 * n + n];
         let kb = &pr.k_pools[0][shared_page_b as usize * 4 * n..shared_page_b as usize * 4 * n + n];
         assert_eq!(ka, kb, "shared page KV identical after both writes");
+    }
+
+    #[test]
+    fn paged_ref_mla_matches_ref_model_exact() {
+        let cfg = Config::mla(128, 2, 4, 1024, 256, 8, 16, 64, 64, 64);
+        let w = Weights::random(&cfg, 91).expect("weights");
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // spans 3 pages of 4
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 8, 4);
+        let paged = pr.prefill(0, &tokens).expect("prefill");
+        let mut ref_m = RefModel::new(cfg, w);
+        let ref_logits = ref_m.forward(&tokens);
+        assert_eq!(
+            max_abs_diff(&paged, &ref_logits),
+            0.0,
+            "paged MLA ref must equal RefModel exactly"
+        );
+    }
+
+    #[test]
+    fn paged_ref_mla_shared_prefix_pages_keep_correctness() {
+        let cfg = Config::mla(128, 2, 4, 1024, 256, 8, 16, 64, 64, 64);
+        let w = Weights::random(&cfg, 92).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 16, 4);
+        let logits_a = pr.prefill(0, &a).expect("A");
+        let pages = pr.slot_table(0).expect("A table").pages().to_vec();
+        pr.share_prefix(1, &pages[..2]);
+        let logits_b = pr.prefill(1, &b).expect("B");
+        let mut ref_b = RefModel::new(cfg, w.clone());
+        let ref_logits_b = ref_b.forward(&b);
+        assert_eq!(
+            max_abs_diff(&logits_b, &ref_logits_b),
+            0.0,
+            "MLA shared-prefix pages must equal full recompute"
+        );
+        let mut ref_a = RefModel::new(cfg, w);
+        assert_eq!(
+            max_abs_diff(&logits_a, &ref_a.forward(&a)),
+            0.0,
+            "A unchanged"
+        );
     }
 
     #[test]
