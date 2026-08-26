@@ -2736,3 +2736,70 @@ impl Drop for HipKernels {
         }
     }
 }
+
+/// Offline hiprtc compile gate: every kernel source must compile for the
+/// target arch **without a device** (hiprtc is a device-independent compiler).
+/// Needs only the ROCm DLLs present; skips when they are absent (plain CI).
+#[cfg(all(test, feature = "hip"))]
+mod offline_tests {
+    use super::*;
+    use mach_kernel_sys::hip::HipKernelModule;
+
+    macro_rules! all_kernels {
+        ($($name:ident),* $(,)?) => {
+            &[ $( (stringify!($name), $name), )* ]
+        };
+    }
+
+    const ALL_KERNELS: &[(&str, &str)] = all_kernels![
+        EMBED_GATHER,
+        RMS_NORM,
+        QK_NORM,
+        SILU_MUL,
+        ADD,
+        ADD_BIAS,
+        KV_STORE,
+        ROPE,
+        ATTN_DECODE,
+        MLA_ASSEMBLE_Q,
+        MLA_ASSEMBLE_KV,
+        MLA_ATTN_DECODE,
+        EMBED_BATCHED,
+        ROPE_BATCHED,
+        KV_STORE_BATCHED,
+        ATTN_DECODE_BATCHED,
+        MLA_ASSEMBLE_Q_BATCHED,
+        MLA_EXTRACT_KV_LORA,
+        MLA_EXTRACT_K_ROPE,
+        MLA_ASSEMBLE_KV_BATCHED,
+        MLA_ATTN_DECODE_BATCHED,
+        ARGMAX_BATCHED,
+        CAST_F32_F16,
+        CAST_F16_F32,
+        KV_F16,
+        ATTN_DECODE_BATCHED_F16_GQA,
+        ATTN_PREFILL_F16,
+        EMBED_GATHER_F16,
+        MOE_ROUTER,
+        MOE_GATHER_WEIGHTS,
+        MOE_ACCUMULATE,
+        MOE_ROUTER_BATCHED,
+        MOE_COUNT_EXPERTS,
+        MOE_GATHER_ROWS,
+        MOE_SCATTER_ADD,
+        MOE_PREFIX_SUM,
+    ];
+
+    #[test]
+    fn all_kernel_sources_compile_offline() {
+        if mach_kernel_sys::hip::hip().is_err() {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        }
+        for (name, src) in ALL_KERNELS {
+            let size = HipKernelModule::compile_only("gfx1100", src)
+                .unwrap_or_else(|e| panic!("kernel {name} failed offline hiprtc compile: {e}"));
+            assert!(size > 0, "kernel {name} produced an empty code object");
+        }
+    }
+}

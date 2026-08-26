@@ -585,6 +585,70 @@ impl HipKernelModule {
         })
     }
 
+    /// Compiles `source` for `arch` via hiprtc **without** touching a device
+    /// or loading a module (hiprtc is a device-independent clang compiler).
+    /// Returns the compiled code-object size on success. This is the offline
+    /// syntax/compile gate: it needs the ROCm DLLs present but no active GPU,
+    /// so kernels can be written and compile-validated before a device is
+    /// available.
+    pub fn compile_only(arch: &str, source: &str) -> Result<usize, HipError> {
+        let h = hip()?;
+        let mut prog: HipRtcProgram = std::ptr::null_mut();
+        let src = std::ffi::CString::new(source).map_err(|_| HipError::Rtc {
+            code: -1,
+            msg: "kernel source contains NUL byte".into(),
+        })?;
+        let name = std::ffi::CString::new("mach_kernel.cpp").map_err(|_| HipError::Rtc {
+            code: -1,
+            msg: "bad name".into(),
+        })?;
+        let r = unsafe {
+            (h.api.hip_rtc_create_program)(
+                &mut prog,
+                src.as_ptr(),
+                name.as_ptr(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if r != 0 {
+            return Err(HipError::Rtc {
+                code: r,
+                msg: rtc_msg(&h, r),
+            });
+        }
+        let opt = std::ffi::CString::new(format!("--offload-arch={arch}")).map_err(|_| {
+            HipError::Rtc {
+                code: -1,
+                msg: "bad arch".into(),
+            }
+        })?;
+        let opts = [opt.as_ptr()];
+        let r =
+            unsafe { (h.api.hip_rtc_compile_program)(prog, opts.len() as c_int, opts.as_ptr()) };
+        if r != 0 {
+            let log = rtc_log(&h, prog);
+            unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
+            return Err(HipError::Rtc {
+                code: r,
+                msg: format!("{}; log: {}", rtc_msg(&h, r), log),
+            });
+        }
+        let mut size = 0usize;
+        unsafe { (h.api.hip_rtc_get_code_size)(prog, &mut size) };
+        let mut code = vec![0u8; size];
+        let r = unsafe { (h.api.hip_rtc_get_code)(prog, code.as_mut_ptr() as *mut c_char) };
+        unsafe { (h.api.hip_rtc_destroy_program)(&mut prog) };
+        if r != 0 {
+            return Err(HipError::Rtc {
+                code: r,
+                msg: rtc_msg(&h, r),
+            });
+        }
+        Ok(size)
+    }
+
     /// Launches the kernel. `params` holds one pointer per kernel argument,
     /// each pointing at the argument value (HIP convention).
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
