@@ -784,4 +784,160 @@ mod tests {
         );
         assert_ne!(a.get(1), b.get(1), "tail pages differ");
     }
+
+    // -- deterministic stress: random build_table preserves builder invariants --
+
+    struct Xs(u64);
+    impl Xs {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_add(0x9e37_79b9_7f4a_7c15))
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn random_build_table_preserves_builder_invariants() {
+        const NUM_PAGES: u32 = 32;
+        const TPP: usize = 4;
+        const VOCAB: usize = 8;
+        const MAX_TOKENS: usize = 40;
+        const ITERS: usize = 3000;
+        // Fixed shared prefixes (mutually distinct page contents) are mixed
+        // into the random stream so shared-prefix reuse is exercised
+        // structurally instead of only by chance.
+        let prefixes: Vec<Vec<i32>> = vec![
+            vec![1, 2, 3, 4],
+            vec![7, 6, 5, 4, 3, 2, 1],
+            vec![0, 2, 4, 6, 1, 3, 5, 7, 2, 4],
+            vec![3, 1, 4, 1, 5, 9],
+        ];
+        let mut b = GpuBlockTableBuilder::new(NUM_PAGES, TPP);
+        let mut rng = Xs::new(0x1234_5678);
+        let mut successes = 0usize;
+        let mut failures = 0usize;
+        for _ in 0..ITERS {
+            // Random prompt of 0..=40 tokens from the 8-id vocab; a quarter of
+            // the time it is a fixed shared prefix + random tail.
+            let mut tokens: Vec<i32> = Vec::new();
+            let prefix = if rng.below(4) == 0 {
+                let p = prefixes[rng.below(prefixes.len())].clone();
+                tokens.extend_from_slice(&p);
+                Some(p)
+            } else {
+                None
+            };
+            let tail_len = rng.below(MAX_TOKENS + 1 - tokens.len());
+            for _ in 0..tail_len {
+                tokens.push(rng.below(VOCAB) as i32);
+            }
+
+            let cached_before = b.cached_pages();
+            match b.build_table(&tokens) {
+                Ok((table, reused)) => {
+                    successes += 1;
+                    // Every logical page maps to a physical page inside the pool.
+                    assert_eq!(table.len(), tokens.len().div_ceil(TPP), "table length");
+                    for logical in 0..table.len() {
+                        let physical = table.get(logical).expect("logical page mapped");
+                        assert!(
+                            physical < NUM_PAGES,
+                            "physical page {physical} inside pool of {NUM_PAGES}"
+                        );
+                    }
+                    // Reuse covers a leading page run: page-aligned unless the
+                    // whole prompt (possibly ending in a partial page) is reused.
+                    assert!(reused <= tokens.len(), "reused tokens within prompt");
+                    assert!(
+                        reused % TPP == 0 || reused == tokens.len(),
+                        "reuse is a leading page run"
+                    );
+                    // Core invariant: the shared pool is never oversold.
+                    assert!(
+                        b.cached_pages() <= NUM_PAGES as usize,
+                        "pool not oversold (cached {} > {NUM_PAGES})",
+                        b.cached_pages()
+                    );
+
+                    // Shared consistency: rebuilding the same prompt right away
+                    // must reproduce the identical block table — every page is
+                    // cached after the success and no build ran in between to
+                    // change the mapping.
+                    if rng.below(5) == 0 {
+                        let (again, r_again) = b.build_table(&tokens).expect("cached rebuild");
+                        assert_eq!(
+                            again.pages(),
+                            table.pages(),
+                            "identical prompt => identical block table"
+                        );
+                        assert_eq!(r_again, tokens.len(), "fully cached prompt fully reused");
+                    }
+
+                    // Shared consistency: same shared prefix, different tail;
+                    // when both builds succeed, the leading pages must match.
+                    if let Some(p) = prefix
+                        && rng.below(3) == 0
+                    {
+                        let tail2 = rng.below(MAX_TOKENS + 1 - p.len());
+                        let mut t2 = p.clone();
+                        for _ in 0..tail2 {
+                            t2.push(rng.below(VOCAB) as i32);
+                        }
+                        if let Ok((t2_table, _)) = b.build_table(&t2) {
+                            let shared_pages = p.len().div_ceil(TPP);
+                            for logical in 0..shared_pages {
+                                assert_eq!(
+                                    table.get(logical),
+                                    t2_table.get(logical),
+                                    "same prefix {p:?} shares leading page {logical}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    failures += 1;
+                    // Rollback: a failed build never leaves new cache entries
+                    // behind, and the pool is never oversold. (A failure can
+                    // only shrink the cache: when a request overwrites an
+                    // already-cached page after its first miss, the documented
+                    // rollback removes that overwritten entry too, so the exact
+                    // pre-call count is not restorable in general.)
+                    assert!(
+                        b.cached_pages() <= cached_before,
+                        "failed build must not grow the cache ({} -> {})",
+                        cached_before,
+                        b.cached_pages()
+                    );
+                    // When the pool was already full, the failure happens at
+                    // the first uncached page with no fresh allocation this
+                    // call, so rollback restores the exact cache count.
+                    if cached_before == NUM_PAGES as usize {
+                        assert_eq!(
+                            b.cached_pages(),
+                            cached_before,
+                            "full-pool failure rolls back exactly"
+                        );
+                    }
+                    assert!(b.cached_pages() <= NUM_PAGES as usize, "pool not oversold");
+                }
+            }
+        }
+        // Both the success and the failure paths must have been exercised.
+        assert!(successes > 0, "stress must exercise the success path");
+        assert!(failures > 0, "stress must exercise the failure path");
+        assert!(
+            b.cached_pages() <= NUM_PAGES as usize,
+            "final pool not oversold"
+        );
+    }
 }
