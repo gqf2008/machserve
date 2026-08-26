@@ -12,10 +12,10 @@
 //! decoded one token per step until their `max_new` budget is exhausted.
 //!
 //! **Serving notes for the GPU wiring**: `capacity` bounds only the number of
-//! concurrent slots — the admission queue itself is unbounded, so an HTTP
-//! layer must add backpressure. Completed records ([`Self::finished`]) grow
-//! without bound in this reference engine; the GPU engine should use a ring
-//! buffer or periodic drain. `max_new = 0` is accepted: the prompt is prefilled
+//! concurrent slots; the admission queue is bounded by `max_pending` (backpressure)
+//! and completed records by `max_finished` (oldest dropped) when built with
+//! [`Self::new_with_limits`] — the HTTP layer should surface `add`'s error as
+//! 429-style backpressure. `max_new = 0` is accepted: the prompt is prefilled
 //! (and cached) and the request finishes with no decoded tokens.
 
 use std::collections::VecDeque;
@@ -89,8 +89,12 @@ pub struct CpuEngine {
     capacity: usize,
     slots: Vec<Option<Slot>>,
     pending: VecDeque<PendingRequest>,
+    /// Admission-queue bound (backpressure); `add` rejects when full.
+    max_pending: usize,
     next_id: u64,
     finished: Vec<FinishedRequest>,
+    /// Completed-record bound; oldest records are dropped when exceeded.
+    max_finished: usize,
     stats: CpuEngineStats,
 }
 
@@ -105,6 +109,30 @@ impl CpuEngine {
         pool_blocks: i32,
         tokens_per_page: usize,
     ) -> Self {
+        Self::new_with_limits(
+            cfg,
+            w,
+            capacity,
+            pool_blocks,
+            tokens_per_page,
+            usize::MAX,
+            usize::MAX,
+        )
+    }
+
+    /// Builds an engine with bounded admission queue and completed records:
+    /// `max_pending` caps queued-but-not-admitted requests (backpressure for an
+    /// HTTP layer), `max_finished` caps retained records (oldest dropped).
+    #[must_use]
+    pub fn new_with_limits(
+        cfg: Config,
+        w: Weights,
+        capacity: usize,
+        pool_blocks: i32,
+        tokens_per_page: usize,
+        max_pending: usize,
+        max_finished: usize,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
         Self {
             cache: PrefixKvCache::new(pool_blocks, tokens_per_page),
@@ -113,8 +141,10 @@ impl CpuEngine {
             capacity,
             slots: (0..capacity).map(|_| None).collect(),
             pending: VecDeque::new(),
+            max_pending,
             next_id: 1,
             finished: Vec::new(),
+            max_finished,
             stats: CpuEngineStats::default(),
         }
     }
@@ -130,6 +160,11 @@ impl CpuEngine {
         if prompt.is_empty() {
             return Err(Error::InvalidArgument(
                 "cpu engine rejects an empty prompt".into(),
+            ));
+        }
+        if self.pending.len() >= self.max_pending {
+            return Err(Error::InvalidArgument(
+                "cpu engine admission queue is full (max_pending)".into(),
             ));
         }
         let id = self.next_id;
@@ -259,6 +294,9 @@ impl CpuEngine {
             computed_tokens: slot.computed_tokens,
             total_prompt_tokens: slot.prompt.len(),
         });
+        while self.finished.len() > self.max_finished {
+            self.finished.remove(0);
+        }
     }
 }
 
@@ -397,6 +435,40 @@ mod tests {
         let mut eng = CpuEngine::new(cfg, w, 2, 16, 4);
         assert!(eng.is_idle());
         assert!(!eng.step().expect("step"), "idle engine reports no work");
+    }
+
+    #[test]
+    fn admission_queue_is_bounded() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 71).expect("weights");
+        // `add` always queues (slots fill on step); max_pending caps the queue.
+        let mut eng = CpuEngine::new_with_limits(cfg, w, 1, 16, 4, 1, usize::MAX);
+        eng.add(&[1, 2, 3, 4], 1).expect("queued (pending 1)");
+        assert!(
+            eng.add(&[5, 6, 7, 8], 1).is_err(),
+            "queue full -> backpressure"
+        );
+        // Run drains the queue; a new request can queue again.
+        eng.step_until_done().expect("run");
+        eng.add(&[9, 10, 11, 12], 1).expect("space freed");
+        eng.step_until_done().expect("run");
+        eng.step_until_done().expect("run");
+    }
+
+    #[test]
+    fn finished_records_are_bounded() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 72).expect("weights");
+        let mut eng = CpuEngine::new_with_limits(cfg, w, 2, 32, 4, usize::MAX, 2);
+        for i in 0..3u32 {
+            eng.add(&[1 + i, 2 + i, 3 + i, 4 + i], 1).expect("add");
+        }
+        eng.step_until_done().expect("run");
+        assert_eq!(
+            eng.finished().len(),
+            2,
+            "oldest record dropped beyond max_finished"
+        );
     }
 
     #[test]
