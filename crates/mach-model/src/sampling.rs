@@ -138,7 +138,7 @@ extern "C" __global__ void sample_batched(
     int max_pen, int max_bias, int vocab, int batch)
 {
     const int s = blockIdx.x;
-    float* row = logits + (long long)s * vocab; // penalties modify in place
+    float* row = logits + (long long)s * vocab; // penalties applied in place (intentional: sampling + top_logprobs read the penalized distribution)
     const int T = blockDim.x;
     const int tid = threadIdx.x;
 

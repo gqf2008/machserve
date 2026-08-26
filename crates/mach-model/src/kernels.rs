@@ -2705,6 +2705,14 @@ impl HipKernels {
         max_seq: i32,
         slot: i32,
     ) -> Result<(), Error> {
+        // The kernel hard-codes 64 query rows per run (r = tid/4, s_max[64])
+        // and 16 dim groups (qreg[16], D = head_dim/4): reject anything larger
+        // loudly instead of silently corrupting smem when this path is wired.
+        if c > 64 || head_dim > 64 {
+            return Err(Error::InvalidArgument(format!(
+                "attn_prefill_f16 unsupported geometry: run length C={c} (>64) or head_dim={head_dim} (>64)"
+            )));
+        }
         let qp = q;
         let kp = kc;
         let vp = vc;
