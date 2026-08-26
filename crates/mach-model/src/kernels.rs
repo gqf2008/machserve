@@ -1354,6 +1354,8 @@ pub struct HipKernels {
     rope_batched: HipKernelModule,
     kv_store_batched: HipKernelModule,
     attn_decode_batched: HipKernelModule,
+    kv_store_paged: HipKernelModule,
+    attn_decode_paged: HipKernelModule,
     argmax_batched: HipKernelModule,
     cast_f32_f16: HipKernelModule,
     cast_f16_f32: HipKernelModule,
@@ -1473,6 +1475,8 @@ impl HipKernels {
             rope_batched: compile_cached(&arch, ROPE_BATCHED, "rope_batched")?,
             kv_store_batched: compile_cached(&arch, KV_STORE_BATCHED, "kv_store_batched")?,
             attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
+            kv_store_paged: compile_cached(&arch, KV_STORE_PAGED, "kv_store_paged")?,
+            attn_decode_paged: compile_cached(&arch, ATTN_DECODE_PAGED, "attn_decode_paged")?,
             argmax_batched: compile_cached(&arch, ARGMAX_BATCHED, "argmax_batched")?,
             cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
             cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
@@ -2514,7 +2518,98 @@ impl HipKernels {
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
-    /// Decode attention over an fp16 KV cache (f32 q, fp32 output).
+    #[allow(clippy::too_many_arguments)]
+    /// Paged KV store (batched): writes per-row K/V into a page pool via the
+    /// block table, for the paged decode path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_paged(
+        &self,
+        kv: *const f32,
+        pool: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        block_tables: *const i32,
+        batch: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let pp = pool;
+        let posp = pos;
+        let toff = table_offsets;
+        let bt = block_tables;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &pp as *const *mut f32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_heads * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .kv_store_paged
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Paged decode attention (batched): reads the KV prefix through per-row
+    /// block tables from the page pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_paged(
+        &self,
+        q: *const f32,
+        k_pool: *const f32,
+        v_pool: *const f32,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+        max_pages: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let bt = block_tables;
+        let op = out;
+        let pp = pos;
+        let toff = table_offsets;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &max_pages as *const i32 as *mut core::ffi::c_void,
+        ];
+        let shared = ((max_pages * tokens_per_page + 256) * 4) as u32;
+        Ok(self.attn_decode_paged.launch_shmem(
+            [(batch * n_heads) as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn launch_attn_decode_batched_f16_gqa(
         &self,

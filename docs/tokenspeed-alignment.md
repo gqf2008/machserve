@@ -88,9 +88,11 @@
 - [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
   - 地基已备：`paged_kv.rs`（块表 + 页分配器 + 分页 attention + **分页参考变压器
     `PagedRef`**：全 transformer 分页 KV == RefModel 逐位一致；共享前缀物理页下
-    结果正确、共享页 KV 逐位一致）、`ATTN_DECODE_PAGED` 内核（已进离线 hiprtc
-    编译门禁，37 内核全过）；剩余：batched.rs 按 `PagedRef` 蓝图接内核 + 数值
-    对拍 + 真机 A/B
+    结果正确、共享页 KV 逐位一致）、`kv_store_paged`/`ATTN_DECODE_PAGED` 内核
+    （38 内核离线门禁全过 + **7900 XTX 真机对拍逐位一致**）；
+  - **batched.rs 已接入**（`BatchedModel::with_paged_kv`，稠密 F32 decode 走分页
+    内核；静态恒等块表映射，GPU 上 70 token 跨 2 页与静态路径对拍通过）；
+    剩余：共享前缀页（reuse-planner 落地）+ f16/MLA/prefill 分页 + 真机 A/B
 - [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
       释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
       池满时 LRU 驱逐最冷页（索引 + 主机页 + 释放块），缓存有界
