@@ -287,6 +287,39 @@ impl PagedRef {
         Ok(logits)
     }
 
+    /// Starts a slot from a **shared prefix**: `shared_pages` already hold the
+    /// KV for the first `reused_tokens` prompt tokens, so only the delta is
+    /// computed — the slot's position begins at `reused_tokens` and fresh pages
+    /// are allocated beyond the shared prefix. This is the delta-only decode
+    /// the GPU path mirrors (block tables + page pool).
+    ///
+    /// **Precondition (enforced in debug builds)**: `shared_pages` must cover
+    /// exactly `reused_tokens` tokens on page boundaries
+    /// (`shared_pages.len() * tokens_per_page == reused_tokens`). A misaligned
+    /// start would write the delta into a shared page's middle, silently
+    /// corrupting the canonical owner's KV for other slots.
+    pub fn start_with_shared_prefix(
+        &mut self,
+        slot: usize,
+        shared_pages: &[u32],
+        reused_tokens: usize,
+    ) {
+        debug_assert_eq!(
+            shared_pages.len() * self.tokens_per_page,
+            reused_tokens,
+            "shared prefix must cover exactly reused_tokens on page boundaries"
+        );
+        let mut table = BlockTable::new();
+        for &p in shared_pages {
+            table.append(p);
+        }
+        self.slots[slot] = Some(PagedSlot {
+            table,
+            pos: reused_tokens,
+            last_hidden: Vec::new(),
+        });
+    }
+
     /// Reuses `pages` as `slot`'s leading block table (a shared prefix). The
     /// slot continues appending fresh pages beyond them. Call this only on a
     /// slot that has not prefilled anything yet (replacing an in-use table
@@ -852,6 +885,65 @@ mod tests {
         pr.share_prefix(1, &pages[..1]);
         let b = pr.prefill(1, &[1, 2, 3, 4, 9]).expect("B shares A page0");
         assert_eq!(b.len(), cfg.vocab_size);
+    }
+
+    #[test]
+    fn pagedref_shared_prefix_e2e_via_table_builder() {
+        // End-to-end shared-prefix flow on CPU: GpuBlockTableBuilder allocates
+        // the shared prefix pages, PagedRef consumes them delta-only, and the
+        // result equals a full recompute.
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 81).expect("weights");
+        let system = [1u32, 2, 3, 4, 5, 6, 7, 8]; // 2 pages of 4
+        let mut a = system.to_vec();
+        a.push(100);
+        let mut b = system.to_vec();
+        b.push(200);
+        let a_i32: Vec<i32> = a.iter().map(|&t| t as i32).collect();
+        let b_i32: Vec<i32> = b.iter().map(|&t| t as i32).collect();
+
+        // 1) Table builder: B reuses A's two system pages.
+        let mut bld = GpuBlockTableBuilder::new(16, 4);
+        let (table_a, r_a) = bld.build_table(&a_i32).expect("A");
+        let (table_b, r_b) = bld.build_table(&b_i32).expect("B");
+        assert_eq!(r_a, 0);
+        assert_eq!(r_b, 8, "B reuses the 8-token system prefix");
+        let shared: Vec<u32> = (0..2).map(|i| table_b.get(i).unwrap()).collect();
+        assert_eq!(
+            shared,
+            vec![table_a.get(0).unwrap(), table_a.get(1).unwrap()]
+        );
+
+        // 2) PagedRef: A full prefill; B starts from the shared prefix (the
+        //    builder's physical page ids coincide with PagedRef's for the first
+        //    request — the canonical cache owner) and computes only the delta.
+        let mut pr = PagedRef::new(cfg, w.clone(), 2, 16, 4);
+        let logits_a = pr.prefill(0, &a).expect("prefill A");
+        pr.start_with_shared_prefix(1, &shared, 8);
+        let logits_b = pr.prefill(1, &b[8..]).expect("prefill B delta");
+
+        // 3) Correctness: B (delta-only from shared pages) == full recompute.
+        let mut ref_b = RefModel::new(cfg, w.clone());
+        let ref_logits_b = ref_b.forward(&b);
+        assert_eq!(
+            max_abs_diff(&logits_b, &ref_logits_b),
+            0.0,
+            "delta-only shared-prefix decode must equal full recompute"
+        );
+        // A is unchanged (its system pages were read, not rewritten by B).
+        let mut ref_a = RefModel::new(cfg, w);
+        let ref_logits_a = ref_a.forward(&a);
+        assert_eq!(max_abs_diff(&logits_a, &ref_logits_a), 0.0, "A unchanged");
+    }
+
+    #[test]
+    #[should_panic(expected = "must cover exactly reused_tokens")]
+    fn start_with_shared_prefix_rejects_misaligned_reused_tokens() {
+        let cfg = Config::tiny();
+        let w = Weights::random(&cfg, 82).expect("weights");
+        let mut pr = PagedRef::new(cfg, w, 2, 16, 4);
+        // 6 tokens with 2 shared pages (8 token capacity) is misaligned.
+        pr.start_with_shared_prefix(0, &[0, 1], 6);
     }
 
     #[test]
