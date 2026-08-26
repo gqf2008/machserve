@@ -8,6 +8,39 @@ use mach_model::config::ModelDType;
 use mach_model::model::GpuModel;
 use mach_model::{Config, Weights};
 
+/// Paged-KV decode must match the static (contiguous) decode on the GPU: the
+/// paged kernels route the same KV through block tables, so logits must agree
+/// tightly across a long sequence spanning multiple pages.
+#[test]
+fn batched_paged_decode_matches_static_gpu() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256, tokens_per_page 64 -> 4 pages
+    let w = Weights::random(&cfg, 61).unwrap();
+    let mut stat = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut paged = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, 64).unwrap();
+
+    // 70 single-token steps spans 2 pages (64 + 6), exercising the block-table
+    // page boundary on the decode path.
+    let tokens: Vec<u32> = (0..70u32).map(|i| (i * 37) % 1024 + 1).collect();
+    for (i, &t) in tokens.iter().enumerate() {
+        stat.decode_step(&[t]).unwrap();
+        paged.decode_step(&[t]).unwrap();
+        let sl = stat.read_logits().unwrap();
+        let pl = paged.read_logits().unwrap();
+        assert_eq!(sl.len(), cfg.vocab_size);
+        let scale = sl.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = sl
+            .iter()
+            .zip(&pl)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d <= 1e-4 + 1e-4 * scale,
+            "pos {i}: paged vs static logits max diff {d} (scale {scale})"
+        );
+    }
+}
+
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
     match hip::hip() {
         Ok(h) => match hip::device_count() {
