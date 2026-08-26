@@ -458,6 +458,33 @@ extern "C" __global__ void attn_decode_batched(
 }
 "#;
 
+/// Paged KV store: writes one token's `[kv_heads, head_dim]` K/V row into a
+/// page pool at `(physical page, in-page offset)` resolved via the block table
+/// — the store counterpart of `attn_decode_paged`. Wired into `batched.rs` in
+/// the paged-KV integration batch.
+#[allow(dead_code)]
+const KV_STORE_PAGED: &str = r#"
+extern "C" __global__ void kv_store_paged(const float* kv, float* pool,
+                                          const int* pos_buf,
+                                          const int* table_offsets,
+                                          const int* block_tables,
+                                          int batch, int kv_heads, int head_dim,
+                                          int tokens_per_page) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * kv_heads * head_dim;
+    if (idx < total) {
+        int s = idx / (kv_heads * head_dim);
+        int i = idx % (kv_heads * head_dim);
+        int p = pos_buf[s];
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = block_tables[table_offsets[s] + logical];
+        pool[((long long)page * tokens_per_page + off) * kv_heads * head_dim + i] =
+            kv[(long long)s * kv_heads * head_dim + i];
+    }
+}
+"#;
+
 /// Paged decode attention: reads the KV prefix `0..=pos` through per-request
 /// block tables from a page pool (`[num_pages, tokens_per_page, kv_heads,
 /// head_dim]`), enabling cross-request prefix sharing. Mirrors the CPU
@@ -2862,6 +2889,7 @@ mod offline_tests {
         MOE_GATHER_ROWS,
         MOE_SCATTER_ADD,
         MOE_PREFIX_SUM,
+        KV_STORE_PAGED,
         ATTN_DECODE_PAGED,
     ];
 
@@ -2875,6 +2903,305 @@ mod offline_tests {
             let size = HipKernelModule::compile_only("gfx1100", src)
                 .unwrap_or_else(|e| panic!("kernel {name} failed offline hiprtc compile: {e}"));
             assert!(size > 0, "kernel {name} produced an empty code object");
+        }
+    }
+}
+/// GPU parity: the paged kernels (`kv_store_paged` / `attn_decode_paged`) must
+/// produce bit-identical results to the contiguous kernels on the device.
+#[cfg(all(test, feature = "hip"))]
+mod gpu_tests {
+    use super::*;
+    use mach_kernel_sys::hip;
+
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 32) as u32 as f32) / (u32::MAX as f32) - 0.5
+        }
+    }
+
+    #[test]
+    fn paged_attn_and_store_match_contiguous_gpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let arch = "gfx1100";
+        let attn_c =
+            hip::HipKernelModule::compile(arch, ATTN_DECODE_BATCHED, "attn_decode_batched")
+                .expect("compile attn contig");
+        let attn_p = hip::HipKernelModule::compile(arch, ATTN_DECODE_PAGED, "attn_decode_paged")
+            .expect("compile attn paged");
+        let store_c = hip::HipKernelModule::compile(arch, KV_STORE_BATCHED, "kv_store_batched")
+            .expect("compile store contig");
+        let store_p = hip::HipKernelModule::compile(arch, KV_STORE_PAGED, "kv_store_paged")
+            .expect("compile store paged");
+
+        let batch = 1usize;
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let max_seq = 12usize;
+        let tpp = 4usize;
+        let max_pages = 3usize;
+        let pos: i32 = 11; // last position (spans all 3 pages)
+        let mut rng = lcg(7);
+
+        // q, a K/V row to store, and the contiguous prefix KV.
+        let q: Vec<f32> = (0..batch * n_heads * head_dim).map(|_| rng()).collect();
+        let kv_row: Vec<f32> = (0..batch * n_kv_heads * head_dim).map(|_| rng()).collect();
+        let kvn = max_seq * n_kv_heads * head_dim;
+        let mut kc = vec![0.0f32; kvn];
+        let mut vc = vec![0.0f32; kvn];
+        for p in 0..max_seq {
+            for kvh in 0..n_kv_heads {
+                for dd in 0..head_dim {
+                    kc[(p * n_kv_heads + kvh) * head_dim + dd] = rng();
+                    vc[(p * n_kv_heads + kvh) * head_dim + dd] = rng();
+                }
+            }
+        }
+        // Page pools hold the same KV arranged by page.
+        let pooln = max_pages * tpp * n_kv_heads * head_dim;
+        let mut k_pool = vec![0.0f32; pooln];
+        let mut v_pool = vec![0.0f32; pooln];
+        for p in 0..max_seq {
+            let (page, off) = (p / tpp, p % tpp);
+            for kvh in 0..n_kv_heads {
+                for dd in 0..head_dim {
+                    k_pool[((page * tpp + off) * n_kv_heads + kvh) * head_dim + dd] =
+                        kc[(p * n_kv_heads + kvh) * head_dim + dd];
+                    v_pool[((page * tpp + off) * n_kv_heads + kvh) * head_dim + dd] =
+                        vc[(p * n_kv_heads + kvh) * head_dim + dd];
+                }
+            }
+        }
+        let block_tables: Vec<i32> = vec![0, 1, 2];
+        let table_offsets: Vec<i32> = vec![0];
+        let pos_buf: Vec<i32> = vec![pos];
+        let slots: Vec<i32> = vec![0];
+
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let ibytes = |n: usize| n * std::mem::size_of::<i32>();
+        let dq = hip::malloc(&h, bytes(q.len())).unwrap();
+        let dkc = hip::malloc(&h, bytes(kc.len())).unwrap();
+        let dvc = hip::malloc(&h, bytes(vc.len())).unwrap();
+        let dkrow = hip::malloc(&h, bytes(kv_row.len())).unwrap();
+        let dk_pool = hip::malloc(&h, bytes(k_pool.len())).unwrap();
+        let dv_pool = hip::malloc(&h, bytes(v_pool.len())).unwrap();
+        let dout_c = hip::malloc(&h, bytes(q.len())).unwrap();
+        let dout_p = hip::malloc(&h, bytes(q.len())).unwrap();
+        let dpos = hip::malloc(&h, ibytes(pos_buf.len())).unwrap();
+        let dslots = hip::malloc(&h, ibytes(slots.len())).unwrap();
+        let dtables = hip::malloc(&h, ibytes(block_tables.len())).unwrap();
+        let doffs = hip::malloc(&h, ibytes(table_offsets.len())).unwrap();
+        // The contiguous store writes into a scratch cache; page store into pools.
+        let dstore_c = hip::malloc(&h, bytes(kc.len())).unwrap();
+
+        let cp = |dst: *mut std::ffi::c_void, src: &[f32]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                bytes(src.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap()
+        };
+        let cpi = |dst: *mut std::ffi::c_void, src: &[i32]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                ibytes(src.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap()
+        };
+        cp(dq, &q);
+        cp(dkc, &kc);
+        cp(dvc, &vc);
+        cp(dkrow, &kv_row);
+        cp(dk_pool, &k_pool);
+        cp(dv_pool, &v_pool);
+        cpi(dpos, &pos_buf);
+        cpi(dslots, &slots);
+        cpi(dtables, &block_tables);
+        cpi(doffs, &table_offsets);
+
+        let qp = dq;
+        let kcp = dkc;
+        let vcp = dvc;
+        let kpoolp = dk_pool;
+        let vpoolp = dv_pool;
+        let dtp = dtables;
+        let doffp = doffs;
+        let posp = dpos;
+        let slotp = dslots;
+        let stream = std::ptr::null_mut();
+
+        // Contiguous attention launch.
+        let mut p1: Vec<*mut std::ffi::c_void> = vec![
+            &qp as *const *mut std::ffi::c_void as *mut _,
+            &kcp as *const *mut std::ffi::c_void as *mut _,
+            &vcp as *const *mut std::ffi::c_void as *mut _,
+            &dout_c as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &slotp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_heads as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(1.0f32 / (head_dim as f32).sqrt()) as *const f32 as *mut _,
+            &(max_seq as i32) as *const i32 as *mut _,
+        ];
+        let shared_c = ((max_seq + 256) * 4) as u32;
+        attn_c
+            .launch_shmem(
+                [(batch * n_heads) as u32, 1, 1],
+                [256, 1, 1],
+                &mut p1,
+                stream,
+                shared_c,
+            )
+            .expect("launch attn contig");
+
+        // Paged attention launch.
+        let mut p2: Vec<*mut std::ffi::c_void> = vec![
+            &qp as *const *mut std::ffi::c_void as *mut _,
+            &kpoolp as *const *mut std::ffi::c_void as *mut _,
+            &vpoolp as *const *mut std::ffi::c_void as *mut _,
+            &dtp as *const *mut std::ffi::c_void as *mut _,
+            &dout_p as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &doffp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_heads as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(1.0f32 / (head_dim as f32).sqrt()) as *const f32 as *mut _,
+            &(tpp as i32) as *const i32 as *mut _,
+            &(max_pages as i32) as *const i32 as *mut _,
+        ];
+        let shared_p = ((max_pages * tpp + 256) * 4) as u32;
+        attn_p
+            .launch_shmem(
+                [(batch * n_heads) as u32, 1, 1],
+                [256, 1, 1],
+                &mut p2,
+                stream,
+                shared_p,
+            )
+            .expect("launch attn paged");
+
+        // Contiguous store: writes kv_row into dstore_c at slot 0, pos.
+        let mut p3: Vec<*mut std::ffi::c_void> = vec![
+            &dkrow as *const *mut std::ffi::c_void as *mut _,
+            &dstore_c as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &slotp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(max_seq as i32) as *const i32 as *mut _,
+        ];
+        store_c
+            .launch(
+                [((batch * n_kv_heads * head_dim) as u32).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                &mut p3,
+                stream,
+            )
+            .expect("launch store contig");
+
+        // Paged store: writes kv_row into dk_pool at (page, off) for pos.
+        let mut p4: Vec<*mut std::ffi::c_void> = vec![
+            &dkrow as *const *mut std::ffi::c_void as *mut _,
+            &dk_pool as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &doffp as *const *mut std::ffi::c_void as *mut _,
+            &dtp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(tpp as i32) as *const i32 as *mut _,
+        ];
+        store_p
+            .launch(
+                [((batch * n_kv_heads * head_dim) as u32).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                &mut p4,
+                stream,
+            )
+            .expect("launch store paged");
+
+        unsafe {
+            hip::check(&h, (h.api.hip_device_synchronize)()).unwrap();
+        }
+
+        let mut out_c = vec![0.0f32; q.len()];
+        let mut out_p = vec![0.0f32; q.len()];
+        hip::memcpy(
+            &h,
+            out_c.as_mut_ptr() as *mut _,
+            dout_c as *const _,
+            bytes(q.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            out_p.as_mut_ptr() as *mut _,
+            dout_p as *const _,
+            bytes(q.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        assert_eq!(
+            out_c, out_p,
+            "paged attention must be bit-identical to contiguous on GPU"
+        );
+
+        // Store parity: the contiguous slot-(0,pos) row == paged (page,off) row.
+        let mut store_c = vec![0.0f32; kv_row.len()];
+        let mut store_p = vec![0.0f32; kv_row.len()];
+        hip::memcpy(
+            &h,
+            store_c.as_mut_ptr() as *mut _,
+            unsafe { dstore_c.add((pos as usize * n_kv_heads * head_dim) * 4) } as *const _,
+            bytes(kv_row.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        let (page, off) = ((pos as usize) / tpp, (pos as usize) % tpp);
+        hip::memcpy(
+            &h,
+            store_p.as_mut_ptr() as *mut _,
+            // SAFETY: `dk_pool` is the page pool buffer; the (page, off)
+            // offset for position `pos` stays within the allocated
+            // `[max_pages, tpp, kv_heads, head_dim]` extent.
+            unsafe { dk_pool.add(((page * tpp + off) * n_kv_heads * head_dim) * 4) } as *const _,
+            bytes(kv_row.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        assert_eq!(
+            store_c, store_p,
+            "paged store must write the same row as contiguous store"
+        );
+
+        for p in [
+            dq, dkc, dvc, dkrow, dk_pool, dv_pool, dout_c, dout_p, dpos, dslots, dtables, doffs,
+            dstore_c,
+        ] {
+            hip::free(&h, p).unwrap();
         }
     }
 }
