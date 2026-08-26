@@ -559,6 +559,122 @@ extern "C" __global__ void attn_decode_paged(
 }
 "#;
 
+/// Paged KV store (f16): same signature/addressing as `kv_store_paged`, but
+/// the page pool holds f16 bit patterns (`unsigned short`) instead of f32 —
+/// the store counterpart of `attn_decode_paged_f16_gqa`. Converts each f32 K/V
+/// element to f16 before writing, following `kv_store_batched_f16`.
+#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
+const KV_STORE_PAGED_F16: &str = r#"
+__device__ inline unsigned short f32_to_f16_bits(float x) {
+    _Float16 h = (_Float16)x;
+    union { _Float16 h; unsigned short u; } c;
+    c.h = h;
+    return c.u;
+}
+
+extern "C" __global__ void kv_store_paged_f16(const float* kv,
+                                              unsigned short* pool,
+                                              const int* pos_buf,
+                                              const int* table_offsets,
+                                              const int* block_tables,
+                                              int batch, int kv_heads, int head_dim,
+                                              int tokens_per_page) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * kv_heads * head_dim;
+    if (idx < total) {
+        int s = idx / (kv_heads * head_dim);
+        int i = idx % (kv_heads * head_dim);
+        int p = pos_buf[s];
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = block_tables[table_offsets[s] + logical];
+        pool[((long long)page * tokens_per_page + off) * kv_heads * head_dim + i] =
+            f32_to_f16_bits(kv[(long long)s * kv_heads * head_dim + i]);
+    }
+}
+"#;
+
+/// Paged decode attention (f16 KV): same signature/addressing as
+/// `attn_decode_paged`, but k_pool/v_pool hold f16 bit patterns
+/// (`unsigned short`, `[num_pages, tokens_per_page, kv_heads, head_dim]`) that
+/// are read back to f32 for the softmax math, following the f16 reads in
+/// `attn_decode_batched_f16_gqa`. Covered by the offline hiprtc compile gate.
+/// Not yet wired into `batched.rs` (the paged-KV integration batch), so it is
+#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
+const ATTN_DECODE_PAGED_F16_GQA: &str = r#"
+__device__ inline float f16_bits_to_f32(unsigned short u) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = u;
+    return (float)c.h;
+}
+
+extern "C" __global__ void attn_decode_paged_f16_gqa(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_pool,
+    const unsigned short* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page, int max_pages) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_pages * tokens_per_page;
+
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int groups = n_heads / n_kv_heads;
+    int kv = h / groups;
+    int pos = pos_buf[s];
+    const int* table = block_tables + table_offsets[s];
+    const float* qh = q + ((long long)s * n_heads + h) * head_dim;
+
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = table[logical];
+        const unsigned short* kp = k_pool + ((long long)page * tokens_per_page + off) * n_kv_heads * head_dim + kv * head_dim;
+        float sc = 0.0f;
+        for (int dd = 0; dd < head_dim; dd++) sc += qh[dd] * f16_bits_to_f32(kp[dd]);
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+
+    for (int dd = threadIdx.x; dd < head_dim; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = table[logical];
+            const unsigned short* vp = v_pool + ((long long)page * tokens_per_page + off) * n_kv_heads * head_dim + kv * head_dim + dd;
+            acc += __expf(scores[p] - m) * f16_bits_to_f32(*vp);
+        }
+        out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// MLA batched: merge q_nope / q_rope into q across `batch` rows.
 const MLA_ASSEMBLE_Q_BATCHED: &str = r#"
 extern "C" __global__ void mla_assemble_q_batched(
@@ -2986,6 +3102,8 @@ mod offline_tests {
         MOE_PREFIX_SUM,
         KV_STORE_PAGED,
         ATTN_DECODE_PAGED,
+        KV_STORE_PAGED_F16,
+        ATTN_DECODE_PAGED_F16_GQA,
     ];
 
     #[test]
