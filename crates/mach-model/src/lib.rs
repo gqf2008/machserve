@@ -13,6 +13,7 @@ pub mod batched;
 pub mod config;
 #[cfg(feature = "hip")]
 pub mod continuous;
+pub mod cpu_engine;
 pub mod fp16;
 pub mod fp64_ref;
 pub mod fp8;
