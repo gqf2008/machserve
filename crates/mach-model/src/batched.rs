@@ -156,10 +156,6 @@ pub struct BatchedModel {
     mla_kv: *mut f32,
     mla_k_rope: *mut f32,
     mla_attn: *mut f32,
-    /// MLA paged path: expanded per-row k/v scratch (`[rows, heads*hd]` with
-    /// hd = nope + rope / `[rows, heads*v_hd]`) fed to `kv_store_paged_mla`.
-    mla_k_asm: *mut f32,
-    mla_v_asm: *mut f32,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
@@ -512,17 +508,6 @@ impl BatchedModel {
             }
         }
         self.tables_host = tables;
-        // Paged MLA path: per-row expanded scratch consumed by
-        // kv_store_paged_mla (allocated only in paged mode — the contiguous
-        // MLA path assembles straight into its caches).
-        if self.cfg.kv_lora_rank > 0 {
-            let b = self.rows;
-            let heads = self.cfg.n_heads;
-            let hd = self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim;
-            let v_hd = self.cfg.v_head_dim;
-            self.mla_k_asm = self.dalloc(b * heads * hd * 4)?;
-            self.mla_v_asm = self.dalloc(b * heads * v_hd * 4)?;
-        }
         // Per-row offsets: row r -> r*max_pages (row == slot during decode).
         let mut offsets: Vec<i32> = Vec::with_capacity(self.rows);
         for r in 0..self.rows {
@@ -682,8 +667,6 @@ impl BatchedModel {
             mla_kv: std::ptr::null_mut(),
             mla_k_rope: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
-            mla_k_asm: std::ptr::null_mut(),
-            mla_v_asm: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
@@ -1671,25 +1654,15 @@ impl BatchedModel {
                 let (kc, vc) = self.mla_kv_cache[li];
                 let scale = 1.0 / ((nope + rope) as f32).sqrt();
                 if self.paged {
-                    // Paged MLA: expand to per-row scratch, store through the
-                    // block tables into the per-head page pools, then batched
-                    // attention over them.
+                    // Paged MLA: one fused kernel expands kv + shared k_rope
+                    // on the fly while storing through the block tables into
+                    // the per-head page pools, then batched attention over
+                    // them (no intermediate scratch roundtrip).
                     let tpp = self.tokens_per_page as i32;
                     let max_pages = self.max_pages_per_seq as i32;
-                    k.launch_mla_assemble_kv_rows(
+                    k.launch_kv_store_paged_mla(
                         self.mla_kv,
                         self.mla_k_rope,
-                        self.mla_k_asm,
-                        self.mla_v_asm,
-                        b,
-                        heads,
-                        nope,
-                        rope,
-                        v_hd,
-                    )?;
-                    k.launch_kv_store_paged_mla(
-                        self.mla_k_asm,
-                        self.mla_v_asm,
                         kc as *mut f32,
                         vc as *mut f32,
                         self.pos_dev,
@@ -1697,7 +1670,8 @@ impl BatchedModel {
                         self.block_tables,
                         b,
                         heads,
-                        nope + rope,
+                        nope,
+                        rope,
                         v_hd,
                         tpp,
                     )?;

@@ -675,39 +675,53 @@ extern "C" __global__ void attn_decode_paged_f16_gqa(
 /// the MLA page pools at `(page, off)` resolved via the block table, in the
 /// per-head layout `[num_pages, tokens_per_page, heads, dim]` read back by
 /// `attn_decode_paged_mla` (mirrors `store_row_paged_mla` in `paged_kv.rs`).
-/// Same addressing/style as `kv_store_paged`, but per-head MLA layout and both
-/// K/V rows written in one launch.
+/// Paged MLA store, **fused expansion**: writes both per-head rows straight
+/// from the projection outputs into the MLA page pools at the block-table
+/// position of each row — `kv` `[batch, heads*(nope+v_hd)]` carries k-nope
+/// prefix + v suffix per head and shared `k_rope` `[batch, rope]` completes
+/// k, expanded on the fly (mirrors `store_row_paged_mla` in `paged_kv.rs`).
+/// Same addressing/style as `kv_store_paged`, but per-head MLA layout and
+/// both K/V written in one launch with no intermediate scratch roundtrip.
 const KV_STORE_PAGED_MLA: &str = r#"
 extern "C" __global__ void kv_store_paged_mla(
-    const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ kv,
+    const float* __restrict__ k_rope,
     float* __restrict__ k_pool, float* __restrict__ v_pool,
     const int* __restrict__ pos_buf,
     const int* __restrict__ table_offsets,
     const int* __restrict__ block_tables,
-    int batch, int heads, int hd, int v_hd,
+    int batch, int heads, int nope, int rope, int v_hd,
     int tokens_per_page) {
+    int hd = nope + rope;
+    // K side: expand (nope from kv + rope from k_rope) while storing.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_k = batch * heads * hd;
     if (idx < total_k) {
         int s = idx / (heads * hd);
-        int i = idx % (heads * hd);
+        int rem = idx % (heads * hd);
+        int h = rem / hd;
+        int dd = rem % hd;
+        float val = (dd < nope)
+            ? kv[(long long)s * heads * (nope + v_hd) + h * (nope + v_hd) + dd]
+            : k_rope[(long long)s * rope + (dd - nope)];
         int p = pos_buf[s];
         int logical = p / tokens_per_page;
         int off = p % tokens_per_page;
         int page = block_tables[table_offsets[s] + logical];
-        k_pool[((long long)page * tokens_per_page + off) * heads * hd + i] =
-            k[(long long)s * heads * hd + i];
+        k_pool[((long long)page * tokens_per_page + off) * heads * hd + h * hd + dd] = val;
     }
+    // V side: contiguous v tail inside kv.
     int total_v = batch * heads * v_hd;
     if (idx < total_v) {
         int s = idx / (heads * v_hd);
-        int i = idx % (heads * v_hd);
+        int h = (idx % (heads * v_hd)) / v_hd;
+        int dd = idx % v_hd;
         int p = pos_buf[s];
         int logical = p / tokens_per_page;
         int off = p % tokens_per_page;
         int page = block_tables[table_offsets[s] + logical];
-        v_pool[((long long)page * tokens_per_page + off) * heads * v_hd + i] =
-            v[(long long)s * heads * v_hd + i];
+        v_pool[((long long)page * tokens_per_page + off) * heads * v_hd + h * v_hd + dd] =
+            kv[(long long)s * heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
     }
 }
 "#;
@@ -942,39 +956,6 @@ extern "C" __global__ void mla_assemble_kv_batched(
         int slot = slots[s];
         int pos = pos_buf[s];
         vc[((long long)slot * max_seq + pos) * n_heads * v_hd + h * v_hd + dd] =
-            kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
-    }
-}
-"#;
-
-/// MLA batched: expand kv + shared k_rope into plain row-indexed scratch
-/// (`[batch, heads*hd]` / `[batch, heads*v_hd]`) — the paged counterpart of
-/// `mla_assemble_kv_batched`: its output goes through `kv_store_paged_mla`
-/// into the block-table page pools instead of the contiguous caches.
-const MLA_ASSEMBLE_KV_ROWS: &str = r#"
-extern "C" __global__ void mla_assemble_kv_rows(
-    const float* __restrict__ kv, const float* __restrict__ k_rope,
-    float* __restrict__ k_rows, float* __restrict__ v_rows,
-    int batch, int n_heads, int nope, int rope, int v_hd) {
-    int hd = nope + rope;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * n_heads * hd;
-    if (i < total) {
-        int s = i / (n_heads * hd);
-        int rem = i % (n_heads * hd);
-        int h = rem / hd;
-        int dd = rem % hd;
-        k_rows[i] = (dd < nope)
-            ? kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + dd]
-            : k_rope[(long long)s * rope + (dd - nope)];
-    }
-    int total_v = batch * n_heads * v_hd;
-    if (i < total_v) {
-        int s = i / (n_heads * v_hd);
-        int rem = i % (n_heads * v_hd);
-        int h = rem / v_hd;
-        int dd = rem % v_hd;
-        v_rows[i] =
             kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
     }
 }
@@ -1690,7 +1671,6 @@ pub struct HipKernels {
     kv_store_paged_f16: HipKernelModule,
     attn_decode_paged_f16_gqa: HipKernelModule,
     kv_store_paged_mla: HipKernelModule,
-    mla_assemble_kv_rows: HipKernelModule,
     attn_decode_paged_mla_batched: HipKernelModule,
     argmax_batched: HipKernelModule,
     cast_f32_f16: HipKernelModule,
@@ -1824,11 +1804,6 @@ impl HipKernels {
                 "attn_decode_paged_f16_gqa",
             )?,
             kv_store_paged_mla: compile_cached(&arch, KV_STORE_PAGED_MLA, "kv_store_paged_mla")?,
-            mla_assemble_kv_rows: compile_cached(
-                &arch,
-                MLA_ASSEMBLE_KV_ROWS,
-                "mla_assemble_kv_rows",
-            )?,
             attn_decode_paged_mla_batched: compile_cached(
                 &arch,
                 ATTN_DECODE_PAGED_MLA_BATCHED,
@@ -2991,52 +2966,15 @@ impl HipKernels {
         )?)
     }
 
-    /// MLA batched: expand kv/k_rope into plain row-indexed k/v scratch rows
-    /// consumed by `launch_kv_store_paged_mla` (the paged variant of
-    /// `launch_mla_assemble_kv_batched`, which writes the caches directly).
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_mla_assemble_kv_rows(
-        &self,
-        kv: *const f32,
-        k_rope: *const f32,
-        k_rows: *mut f32,
-        v_rows: *mut f32,
-        batch: i32,
-        n_heads: i32,
-        nope: i32,
-        rope: i32,
-        v_hd: i32,
-    ) -> Result<(), Error> {
-        let kvp = kv;
-        let rp = k_rope;
-        let kp = k_rows;
-        let vp = v_rows;
-        let mut p = vec![
-            &kvp as *const *const f32 as *mut core::ffi::c_void,
-            &rp as *const *const f32 as *mut core::ffi::c_void,
-            &kp as *const *mut f32 as *mut core::ffi::c_void,
-            &vp as *const *mut f32 as *mut core::ffi::c_void,
-            &batch as *const i32 as *mut core::ffi::c_void,
-            &n_heads as *const i32 as *mut core::ffi::c_void,
-            &nope as *const i32 as *mut core::ffi::c_void,
-            &rope as *const i32 as *mut core::ffi::c_void,
-            &v_hd as *const i32 as *mut core::ffi::c_void,
-        ];
-        let total = (batch * n_heads * (nope + rope)).max(batch * n_heads * v_hd) as u32;
-        let blocks = total.div_ceil(256);
-        Ok(self
-            .mla_assemble_kv_rows
-            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
-    }
-
-    /// Paged MLA KV store: writes both assembled per-head rows (`[batch,
-    /// heads*hd]` / `[batch, heads*v_hd]`) into the MLA page pools at the
-    /// block-table position of each row.
+    /// Paged MLA KV store (fused expansion): writes both per-head rows
+    /// straight from `kv` (k-nope prefix + v tail per head) and shared
+    /// `k_rope` into the MLA page pools at the block-table position of each
+    /// row — no intermediate scratch roundtrip.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_kv_store_paged_mla(
         &self,
-        k: *const f32,
-        v: *const f32,
+        kv: *const f32,
+        k_rope: *const f32,
         k_pool: *mut f32,
         v_pool: *mut f32,
         pos: *const i32,
@@ -3044,20 +2982,21 @@ impl HipKernels {
         block_tables: *const i32,
         batch: i32,
         heads: i32,
-        hd: i32,
+        nope: i32,
+        rope: i32,
         v_hd: i32,
         tokens_per_page: i32,
     ) -> Result<(), Error> {
-        let kp = k;
-        let vp = v;
+        let kvp = kv;
+        let rp = k_rope;
         let kpp = k_pool;
         let vpp = v_pool;
         let pp = pos;
         let toff = table_offsets;
         let bt = block_tables;
         let mut p = vec![
-            &kp as *const *const f32 as *mut core::ffi::c_void,
-            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &rp as *const *const f32 as *mut core::ffi::c_void,
             &kpp as *const *mut f32 as *mut core::ffi::c_void,
             &vpp as *const *mut f32 as *mut core::ffi::c_void,
             &pp as *const *const i32 as *mut core::ffi::c_void,
@@ -3065,11 +3004,12 @@ impl HipKernels {
             &bt as *const *const i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
             &heads as *const i32 as *mut core::ffi::c_void,
-            &hd as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
             &v_hd as *const i32 as *mut core::ffi::c_void,
             &tokens_per_page as *const i32 as *mut core::ffi::c_void,
         ];
-        let total = (batch * heads * hd).max(batch * heads * v_hd) as u32;
+        let total = (batch * heads * (nope + rope)).max(batch * heads * v_hd) as u32;
         let blocks = total.div_ceil(256);
         Ok(self
             .kv_store_paged_mla
@@ -3585,7 +3525,6 @@ mod offline_tests {
         ATTN_DECODE_PAGED_F16_GQA,
         KV_STORE_PAGED_MLA,
         ATTN_DECODE_PAGED_MLA,
-        MLA_ASSEMBLE_KV_ROWS,
         ATTN_DECODE_PAGED_MLA_BATCHED,
     ];
 
