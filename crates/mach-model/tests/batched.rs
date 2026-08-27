@@ -434,6 +434,44 @@ fn shared_prefix_paged_reuse_matches_full_compute() {
     }
 }
 
+/// Paged decode in F16 mode (#78 C3): the newly wired
+/// `kv_store_paged_f16` / `attn_decode_paged_f16_gqa` must track the static
+/// F16 path bit-tight across a page boundary, mirroring the F32 paged test.
+#[test]
+fn batched_paged_f16_decode_matches_static_gpu() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny(); // max_seq 256, tokens_per_page 64 -> 4 pages
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 97).unwrap();
+    let mut stat = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut paged = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, 64).unwrap();
+
+    // 70 single-token steps span 2 pages, exercising the block-table page
+    // boundary on the F16 store/attention path.
+    let tokens: Vec<u32> = (0..70u32).map(|i| (i * 37) % 1024 + 1).collect();
+    for (i, &t) in tokens.iter().enumerate() {
+        let s_next = stat.decode_step(&[t]).unwrap();
+        let p_next = paged.decode_step(&[t]).unwrap();
+        assert_eq!(
+            s_next, p_next,
+            "pos {i}: f16 paged vs static greedy token diverged"
+        );
+        let sl = stat.read_logits().unwrap();
+        let pl = paged.read_logits().unwrap();
+        assert_eq!(sl.len(), cfg.vocab_size);
+        let scale = sl.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = sl
+            .iter()
+            .zip(&pl)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d <= 1e-3 + 1e-3 * scale,
+            "pos {i}: f16 paged vs static logits max diff {d} (scale {scale})"
+        );
+    }
+}
+
 /// Paged chunked prefill (#78 C2): several prompt positions of one sequence
 /// packed into distinct rows of a single step must produce the same per-
 /// position logits and greedy tokens as sequential single-token stepping.

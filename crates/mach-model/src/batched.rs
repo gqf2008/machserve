@@ -254,12 +254,12 @@ impl BatchedModel {
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
             "tokens_per_page must divide max_seq_len"
         );
-        // The paged decode branch only dispatches dense F32 (see `decode_step`);
-        // f16/MLA would silently fall through to the contiguous kernels while
-        // still owning block tables. Reject them loudly at construction.
+        // The paged decode branch dispatches dense F32 and F16 (the F16 paged
+        // kernels); MLA would silently fall through to the contiguous kernels
+        // while still owning block tables. Reject it loudly at construction.
         assert!(
-            cfg.dtype == ModelDType::F32,
-            "paged-KV mode supports dense F32 only (got {:?}); f16 paged kernels are follow-ups",
+            matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16),
+            "paged-KV mode supports dense F32/F16 only (got {:?})",
             cfg.dtype
         );
         assert!(
@@ -1674,7 +1674,50 @@ impl BatchedModel {
                     c.rope_theta,
                 )?;
                 let (kc, vc) = self.kv_cache[li];
-                if f16 {
+                if f16 && self.paged {
+                    // Paged decode (F16 KV): store + attention through the
+                    // block tables; same addressing as the F32 paged branch.
+                    let tpp = self.tokens_per_page as i32;
+                    let max_pages = self.max_pages_per_seq as i32;
+                    k.launch_kv_store_paged_f16(
+                        self.k_buf,
+                        kc as *mut u16,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_kv_store_paged_f16(
+                        self.v_buf,
+                        vc as *mut u16,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_attn_decode_paged_f16_gqa(
+                        self.q,
+                        kc as *const u16,
+                        vc as *const u16,
+                        self.block_tables,
+                        self.attn,
+                        self.pos_dev,
+                        self.table_offsets,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        tpp,
+                        max_pages,
+                    )?;
+                } else if f16 {
                     k.launch_kv_store_batched_f16(
                         self.k_buf,
                         kc as *mut u16,

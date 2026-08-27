@@ -489,8 +489,6 @@ extern "C" __global__ void kv_store_paged(const float* kv, float* pool,
 /// block tables from a page pool (`[num_pages, tokens_per_page, kv_heads,
 /// head_dim]`), enabling cross-request prefix sharing. Mirrors the CPU
 /// reference in `paged_kv.rs`; covered by the offline hiprtc compile gate.
-/// Not yet wired into `batched.rs` (the paged-KV integration batch), so it is
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const ATTN_DECODE_PAGED: &str = r#"
 extern "C" __global__ void attn_decode_paged(
     const float* __restrict__ q,
@@ -563,7 +561,6 @@ extern "C" __global__ void attn_decode_paged(
 /// the page pool holds f16 bit patterns (`unsigned short`) instead of f32 —
 /// the store counterpart of `attn_decode_paged_f16_gqa`. Converts each f32 K/V
 /// element to f16 before writing, following `kv_store_batched_f16`.
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const KV_STORE_PAGED_F16: &str = r#"
 __device__ inline unsigned short f32_to_f16_bits(float x) {
     _Float16 h = (_Float16)x;
@@ -599,8 +596,6 @@ extern "C" __global__ void kv_store_paged_f16(const float* kv,
 /// (`unsigned short`, `[num_pages, tokens_per_page, kv_heads, head_dim]`) that
 /// are read back to f32 for the softmax math, following the f16 reads in
 /// `attn_decode_batched_f16_gqa`. Covered by the offline hiprtc compile gate.
-/// Not yet wired into `batched.rs` (the paged-KV integration batch), so it is
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const ATTN_DECODE_PAGED_F16_GQA: &str = r#"
 __device__ inline float f16_bits_to_f32(unsigned short u) {
     union { _Float16 h; unsigned short u; } c;
@@ -1585,6 +1580,8 @@ pub struct HipKernels {
     attn_decode_batched: HipKernelModule,
     kv_store_paged: HipKernelModule,
     attn_decode_paged: HipKernelModule,
+    kv_store_paged_f16: HipKernelModule,
+    attn_decode_paged_f16_gqa: HipKernelModule,
     argmax_batched: HipKernelModule,
     cast_f32_f16: HipKernelModule,
     cast_f16_f32: HipKernelModule,
@@ -1710,6 +1707,12 @@ impl HipKernels {
             attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
             kv_store_paged: compile_cached(&arch, KV_STORE_PAGED, "kv_store_paged")?,
             attn_decode_paged: compile_cached(&arch, ATTN_DECODE_PAGED, "attn_decode_paged")?,
+            kv_store_paged_f16: compile_cached(&arch, KV_STORE_PAGED_F16, "kv_store_paged_f16")?,
+            attn_decode_paged_f16_gqa: compile_cached(
+                &arch,
+                ATTN_DECODE_PAGED_F16_GQA,
+                "attn_decode_paged_f16_gqa",
+            )?,
             argmax_batched: compile_cached(&arch, ARGMAX_BATCHED, "argmax_batched")?,
             cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
             cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
@@ -2773,6 +2776,98 @@ impl HipKernels {
         Ok(self
             .kv_store_paged
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Paged KV store (f16 page pool): `kv_store_paged` with the pool holding
+    /// f16 bit patterns; K/V rows stay f32 and are converted on write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_paged_f16(
+        &self,
+        kv: *const f32,
+        pool: *mut u16,
+        pos: *const i32,
+        table_offsets: *const i32,
+        block_tables: *const i32,
+        batch: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let pp = pool;
+        let posp = pos;
+        let toff = table_offsets;
+        let bt = block_tables;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &pp as *const *mut u16 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_heads * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .kv_store_paged_f16
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Paged decode attention (f16 KV): reads f16-bit-pattern pages back to
+    /// f32 for the softmax; same addressing/launch shape as
+    /// `launch_attn_decode_paged`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_paged_f16_gqa(
+        &self,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+        max_pages: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let bt = block_tables;
+        let op = out;
+        let pp = pos;
+        let toff = table_offsets;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &max_pages as *const i32 as *mut core::ffi::c_void,
+        ];
+        let shared = ((max_pages * tokens_per_page + 256) * 4) as u32;
+        Ok(self.attn_decode_paged_f16_gqa.launch_shmem(
+            [(batch * n_heads) as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
     }
 
     /// Paged decode attention (batched): reads the KV prefix through per-row
