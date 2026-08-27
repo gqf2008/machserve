@@ -203,6 +203,10 @@ pub struct BatchedModel {
     /// (`offsets[row] = slot[row] * max_pages_per_seq`; prefill rows may all
     /// point at one slot's pages).
     offsets_host: *mut i32,
+    /// True when the device offsets buffer may differ from the identity
+    /// mapping (an explicit step packed non-identity slots). `decode_step`
+    /// refreshes only when dirty — its rows are always identity.
+    offsets_dirty: bool,
     /// Device per-row table offsets: `[rows]` ints, `offset[row] = slots[row] *
     /// max_pages_per_seq`, refreshed per step.
     table_offsets: *mut i32,
@@ -258,6 +262,21 @@ impl BatchedModel {
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
             "tokens_per_page must divide max_seq_len"
         );
+        // The paged attention kernels stage the full per-row score array in
+        // dynamic shared memory: `(max_pages * tokens_per_page + 256) * 4` ==
+        // `(max_seq_len + 256) * 4` bytes. Enforce the 64 KiB device limit
+        // here so an unsupported context size fails at construction with a
+        // clear error, not with a cryptic launch failure mid-request. (The
+        // contiguous attention kernels share the same smem bound.)
+        let smem = (cfg.max_seq_len + 256) * 4;
+        if smem > 64 * 1024 {
+            return Err(Error::InvalidArgument(format!(
+                "max_seq_len {} needs {smem} bytes of attention smem (64 KiB device limit); \
+                 paged-KV mode supports contexts up to {} tokens",
+                cfg.max_seq_len,
+                (64 * 1024) / 4 - 256
+            )));
+        }
         // The paged decode branch dispatches dense F32/F16 and MLA (F32); any
         // other dtype would silently fall through to the contiguous kernels
         // while still owning block tables. Reject loudly at construction.
@@ -451,6 +470,17 @@ impl BatchedModel {
             }
         }
         self.tables_host = tables;
+        // Paged MLA path: per-row expanded scratch consumed by
+        // kv_store_paged_mla (allocated only in paged mode — the contiguous
+        // MLA path assembles straight into its caches).
+        if self.cfg.kv_lora_rank > 0 {
+            let b = self.rows;
+            let heads = self.cfg.n_heads;
+            let hd = self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim;
+            let v_hd = self.cfg.v_head_dim;
+            self.mla_k_asm = self.dalloc(b * heads * hd * 4)?;
+            self.mla_v_asm = self.dalloc(b * heads * v_hd * 4)?;
+        }
         // Per-row offsets: row r -> r*max_pages (row == slot during decode).
         let mut offsets: Vec<i32> = Vec::with_capacity(self.rows);
         for r in 0..self.rows {
@@ -627,6 +657,7 @@ impl BatchedModel {
             block_tables: std::ptr::null_mut(),
             tables_host: Vec::new(),
             offsets_host: std::ptr::null_mut(),
+            offsets_dirty: false,
             table_offsets: std::ptr::null_mut(),
         };
         m.alloc_buffers()?;
@@ -861,10 +892,6 @@ impl BatchedModel {
             self.mla_kv = self.dalloc(b * heads * (nope + v_hd) * 4)?;
             self.mla_k_rope = self.dalloc(b * rope * 4)?;
             self.mla_attn = self.dalloc(b * heads * v_hd * 4)?;
-            // Paged MLA path: per-row expanded scratch consumed by
-            // kv_store_paged_mla (the contiguous caches skip it).
-            self.mla_k_asm = self.dalloc(b * heads * (nope + rope) * 4)?;
-            self.mla_v_asm = self.dalloc(b * heads * v_hd * 4)?;
             // MLA KV caches are stored as f32 (expanded per-head layout).
             let k_bytes = self.batch * c.max_seq_len * heads * (nope + rope) * 4;
             let v_bytes = self.batch * c.max_seq_len * heads * v_hd * 4;
@@ -1402,7 +1429,7 @@ impl BatchedModel {
                 self.k.stream,
             )?;
         }
-        self.refresh_table_offsets(&(0..self.batch as u32).collect::<Vec<_>>())?;
+        self.refresh_offsets_if_dirty()?;
         self.run_kernels(self.batch as i32, self.slots_dev, self.run_mask_dev, 0)?;
         let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
@@ -1433,6 +1460,17 @@ impl BatchedModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 self.k.stream,
             )?;
+        }
+        Ok(())
+    }
+
+    /// `decode_step` fast path: refresh the offsets only when a previous
+    /// explicit step left them non-identity. `decode_step` always packs
+    /// rows == slots 0..batch, matching the initial identity upload.
+    fn refresh_offsets_if_dirty(&mut self) -> Result<(), Error> {
+        if self.offsets_dirty {
+            self.refresh_table_offsets(&(0..self.batch as u32).collect::<Vec<_>>())?;
+            self.offsets_dirty = false;
         }
         Ok(())
     }
@@ -2323,6 +2361,7 @@ impl BatchedModel {
             self.last_row_by_slot[s as usize] = r;
         }
         self.refresh_table_offsets(slots)?;
+        self.offsets_dirty = true;
         self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
         self.sampler
             .sample_batched(self.logits, params, counts, bias, self.cfg.vocab_size)
@@ -2623,7 +2662,12 @@ impl BatchedModel {
     /// into more rows than slots writes `[rows, vocab]`, so row-level
     /// inspection needs the active count, not the slot count.
     pub fn read_logits_rows(&self, n: usize) -> Result<Vec<f32>, Error> {
-        debug_assert!(n <= self.rows, "row count exceeds capacity");
+        if n > self.rows {
+            return Err(Error::InvalidArgument(format!(
+                "row count {n} exceeds capacity {}",
+                self.rows
+            )));
+        }
         self.k.sync()?;
         let elems = n * self.cfg.vocab_size;
         let mut out = vec![0.0f32; elems];

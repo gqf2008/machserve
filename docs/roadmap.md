@@ -800,7 +800,7 @@
   - C1 per-slot 块表(`set_block_table`):共享前缀物理页混叠,reuse logits == 全算
     (64-token 页,B delta-only);
   - C2 chunked prefill 分页:per-row 表偏移刷新,12/8 行两种形态 vs 逐 token 对拍;
-  - C3/C4 f16 / MLA 分页接线:运行期编译 4+2 内核(46 内核离线门禁),70 步跨页对拍;
+  - C3/C4 f16 / MLA 分页接线:运行期编译 4+2 内核(44 内核离线门禁),70 步跨页对拍;
   - C5 服务链:`ContinuousModel::with_paged_prefill_rows`(物化水位门控复用 + 表搬移
     压缩 + reuse 统计)+ `MACH_PAGED=1` HTTP e2e(输出 == 直接引擎,reused==64);
   - C6 真机 A/B(paged_prefix_ab_bench,交错准入 + 热身):提示词 325→69(节省 78.8%

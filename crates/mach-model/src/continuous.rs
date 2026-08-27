@@ -431,17 +431,32 @@ impl ContinuousModel {
             // Reuse only materialized pages (see PagedEngineState::find_reusable);
             // otherwise compute everything into fresh pages (registered later
             // when this request's prefill completes).
-            let r = pg.find_reusable(prompt);
+            let mut r = pg.find_reusable(prompt);
+            if r == prompt.len() {
+                // Full-prefix reuse would leave an empty prefill queue with no
+                // first decode token (step() panics). Keep the last page: it
+                // is recomputed into the (identical-content) aliased page —
+                // benign — and the prefill produces the first token normally.
+                r -= pg.tokens_per_page;
+            }
             let table = if r > 0 {
-                let (t, _reused) = pg
+                let (mut t, _reused) = pg
                     .builder
                     .build_table(&i32p)
                     .map_err(|e| Error::Model(format!("paged build_table: {e}")))?;
+                pg.builder
+                    .pad_table(&mut t, self.model.max_pages_per_seq())
+                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
                 t
             } else {
-                pg.builder
+                let mut t = pg
+                    .builder
                     .build_table_fresh(&i32p)
-                    .map_err(|e| Error::Model(format!("paged build_table_fresh: {e}")))?
+                    .map_err(|e| Error::Model(format!("paged build_table_fresh: {e}")))?;
+                pg.builder
+                    .pad_table(&mut t, self.model.max_pages_per_seq())
+                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
+                t
             };
             self.model
                 .set_block_table(slot, table.pages())
@@ -751,6 +766,8 @@ impl ContinuousModel {
             top_logprobs,
             stopped,
         });
+        // Retired-metadata cap, computed before the paged-borrow below.
+        let retired_cap = self.capacity().saturating_mul(4);
         if let Some(pg) = &mut self.paged {
             // Paged compaction: KV lives in pages addressed by the block
             // tables, so moving a sequence means moving its table (the pages
@@ -774,6 +791,12 @@ impl ContinuousModel {
             pg.tables[self.active - 1] = None;
             pg.entries[self.active - 1] = empty();
             pg.retired.push(entry);
+            // Bound the retired metadata: pages stay in the pool either way
+            // (no eviction yet), but dropping the oldest entries caps host
+            // memory growth on long-running servers.
+            if pg.retired.len() > retired_cap {
+                pg.retired.drain(0..(pg.retired.len() - retired_cap));
+            }
             self.active -= 1;
             return;
         }

@@ -375,19 +375,30 @@ impl ServerEngine {
                 let mut streams = self.streams.lock().unwrap();
                 while !pending.is_empty() && model.active() < self.capacity {
                     let r = pending.pop_front().expect("checked non-empty");
-                    let id = model
-                        .add(
-                            &r.prompt,
-                            r.max_new,
-                            r.eos,
-                            r.stop_seqs,
-                            r.logit_bias,
-                            r.params,
-                        )
-                        .expect("capacity guaranteed");
-                    txs.insert(id, r.done);
-                    if let Some(stx) = r.tokens_tx {
-                        streams.insert(id, stx);
+                    match model.add(
+                        &r.prompt,
+                        r.max_new,
+                        r.eos,
+                        r.stop_seqs,
+                        r.logit_bias,
+                        r.params,
+                    ) {
+                        Ok(id) => {
+                            txs.insert(id, r.done);
+                            if let Some(stx) = r.tokens_tx {
+                                streams.insert(id, stx);
+                            }
+                        }
+                        // Admission failure (e.g. paged page-pool exhaustion):
+                        // reject the request instead of panicking the engine
+                        // thread while holding the pending/txs locks. The
+                        // oneshot delivers an empty completion; the caller
+                        // sees an empty generation rather than a hang.
+                        Err(e) => {
+                            eprintln!("engine: rejecting request: {e}");
+                            let _ = r.done.send((Vec::new(), Vec::new(), Vec::new(), "error"));
+                            drop(r.tokens_tx);
+                        }
                     }
                 }
                 drop(streams);
