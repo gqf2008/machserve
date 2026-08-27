@@ -821,6 +821,145 @@ fn paged_engine_evicts_cold_pages_under_pressure() {
     );
 }
 
+/// Eviction with sibling retired entries sharing content (PR #81 review):
+/// two concurrent same-prompt requests both allocate fresh pages and the
+/// loser's duplicates are freed at retire — both retired entries then claim
+/// the SAME hashes. Eviction must release shared pages with the last
+/// claimant and keep surviving chains resolvable; a later same-prompt
+/// request must either alias written pages or full-compute — never skip
+/// prefill over pages that no longer hold KV (the stale-reuse-boundary bug
+/// produced silent garbage here).
+#[test]
+fn paged_engine_eviction_with_sibling_retired_entries() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256, tpp 64 -> 4 pages/seq; pool = 8
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 61).unwrap();
+    // 192 tokens = 3 full pages (+1 pad freed at retire): each table is 4
+    // pages, so two concurrent requests exactly fill the 8-page pool, while
+    // prompt + 2 generated tokens stay inside max_seq_len for the reference.
+    let len = 3 * tpp;
+    let mk = |base: u32| -> Vec<u32> { (0..len as u32).map(|i| (base + i) % 1024 + 1).collect() };
+    let p0 = mk(0);
+    let p300 = mk(300);
+    let p600 = mk(600);
+    let refs = [
+        gen_ref(&hip, cfg, &w, &p0, 2),
+        gen_ref(&hip, cfg, &w, &p300, 2),
+        gen_ref(&hip, cfg, &w, &p600, 2),
+    ];
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, 8, tpp).unwrap();
+
+    // Phase 1: A and B share p0 and are admitted concurrently (both plan
+    // fresh — 4 pages each, exactly the 8-page pool).
+    let id_a = eng
+        .add(
+            &p0,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    let id_b = eng
+        .add(
+            &p0,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(eng.generated(id_a), refs[0]);
+    assert_eq!(eng.generated(id_b), refs[0]);
+
+    // Phase 2: distinct content consumes the sibling-freed pages, leaving
+    // less than one full table free.
+    let id_c = eng
+        .add(
+            &p300,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(eng.generated(id_c), refs[1]);
+
+    // Phase 3: another distinct prompt cannot fit — eviction drains the
+    // sibling pair (shared pages released with the last claimant) and c's
+    // pages, then the admission retries.
+    let id_d = eng
+        .add(
+            &p600,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(eng.generated(id_d), refs[2]);
+
+    // Phase 4: p0 was evicted — this request must full-compute (its output
+    // equals the reference; the stale-boundary bug served garbage here).
+    let id_e = eng
+        .add(
+            &p0,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(id_e),
+        refs[0],
+        "post-eviction same-prompt request must equal full recompute"
+    );
+
+    // Phase 5: d's materialized prefix survived — reuse resumes healthily.
+    let id_f = eng
+        .add(
+            &p600,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(eng.generated(id_f), refs[2]);
+    let stats = eng.paged_reuse_stats().expect("paged");
+    assert_eq!(stats.requests, 6, "all six requests admitted");
+    assert_eq!(
+        stats.reused_tokens,
+        len - tpp,
+        "only f reuses (full prefix minus the kept last page)"
+    );
+}
+
 /// Concurrent same-prompt decode must not clobber (#80 review fix): the
 /// shared prompt's LAST page is partial (130 tokens, tpp 64) — the first
 /// generated token of every request lands in that page's offsets. Each
@@ -955,103 +1094,10 @@ fn paged_engine_concurrent_identical_prompts_do_not_leak_pool() {
 
 // ---------- paged storage-quantized engines (#80 P3) ----------
 
-/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors
-/// copied) for the Q4 paged-engine test.
-fn to_q4(w: &Weights) -> mach_model::WeightsQ4 {
-    use mach_model::LayerWeightsQ4;
-    use mach_model::q4::Q4Tensor;
-    let q = |v: &[f32]| Q4Tensor::quantize(v);
-    mach_model::WeightsQ4 {
-        tok_emb: q(&w.tok_emb),
-        rms_final: w.rms_final.clone(),
-        lm_head: q(&w.lm_head),
-        layers: w
-            .layers
-            .iter()
-            .map(|l| LayerWeightsQ4 {
-                wq: q(&l.wq),
-                wk: q(&l.wk),
-                wv: q(&l.wv),
-                wo: q(&l.wo),
-                rms_attn: l.rms_attn.clone(),
-                wg: q(&l.wg),
-                wu: q(&l.wu),
-                wd: q(&l.wd),
-                rms_mlp: l.rms_mlp.clone(),
-                bq: l.bq.clone(),
-                bk: l.bk.clone(),
-                bv: l.bv.clone(),
-                q_norm: l.q_norm.clone(),
-                k_norm: l.k_norm.clone(),
-                mla_q_a: q(&l.mla_q_a),
-                mla_q_a_norm: l.mla_q_a_norm.clone(),
-                mla_q_b: q(&l.mla_q_b),
-                mla_q_rope: q(&l.mla_q_rope),
-                mla_kv_a: q(&l.mla_kv_a),
-                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
-                mla_kv_b: q(&l.mla_kv_b),
-                mla_o: q(&l.mla_o),
-                moe_router: l.moe_router.clone(),
-                moe_wg: q(&l.moe_wg),
-                moe_wu: q(&l.moe_wu),
-                moe_wd: q(&l.moe_wd),
-            })
-            .collect(),
-    }
-}
-
-/// Converts f32 weights to storage-FP8 (GEMM tensors E4M3-quantized with
-/// per-tensor scales) for the FP8 paged-engine test.
-fn to_fp8(w: &Weights) -> mach_model::WeightsFp8 {
-    use mach_model::LayerWeightsFp8;
-    use mach_model::fp8::Fp8Tensor;
-    let q = |v: &[f32]| Fp8Tensor::quantize(v);
-    mach_model::WeightsFp8 {
-        tok_emb: q(&w.tok_emb),
-        rms_final: w.rms_final.clone(),
-        lm_head: q(&w.lm_head),
-        layers: w
-            .layers
-            .iter()
-            .map(|l| LayerWeightsFp8 {
-                wq: q(&l.wq),
-                wk: q(&l.wk),
-                wv: q(&l.wv),
-                wo: q(&l.wo),
-                rms_attn: l.rms_attn.clone(),
-                wg: q(&l.wg),
-                wu: q(&l.wu),
-                wd: q(&l.wd),
-                rms_mlp: l.rms_mlp.clone(),
-                bq: l.bq.clone(),
-                bk: l.bk.clone(),
-                bv: l.bv.clone(),
-                q_norm: l.q_norm.clone(),
-                k_norm: l.k_norm.clone(),
-                mla_q_a: q(&l.mla_q_a),
-                mla_q_a_norm: l.mla_q_a_norm.clone(),
-                mla_q_b: q(&l.mla_q_b),
-                mla_q_rope: q(&l.mla_q_rope),
-                mla_kv_a: q(&l.mla_kv_a),
-                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
-                mla_kv_b: q(&l.mla_kv_b),
-                mla_o: q(&l.mla_o),
-                moe_router: l.moe_router.clone(),
-                moe_wg: q(&l.moe_wg),
-                moe_wu: q(&l.moe_wu),
-                moe_wd: q(&l.moe_wd),
-            })
-            .collect(),
-    }
-}
-
-/// Shared-prefix helper: A fully finishes first (materializing pages), then B
-/// is admitted and runs to completion. Returns outputs + reuse stats tokens.
-fn run_paged_two_requests(
-    eng: &mut ContinuousModel,
-    a: &[u32],
-    b: &[u32],
-) -> (Vec<Vec<u32>>, usize) {
+/// Two-request run helper: A fully finishes first (materializing pages),
+/// then B is admitted and runs to completion. Returns outputs + the engine's
+/// reused-token count (contiguous engines have no paged stats → 0).
+fn run_two_requests(eng: &mut ContinuousModel, a: &[u32], b: &[u32]) -> (Vec<Vec<u32>>, usize) {
     let id_a = eng
         .add(
             a,
@@ -1078,43 +1124,11 @@ fn run_paged_two_requests(
     while !eng.all_done() {
         eng.step().unwrap();
     }
-    let reused = eng.paged_reuse_stats().expect("paged").reused_tokens;
+    let reused = eng
+        .paged_reuse_stats()
+        .map(|s| s.reused_tokens)
+        .unwrap_or(0);
     (vec![eng.generated(id_a), eng.generated(id_b)], reused)
-}
-
-/// Contiguous counterpart of [`run_paged_two_requests`] (no reuse stats).
-fn run_contiguous_two_requests(
-    eng: &mut ContinuousModel,
-    a: &[u32],
-    b: &[u32],
-) -> (Vec<Vec<u32>>, usize) {
-    let id_a = eng
-        .add(
-            a,
-            3,
-            None,
-            Vec::new(),
-            Vec::new(),
-            SamplingParams::default(),
-        )
-        .unwrap();
-    while !eng.is_done(id_a) {
-        eng.step().unwrap();
-    }
-    let id_b = eng
-        .add(
-            b,
-            3,
-            None,
-            Vec::new(),
-            Vec::new(),
-            SamplingParams::default(),
-        )
-        .unwrap();
-    while !eng.all_done() {
-        eng.step().unwrap();
-    }
-    (vec![eng.generated(id_a), eng.generated(id_b)], 0)
 }
 
 /// Storage-quantized paged engines (#80 P3): Q4 and FP8 device-f16 paths serve
@@ -1132,7 +1146,7 @@ fn paged_engine_quantized_reuses_shared_prefix() {
         match quant {
             0 => {
                 let w = Weights::random(&cfg, 91).unwrap();
-                let wq = to_q4(&w);
+                let wq = mach_model::WeightsQ4::from(&w);
                 let run = |paged: bool| -> (Vec<Vec<u32>>, usize) {
                     if paged {
                         let mut eng = ContinuousModel::with_paged_prefill_rows_q4(
@@ -1144,12 +1158,12 @@ fn paged_engine_quantized_reuses_shared_prefix() {
                             tpp,
                         )
                         .unwrap();
-                        run_paged_two_requests(&mut eng, &a, &b)
+                        run_two_requests(&mut eng, &a, &b)
                     } else {
                         let mut eng =
                             ContinuousModel::with_prefill_rows_q4(hip.clone(), cfg, &wq, 2, 2)
                                 .unwrap();
-                        run_contiguous_two_requests(&mut eng, &a, &b)
+                        run_two_requests(&mut eng, &a, &b)
                     }
                 };
                 let (contig_out, _) = run(false);
@@ -1167,7 +1181,7 @@ fn paged_engine_quantized_reuses_shared_prefix() {
             }
             _ => {
                 let w = Weights::random(&cfg, 93).unwrap();
-                let wf = to_fp8(&w);
+                let wf = mach_model::WeightsFp8::from(&w);
                 let run = |paged: bool| -> (Vec<Vec<u32>>, usize) {
                     if paged {
                         let mut eng = ContinuousModel::with_paged_prefill_rows_fp8(
@@ -1179,12 +1193,12 @@ fn paged_engine_quantized_reuses_shared_prefix() {
                             tpp,
                         )
                         .unwrap();
-                        run_paged_two_requests(&mut eng, &a, &b)
+                        run_two_requests(&mut eng, &a, &b)
                     } else {
                         let mut eng =
                             ContinuousModel::with_prefill_rows_fp8(hip.clone(), cfg, &wf, 2, 2)
                                 .unwrap();
-                        run_contiguous_two_requests(&mut eng, &a, &b)
+                        run_two_requests(&mut eng, &a, &b)
                     }
                 };
                 let (contig_out, _) = run(false);
@@ -1201,4 +1215,50 @@ fn paged_engine_quantized_reuses_shared_prefix() {
             }
         }
     }
+}
+
+/// Retired-metadata cap with shared content: sequential same-prefix requests
+/// pile up retired entries (admissions alias, so the pool never pressures a
+/// drain). At the cap the metadata drains and the shared page releases with
+/// the last claimant; the next request must full-compute correctly and reuse
+/// must resume healthily afterwards (no orphaned, unreachable pages).
+#[test]
+fn paged_engine_retired_cap_recovers_and_reuses() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256, tpp 64 -> 4 pages/seq; pool = 8
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 63).unwrap();
+
+    // Exactly 2 full pages: reuse skips 64 tokens (the kept last page).
+    let prompt: Vec<u32> = (0..128u32).map(|i| (i * 3 + 5) % 1024 + 1).collect();
+    let want = gen_ref(&hip, cfg, &w, &prompt, 2);
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, 8, tpp).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..11 {
+        let id = eng
+            .add(
+                &prompt,
+                2,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !eng.is_done(id) {
+            eng.step().unwrap();
+        }
+        assert_eq!(eng.generated(id), want, "every request must be correct");
+        ids.push(id);
+    }
+    let stats = eng.paged_reuse_stats().expect("paged");
+    assert_eq!(stats.requests, 11);
+    // r2..r9 reuse (8x), r10 full-computes after the cap drain, r11 reuses.
+    assert_eq!(
+        stats.reused_tokens,
+        9 * (tpp),
+        "reuse before and after the cap drain"
+    );
 }

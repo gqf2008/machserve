@@ -104,6 +104,52 @@ pub struct WeightsQ4 {
     pub layers: Vec<LayerWeightsQ4>,
 }
 
+/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, norms/biases
+/// and the tiny router copied) — the same conversion the safetensors Q4
+/// loader applies, shared by tests and future re-quantization paths.
+impl From<&Weights> for WeightsQ4 {
+    fn from(w: &Weights) -> Self {
+        let q = |v: &[f32]| crate::q4::Q4Tensor::quantize(v);
+        Self {
+            tok_emb: q(&w.tok_emb),
+            rms_final: w.rms_final.clone(),
+            lm_head: q(&w.lm_head),
+            layers: w
+                .layers
+                .iter()
+                .map(|l| LayerWeightsQ4 {
+                    wq: q(&l.wq),
+                    wk: q(&l.wk),
+                    wv: q(&l.wv),
+                    wo: q(&l.wo),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: q(&l.wg),
+                    wu: q(&l.wu),
+                    wd: q(&l.wd),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: q(&l.mla_q_a),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: q(&l.mla_q_b),
+                    mla_q_rope: q(&l.mla_q_rope),
+                    mla_kv_a: q(&l.mla_kv_a),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: q(&l.mla_kv_b),
+                    mla_o: q(&l.mla_o),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: q(&l.moe_wg),
+                    moe_wu: q(&l.moe_wu),
+                    moe_wd: q(&l.moe_wd),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// FP8 (storage-level E4M3) layer weights: GEMM tensors quantized, norms and
 /// biases kept as f32. Mirrors [`LayerWeights`] / [`LayerWeightsQ4`].
 #[derive(Debug, Clone)]
@@ -146,6 +192,53 @@ pub struct WeightsFp8 {
     pub rms_final: Vec<f32>,
     pub lm_head: crate::fp8::Fp8Tensor,
     pub layers: Vec<LayerWeightsFp8>,
+}
+
+/// Converts f32 weights to storage-FP8 (GEMM tensors E4M3-quantized with
+/// per-tensor scales, norms/biases and the tiny router copied) — the same
+/// conversion the safetensors FP8 loader applies, shared by tests and future
+/// re-quantization paths.
+impl From<&Weights> for WeightsFp8 {
+    fn from(w: &Weights) -> Self {
+        let q = |v: &[f32]| crate::fp8::Fp8Tensor::quantize(v);
+        Self {
+            tok_emb: q(&w.tok_emb),
+            rms_final: w.rms_final.clone(),
+            lm_head: q(&w.lm_head),
+            layers: w
+                .layers
+                .iter()
+                .map(|l| LayerWeightsFp8 {
+                    wq: q(&l.wq),
+                    wk: q(&l.wk),
+                    wv: q(&l.wv),
+                    wo: q(&l.wo),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: q(&l.wg),
+                    wu: q(&l.wu),
+                    wd: q(&l.wd),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: q(&l.mla_q_a),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: q(&l.mla_q_b),
+                    mla_q_rope: q(&l.mla_q_rope),
+                    mla_kv_a: q(&l.mla_kv_a),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: q(&l.mla_kv_b),
+                    mla_o: q(&l.mla_o),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: q(&l.moe_wg),
+                    moe_wu: q(&l.moe_wu),
+                    moe_wd: q(&l.moe_wd),
+                })
+                .collect(),
+        }
+    }
 }
 /// All model weights.
 #[derive(Debug, Clone)]

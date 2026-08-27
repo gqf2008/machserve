@@ -182,6 +182,11 @@ pub fn contiguous_attention_decode(
 #[derive(Debug, Clone, Default)]
 pub struct PageAllocator {
     free: Vec<u32>,
+    /// One slot per page: true while the page is owned by a table or plan.
+    /// Makes `free` catch every *observable* double free in O(1) — the
+    /// free→realloc→free-by-first-owner residue is indistinguishable from
+    /// the second owner's legitimate free (see `free`'s doc).
+    allocated: Vec<bool>,
     next: u32,
     num_pages: u32,
 }
@@ -192,6 +197,7 @@ impl PageAllocator {
     pub fn new(num_pages: u32) -> Self {
         Self {
             free: Vec::new(),
+            allocated: vec![false; num_pages as usize],
             next: 0,
             num_pages,
         }
@@ -199,29 +205,39 @@ impl PageAllocator {
 
     /// Allocates a physical page, or `None` when the pool is exhausted.
     pub fn alloc(&mut self) -> Option<u32> {
-        if let Some(p) = self.free.pop() {
-            return Some(p);
-        }
-        if self.next < self.num_pages {
+        let p = if let Some(p) = self.free.pop() {
+            p
+        } else if self.next < self.num_pages {
             let p = self.next;
             self.next += 1;
-            Some(p)
+            p
         } else {
-            None
-        }
+            return None;
+        };
+        assert!(
+            !self.allocated[p as usize],
+            "PageAllocator alloc of live page {p}"
+        );
+        self.allocated[p as usize] = true;
+        Some(p)
     }
 
     /// Returns a page to the pool for reuse.
     ///
-    /// Panics on an out-of-range id or a double-free while the page is still
-    /// on the free list (handing the same physical page to two tables would
-    /// silently corrupt both).
+    /// Panics on an out-of-range id or freeing a page whose ownership was
+    /// already released (double free), in O(1) via the allocated bitmap.
+    /// Note the residue a bitmap cannot see: a page freed, re-allocated to
+    /// a second owner, then freed *again by the first owner* is
+    /// indistinguishable from the second owner's legitimate free — catching
+    /// that would need per-owner tracking (the four free paths here are
+    /// mutually exclusive by invariant).
     pub fn free(&mut self, page: u32) {
         assert!(
-            page < self.num_pages && !self.free.contains(&page),
+            page < self.num_pages && self.allocated[page as usize],
             "PageAllocator double-free or out-of-range page {page} (num_pages {})",
             self.num_pages
         );
+        self.allocated[page as usize] = false;
         self.free.push(page);
     }
 }
@@ -686,7 +702,7 @@ impl PagedRef {
 
 /// Admission-time resolution result: the per-request block table, the reused
 /// prefix token count, and the precomputed content-hash chain (consumed by
-/// [`GpuPagedTableBuilder::register_plan`] at materialization — no rehash).
+/// [`GpuPagedTableBuilder::register_chain`] at materialization — no rehash).
 pub struct PagedTablePlan {
     /// Logical → physical block table (prompt pages only; pad separately).
     pub table: PagedTable,
@@ -695,7 +711,10 @@ pub struct PagedTablePlan {
     /// Aliased prefix pages (exact page count — `reused_tokens` clamps a
     /// partial final page, which `free_plan_pages` must not misread).
     pub reused_pages: usize,
-    /// Per-page content hashes (chain), in page order.
+    /// Per-page content hashes (chain), in page order. Consumed by the
+    /// hip-gated engine (`continuous`) at materialization and eviction, so
+    /// the CPU-only face sees no reader.
+    #[cfg_attr(not(feature = "hip"), allow(dead_code))]
     pub(crate) chain: Vec<String>,
 }
 
@@ -735,7 +754,7 @@ impl GpuPagedTableBuilder {
     /// Errors when the page pool cannot satisfy the fresh demand.
     ///
     /// The content cache is **read-only** here: fresh tail pages are allocated
-    /// but NOT registered — registration happens in [`Self::register_table`]
+    /// but NOT registered — registration happens in [`Self::register_chain`]
     /// once the pages actually hold their KV (the engine's materialization
     /// gate). An eager insert would let a concurrent request alias pages whose
     /// content is not written yet, and both requests would then clobber each
@@ -746,11 +765,20 @@ impl GpuPagedTableBuilder {
         Ok((plan.table, reused))
     }
 
-    /// One admission-time resolution: computes the content-hash chain **once**
-    /// for `tokens`, then either aliases materialized cached pages
-    /// (`allow_reuse`) or allocates fresh pages for every prompt page. The
-    /// returned plan carries the chain so [`Self::register_plan`] can register
-    /// the content at materialization **without rehashing**.
+    /// Computes the per-page content-hash chain for `tokens` (prompt chunked
+    /// into pages, in page order). Admission computes this **once** and feeds
+    /// it to [`Self::plan_with_chain`] — including every eviction-retry
+    /// attempt, so pool pressure never triggers a rehash.
+    #[must_use]
+    pub fn compute_chain(&self, tokens: &[i32]) -> Vec<String> {
+        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
+        crate::prefix_cache::compute_prefix_hashes(&pages, "", &[])
+    }
+
+    /// One admission-time resolution: either aliases materialized cached
+    /// pages (`allow_reuse`) or allocates fresh pages for every prompt page.
+    /// The returned plan carries the chain so [`Self::register_chain`] can
+    /// register the content at materialization **without rehashing**.
     ///
     /// Reuse covers **full prompt pages only**: a partial last page is always
     /// allocated fresh. An aliased partial page would be written by every
@@ -758,9 +786,21 @@ impl GpuPagedTableBuilder {
     /// and two concurrently-active identical prompts would clobber each
     /// other's generated KV at the same offsets.
     pub fn plan(&mut self, tokens: &[i32], allow_reuse: bool) -> Result<PagedTablePlan, Error> {
-        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
-        let chain = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
-        // Only the leading FULL pages may be aliased (see doc above).
+        let chain = self.compute_chain(tokens);
+        self.plan_with_chain(tokens, &chain, allow_reuse)
+    }
+
+    /// [`Self::plan`] over a precomputed [`Self::compute_chain`] chain: same
+    /// aliasing, allocation, and rollback behavior without rehashing. `chain`
+    /// must be `tokens`' own chain (the engine computes both together at
+    /// admission).
+    pub fn plan_with_chain(
+        &mut self,
+        tokens: &[i32],
+        chain: &[String],
+        allow_reuse: bool,
+    ) -> Result<PagedTablePlan, Error> {
+        // Only the leading FULL pages may be aliased (see plan's doc above).
         let full_pages = tokens.len() / self.tokens_per_page;
         let mut table = PagedTable::new();
         let mut reused_pages = 0usize;
@@ -786,22 +826,17 @@ impl GpuPagedTableBuilder {
             };
             table.append(page);
         }
-        // Exact reused-page count (NOT clamped to the token length: the
-        // clamped token figure would undercount a partial final page and
-        // `free_plan_pages` would free an aliased page on pad failure).
-        let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
+        // Exact reused-token boundary: only full pages alias, so this equals
+        // `reused_pages * tokens_per_page` (no clamp — a partial final page
+        // is never in the aliased run). `free_plan_pages` must derive its
+        // fresh/aliased boundary from `reused_pages`, never from this field.
+        let reused_tokens = reused_pages * self.tokens_per_page;
         Ok(PagedTablePlan {
             table,
             reused_tokens,
             reused_pages,
-            chain,
+            chain: chain.to_vec(),
         })
-    }
-
-    /// Registers a plan's pages under its (already computed) content chain —
-    /// call only once the pages hold their KV. No hashing.
-    pub fn register_plan(&mut self, plan: &PagedTablePlan, table: &PagedTable) {
-        self.register_chain(&plan.chain, table);
     }
 
     /// Registers `chain`'s pages — call only once the pages hold their KV
@@ -879,30 +914,6 @@ impl GpuPagedTableBuilder {
     /// Returns a raw page to the pool (pads and other unregistered pages).
     pub fn free_page(&mut self, page: u32) {
         self.allocator.free(page);
-    }
-
-    /// Allocates fresh pages for every token page of `tokens` **without
-    /// consulting or filling the content cache**. Callers whose reuse check
-    /// failed (the matching pages are not materialized yet) must build fresh:
-    /// the pages are aliases only for this request, and the content is
-    /// registered later via [`Self::register_table`] once the KV is written.
-    pub fn build_table_fresh(&mut self, tokens: &[i32]) -> Result<PagedTable, Error> {
-        let plan = self.plan(tokens, false)?;
-        Ok(plan.table)
-    }
-
-    /// Registers `table`'s pages under `tokens`' content hashes — call only
-    /// once the pages actually hold the KV (prefill materialized). Later
-    /// `build_table` calls reuse the chain from this point on. First writer
-    /// wins: when two requests computed the same content into *different*
-    /// fresh pages (both admitted before either materialized), only the first
-    /// registration maps the hash; the second request's duplicate pages stay
-    /// private to its own table (its table still addresses them directly), and
-    /// later reuse resolves to the registered ones.
-    pub fn register_table(&mut self, tokens: &[i32], table: &PagedTable) {
-        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
-        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
-        self.register_chain(&hashes, table);
     }
 }
 
@@ -1304,8 +1315,9 @@ mod tests {
         // 1) Table builder: B reuses A's two system pages (A's content is
         //    registered first — materialized pages are the only reusable ones).
         let mut bld = GpuPagedTableBuilder::new(16, 4);
+        let chain_a = bld.compute_chain(&a_i32);
         let (table_a, r_a) = bld.build_table(&a_i32).expect("A");
-        bld.register_table(&a_i32, &table_a);
+        bld.register_chain(&chain_a, &table_a);
         let (table_b, r_b) = bld.build_table(&b_i32).expect("B");
         assert_eq!(r_a, 0);
         assert_eq!(r_b, 8, "B reuses the 8-token system prefix");
@@ -1390,8 +1402,9 @@ mod tests {
             t.push(tail);
             t
         };
+        let c_a = b.compute_chain(&mk(100));
         let (t_a, r_a) = b.build_table(&mk(100)).expect("A");
-        b.register_table(&mk(100), &t_a); // A materialized
+        b.register_chain(&c_a, &t_a); // A materialized
         let (t_b, r_b) = b.build_table(&mk(200)).expect("B");
         let (t_c, r_c) = b.build_table(&mk(300)).expect("C");
         // First request: everything fresh.
@@ -1428,8 +1441,9 @@ mod tests {
         assert_eq!(r, 0, "no unwritten page reused");
         assert_eq!(t.len(), 2);
         assert_eq!(b.cached_pages(), 0, "unmaterialized pages are not reusable");
-        // ...and enter the cache only once materialized (register_table).
-        b.register_table(&[1, 2, 3, 4, 5, 6, 7, 8], &t);
+        // ...and enter the cache only once materialized (register_chain).
+        let c = b.compute_chain(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        b.register_chain(&c, &t);
         assert_eq!(b.cached_pages(), 2, "registered pages");
         // A later identical request now resolves the full chain.
         let (t2, r2) = b
@@ -1550,7 +1564,8 @@ mod tests {
                     // Materialize: register the built pages (the engine does
                     // this when prefill completes), so later builds can reuse
                     // them — the production flow under test.
-                    b.register_table(&tokens, &table);
+                    let c = b.compute_chain(&tokens);
+                    b.register_chain(&c, &table);
 
                     // Shared consistency: rebuilding the same prompt right away
                     // must reproduce the identical FULL-page prefix — full
@@ -1627,5 +1642,154 @@ mod tests {
             b.cached_pages() <= NUM_PAGES as usize,
             "final pool not oversold"
         );
+    }
+
+    // ---- plan/register/evict invariants (CPU parity for the engine's
+    // admission and eviction paths; the GPU integration tests cover the
+    // wiring, these pin the builder contract itself) ----
+
+    /// Reuse covers materialized whole pages only: a partial final page is
+    /// never aliased, and only registered content resolves.
+    #[test]
+    fn plan_reuses_only_materialized_whole_pages() {
+        let mut b = GpuPagedTableBuilder::new(16, 4);
+        let tokens = [1, 2, 3, 4, 5, 6]; // 1 full page + 2-token partial
+        let chain = b.compute_chain(&tokens);
+
+        // Nothing materialized: full fresh compute.
+        let p0 = b.plan_with_chain(&tokens, &chain, true).unwrap();
+        assert_eq!(p0.reused_pages, 0);
+        assert_eq!(p0.reused_tokens, 0);
+        assert_eq!(p0.table.len(), 2, "full page + partial page");
+
+        // Register page 0's content only (prefill materialized).
+        b.register_chain(&chain[..1], &p0.table);
+
+        // Re-plan: exactly the one materialized full page aliases; the
+        // partial page stays per-request fresh.
+        let p1 = b.plan_with_chain(&tokens, &chain, true).unwrap();
+        assert_eq!(p1.reused_pages, 1, "only the materialized full page");
+        assert_eq!(p1.reused_tokens, 4, "one full page worth of tokens");
+        assert_eq!(p1.table.get(0), p0.table.get(0), "page 0 aliased");
+        assert_ne!(
+            p1.table.get(1),
+            p0.table.get(1),
+            "partial page is per-request fresh"
+        );
+    }
+
+    /// First writer wins: two materializations of the same content register
+    /// once; the loser's duplicate pages stay private (its table still
+    /// addresses them directly).
+    #[test]
+    fn register_chain_first_writer_wins() {
+        let mut b = GpuPagedTableBuilder::new(16, 4);
+        let tokens = [7i32; 8];
+        let chain = b.compute_chain(&tokens);
+
+        let pa = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        let pb = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        assert_ne!(
+            pa.table.get(0),
+            pb.table.get(0),
+            "fresh plans get distinct pages"
+        );
+
+        b.register_chain(&chain, &pa.table);
+        b.register_chain(&chain, &pb.table);
+        assert_eq!(
+            b.page_of(&chain[0]),
+            pa.table.get(0),
+            "the first registration owns the mapping"
+        );
+    }
+
+    /// `free_plan_pages` releases exactly the fresh pages and never an
+    /// aliased one (the aliased page is shared with its first owner).
+    #[test]
+    fn free_plan_pages_spares_aliased_pages() {
+        let mut b = GpuPagedTableBuilder::new(16, 4);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let chain = b.compute_chain(&tokens);
+
+        let pa = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        b.register_chain(&chain, &pa.table);
+        let page0 = pa.table.get(0).unwrap();
+
+        let pb = b.plan_with_chain(&tokens, &chain, true).unwrap();
+        assert_eq!(pb.reused_pages, 2, "both materialized pages alias");
+        b.free_plan_pages(&pb, &pb.table);
+
+        assert_eq!(b.page_of(&chain[0]), Some(page0), "alias survives");
+        assert_eq!(b.page_of(&chain[1]), pa.table.get(1), "alias survives");
+        // The freed fresh page comes back; the aliased pages do not.
+        let recycled = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        assert_eq!(recycled.reused_pages, 0);
+        for p in recycled.table.pages() {
+            assert!(
+                !pa.table.pages().contains(p),
+                "a freed pool must not hand out aliased pages"
+            );
+        }
+    }
+
+    /// `pad_table` rolls back its appended pages on exhaustion, leaving the
+    /// table (and the pool) exactly as before the call.
+    #[test]
+    fn pad_table_rollback_frees_on_exhaustion() {
+        let mut b = GpuPagedTableBuilder::new(6, 4);
+        let mut t = {
+            let c = b.compute_chain(&[1, 2, 3, 4]);
+            let p = b.plan_with_chain(&[1, 2, 3, 4], &c, false).unwrap();
+            p.table
+        };
+        let before = t.len();
+        assert!(b.pad_table(&mut t, 10).is_err(), "6-page pool < 10 pages");
+        assert_eq!(t.len(), before, "table truncated to pre-pad length");
+        // All 5 remaining pages are allocatable again.
+        for _ in 0..5 {
+            assert!(b.allocator.alloc().is_some(), "rollback freed the pads");
+        }
+        assert!(b.allocator.alloc().is_none(), "pool is exactly drained");
+    }
+
+    /// Eviction unregisters and frees; a plan afterwards full-computes (the
+    /// reuse boundary tracks what the cache actually resolves — the
+    /// engine derives `r` from this, so a stale registry entry can never
+    /// skip unwritten positions).
+    #[test]
+    fn evicted_content_is_not_reused() {
+        let mut b = GpuPagedTableBuilder::new(16, 4);
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        let chain = b.compute_chain(&tokens);
+        let p = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        b.register_chain(&chain, &p.table);
+        assert_eq!(b.plan(&tokens, true).unwrap().reused_pages, 2);
+
+        for h in &chain {
+            assert!(b.evict_page(h), "registered hash must evict");
+        }
+        assert!(b.page_of(&chain[0]).is_none());
+        let after = b.plan(&tokens, true).unwrap();
+        assert_eq!(after.reused_pages, 0, "evicted content must not be reused");
+        assert_eq!(after.reused_tokens, 0);
+        // Freed pages are recycled, not double-counted.
+        assert_eq!(b.cached_pages(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn page_allocator_rejects_double_free() {
+        let mut a = PageAllocator::new(2);
+        let p = a.alloc().unwrap();
+        a.free(p);
+        a.free(p); // ownership already released — must panic
+    }
+
+    #[test]
+    #[should_panic(expected = "out-of-range")]
+    fn page_allocator_rejects_out_of_range() {
+        let mut a = PageAllocator::new(2);
+        a.free(99);
     }
 }

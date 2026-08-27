@@ -393,10 +393,11 @@ fn shared_prefix_paged_reuse_matches_full_compute() {
     let pool_pages = (2 * cfg.max_seq_len / tpp) as u32;
     let mut builder = GpuPagedTableBuilder::new(pool_pages, tpp);
     let as_i32 = |v: &[u32]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+    let chain_a = builder.compute_chain(&as_i32(&seq_a));
     let (ta, _ra) = builder.build_table(&as_i32(&seq_a)).unwrap();
     // Materialize A's pages (the engine registers content only after prefill
     // completes); B's build then resolves the shared prefix through the cache.
-    builder.register_table(&as_i32(&seq_a), &ta);
+    builder.register_chain(&chain_a, &ta);
     let (tb, rb) = builder.build_table(&as_i32(&seq_b)).unwrap();
     assert_eq!(ta.len(), 2, "ceil((64+3+3)/64) pages");
     assert_eq!(rb, tpp, "B reuses exactly the shared prefix page");

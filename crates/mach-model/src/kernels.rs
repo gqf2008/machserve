@@ -3528,6 +3528,20 @@ mod offline_tests {
         ATTN_DECODE_PAGED_MLA_BATCHED,
     ];
 
+    /// Pins the hand-maintained kernel count (CLAUDE.md's offline-gate
+    /// section and docs/roadmap.md state the same number): the gate has no
+    /// machine check for *added* kernels, so a stale documented count is the
+    /// first thing a manual audit compares against. Bump both together when
+    /// this list changes.
+    #[test]
+    fn kernel_count_matches_documented_gate() {
+        assert_eq!(
+            ALL_KERNELS.len(),
+            43,
+            "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
+        );
+    }
+
     #[test]
     fn all_kernel_sources_compile_offline() {
         if mach_kernel_sys::hip::hip().is_err() {

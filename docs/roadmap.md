@@ -823,3 +823,39 @@
   - 验证:continuous 20/20(含并发部分末页、并发同 prompt 池不泄漏、
     驱逐压力)、batched 14/14、server 17/17(含 Q4 paged HTTP e2e)、
     CPU lib 5 套件、离线门禁 44 内核。
+
+- **PR #81 三轮审查修复(2026-08-28,7900 XTX)**:code-review max 15 条
+  findings 兑现,正确性优先——
+  - 复用边界单一事实源(critical):`r` 改由 plan 的真实别名页数派生
+    (cache 恰持物化页,陈旧注册项最多造成 cache miss,不可能跳过未写
+    位置);`find_reusable` 整体删除,O(entries×pages×tpp) 准入扫描与
+    PagedEntry.prefix/registered 一并退役(准入少一次全 prompt 拷贝);
+  - 驱逐正确性:共享 hash 由最后认领者释放(驱逐时逐 hash 查兄弟认领,
+    存活链恒可解析),全失效条目按死元数据清扫;retired 上限兜底改
+    逐页强驱逐(活跃表别名的页保持注册、经别名表自身条目可恢复,不再
+    产生永久不可达的孤儿页);
+  - `set_block_table` 失败路径补 free_plan_pages(不再泄漏 plan 新页);
+  - 行为回归收敛:Q4/FP8+MLA+MACH_PAGED 恢复降级服务(告警+连续,
+    不再启动硬失败);MACH_TPP 校验下沉到真正消费 paged 的分支
+    (SPEC/MoE-offload 忽略 MACH_PAGED 时不再被陈旧值 abort,MoE 分支
+    补齐忽略告警);
+  - 加固/清理:PageAllocator 加 allocated 位图(O(1) 双释放检测;
+    free→realloc→再 free 属无 owner 追踪不可检测,文档如实标注)、
+    plan 注释与代码矛盾消除(reused_tokens 恒等整页语义)、死 API
+    register_plan/build_table_fresh/register_table 删除(收敛为
+    plan→register_chain 单路)、权重 Q4/FP8 测试转换 4 份拷贝收敛为
+    `From<&Weights>`;
+  - 测试覆盖:驱逐+兄弟 retired 条目端到端回归(并发同 prompt→池压
+    驱逐→同 prompt 复用,静默垃圾路径钉死)、retired 上限排空后恢复
+    复用、paged_kv CPU 纯逻辑测试 6 组(plan 整页语义/first-writer/
+    free_plan_pages 别名安全/pad 回滚/驱逐不复用/分配器双释放)、
+    paged MLA 对拍 CPU 参考(tpp=8 跨页,重写内核寻址钉到参考实现);
+  - 内核计数机器校验:ALL_KERNELS 计数断言入 offline_tests(实际 43,
+    融合内核退役 MLA_ASSEMBLE_KV_ROWS 后 R1 条目 44 为误记);主仓
+    CLAUDE.md(未跟踪文件)计数需同步为 43;
+  - 验证:CPU lib 184/184(mach-model 166 + server/其余 18)、fmt/clippy
+    (-D warnings)/check×2 全绿;GPU 面(7900 XTX,--test-threads 1):
+    continuous 22/22(含新增驱逐兄弟/retired 上限回归)、batched 14/14、
+    mla 5/5(含新增 paged MLA 对拍 CPU 参考)、fp16 6/6、decode_slice
+    2/2、server 全绿(含 ignored Q4/FP8 HTTP e2e)、离线门禁 2/2
+    (43 内核 + 计数断言)。

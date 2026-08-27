@@ -7,11 +7,9 @@ use axum::http::{Request, StatusCode};
 use mach_kernel_sys::hip;
 use mach_model::config::ModelDType;
 use mach_model::continuous::ContinuousModel;
-use mach_model::fp8::Fp8Tensor;
-use mach_model::q4::Q4Tensor;
 use mach_model::sampling::SamplingParams;
 use mach_model::tokenizer::Tokenizer;
-use mach_model::{Config, LayerWeightsFp8, LayerWeightsQ4, Weights, WeightsFp8, WeightsQ4};
+use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 use mach_server::{AppState, ServerEngine, router};
 use tower::ServiceExt;
 
@@ -101,92 +99,6 @@ fn moe_cfg() -> Config {
     cfg
 }
 
-/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors
-/// copied) for the Q4 server-path test.
-fn to_q4(w: &Weights) -> WeightsQ4 {
-    let q = |v: &[f32]| Q4Tensor::quantize(v);
-    WeightsQ4 {
-        tok_emb: q(&w.tok_emb),
-        rms_final: w.rms_final.clone(),
-        lm_head: q(&w.lm_head),
-        layers: w
-            .layers
-            .iter()
-            .map(|l| LayerWeightsQ4 {
-                wq: q(&l.wq),
-                wk: q(&l.wk),
-                wv: q(&l.wv),
-                wo: q(&l.wo),
-                rms_attn: l.rms_attn.clone(),
-                wg: q(&l.wg),
-                wu: q(&l.wu),
-                wd: q(&l.wd),
-                rms_mlp: l.rms_mlp.clone(),
-                bq: l.bq.clone(),
-                bk: l.bk.clone(),
-                bv: l.bv.clone(),
-                q_norm: l.q_norm.clone(),
-                k_norm: l.k_norm.clone(),
-                mla_q_a: q(&l.mla_q_a),
-                mla_q_a_norm: l.mla_q_a_norm.clone(),
-                mla_q_b: q(&l.mla_q_b),
-                mla_q_rope: q(&l.mla_q_rope),
-                mla_kv_a: q(&l.mla_kv_a),
-                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
-                mla_kv_b: q(&l.mla_kv_b),
-                mla_o: q(&l.mla_o),
-                moe_router: l.moe_router.clone(),
-                moe_wg: q(&l.moe_wg),
-                moe_wu: q(&l.moe_wu),
-                moe_wd: q(&l.moe_wd),
-            })
-            .collect(),
-    }
-}
-
-/// Converts f32 weights to storage-FP8 (GEMM tensors quantized with per-tensor
-/// scales, small tensors copied) for the FP8 server-path test.
-fn to_fp8(w: &Weights) -> WeightsFp8 {
-    let q = |v: &[f32]| Fp8Tensor::quantize(v);
-    WeightsFp8 {
-        tok_emb: q(&w.tok_emb),
-        rms_final: w.rms_final.clone(),
-        lm_head: q(&w.lm_head),
-        layers: w
-            .layers
-            .iter()
-            .map(|l| LayerWeightsFp8 {
-                wq: q(&l.wq),
-                wk: q(&l.wk),
-                wv: q(&l.wv),
-                wo: q(&l.wo),
-                rms_attn: l.rms_attn.clone(),
-                wg: q(&l.wg),
-                wu: q(&l.wu),
-                wd: q(&l.wd),
-                rms_mlp: l.rms_mlp.clone(),
-                bq: l.bq.clone(),
-                bk: l.bk.clone(),
-                bv: l.bv.clone(),
-                q_norm: l.q_norm.clone(),
-                k_norm: l.k_norm.clone(),
-                mla_q_a: q(&l.mla_q_a),
-                mla_q_a_norm: l.mla_q_a_norm.clone(),
-                mla_q_b: q(&l.mla_q_b),
-                mla_q_rope: q(&l.mla_q_rope),
-                mla_kv_a: q(&l.mla_kv_a),
-                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
-                mla_kv_b: q(&l.mla_kv_b),
-                mla_o: q(&l.mla_o),
-                moe_router: l.moe_router.clone(),
-                moe_wg: q(&l.moe_wg),
-                moe_wu: q(&l.moe_wu),
-                moe_wd: q(&l.moe_wd),
-            })
-            .collect(),
-    }
-}
-
 #[tokio::test]
 async fn completions_endpoint_moe_matches_direct_engine() {
     let Some(hip) = hip_ctx() else { return };
@@ -262,7 +174,7 @@ async fn completions_endpoint_q4_matches_direct_engine() {
     let mut cfg = moe_cfg();
     cfg.dtype = ModelDType::F16;
     let w = Weights::random(&cfg, 91).unwrap();
-    let wq4 = to_q4(&w);
+    let wq4 = WeightsQ4::from(&w);
     let prompt = vec![5u32, 9, 3];
     let max_new = 4usize;
 
@@ -335,7 +247,7 @@ async fn completions_endpoint_fp8_matches_direct_engine() {
     let mut cfg = moe_cfg();
     cfg.dtype = ModelDType::F16;
     let w = Weights::random(&cfg, 91).unwrap();
-    let wfp8 = to_fp8(&w);
+    let wfp8 = WeightsFp8::from(&w);
     let prompt = vec![5u32, 9, 3];
     let max_new = 4usize;
 
@@ -1361,7 +1273,7 @@ async fn completions_endpoint_q4_paged_reuses_shared_prefix() {
     cfg.dtype = ModelDType::F16;
     let tpp = 64usize;
     let w = Weights::random(&cfg, 63).unwrap();
-    let wq4 = to_q4(&w);
+    let wq4 = WeightsQ4::from(&w);
 
     let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 37 + 3) % 1024 + 1).collect();
     let d_a: Vec<u32> = vec![42, 99];
