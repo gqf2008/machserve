@@ -87,7 +87,7 @@ thirdparty/        第三方参考代码(占位)
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
 | **存储级 Q4**(#16/#20/#24/#25/#27/#30) | 8B 主机内存 48GB→~5GB,`MACH_Q4=1` 服务,加载 13x 加速 | Qwen3-8B 真机验证 + GPU 对拍 |
 | **FP8** | 计算级关闭(hipBLAS 拒绝 fp8);存储级 E4M3→f16 路径已合入(#38) | P3aq 探针 + 真机对拍 |
-| **分页 KV + 跨请求前缀共享**(#52-#60) | 分页 decode 接入 batched.rs(`with_paged_kv`)并在 7900 XTX 与静态路径对拍通过;共享前缀物理页分配器/块表构造 + f16 分页内核 + 40 内核离线编译门禁 | 全回归绿;共享前缀页接入 decode 与真机 A/B 待 GPU 验证 |
+| **分页 KV + 跨请求前缀共享**(#52-#68) | 分页 decode 接入 batched.rs(`with_paged_kv`,7900 XTX 对拍);F32/F16/MLA 分页内核全接线(46 内核门禁);服务链 `MACH_PAGED=1` 可跑;**真机 A/B(2026-08-27):5 请求共享 64-token 系统提示 → 提示词节省 78.8%(== 理论值)、端到端 2.84x、后续请求 TTFT 13.4x** | 全回归绿 + [docs/benchmark-results-paged-prefix.md](docs/benchmark-results-paged-prefix.md) |
 
 ## 安装与排障（个人用户从这里开始）
 
@@ -128,7 +128,8 @@ cargo run -p mach-model --release --features hip --example chat_check
 cargo run -p mach-server --release --features hip
 #   环境变量:MACH_MODELS(默认 .models)、MACH_MODEL、MACH_CONFIG、
 #   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)、
-#   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)
+#   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)、
+#   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64)
 
 # 调用示例
 curl -s http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/json" \
