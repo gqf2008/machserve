@@ -195,8 +195,12 @@ pub struct BatchedModel {
     block_tables: *mut i32,
     /// Host mirror of the device table region (one upload source per slot).
     tables_host: Vec<i32>,
+    /// Pinned host mirror of the per-row table offsets, refilled per step
+    /// (`offsets[row] = slot[row] * max_pages_per_seq`; prefill rows may all
+    /// point at one slot's pages).
+    offsets_host: *mut i32,
     /// Device per-row table offsets: `[rows]` ints, `offset[row] = slots[row] *
-    /// max_pages_per_seq`, refreshed per decode step.
+    /// max_pages_per_seq`, refreshed per step.
     table_offsets: *mut i32,
 }
 
@@ -231,9 +235,24 @@ impl BatchedModel {
         slots: usize,
         tokens_per_page: usize,
     ) -> Result<Self, Error> {
+        Self::with_paged_kv_rows(hip, cfg, w, slots, slots, tokens_per_page)
+    }
+
+    /// [`Self::with_paged_kv`] variant with an independent prefill row
+    /// capacity (`rows >= slots`): a prefill step may pack several prompt
+    /// positions of one sequence into distinct rows, each addressed through
+    /// the sequence's block table via per-row table offsets.
+    pub fn with_paged_kv_rows(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
         assert!(
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
-            "tokens_per_page must divide max_seq_len for the static identity mapping"
+            "tokens_per_page must divide max_seq_len"
         );
         // The paged decode branch only dispatches dense F32 (see `decode_step`);
         // f16/MLA would silently fall through to the contiguous kernels while
@@ -247,7 +266,7 @@ impl BatchedModel {
             cfg.kv_lora_rank == 0,
             "paged-KV mode supports dense attention only (MLA paged kernels are follow-ups)"
         );
-        let mut m = Self::build(hip, cfg, w, slots, slots, usize::MAX)?;
+        let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
         m.init_paged(tokens_per_page)?;
         Ok(m)
     }
@@ -431,6 +450,9 @@ impl BatchedModel {
             offsets.push((r * max_pages) as i32);
         }
         let hip = self.k.hip();
+        let oh = hip::host_malloc(hip, offsets.len() * 4)?;
+        self.host_pins.push(oh);
+        self.offsets_host = oh as *mut i32;
         let bt = hip::malloc(hip, self.tables_host.len() * 4)?;
         self.allocs.push(bt);
         hip::memcpy(
@@ -595,6 +617,7 @@ impl BatchedModel {
             max_pages_per_seq: 0,
             block_tables: std::ptr::null_mut(),
             tables_host: Vec::new(),
+            offsets_host: std::ptr::null_mut(),
             table_offsets: std::ptr::null_mut(),
         };
         m.alloc_buffers()?;
@@ -1366,12 +1389,39 @@ impl BatchedModel {
                 self.k.stream,
             )?;
         }
+        self.refresh_table_offsets(&(0..self.batch as u32).collect::<Vec<_>>())?;
         self.run_kernels(self.batch as i32, self.slots_dev, self.run_mask_dev, 0)?;
         let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
             *l += 1;
         }
         Ok(next)
+    }
+
+    /// Paged mode: refills the per-row table offsets for the next step's
+    /// active rows (`offsets[row] = slot[row] * pages_per_seq`) and uploads
+    /// them stream-ordered before the kernels. Prefill packing means `row ==
+    /// slot` no longer holds — every row addresses its sequence's pages via
+    /// this offset. No-op outside paged mode.
+    fn refresh_table_offsets(&mut self, slots: &[u32]) -> Result<(), Error> {
+        if !self.paged {
+            return Ok(());
+        }
+        debug_assert!(slots.len() <= self.rows, "active rows exceed capacity");
+        unsafe {
+            for (r, &s) in slots.iter().enumerate() {
+                *self.offsets_host.add(r) = (s as usize * self.max_pages_per_seq) as i32;
+            }
+            hip::memcpy_async(
+                self.k.hip(),
+                self.table_offsets as *mut core::ffi::c_void,
+                self.offsets_host as *const core::ffi::c_void,
+                slots.len() * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
+        }
+        Ok(())
     }
 
     fn run_kernels(
@@ -1686,16 +1736,11 @@ impl BatchedModel {
                     }
                 } else if self.paged {
                     // Paged decode (dense F32): KV store + attention go through
-                    // the per-slot block tables into the page pool. Default
-                    // identity mapping; `set_block_table` may alias prefix
-                    // physical pages across slots between steps.
-                    // Guard: this first integration assumes row == slot; a
-                    // continuous engine with slot reuse (slots[r] != r) must
-                    // switch to reuse-planner-driven block tables first.
-                    debug_assert!(
-                        (0..b).all(|r| unsafe { *self.slots_host.add(r as usize) } == r),
-                        "paged path requires row == slot (static block tables)"
-                    );
+                    // the per-slot block tables into the page pool. Rows are
+                    // addressed by per-row table offsets (`refresh_table_
+                    // offsets`), so prefill packing (several rows on one slot)
+                    // works alongside plain decode. `set_block_table` may
+                    // alias prefix physical pages across slots between steps.
                     let tpp = self.tokens_per_page as i32;
                     let max_pages = self.max_pages_per_seq as i32;
                     k.launch_kv_store_paged(
@@ -2171,6 +2216,7 @@ impl BatchedModel {
         for (r, &s) in slots.iter().enumerate() {
             self.last_row_by_slot[s as usize] = r;
         }
+        self.refresh_table_offsets(slots)?;
         self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
         self.sampler
             .sample_batched(self.logits, params, counts, bias, self.cfg.vocab_size)
@@ -2464,9 +2510,17 @@ impl BatchedModel {
     /// operate on those, matching the sampled distribution). For the raw model
     /// output, read before sampling (or use a penalty-free greedy step).
     pub fn read_logits(&self) -> Result<Vec<f32>, Error> {
+        self.read_logits_rows(self.batch)
+    }
+
+    /// [`Self::read_logits`] for `n` forwarded rows: a prefill step packed
+    /// into more rows than slots writes `[rows, vocab]`, so row-level
+    /// inspection needs the active count, not the slot count.
+    pub fn read_logits_rows(&self, n: usize) -> Result<Vec<f32>, Error> {
+        debug_assert!(n <= self.rows, "row count exceeds capacity");
         self.k.sync()?;
-        let n = self.batch * self.cfg.vocab_size;
-        let mut out = vec![0.0f32; n];
+        let elems = n * self.cfg.vocab_size;
+        let mut out = vec![0.0f32; elems];
         hip::memcpy(
             self.k.hip(),
             out.as_mut_ptr() as *mut core::ffi::c_void,

@@ -332,6 +332,27 @@ fn assert_close(got: &[f32], want: &[f32], ctx: &str) {
     );
 }
 
+/// One forward over arbitrary rows; returns sampled tokens and the dense
+/// logits head (`n * vocab` entries, row-major by forwarded row).
+fn fwd_rows(
+    m: &mut BatchedModel,
+    toks: &[u32],
+    poss: &[u32],
+    slts: &[u32],
+    vocab: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut params: Vec<SamplingParams> = (0..toks.len())
+        .map(|i| SamplingParams::greedy(1000 + i as u64))
+        .collect();
+    let counts = vec![Vec::<(u32, u32)>::new(); toks.len()];
+    let bias = vec![Vec::<(u32, f32)>::new(); toks.len()];
+    let (sampled, _, _) = m
+        .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias)
+        .unwrap();
+    let logits = m.read_logits_rows(toks.len()).unwrap();
+    (sampled, logits[..toks.len() * vocab].to_vec())
+}
+
 /// Shared-prefix block tables (#78 C1): two sequences whose tables (built by
 /// the content-hash `GpuPagedTableBuilder`) alias the same physical prefix
 /// page must produce results identical to full recompute — and the second
@@ -388,43 +409,91 @@ fn shared_prefix_paged_reuse_matches_full_compute() {
     m.set_block_table(0, ta.pages()).unwrap();
     m.set_block_table(1, tb.pages()).unwrap();
 
-    // One forward over arbitrary rows; returns sampled tokens and the dense
-    // logits head (`n * vocab` entries, row-major by forwarded row).
-    let fwd =
-        |m: &mut BatchedModel, toks: &[u32], poss: &[u32], slts: &[u32]| -> (Vec<u32>, Vec<f32>) {
-            let mut params: Vec<SamplingParams> = (0..toks.len())
-                .map(|i| SamplingParams::greedy(1000 + i as u64))
-                .collect();
-            let counts = vec![Vec::<(u32, u32)>::new(); toks.len()];
-            let bias = vec![Vec::<(u32, f32)>::new(); toks.len()];
-            let (sampled, _, _) = m
-                .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias)
-                .unwrap();
-            let logits = m.read_logits().unwrap();
-            (sampled, logits[..toks.len() * vocab].to_vec())
-        };
-
     // Phase 1: prefix on m is computed by sequence A alone (pages get their
     // values once); references advance independently in their own pools.
     for t in 0..tpp {
         let pos = t as u32;
-        let _ = fwd(&mut m, &[seq_a[t]], &[pos], &[0]);
-        let _ = fwd(&mut r0, &[seq_a[t]], &[pos], &[0]);
-        let _ = fwd(&mut r1, &[seq_b[t]], &[pos], &[0]);
+        let _ = fwd_rows(&mut m, &[seq_a[t]], &[pos], &[0], vocab);
+        let _ = fwd_rows(&mut r0, &[seq_a[t]], &[pos], &[0], vocab);
+        let _ = fwd_rows(&mut r1, &[seq_b[t]], &[pos], &[0], vocab);
     }
 
     // Phase 2: joint deltas/continuations. Sequence B's rows address the
     // prefix through B's table — the physical page written by A.
     for j in tpp..seq_b.len() {
         let pos = j as u32;
-        let (sm, lm) = fwd(&mut m, &[seq_a[j], seq_b[j]], &[pos, pos], &[0, 1]);
-        let (_, la) = fwd(&mut r0, &[seq_a[j]], &[pos], &[0]);
-        let (_, lb) = fwd(&mut r1, &[seq_b[j]], &[pos], &[0]);
+        let (sm, lm) = fwd_rows(&mut m, &[seq_a[j], seq_b[j]], &[pos, pos], &[0, 1], vocab);
+        let (_, la) = fwd_rows(&mut r0, &[seq_a[j]], &[pos], &[0], vocab);
+        let (_, lb) = fwd_rows(&mut r1, &[seq_b[j]], &[pos], &[0], vocab);
         let row_a = &lm[..vocab];
         let row_b = &lm[vocab..2 * vocab];
         assert_close(row_a, &la, &format!("shared-prefix slot A @pos {pos}"));
         assert_close(row_b, &lb, &format!("aliased-prefix slot B @pos {pos}"));
         assert_eq!(sm[0], greedy_argmax(&la), "greedy token A @pos {pos}");
         assert_eq!(sm[1], greedy_argmax(&lb), "greedy token B @pos {pos}");
+    }
+}
+
+/// Paged chunked prefill (#78 C2): several prompt positions of one sequence
+/// packed into distinct rows of a single step must produce the same per-
+/// position logits and greedy tokens as sequential single-token stepping.
+/// Exercises the per-row table-offset refresh (`row != slot`) across two
+/// chunks with different row counts spanning a page boundary region.
+#[test]
+fn batched_paged_chunked_prefill_matches_sequential() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256; tokens_per_page 64
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 71).unwrap();
+    let vocab = cfg.vocab_size;
+
+    let seq: Vec<u32> = (0..24u32).map(|i| (i * 53 + 11) % 1024 + 1).collect();
+
+    // One slot, 16 rows: a prefill step may pack up to 16 positions at once,
+    // every one of them addressed through slot 0's block table.
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 16, tpp).unwrap();
+    let mut r = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+
+    // Sequential reference: capture the logits after each single step.
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(seq.len());
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+
+    // Chunk 1 (12 rows): intra-chunk causality — row `p` attends over exactly
+    // positions 0..=p because kv_store_paged stores all rows before attention.
+    let lens1: Vec<u32> = (0..12u32).collect();
+    let slots1: Vec<u32> = vec![0; 12];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..12], &lens1, &slots1, vocab);
+    for &row in &[5usize, 10, 11] {
+        assert_close(
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("chunk1 row {row} (pos {row})"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "chunk1 greedy row {row}"
+        );
+    }
+
+    // Chunk 2 (8 rows, different shape): rows cross into the next position
+    // range; offsets are refreshed for the new active set.
+    let lens2: Vec<u32> = (12..20u32).collect();
+    let slots2: Vec<u32> = vec![0; 8];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[12..20], &lens2, &slots2, vocab);
+    for &row in &[3usize, 7] {
+        let pos = 12 + row;
+        assert_close(
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "chunk2 greedy row {row} (pos {pos})"
+        );
     }
 }
