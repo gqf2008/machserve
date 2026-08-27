@@ -464,6 +464,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (device f16 served by the f16 paged kernels); MACH_SPEC remains
     // contiguous-only (warned).
     let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
+    // Paged-KV engine: requests sharing a prompt prefix reuse the same
+    // physical KV pages (cross-request prefix sharing). Parsed once up front
+    // and validated against the checkpoint so every mode that supports it
+    // (plain / Q4 / FP8) engages it; MACH_SPEC stays contiguous-only.
+    let paged_tpp: Option<usize> = if paged_requested {
+        let tpp: usize = std::env::var("MACH_TPP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        if tpp == 0 || !cfg.max_seq_len.is_multiple_of(tpp) {
+            eprintln!(
+                "MACH_TPP={tpp} is invalid: must be a non-zero divisor of max_seq_len {}",
+                cfg.max_seq_len
+            );
+            std::process::exit(1);
+        }
+        Some(tpp)
+    } else {
+        None
+    };
     let (engine, engine_handle) = if q4 {
         let wq4: WeightsQ4 =
             load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load q4 weights");
@@ -471,7 +491,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage Q4; host weights stay packed int4, device dequantizes to f16)",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
         );
-        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let eng = if let Some(tpp) = paged_tpp {
+            ServerEngine::with_paged(capacity, prefill_rows, tpp)
+        } else {
+            ServerEngine::with_prefill_rows(capacity, prefill_rows)
+        };
         let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
         (eng, handle)
     } else if fp8 {
@@ -481,7 +505,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage FP8; host weights stay packed E4M3, device dequantizes to f16)",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
         );
-        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let eng = if let Some(tpp) = paged_tpp {
+            ServerEngine::with_paged(capacity, prefill_rows, tpp)
+        } else {
+            ServerEngine::with_prefill_rows(capacity, prefill_rows)
+        };
         let handle = eng.clone().spawn_fp8(hip, cfg, wfp8)?;
         (eng, handle)
     } else if spec {
@@ -522,20 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let eng = if let Some(slots) = moe_slots {
             ServerEngine::with_offload(capacity, prefill_rows, slots)
-        } else if std::env::var("MACH_PAGED").is_ok_and(|v| v != "0") {
-            // Paged-KV engine: requests sharing a prompt prefix reuse the same
-            // physical KV pages (cross-request prefix sharing).
-            let tpp: usize = std::env::var("MACH_TPP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(64);
-            if tpp == 0 || !cfg.max_seq_len.is_multiple_of(tpp) {
-                eprintln!(
-                    "MACH_TPP={tpp} is invalid: must be a non-zero divisor of max_seq_len {}",
-                    cfg.max_seq_len
-                );
-                std::process::exit(1);
-            }
+        } else if let Some(tpp) = paged_tpp {
             ServerEngine::with_paged(capacity, prefill_rows, tpp)
         } else {
             ServerEngine::with_prefill_rows(capacity, prefill_rows)

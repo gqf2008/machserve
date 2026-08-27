@@ -821,6 +821,138 @@ fn paged_engine_evicts_cold_pages_under_pressure() {
     );
 }
 
+/// Concurrent same-prompt decode must not clobber (#80 review fix): the
+/// shared prompt's LAST page is partial (130 tokens, tpp 64) — the first
+/// generated token of every request lands in that page's offsets. Each
+/// request must get its own partial page (reuse covers full pages only), so
+/// A mid-decode and B admitted after A's first token both produce the
+/// reference output.
+#[test]
+fn paged_engine_concurrent_partial_page_does_not_clobber() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256, tpp 64 -> 4 pages/seq; pool = 8
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 57).unwrap();
+
+    // 130 tokens = 2 full pages + a 2-token partial page.
+    let prompt: Vec<u32> = (0..130u32).map(|i| (i * 7 + 1) % 1024 + 1).collect();
+    let want = gen_ref(&hip, cfg, &w, &prompt, 8);
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, 8, tpp).unwrap();
+    let id_a = eng
+        .add(
+            &prompt,
+            8,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    // Run A until its first generated token: A is now decoding and has
+    // written generated KV into the partial page it owns.
+    let mut emitted = false;
+    while !emitted {
+        for (id, _) in eng.step().unwrap() {
+            if id == id_a {
+                emitted = true;
+            }
+        }
+    }
+    // B (identical prompt) is admitted while A is mid-decode.
+    let id_b = eng
+        .add(
+            &prompt,
+            8,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(id_a),
+        want,
+        "A must keep its own generated KV (no clobber)"
+    );
+    assert_eq!(
+        eng.generated(id_b),
+        want,
+        "B must produce the reference output with its own partial page"
+    );
+}
+
+/// First-writer-wins registration must not leak the loser's pages (#80
+/// review fix): two identical prompts admitted before either materializes
+/// allocate duplicate pages; the loser's pages are freed at retire, so a
+/// third identical request still fits the fixed pool and stays correct.
+#[test]
+fn paged_engine_concurrent_identical_prompts_do_not_leak_pool() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // pool = 2 slots * 4 pages = 8
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 59).unwrap();
+    let prompt: Vec<u32> = (0..130u32).map(|i| (i * 11 + 3) % 1024 + 1).collect();
+    let want = gen_ref(&hip, cfg, &w, &prompt, 6);
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, 8, tpp).unwrap();
+    // Both admitted before any step: each allocates its own 4 pages (8 total).
+    let id_a = eng
+        .add(
+            &prompt,
+            6,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    let id_b = eng
+        .add(
+            &prompt,
+            6,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(eng.generated(id_a), want, "A output");
+    assert_eq!(eng.generated(id_b), want, "B output");
+
+    // C reuses A's registered full pages; its partial page is fresh. The
+    // loser's duplicate pages must have been freed at retire, so C still fits.
+    let id_c = eng
+        .add(
+            &prompt,
+            6,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(id_c),
+        want,
+        "C output (pool must not have shrunk)"
+    );
+    let stats = eng.paged_reuse_stats().expect("paged");
+    assert_eq!(stats.requests, 3);
+    assert_eq!(stats.reused_tokens, 2 * tpp, "C reuses the two full pages");
+}
+
 // ---------- paged storage-quantized engines (#80 P3) ----------
 
 /// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors

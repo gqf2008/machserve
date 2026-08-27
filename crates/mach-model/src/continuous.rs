@@ -533,20 +533,24 @@ impl ContinuousModel {
             // Reuse only materialized pages (see PagedEngineState::find_reusable);
             // otherwise compute everything into fresh pages (registered later
             // when this request's prefill completes).
-            let mut r = pg.find_reusable(prompt);
-            if r == prompt.len() {
-                // Full-prefix reuse would leave an empty prefill queue with no
-                // first decode token (step() panics). Keep the last page: it
-                // is recomputed into the (identical-content) aliased page —
-                // benign — and the prefill produces the first token normally.
-                r -= pg.tokens_per_page;
-            }
             // One hash-chain computation per admission: plan() resolves and
             // allocates; the chain is stored for materialization-time
             // registration without rehashing. Pool exhaustion evicts cold
             // retired pages and retries (bounded: each eviction removes an
             // entry; a failed plan/pad frees its own pages, so nothing leaks).
-            let plan = loop {
+            // `r` is recomputed inside the loop: eviction may remove the very
+            // entry it matched, and a stale r would skip prefilling positions
+            // whose pages no longer hold KV.
+            let (plan, r) = loop {
+                let mut r = pg.find_reusable(prompt);
+                if r == prompt.len() {
+                    // Full-prefix reuse would leave an empty prefill queue
+                    // with no first decode token (step() panics). Keep the
+                    // last page: it is recomputed into the (identical-content)
+                    // aliased page — benign — and the prefill produces the
+                    // first token normally.
+                    r -= pg.tokens_per_page;
+                }
                 let mut p = match pg.builder.plan(&i32p, r > 0) {
                     Ok(p) => p,
                     Err(e) => {
@@ -560,7 +564,7 @@ impl ContinuousModel {
                     .builder
                     .pad_table(&mut p.table, self.model.max_pages_per_seq())
                 {
-                    Ok(()) => break p,
+                    Ok(()) => break (p, r),
                     Err(e) => {
                         pg.builder.free_plan_pages(&p, &p.table);
                         if pg.evict_one_retired() {
@@ -888,12 +892,20 @@ impl ContinuousModel {
             // in the pool — later requests may still reuse them.
             // The finishing table's PAD pages (its generated-KV region) are
             // not registered content: free them on retire so long-running
-            // pools never fill with orphaned pads (content pages stay for
-            // reuse; eviction handles them on demand).
+            // pools never fill with orphaned pads. Content pages that LOST a
+            // first-writer-wins race (their hash now maps to a different
+            // physical page — a concurrent identical prompt registered first)
+            // are duplicates: free them too, or the pool shrinks permanently
+            // by one page per lost race.
             if let Some(t) = pg.tables[slot].as_ref() {
-                let content_pages = pg.entries[slot].chain.len();
-                for &page in t.pages().iter().skip(content_pages) {
-                    pg.builder.free_page(page);
+                let chain = &pg.entries[slot].chain;
+                for (i, &page) in t.pages().iter().enumerate() {
+                    let is_content = i < chain.len();
+                    let lost_race = is_content
+                        && chain.get(i).and_then(|h| pg.builder.page_of(h)) != Some(page);
+                    if !is_content || lost_race {
+                        pg.builder.free_page(page);
+                    }
                 }
             }
             let empty = || PagedEntry {
@@ -915,13 +927,14 @@ impl ContinuousModel {
             pg.tables[self.active - 1] = None;
             pg.entries[self.active - 1] = empty();
             pg.retired.push(entry);
-            // Bound the retired metadata: pages stay in the pool either way,
-            // but dropping the oldest entries (via real eviction when
-            // unreferenced) caps host memory growth on long-running servers.
-            // Entries still aliased by live tables are kept until they free up.
+            // Bound the retired metadata: entries whose pages are aliased by
+            // live tables cannot be evicted — drop the oldest entry's metadata
+            // anyway in that case (its pages stay registered in the cache, so
+            // later reuse still resolves; find_reusable degrades to fresh
+            // compute until the pages are evicted on demand).
             while pg.retired.len() > retired_cap {
                 if !pg.evict_one_retired() {
-                    break;
+                    pg.retired.remove(0);
                 }
             }
             self.active -= 1;

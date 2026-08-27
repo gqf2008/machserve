@@ -1350,3 +1350,108 @@ async fn completions_endpoint_paged_shared_prefix_matches_direct_engine() {
         "prompt-token savings must equal the shared prefix"
     );
 }
+
+/// Paged Q4 serving (#80 review fix): the MACH_Q4=1 MACH_PAGED=1
+/// configuration — `ServerEngine::with_paged` + `spawn_q4` — must serve
+/// cross-request prefix reuse over the dequantized f16 path.
+#[tokio::test]
+async fn completions_endpoint_q4_paged_reuses_shared_prefix() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny(); // max_seq 256
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 63).unwrap();
+    let wq4 = to_q4(&w);
+
+    let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 37 + 3) % 1024 + 1).collect();
+    let d_a: Vec<u32> = vec![42, 99];
+    let d_b: Vec<u32> = vec![300, 17, 8];
+    let a: Vec<u32> = prefix.iter().chain(&d_a).copied().collect();
+    let b: Vec<u32> = prefix.iter().chain(&d_b).copied().collect();
+
+    // Reference: the same prompts through the direct paged Q4 engine.
+    let mut cm =
+        ContinuousModel::with_paged_prefill_rows_q4(hip.clone(), cfg, &wq4, 4, 4, tpp).unwrap();
+    let id_a = cm
+        .add(
+            &a,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.is_done(id_a) {
+        cm.step().unwrap();
+    }
+    let id_b = cm
+        .add(
+            &b,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.all_done() {
+        cm.step().unwrap();
+    }
+    let want_a = cm.generated(id_a);
+    let want_b = cm.generated(id_b);
+
+    // Server path: paged engine over spawn_q4 (the Q4 paged branch).
+    let engine = ServerEngine::with_paged(4, 4, tpp);
+    let stats_handle = engine.clone();
+    let _handle = engine.clone().spawn_q4(hip, cfg, wq4).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny-q4".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    let app_ref = &app;
+    let post = |prompt: Vec<u32>, max_new: usize| async move {
+        let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
+        let resp = app_ref
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["choices"][0]["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect::<Vec<u32>>()
+    };
+
+    let got_a = post(a, 3).await;
+    let got_b = post(b, 3).await;
+    assert_eq!(
+        got_a, want_a,
+        "Q4 paged HTTP output A must equal direct engine"
+    );
+    assert_eq!(
+        got_b, want_b,
+        "Q4 paged reused HTTP output B must equal direct engine"
+    );
+    let stats = stats_handle
+        .paged_reuse_stats()
+        .expect("paged Q4 engine reports reuse stats");
+    assert_eq!(stats.reused_tokens, tpp, "Q4 server reuses the shared page");
+}

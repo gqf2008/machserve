@@ -807,5 +807,19 @@
     == 理论值)、端到端 2.84x、后续请求 TTFT 17.4→1.3ms(13.4x)、首请求公平对齐;
   - C7 文档同步:tokenspeed-alignment 状态表/第 4 节勾选、README 性能地图、
     benchmark-results-paged-prefix.md;
-  - 剩余:页池 LRU 驱逐(当前池满即拒)、真实模型同口径 A/B、scheduler_fsm 接入
+  - 剩余:真实模型同口径 A/B、scheduler_fsm 接入(页池驱逐与 paged 量化接线已落地,见 #80)
     continuous.rs(见 tokenspeed-alignment.md 接入计划)。
+
+- **分页 KV 后续(#80 P1-P4,2026-08-27,7900 XTX)**:审查(#79)延迟项兑现——
+  - P1 准入哈希链单次计算(plan/register_chain,免物化重哈希);
+  - P2 MLA 融合 store 内核(边展开边写页池,scratch 退役,净 -87 行);
+  - P3 paged Q4/FP8 接线(with_paged_kv_rows_q4/_fp8,server spawn 分支);
+  - P4 页池驱逐(整条目驱逐+引用守卫+池满重试;退休即还 pad 页与
+    首写者竞争重复页);
+  - 二轮审查(PR #81)修复:复用限整页(部分末页专属,杜绝并发同
+    prompt 生成区覆写)、pad 回滚截断(防双释放)、free_plan_pages 用
+    精确页数、驱逐后 r 重算、paged_guards 改 Err、Q4/FP8 server 分支
+    真正接线(MACH_PAGED 不再静默忽略);
+  - 验证:continuous 20/20(含并发部分末页、并发同 prompt 池不泄漏、
+    驱逐压力)、batched 14/14、server 17/17(含 Q4 paged HTTP e2e)、
+    CPU lib 5 套件、离线门禁 44 内核。

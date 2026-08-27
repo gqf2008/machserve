@@ -295,13 +295,16 @@ impl BatchedModel {
 
     /// Construction-time paged-mode guards shared by every build variant:
     /// page geometry, attention smem bound, dtype coverage (dense F32/F16;
-    /// MLA stays F32-only) — fail loudly here rather than falling through to
-    /// contiguous kernels while owning block tables, or failing mid-request.
+    /// MLA stays F32-only) — fail loudly (as `Err`, not a panic) here rather
+    /// than falling through to contiguous kernels while owning block tables,
+    /// or failing mid-request.
     fn paged_guards(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
-        assert!(
-            cfg.max_seq_len.is_multiple_of(tokens_per_page),
-            "tokens_per_page must divide max_seq_len"
-        );
+        if tokens_per_page == 0 || !cfg.max_seq_len.is_multiple_of(tokens_per_page) {
+            return Err(Error::InvalidArgument(format!(
+                "tokens_per_page {tokens_per_page} must be a non-zero divisor of max_seq_len {}",
+                cfg.max_seq_len
+            )));
+        }
         // The paged attention kernels stage the full per-row score array in
         // dynamic shared memory: `(max_pages * tokens_per_page + 256) * 4` ==
         // `(max_seq_len + 256) * 4` bytes. Enforce the 64 KiB device limit
@@ -320,17 +323,17 @@ impl BatchedModel {
         // The paged decode branch dispatches dense F32/F16 and MLA (F32); any
         // other dtype would silently fall through to the contiguous kernels
         // while still owning block tables. Reject loudly at construction.
-        assert!(
-            matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16),
-            "paged-KV mode supports dense F32/F16 only (got {:?})",
-            cfg.dtype
-        );
-        if cfg.kv_lora_rank > 0 {
-            assert!(
-                cfg.dtype == ModelDType::F32,
+        if !matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16) {
+            return Err(Error::InvalidArgument(format!(
+                "paged-KV mode supports dense F32/F16 only (got {:?})",
+                cfg.dtype
+            )));
+        }
+        if cfg.kv_lora_rank > 0 && cfg.dtype != ModelDType::F32 {
+            return Err(Error::InvalidArgument(format!(
                 "paged-KV mode supports MLA in F32 only (got {:?})",
                 cfg.dtype
-            );
+            )));
         }
         Ok(())
     }

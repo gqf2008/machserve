@@ -692,6 +692,9 @@ pub struct PagedTablePlan {
     pub table: PagedTable,
     /// Prompt tokens covered by materialized, aliased prefix pages.
     pub reused_tokens: usize,
+    /// Aliased prefix pages (exact page count — `reused_tokens` clamps a
+    /// partial final page, which `free_plan_pages` must not misread).
+    pub reused_pages: usize,
     /// Per-page content hashes (chain), in page order.
     pub(crate) chain: Vec<String>,
 }
@@ -748,14 +751,22 @@ impl GpuPagedTableBuilder {
     /// (`allow_reuse`) or allocates fresh pages for every prompt page. The
     /// returned plan carries the chain so [`Self::register_plan`] can register
     /// the content at materialization **without rehashing**.
+    ///
+    /// Reuse covers **full prompt pages only**: a partial last page is always
+    /// allocated fresh. An aliased partial page would be written by every
+    /// request that reuses it — the first generated token lands in that page,
+    /// and two concurrently-active identical prompts would clobber each
+    /// other's generated KV at the same offsets.
     pub fn plan(&mut self, tokens: &[i32], allow_reuse: bool) -> Result<PagedTablePlan, Error> {
         let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
         let chain = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        // Only the leading FULL pages may be aliased (see doc above).
+        let full_pages = tokens.len() / self.tokens_per_page;
         let mut table = PagedTable::new();
         let mut reused_pages = 0usize;
         let mut allocating = false;
-        for h in &chain {
-            if !allocating && allow_reuse {
+        for (page_idx, h) in chain.iter().enumerate() {
+            if !allocating && allow_reuse && page_idx < full_pages {
                 if let Some(&page) = self.cache.get(h) {
                     table.append(page);
                     reused_pages += 1;
@@ -775,10 +786,14 @@ impl GpuPagedTableBuilder {
             };
             table.append(page);
         }
+        // Exact reused-page count (NOT clamped to the token length: the
+        // clamped token figure would undercount a partial final page and
+        // `free_plan_pages` would free an aliased page on pad failure).
         let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
         Ok(PagedTablePlan {
             table,
             reused_tokens,
+            reused_pages,
             chain,
         })
     }
@@ -814,15 +829,18 @@ impl GpuPagedTableBuilder {
     /// shared page) would silently overwrite prompt KV. Rolls back appended
     /// pages on pool exhaustion.
     pub fn pad_table(&mut self, table: &mut PagedTable, max_pages: usize) -> Result<(), Error> {
-        let mut appended: Vec<u32> = Vec::new();
+        let before = table.len();
         while table.len() < max_pages {
             let Some(page) = self.allocator.alloc() else {
-                for p in &appended {
-                    self.allocator.free(*p);
+                // Roll back: truncate the table so the freed pages are not
+                // freed again by the caller's plan cleanup.
+                let appended: Vec<u32> = table.pages()[before..].to_vec();
+                table.truncate(before);
+                for p in appended {
+                    self.allocator.free(p);
                 }
                 return Err(Error::Model("page pool exhausted (pad)".into()));
             };
-            appended.push(page);
             table.append(page);
         }
         Ok(())
@@ -850,10 +868,10 @@ impl GpuPagedTableBuilder {
 
     /// Frees the freshly-allocated (non-reused) pages of a plan — used when a
     /// later step (e.g. padding) fails after the plan itself succeeded, so
-    /// the partially-built table never leaks its pages.
+    /// the partially-built table never leaks its pages. The reused boundary
+    /// is the plan's exact page count (aliased pages are never freed).
     pub fn free_plan_pages(&mut self, plan: &PagedTablePlan, table: &PagedTable) {
-        let reused_pages = plan.reused_tokens / self.tokens_per_page;
-        for page in table.pages().iter().skip(reused_pages) {
+        for page in table.pages().iter().skip(plan.reused_pages) {
             self.allocator.free(*page);
         }
     }
@@ -1535,17 +1553,19 @@ mod tests {
                     b.register_table(&tokens, &table);
 
                     // Shared consistency: rebuilding the same prompt right away
-                    // must reproduce the identical block table — every page is
-                    // cached after the success and no build ran in between to
-                    // change the mapping.
+                    // must reproduce the identical FULL-page prefix — full
+                    // pages are cached after the success; a partial last page
+                    // is per-request fresh by design (reuse covers full pages
+                    // only, so generated KV never shares a partial page).
                     if rng.below(5) == 0 {
                         let (again, r_again) = b.build_table(&tokens).expect("cached rebuild");
+                        let full = tokens.len() / TPP;
                         assert_eq!(
-                            again.pages(),
-                            table.pages(),
-                            "identical prompt => identical block table"
+                            again.pages()[..full],
+                            table.pages()[..full],
+                            "identical prompt => identical full pages"
                         );
-                        assert_eq!(r_again, tokens.len(), "fully cached prompt fully reused");
+                        assert_eq!(r_again, full * TPP, "reuse covers the full pages only");
                     }
 
                     // Shared consistency: same shared prefix, different tail;
@@ -1559,7 +1579,9 @@ mod tests {
                             t2.push(rng.below(VOCAB) as i32);
                         }
                         if let Ok((t2_table, _)) = b.build_table(&t2) {
-                            let shared_pages = p.len().div_ceil(TPP);
+                            // Full pages of the shared prefix are aliased; a
+                            // partial last prefix page is per-request fresh.
+                            let shared_pages = p.len() / TPP;
                             for logical in 0..shared_pages {
                                 assert_eq!(
                                     table.get(logical),
