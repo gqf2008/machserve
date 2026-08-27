@@ -504,10 +504,10 @@ fn add_rejects_prompt_over_max_seq_len() {
     // prefill; the engine must reject it at admission (regression for the
     // silent OOB-write path in the continuous engine).
     let Some(hip) = hip_ctx() else { return };
-    let cfg = Config::tiny(); // max_seq_len = 1024
+    let cfg = Config::tiny(); // max_seq_len = 256
     let w = Weights::random(&cfg, 41).expect("weights");
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 2).unwrap();
-    let long: Vec<u32> = (0..=1024).map(|i| i % 32000).collect(); // 1025 tokens
+    let long: Vec<u32> = (0..=256).map(|i| i % 32000).collect(); // 257 tokens
     assert!(
         eng.add(
             &long,
@@ -521,7 +521,7 @@ fn add_rejects_prompt_over_max_seq_len() {
         "prompt longer than max_seq_len must be rejected"
     );
     // A prompt that exactly fits is still accepted.
-    let fits: Vec<u32> = (0..1024).map(|i| i % 32000).collect();
+    let fits: Vec<u32> = (0..256).map(|i| i % 32000).collect();
     eng.add(
         &fits,
         1,
@@ -539,10 +539,10 @@ fn decode_stops_at_max_seq_len_without_crashing() {
     // the KV cache; the engine must finish it instead of stepping out of
     // bounds (regression for the hard-stop path).
     let Some(hip) = hip_ctx() else { return };
-    let cfg = Config::tiny(); // max_seq_len = 1024
+    let cfg = Config::tiny(); // max_seq_len = 256
     let w = Weights::random(&cfg, 43).expect("weights");
     let mut eng = ContinuousModel::new(hip.clone(), cfg, &w, 1).unwrap();
-    let full: Vec<u32> = (0..1024).map(|i| i % 32000).collect();
+    let full: Vec<u32> = (0..256).map(|i| i % 32000).collect();
     let id = eng
         .add(
             &full,
@@ -565,4 +565,187 @@ fn decode_stops_at_max_seq_len_without_crashing() {
         gens.len()
     );
     assert!(eng.all_done(), "over-length sequence must finish cleanly");
+}
+
+// ---------- paged-KV engine (#78 C5) ----------
+
+fn shared_prefix_prompt(tpp: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 29 + 5) % 1024 + 1).collect();
+    let d_a = vec![7u32, 11];
+    let d_b = vec![300u32, 17, 9];
+    let a = prefix.iter().chain(&d_a).copied().collect();
+    let b = prefix.iter().chain(&d_b).copied().collect();
+    (a, b, prefix)
+}
+
+/// C5a gate: a request sharing a materialized prefix page aliases it and
+/// prefills only its delta; its output equals full recompute, and the
+/// prompt-token savings are counted.
+#[test]
+fn paged_engine_reuses_shared_prefix() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 51).unwrap();
+    let (a, b, _prefix) = shared_prefix_prompt(tpp);
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, 2, tpp).unwrap();
+    let id_a = eng
+        .add(
+            &a,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.is_done(id_a) {
+        eng.step().unwrap();
+    }
+    let id_b = eng
+        .add(
+            &b,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+
+    let stats = eng.paged_reuse_stats().expect("paged engine");
+    assert_eq!(stats.requests, 2);
+    assert_eq!(
+        stats.reused_tokens, tpp,
+        "B reuses exactly the shared prefix page"
+    );
+    assert_eq!(
+        eng.generated(id_b),
+        gen_ref(&hip, cfg, &w, &b, 3),
+        "reused output must equal full recompute"
+    );
+    assert_eq!(
+        eng.generated(id_a),
+        gen_ref(&hip, cfg, &w, &a, 3),
+        "writer output must be intact"
+    );
+    let want_ratio = tpp as f32 / (a.len() + b.len()) as f32;
+    assert!(
+        (stats.reuse_ratio() - want_ratio).abs() < 1e-6,
+        "reuse ratio {} != {want_ratio}",
+        stats.reuse_ratio()
+    );
+}
+
+/// C5a gate: pages are reusable only after materialization — a request added
+/// before its writer prefills falls back to full compute (never reads
+/// unwritten pages) and still produces the reference output.
+#[test]
+fn paged_engine_defers_reuse_until_materialized() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 61).unwrap();
+    let (a, b, _) = shared_prefix_prompt(tpp);
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, 2, tpp).unwrap();
+    let id_a = eng
+        .add(
+            &a,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    // B is admitted before A produced any page content.
+    let id_b = eng
+        .add(
+            &b,
+            2,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    let stats = eng.paged_reuse_stats().expect("paged engine");
+    assert_eq!(stats.reused_tokens, 0, "no materialized page may be reused");
+    assert_eq!(
+        eng.generated(id_a),
+        gen_ref(&hip, cfg, &w, &a, 2),
+        "writer output must be correct"
+    );
+    assert_eq!(
+        eng.generated(id_b),
+        gen_ref(&hip, cfg, &w, &b, 2),
+        "deferred-reuse request must full-compute correctly"
+    );
+}
+
+/// C5a gate: slot compaction in paged mode moves the block table (pages
+/// alias), so a sequence that survives a compaction keeps reading its KV and
+/// stays bit-identical to full recompute.
+#[test]
+fn paged_engine_compaction_moves_tables() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny();
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 71).unwrap();
+    let (a, b, _) = shared_prefix_prompt(tpp);
+
+    // prefill_rows == tpp: A's 66-token prompt drains in exactly two steps
+    // (64 + 2), materializing the shared page before B is admitted.
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, tpp, tpp).unwrap();
+    let id_a = eng
+        .add(
+            &a,
+            6,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    eng.step().unwrap();
+    eng.step().unwrap(); // A prefill complete -> registered
+    let id_b = eng
+        .add(
+            &b,
+            4,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        eng.paged_reuse_stats().unwrap().reused_tokens,
+        tpp,
+        "B reuses the materialized prefix"
+    );
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    assert_eq!(
+        eng.generated(id_b),
+        gen_ref(&hip, cfg, &w, &b, 4),
+        "survivor of compaction must equal full recompute"
+    );
+    assert_eq!(
+        eng.generated(id_a),
+        gen_ref(&hip, cfg, &w, &a, 6),
+        "writer output must be intact"
+    );
 }

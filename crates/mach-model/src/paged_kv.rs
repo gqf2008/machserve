@@ -758,6 +758,51 @@ impl GpuPagedTableBuilder {
         let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
         Ok((table, reused_tokens))
     }
+
+    /// Allocates fresh pages for every token page of `tokens` **without
+    /// consulting or filling the content cache**. Callers whose reuse check
+    /// failed (the matching pages are not materialized yet) must build fresh:
+    /// the pages are aliases only for this request, and the content is
+    /// registered later via [`Self::register_table`] once the KV is written.
+    pub fn build_table_fresh(&mut self, tokens: &[i32]) -> Result<PagedTable, Error> {
+        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
+        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        let mut table = PagedTable::new();
+        let mut fresh_this_call: Vec<(String, u32)> = Vec::new();
+        for h in &hashes {
+            // Allocation-only: a cached page for this content may not hold KV
+            // yet, so we never alias it here (register_table decides when a
+            // page is reusable). Hashes are registered at materialization.
+            let Some(page) = self.allocator.alloc() else {
+                for (_hash, page) in fresh_this_call {
+                    self.allocator.free(page);
+                }
+                return Err(Error::Model("page pool exhausted".into()));
+            };
+            fresh_this_call.push((h.clone(), page));
+            table.append(page);
+        }
+        Ok(table)
+    }
+
+    /// Registers `table`'s pages under `tokens`' content hashes — call only
+    /// once the pages actually hold the KV (prefill materialized). Later
+    /// `build_table` calls reuse the chain from this point on. First writer
+    /// wins: when two requests computed the same content into *different*
+    /// fresh pages (both admitted before either materialized), only the first
+    /// registration maps the hash; the second request's duplicate pages stay
+    /// private to its own table (its table still addresses them directly), and
+    /// later reuse resolves to the registered ones.
+    pub fn register_table(&mut self, tokens: &[i32], table: &PagedTable) {
+        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
+        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        for (h, &logical) in hashes.iter().zip(table.pages()) {
+            if self.cache.contains_key(h) {
+                continue;
+            }
+            self.cache.insert(h.clone(), logical);
+        }
+    }
 }
 
 #[cfg(test)]
