@@ -1238,3 +1238,115 @@ async fn completions_endpoint_mla_matches_direct_engine() {
         .collect();
     assert_eq!(got, want, "server MLA output must equal direct engine run");
 }
+
+/// Paged-KV server e2e (#78 C5b): two HTTP requests sharing a system-prompt
+/// prefix alias the same physical KV pages — the second request's output
+/// equals a direct paged-engine run and the engine reports the exact
+/// prompt-token savings.
+#[tokio::test]
+async fn completions_endpoint_paged_shared_prefix_matches_direct_engine() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 61).unwrap();
+
+    let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 37 + 3) % 1024 + 1).collect();
+    let d_a: Vec<u32> = vec![42, 99];
+    let d_b: Vec<u32> = vec![300, 17, 8];
+    let a: Vec<u32> = prefix.iter().chain(&d_a).copied().collect();
+    let b: Vec<u32> = prefix.iter().chain(&d_b).copied().collect();
+
+    // Reference: the same prompts through a direct paged engine (sequential —
+    // A fully materializes its pages before B reuses them).
+    let mut cm = ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 4, 4, tpp).unwrap();
+    let id_a = cm
+        .add(
+            &a,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.is_done(id_a) {
+        cm.step().unwrap();
+    }
+    let id_b = cm
+        .add(
+            &b,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.all_done() {
+        cm.step().unwrap();
+    }
+    let want_a = cm.generated(id_a);
+    let want_b = cm.generated(id_b);
+
+    // Server path (paged engine). A second engine handle reads the reuse
+    // stats snapshot after both requests complete.
+    let engine = ServerEngine::with_paged(4, 4, tpp);
+    let stats_handle = engine.clone();
+    let _handle = engine.clone().spawn(hip, cfg, w).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    let app_ref = &app;
+    let post = |prompt: Vec<u32>, max_new: usize| async move {
+        let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
+        let resp = app_ref
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["choices"][0]["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect::<Vec<u32>>()
+    };
+
+    // First request writes the shared prefix pages; the second reuses them.
+    let got_a = post(a, 3).await;
+    let got_b = post(b, 3).await;
+    assert_eq!(
+        got_a, want_a,
+        "paged HTTP output A must equal direct engine"
+    );
+    assert_eq!(
+        got_b, want_b,
+        "reused HTTP output B must equal direct engine"
+    );
+
+    let stats = stats_handle
+        .paged_reuse_stats()
+        .expect("paged engine reports reuse stats");
+    assert_eq!(stats.reused_tokens, tpp, "B reuses exactly the shared page");
+    assert_eq!(stats.requests, 2);
+    assert_eq!(
+        stats.reused_tokens, tpp,
+        "prompt-token savings must equal the shared prefix"
+    );
+}

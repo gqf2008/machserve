@@ -8,7 +8,9 @@
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
 //! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
-//! host weights: int4 or E4M3, dequantized to f16 on the device).
+//! host weights: int4 or E4M3, dequantized to f16 on the device),
+//! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
+//! MACH_TPP (KV page size in tokens, default 64).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
@@ -511,6 +513,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let eng = if let Some(slots) = moe_slots {
             ServerEngine::with_offload(capacity, prefill_rows, slots)
+        } else if std::env::var("MACH_PAGED").is_ok_and(|v| v != "0") {
+            // Paged-KV engine: requests sharing a prompt prefix reuse the same
+            // physical KV pages (cross-request prefix sharing).
+            let tpp: usize = std::env::var("MACH_TPP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
+            ServerEngine::with_paged(capacity, prefill_rows, tpp)
         } else {
             ServerEngine::with_prefill_rows(capacity, prefill_rows)
         };
