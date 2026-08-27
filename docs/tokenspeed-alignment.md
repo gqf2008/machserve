@@ -30,8 +30,8 @@
 | MoE（Kimi-K3 / flashinfer tactics） | MoE 全链路：router + 分组 GEMM + 连续批处理 + HTTP | ✅ 已对齐 |
 | 连续批处理 / 请求生命周期 | `continuous.rs`（prefill/decode 混合、EOS、槽位压缩） | 🟡 功能对齐，无显式 FSM |
 | Agentic state reuse | `state_reuse.rs`（token 边界锚点 + 增量 prefill，dense/moe/mla 对拍） | 🟡 同会话多轮复用；**不跨请求** |
-| **分页 KV + 块表 + LCM 块池** | `kv_block_pool.rs` 已移植（LCM 放置 + 块表 + RAII）；静态槽位尚未替换 | ❌ **架构缺口（地基已备，待接入）** |
-| **全局前缀缓存（SHA-256 前缀哈希链 + matcher）** | `prefix_cache.rs` + `reuse_planner.rs` + `prefix_kv.rs`：CPU 参考路径已实现**跨请求前缀共享**（共享前缀的请求只算 delta，复用 logits 与全算逐位一致） | 🟡 已打通 CPU 路径；GPU（batched.rs）接线待做 |
+| **分页 KV + 块表 + LCM 块池** | `kv_block_pool.rs`（LCM 放置 + 块表 + RAII）+ `with_paged_kv`（per-slot 块表，f16/MLA 分页内核已接线，chunked prefill 按行寻址）；服务链 `MACH_PAGED=1` 可跑 | ✅ **GPU 已接入 + 真机 A/B（见第 4 节）**；剩余：页池驱逐/LRU（当前池满即拒） |
+| **全局前缀缓存（SHA-256 前缀哈希链 + matcher）** | `prefix_cache.rs` + `reuse_planner.rs` + `prefix_kv.rs` CPU 参考已实现（复用 logits == 全算逐位一致）；GPU 侧 `GpuPagedTableBuilder` 内容哈希页复用 + `ContinuousModel` 物化水位门控（C5a） | ✅ **GPU 服务链已闭环 + 真机 A/B**（78.8% 提示词节省、后续请求 TTFT 13.4x，见 `docs/benchmark-results-paged-prefix.md`）；剩余：真实模型同口径 A/B |
 | **调度器 FSM（7 状态 + 事件 + Retracted/WriteBack/LoadBack）** | `scheduler_fsm.rs` 已移植（7 状态 + 12 事件，非法迁移 panic） | 🟡 已实现，未接入 `continuous.rs` |
 | KV 缓存事件（PD 跨节点） | 无（单节点） | ⏸ 单卡目标暂不需要 |
 | spec-decode | 已实现；实测 0.29x 净负，暂停 | ⏸ 需更便宜草稿/批量形态 |
@@ -65,13 +65,14 @@
    运行全部完成、贪心解码与全算逐位一致、prompt 复用 71%；容量 2 的引擎槽位
    复用跑完 5 个排队请求）。
 
-### 接入计划（后续批次，非本分支）
+### 接入计划（后续批次）
 
-- 把 `BlockPool`/`BlockTable` 接到 `batched.rs` 的 KV 布局：静态槽位 → 分页表，
-  长上下文内存按需分配、可驱逐。
-- 用 `prefix_cache` 做跨请求前缀共享：系统提示/工具定义被并发请求复用，多轮
-  TTFT 对标 FreeToken 报告的 65–80% 降幅。
-- 用 `scheduler_fsm` 替换 `continuous.rs` 的隐式生命周期，补 Retracted
+- ✅ 把 `BlockTable` 接到 `batched.rs` 的 KV 布局：静态槽位 → 分页表（#78 C1-C4，
+  `with_paged_kv` / `with_paged_kv_rows`；长上下文按需分配/驱逐的页池 LRU 仍待做）。
+- ✅ 用内容哈希页复用做跨请求前缀共享：`ContinuousModel::with_paged_prefill_rows` +
+  `MACH_PAGED=1`，真机 TTFT/TPOT 已记录（`docs/benchmark-results-paged-prefix.md`，
+  78.8% 提示词节省 ≈ FreeToken 65–80% 带）。
+- ⏳ 用 `scheduler_fsm` 替换 `continuous.rs` 的隐式生命周期，补 Retracted
   （WriteBack/LoadBack 容量驱逐），与 MoE offload（`moe_backend`）协同。
 
 ## 4. 验收清单（对齐门禁）
@@ -85,19 +86,24 @@
 - [x] CPU 参考路径：跨请求前缀共享（复用 logits == 全算，逐位一致；delta-only 计算）
 - [x] CPU 分页调度器：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
 - [x] CPU 连续批处理引擎：队列/槽位复用/交错 prefill+decode + 前缀复用（GPU 接线参考）
-- [ ] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（需真机 A/B：TTFT/TPOT）
-  - 地基已备：`paged_kv.rs`（块表 + 页分配器 + 分页 attention + **分页参考变压器
-    `PagedRef`**：全 transformer 分页 KV == RefModel 逐位一致；共享前缀物理页下
-    结果正确、共享页 KV 逐位一致）、`kv_store_paged`/`ATTN_DECODE_PAGED` 内核
-    （38 内核离线门禁全过 + **7900 XTX 真机对拍逐位一致**）；
-  - **batched.rs 已接入**（`BatchedModel::with_paged_kv`，稠密 F32 decode 走分页
-    内核；静态恒等块表映射，GPU 上 70 token 跨 2 页与静态路径对拍通过）；
-  - **共享前缀已备**：`GpuPagedTableBuilder`（按内容哈希复用前缀物理页 + 块表
-    构造 + 压力测试）+ **f16 分页内核**（`kv_store_paged_f16`/`attn_decode_paged_f16_gqa`，
-    40 内核离线门禁）；
-    剩余：共享前缀页接入 decode（用 #57 块表替换静态恒等映射）+ f16/MLA/prefill
-    分页接入 + 真机 A/B（TTFT/TPOT）
+- [x] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（#78 C1-C6，7900 XTX 真机 A/B）
+  - 地基：`paged_kv.rs`（块表 + 页分配器 + 分页 attention + **分页参考变压器
+    `PagedRef`** == RefModel 逐位一致）、`kv_store_paged`/`attn_decode_paged`
+    内核 + 真机对拍逐位一致；
+  - **batched.rs 已接入**：`BatchedModel::with_paged_kv`（F32）→ C1 per-slot
+    块表（`set_block_table`，共享前缀混叠页，复用 logits == 全算）→ C2
+    chunked prefill（per-row 偏移刷新，行打包逐位对拍）→ C3 f16 分页内核
+    接线（70 步跨 2 页对拍）→ C4 MLA 分页接线（assemble-rows/store/batched-attn，
+    46 内核离线门禁）；
+  - **共享前缀已接入服务链**：`ContinuousModel::with_paged_prefill_rows`
+    （物化水位门控复用 + 表搬移压缩 + `paged_reuse_stats`）+ `MACH_PAGED=1`
+    HTTP e2e（输出 == 直接引擎）；
+  - **真机 A/B 完成**：5 请求共享 64-token 页 → 提示词节省 78.8%（== 理论值）、
+    端到端 2.84x、后续请求 TTFT 13.4x（`docs/benchmark-results-paged-prefix.md`）；
+  - 剩余：页池驱逐/LRU（当前容量=capacity×pages，满即拒）、真实模型同口径
+    A/B、`scheduler_fsm` 替换 `continuous.rs` 隐式生命周期（见接入计划）
 - [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
       释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
       池满时 LRU 驱逐最冷页（索引 + 主机页 + 释放块），缓存有界
-- [ ] README/roadmap 同步（对齐状态表更新，不再把「静态 KV」当长期设计）
+- [x] README/roadmap 同步（对齐状态表更新，不再把「静态 KV」当长期设计；本文件状态表与
+      第 4 节已勾选更新，README 性能地图与 roadmap 日志已同步，见 #78 C7）

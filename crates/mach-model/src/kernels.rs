@@ -489,8 +489,6 @@ extern "C" __global__ void kv_store_paged(const float* kv, float* pool,
 /// block tables from a page pool (`[num_pages, tokens_per_page, kv_heads,
 /// head_dim]`), enabling cross-request prefix sharing. Mirrors the CPU
 /// reference in `paged_kv.rs`; covered by the offline hiprtc compile gate.
-/// Not yet wired into `batched.rs` (the paged-KV integration batch), so it is
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const ATTN_DECODE_PAGED: &str = r#"
 extern "C" __global__ void attn_decode_paged(
     const float* __restrict__ q,
@@ -563,7 +561,6 @@ extern "C" __global__ void attn_decode_paged(
 /// the page pool holds f16 bit patterns (`unsigned short`) instead of f32 —
 /// the store counterpart of `attn_decode_paged_f16_gqa`. Converts each f32 K/V
 /// element to f16 before writing, following `kv_store_batched_f16`.
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const KV_STORE_PAGED_F16: &str = r#"
 __device__ inline unsigned short f32_to_f16_bits(float x) {
     _Float16 h = (_Float16)x;
@@ -599,8 +596,6 @@ extern "C" __global__ void kv_store_paged_f16(const float* kv,
 /// (`unsigned short`, `[num_pages, tokens_per_page, kv_heads, head_dim]`) that
 /// are read back to f32 for the softmax math, following the f16 reads in
 /// `attn_decode_batched_f16_gqa`. Covered by the offline hiprtc compile gate.
-/// Not yet wired into `batched.rs` (the paged-KV integration batch), so it is
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const ATTN_DECODE_PAGED_F16_GQA: &str = r#"
 __device__ inline float f16_bits_to_f32(unsigned short u) {
     union { _Float16 h; unsigned short u; } c;
@@ -682,7 +677,6 @@ extern "C" __global__ void attn_decode_paged_f16_gqa(
 /// `attn_decode_paged_mla` (mirrors `store_row_paged_mla` in `paged_kv.rs`).
 /// Same addressing/style as `kv_store_paged`, but per-head MLA layout and both
 /// K/V rows written in one launch.
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
 const KV_STORE_PAGED_MLA: &str = r#"
 extern "C" __global__ void kv_store_paged_mla(
     const float* __restrict__ k, const float* __restrict__ v,
@@ -718,14 +712,89 @@ extern "C" __global__ void kv_store_paged_mla(
 }
 "#;
 
+/// Paged MLA decode attention (batched): grid `[batch*n_heads]`; reads the KV
+/// prefix `0..=pos` through per-row block tables from the per-head MLA page
+/// pools (`[num_pages, tokens_per_page, heads, hd]` k with hd = nope + rope /
+/// `[num_pages, tokens_per_page, heads, v_head_dim]` v). Combines the row
+/// indexing of `mla_attn_decode_batched` with the block-table addressing of
+/// `attn_decode_paged`, so a whole multi-row step launches once.
+const ATTN_DECODE_PAGED_MLA_BATCHED: &str = r#"
+extern "C" __global__ void attn_decode_paged_mla_batched(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int nope, int rope, int v_hd,
+    float scale, int tokens_per_page, int max_pages) {
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* red = smem + max_pages * tokens_per_page;
+
+    int hd = nope + rope;
+    int s = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    int pos = pos_buf[s];
+    const int* table = block_tables + table_offsets[s];
+    const float* qh = q + ((long long)s * n_heads + h) * hd;
+
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        int logical = p / tokens_per_page;
+        int off = p % tokens_per_page;
+        int page = table[logical];
+        const float* kp = k_pool + ((long long)page * tokens_per_page + off) * n_heads * hd + h * hd;
+        float sc = 0.0f;
+        for (int dd = 0; dd < hd; dd++) sc += qh[dd] * kp[dd];
+        scores[p] = sc * scale;
+    }
+    __syncthreads();
+
+    float maxv = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) maxv = fmaxf(maxv, scores[p]);
+    red[threadIdx.x] = maxv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float m = red[0];
+
+    float sumv = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) sumv += __expf(scores[p] - m);
+    red[threadIdx.x] = sumv;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    float ssum = red[0];
+
+    for (int dd = threadIdx.x; dd < v_hd; dd += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = table[logical];
+            const float* vp = v_pool + ((long long)page * tokens_per_page + off) * n_heads * v_hd + h * v_hd + dd;
+            acc += __expf(scores[p] - m) * (*vp);
+        }
+        out[((long long)s * n_heads + h) * v_hd + dd] = acc / ssum;
+    }
+}
+"#;
+
 /// Paged MLA decode attention: per-head (no GQA grouping) reads the KV prefix
 /// `0..=pos` through the block table from the per-head MLA page pools
 /// (`[num_pages, tokens_per_page, heads, hd]` k / `[num_pages,
 /// tokens_per_page, heads, v_head_dim]` v), mirroring
 /// `paged_attention_decode_mla` in `paged_kv.rs` with the softmax structure of
 /// `mla_attn_decode_batched` / `attn_decode_paged`. One block per head, the
-/// assembled q row is `[heads, hd]`.
-#[allow(dead_code)] // wired into batched.rs in the paged-KV integration batch
+/// assembled q row is `[heads, hd]`. Gate-only: the batched paged wiring uses
+/// `attn_decode_paged_mla_batched` (rows launch together), so this per-row
+/// variant stays covered by the offline compile gate.
+#[allow(dead_code)] // offline gate only (batched wiring uses the _BATCHED sibling)
 const ATTN_DECODE_PAGED_MLA: &str = r#"
 extern "C" __global__ void attn_decode_paged_mla(
     const float* __restrict__ q,
@@ -873,6 +942,39 @@ extern "C" __global__ void mla_assemble_kv_batched(
         int slot = slots[s];
         int pos = pos_buf[s];
         vc[((long long)slot * max_seq + pos) * n_heads * v_hd + h * v_hd + dd] =
+            kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
+    }
+}
+"#;
+
+/// MLA batched: expand kv + shared k_rope into plain row-indexed scratch
+/// (`[batch, heads*hd]` / `[batch, heads*v_hd]`) — the paged counterpart of
+/// `mla_assemble_kv_batched`: its output goes through `kv_store_paged_mla`
+/// into the block-table page pools instead of the contiguous caches.
+const MLA_ASSEMBLE_KV_ROWS: &str = r#"
+extern "C" __global__ void mla_assemble_kv_rows(
+    const float* __restrict__ kv, const float* __restrict__ k_rope,
+    float* __restrict__ k_rows, float* __restrict__ v_rows,
+    int batch, int n_heads, int nope, int rope, int v_hd) {
+    int hd = nope + rope;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * n_heads * hd;
+    if (i < total) {
+        int s = i / (n_heads * hd);
+        int rem = i % (n_heads * hd);
+        int h = rem / hd;
+        int dd = rem % hd;
+        k_rows[i] = (dd < nope)
+            ? kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + dd]
+            : k_rope[(long long)s * rope + (dd - nope)];
+    }
+    int total_v = batch * n_heads * v_hd;
+    if (i < total_v) {
+        int s = i / (n_heads * v_hd);
+        int rem = i % (n_heads * v_hd);
+        int h = rem / v_hd;
+        int dd = rem % v_hd;
+        v_rows[i] =
             kv[(long long)s * n_heads * (nope + v_hd) + h * (nope + v_hd) + nope + dd];
     }
 }
@@ -1585,6 +1687,11 @@ pub struct HipKernels {
     attn_decode_batched: HipKernelModule,
     kv_store_paged: HipKernelModule,
     attn_decode_paged: HipKernelModule,
+    kv_store_paged_f16: HipKernelModule,
+    attn_decode_paged_f16_gqa: HipKernelModule,
+    kv_store_paged_mla: HipKernelModule,
+    mla_assemble_kv_rows: HipKernelModule,
+    attn_decode_paged_mla_batched: HipKernelModule,
     argmax_batched: HipKernelModule,
     cast_f32_f16: HipKernelModule,
     cast_f16_f32: HipKernelModule,
@@ -1710,6 +1817,23 @@ impl HipKernels {
             attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
             kv_store_paged: compile_cached(&arch, KV_STORE_PAGED, "kv_store_paged")?,
             attn_decode_paged: compile_cached(&arch, ATTN_DECODE_PAGED, "attn_decode_paged")?,
+            kv_store_paged_f16: compile_cached(&arch, KV_STORE_PAGED_F16, "kv_store_paged_f16")?,
+            attn_decode_paged_f16_gqa: compile_cached(
+                &arch,
+                ATTN_DECODE_PAGED_F16_GQA,
+                "attn_decode_paged_f16_gqa",
+            )?,
+            kv_store_paged_mla: compile_cached(&arch, KV_STORE_PAGED_MLA, "kv_store_paged_mla")?,
+            mla_assemble_kv_rows: compile_cached(
+                &arch,
+                MLA_ASSEMBLE_KV_ROWS,
+                "mla_assemble_kv_rows",
+            )?,
+            attn_decode_paged_mla_batched: compile_cached(
+                &arch,
+                ATTN_DECODE_PAGED_MLA_BATCHED,
+                "attn_decode_paged_mla_batched",
+            )?,
             argmax_batched: compile_cached(&arch, ARGMAX_BATCHED, "argmax_batched")?,
             cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
             cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
@@ -2775,6 +2899,238 @@ impl HipKernels {
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    /// Paged KV store (f16 page pool): `kv_store_paged` with the pool holding
+    /// f16 bit patterns; K/V rows stay f32 and are converted on write.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_paged_f16(
+        &self,
+        kv: *const f32,
+        pool: *mut u16,
+        pos: *const i32,
+        table_offsets: *const i32,
+        block_tables: *const i32,
+        batch: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let pp = pool;
+        let posp = pos;
+        let toff = table_offsets;
+        let bt = block_tables;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &pp as *const *mut u16 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * kv_heads * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .kv_store_paged_f16
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Paged decode attention (f16 KV): reads f16-bit-pattern pages back to
+    /// f32 for the softmax; same addressing/launch shape as
+    /// `launch_attn_decode_paged`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_paged_f16_gqa(
+        &self,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+        max_pages: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let bt = block_tables;
+        let op = out;
+        let pp = pos;
+        let toff = table_offsets;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &max_pages as *const i32 as *mut core::ffi::c_void,
+        ];
+        let shared = ((max_pages * tokens_per_page + 256) * 4) as u32;
+        Ok(self.attn_decode_paged_f16_gqa.launch_shmem(
+            [(batch * n_heads) as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
+    /// MLA batched: expand kv/k_rope into plain row-indexed k/v scratch rows
+    /// consumed by `launch_kv_store_paged_mla` (the paged variant of
+    /// `launch_mla_assemble_kv_batched`, which writes the caches directly).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_assemble_kv_rows(
+        &self,
+        kv: *const f32,
+        k_rope: *const f32,
+        k_rows: *mut f32,
+        v_rows: *mut f32,
+        batch: i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+        v_hd: i32,
+    ) -> Result<(), Error> {
+        let kvp = kv;
+        let rp = k_rope;
+        let kp = k_rows;
+        let vp = v_rows;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &rp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *mut f32 as *mut core::ffi::c_void,
+            &vp as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads * (nope + rope)).max(batch * n_heads * v_hd) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .mla_assemble_kv_rows
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Paged MLA KV store: writes both assembled per-head rows (`[batch,
+    /// heads*hd]` / `[batch, heads*v_hd]`) into the MLA page pools at the
+    /// block-table position of each row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_paged_mla(
+        &self,
+        k: *const f32,
+        v: *const f32,
+        k_pool: *mut f32,
+        v_pool: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        block_tables: *const i32,
+        batch: i32,
+        heads: i32,
+        hd: i32,
+        v_hd: i32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        let kp = k;
+        let vp = v;
+        let kpp = k_pool;
+        let vpp = v_pool;
+        let pp = pos;
+        let toff = table_offsets;
+        let bt = block_tables;
+        let mut p = vec![
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &kpp as *const *mut f32 as *mut core::ffi::c_void,
+            &vpp as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &heads as *const i32 as *mut core::ffi::c_void,
+            &hd as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * heads * hd).max(batch * heads * v_hd) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .kv_store_paged_mla
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Paged MLA decode attention (batched rows): reads the per-head MLA page
+    /// pools through the block tables; one launch covers `[batch*n_heads]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_paged_mla_batched(
+        &self,
+        q: *const f32,
+        k_pool: *const f32,
+        v_pool: *const f32,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        nope: i32,
+        rope: i32,
+        v_hd: i32,
+        scale: f32,
+        tokens_per_page: i32,
+        max_pages: i32,
+    ) -> Result<(), Error> {
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let bt = block_tables;
+        let op = out;
+        let pp = pos;
+        let toff = table_offsets;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &bt as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &pp as *const *const i32 as *mut core::ffi::c_void,
+            &toff as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &nope as *const i32 as *mut core::ffi::c_void,
+            &rope as *const i32 as *mut core::ffi::c_void,
+            &v_hd as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &max_pages as *const i32 as *mut core::ffi::c_void,
+        ];
+        let shared = ((max_pages * tokens_per_page + 256) * 4) as u32;
+        Ok(self.attn_decode_paged_mla_batched.launch_shmem(
+            [(batch * n_heads) as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
     /// Paged decode attention (batched): reads the KV prefix through per-row
     /// block tables from the page pool.
     #[allow(clippy::too_many_arguments)]
@@ -3229,6 +3585,8 @@ mod offline_tests {
         ATTN_DECODE_PAGED_F16_GQA,
         KV_STORE_PAGED_MLA,
         ATTN_DECODE_PAGED_MLA,
+        MLA_ASSEMBLE_KV_ROWS,
+        ATTN_DECODE_PAGED_MLA_BATCHED,
     ];
 
     #[test]

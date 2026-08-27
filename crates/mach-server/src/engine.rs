@@ -44,11 +44,17 @@ pub struct ServerEngine {
     spec_k: usize,
     /// MoE offload (cpu backend): GPU-resident expert slots per layer; None = full.
     offload_slots: Option<usize>,
+    /// Paged-KV mode: KV in a page pool with cross-request prefix reuse;
+    /// `Some(tokens_per_page)` when enabled.
+    paged_tpp: Option<usize>,
     pending: Mutex<VecDeque<Request>>,
     cond: Condvar,
     txs: Mutex<HashMap<SeqId, DoneSender>>,
     /// Streaming token channels per active sequence.
     streams: Mutex<HashMap<SeqId, tokio::sync::mpsc::Sender<u32>>>,
+    /// Cross-request reuse stats snapshot (paged engines; updated by the
+    /// engine thread after every step).
+    paged_stats: Mutex<Option<mach_model::continuous::PagedReuseStats>>,
     /// Graceful-shutdown flag: the engine thread drains then exits.
     shutdown: AtomicBool,
 }
@@ -97,11 +103,34 @@ impl ServerEngine {
             false,
             0,
             Some(expert_slots),
+            None,
         )
     }
 
     fn with_mode(capacity: usize, prefill_rows: usize, spec: bool, spec_k: usize) -> Arc<Self> {
-        Self::with_mode_offload(capacity, prefill_rows, spec, spec_k, None)
+        Self::with_mode_offload(capacity, prefill_rows, spec, spec_k, None, None)
+    }
+
+    /// Creates a paged-KV engine (`tokens_per_page` page size): requests whose
+    /// prompts share a prefix alias the same physical KV pages and prefill
+    /// only their delta (cross-request prefix reuse).
+    #[must_use]
+    pub fn with_paged(capacity: usize, prefill_rows: usize, tokens_per_page: usize) -> Arc<Self> {
+        Self::with_mode_offload(
+            capacity,
+            prefill_rows.max(capacity),
+            false,
+            0,
+            None,
+            Some(tokens_per_page),
+        )
+    }
+
+    /// Cross-request prefix-reuse statistics of a paged engine (updated by
+    /// the engine thread after every step), else `None`.
+    #[must_use]
+    pub fn paged_reuse_stats(&self) -> Option<mach_model::continuous::PagedReuseStats> {
+        *self.paged_stats.lock().unwrap()
     }
 
     fn with_mode_offload(
@@ -110,6 +139,7 @@ impl ServerEngine {
         spec: bool,
         spec_k: usize,
         offload_slots: Option<usize>,
+        paged_tpp: Option<usize>,
     ) -> Arc<Self> {
         Arc::new(Self {
             capacity,
@@ -117,10 +147,12 @@ impl ServerEngine {
             spec,
             spec_k,
             offload_slots,
+            paged_tpp,
             pending: Mutex::new(VecDeque::new()),
             cond: Condvar::new(),
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            paged_stats: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -240,7 +272,16 @@ impl ServerEngine {
         cfg: Config,
         w: Weights,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
-        let mut model = if let Some(slots) = self.offload_slots {
+        let mut model = if let Some(tpp) = self.paged_tpp {
+            ContinuousModel::with_paged_prefill_rows(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                tpp,
+            )?
+        } else if let Some(slots) = self.offload_slots {
             ContinuousModel::with_prefill_rows_offload(
                 hip,
                 cfg,
@@ -334,25 +375,39 @@ impl ServerEngine {
                 let mut streams = self.streams.lock().unwrap();
                 while !pending.is_empty() && model.active() < self.capacity {
                     let r = pending.pop_front().expect("checked non-empty");
-                    let id = model
-                        .add(
-                            &r.prompt,
-                            r.max_new,
-                            r.eos,
-                            r.stop_seqs,
-                            r.logit_bias,
-                            r.params,
-                        )
-                        .expect("capacity guaranteed");
-                    txs.insert(id, r.done);
-                    if let Some(stx) = r.tokens_tx {
-                        streams.insert(id, stx);
+                    match model.add(
+                        &r.prompt,
+                        r.max_new,
+                        r.eos,
+                        r.stop_seqs,
+                        r.logit_bias,
+                        r.params,
+                    ) {
+                        Ok(id) => {
+                            txs.insert(id, r.done);
+                            if let Some(stx) = r.tokens_tx {
+                                streams.insert(id, stx);
+                            }
+                        }
+                        // Admission failure (e.g. paged page-pool exhaustion):
+                        // reject the request instead of panicking the engine
+                        // thread while holding the pending/txs locks. The
+                        // oneshot delivers an empty completion; the caller
+                        // sees an empty generation rather than a hang.
+                        Err(e) => {
+                            eprintln!("engine: rejecting request: {e}");
+                            let _ = r.done.send((Vec::new(), Vec::new(), Vec::new(), "error"));
+                            drop(r.tokens_tx);
+                        }
                     }
                 }
                 drop(streams);
             }
             if model.active() > 0 {
                 let outputs = model.step().expect("engine step");
+                if self.paged_tpp.is_some() {
+                    *self.paged_stats.lock().unwrap() = model.paged_reuse_stats();
+                }
                 // Deliver completed sequences.
                 let mut txs = self.txs.lock().unwrap();
                 let mut streams = self.streams.lock().unwrap();

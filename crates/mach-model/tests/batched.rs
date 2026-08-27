@@ -6,6 +6,8 @@ use mach_kernel_sys::hip;
 use mach_model::batched::BatchedModel;
 use mach_model::config::ModelDType;
 use mach_model::model::GpuModel;
+use mach_model::paged_kv::GpuPagedTableBuilder;
+use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 
 /// Paged-KV decode must match the static (contiguous) decode on the GPU: the
@@ -305,5 +307,461 @@ fn batched_sequences_are_independent() {
         }
         assert_ne!(got[0], got[1], "different input tokens must diverge");
         prev = Some(got);
+    }
+}
+
+fn greedy_argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
+        .map(|(i, _)| i as u32)
+        .unwrap()
+}
+
+fn assert_close(got: &[f32], want: &[f32], ctx: &str) {
+    let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    let d = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        d <= 1e-4 + 1e-4 * scale,
+        "{ctx}: logits max diff {d} (scale {scale})"
+    );
+}
+
+/// One forward over arbitrary rows; returns sampled tokens and the dense
+/// logits head (`n * vocab` entries, row-major by forwarded row).
+fn fwd_rows(
+    m: &mut BatchedModel,
+    toks: &[u32],
+    poss: &[u32],
+    slts: &[u32],
+    vocab: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut params: Vec<SamplingParams> = (0..toks.len())
+        .map(|i| SamplingParams::greedy(1000 + i as u64))
+        .collect();
+    let counts = vec![Vec::<(u32, u32)>::new(); toks.len()];
+    let bias = vec![Vec::<(u32, f32)>::new(); toks.len()];
+    let (sampled, _, _) = m
+        .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias)
+        .unwrap();
+    let logits = m.read_logits_rows(toks.len()).unwrap();
+    (sampled, logits[..toks.len() * vocab].to_vec())
+}
+
+/// Shared-prefix block tables (#78 C1): two sequences whose tables (built by
+/// the content-hash `GpuPagedTableBuilder`) alias the same physical prefix
+/// page must produce results identical to full recompute — and the second
+/// sequence skips the shared prefix entirely (delta-only stores/decodes; the
+/// prefix K/V it reads were written by the first sequence).
+#[test]
+fn shared_prefix_paged_reuse_matches_full_compute() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256; tokens_per_page 64 -> 4 pages/seq
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 91).unwrap();
+    let vocab = cfg.vocab_size;
+
+    // Shared system-prompt page + distinct tails of EQUAL length (joint steps
+    // keep both rows active through the end) + fixed continuations.
+    let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 37 + 3) % 1024 + 1).collect();
+    let cont_a: Vec<u32> = vec![42, 99, 5, 250];
+    let cont_b: Vec<u32> = vec![300, 17, 8, 63];
+    let gen_tail = vec![7u32, 11, 13];
+    let seq_a: Vec<u32> = prefix
+        .iter()
+        .chain(&cont_a)
+        .chain(&gen_tail)
+        .copied()
+        .collect();
+    let seq_b: Vec<u32> = prefix
+        .iter()
+        .chain(&cont_b)
+        .chain(&gen_tail)
+        .copied()
+        .collect();
+
+    let mut m = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 2, tpp).unwrap();
+    let mut r0 = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, tpp).unwrap();
+    let mut r1 = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, tpp).unwrap();
+
+    // Content-hash tables: B must reuse exactly the shared prefix page(s).
+    let pool_pages = (2 * cfg.max_seq_len / tpp) as u32;
+    let mut builder = GpuPagedTableBuilder::new(pool_pages, tpp);
+    let as_i32 = |v: &[u32]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+    let (ta, _ra) = builder.build_table(&as_i32(&seq_a)).unwrap();
+    // Materialize A's pages (the engine registers content only after prefill
+    // completes); B's build then resolves the shared prefix through the cache.
+    builder.register_table(&as_i32(&seq_a), &ta);
+    let (tb, rb) = builder.build_table(&as_i32(&seq_b)).unwrap();
+    assert_eq!(ta.len(), 2, "ceil((64+3+3)/64) pages");
+    assert_eq!(rb, tpp, "B reuses exactly the shared prefix page");
+    assert!(builder.cached_pages() >= 2, "both requests cached");
+    assert_eq!(ta.get(0), tb.get(0), "prefix physical page is aliased");
+    let union: std::collections::HashSet<u32> =
+        ta.pages().iter().chain(tb.pages()).copied().collect();
+    assert!(
+        union.len() < ta.len() + tb.len(),
+        "physical pages must be shared across the two tables"
+    );
+
+    m.set_block_table(0, ta.pages()).unwrap();
+    m.set_block_table(1, tb.pages()).unwrap();
+
+    // Phase 1: prefix on m is computed by sequence A alone (pages get their
+    // values once); references advance independently in their own pools.
+    for t in 0..tpp {
+        let pos = t as u32;
+        let _ = fwd_rows(&mut m, &[seq_a[t]], &[pos], &[0], vocab);
+        let _ = fwd_rows(&mut r0, &[seq_a[t]], &[pos], &[0], vocab);
+        let _ = fwd_rows(&mut r1, &[seq_b[t]], &[pos], &[0], vocab);
+    }
+
+    // Phase 2: joint deltas/continuations. Sequence B's rows address the
+    // prefix through B's table — the physical page written by A.
+    for j in tpp..seq_b.len() {
+        let pos = j as u32;
+        let (sm, lm) = fwd_rows(&mut m, &[seq_a[j], seq_b[j]], &[pos, pos], &[0, 1], vocab);
+        let (_, la) = fwd_rows(&mut r0, &[seq_a[j]], &[pos], &[0], vocab);
+        let (_, lb) = fwd_rows(&mut r1, &[seq_b[j]], &[pos], &[0], vocab);
+        let row_a = &lm[..vocab];
+        let row_b = &lm[vocab..2 * vocab];
+        assert_close(row_a, &la, &format!("shared-prefix slot A @pos {pos}"));
+        assert_close(row_b, &lb, &format!("aliased-prefix slot B @pos {pos}"));
+        assert_eq!(sm[0], greedy_argmax(&la), "greedy token A @pos {pos}");
+        assert_eq!(sm[1], greedy_argmax(&lb), "greedy token B @pos {pos}");
+    }
+}
+
+/// Paged decode in F16 mode (#78 C3): the newly wired
+/// `kv_store_paged_f16` / `attn_decode_paged_f16_gqa` must track the static
+/// F16 path bit-tight across a page boundary, mirroring the F32 paged test.
+#[test]
+fn batched_paged_f16_decode_matches_static_gpu() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny(); // max_seq 256, tokens_per_page 64 -> 4 pages
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 97).unwrap();
+    let mut stat = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut paged = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, 64).unwrap();
+
+    // 70 single-token steps span 2 pages, exercising the block-table page
+    // boundary on the F16 store/attention path.
+    let tokens: Vec<u32> = (0..70u32).map(|i| (i * 37) % 1024 + 1).collect();
+    for (i, &t) in tokens.iter().enumerate() {
+        let s_next = stat.decode_step(&[t]).unwrap();
+        let p_next = paged.decode_step(&[t]).unwrap();
+        assert_eq!(
+            s_next, p_next,
+            "pos {i}: f16 paged vs static greedy token diverged"
+        );
+        let sl = stat.read_logits().unwrap();
+        let pl = paged.read_logits().unwrap();
+        assert_eq!(sl.len(), cfg.vocab_size);
+        let scale = sl.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = sl
+            .iter()
+            .zip(&pl)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d <= 1e-3 + 1e-3 * scale,
+            "pos {i}: f16 paged vs static logits max diff {d} (scale {scale})"
+        );
+    }
+}
+
+/// Paged decode in MLA mode (#78 C4): the newly wired assemble-to-scratch /
+/// `kv_store_paged_mla` / `attn_decode_paged_mla_batched` path must track the
+/// static contiguous MLA path across a page boundary.
+#[test]
+fn batched_paged_mla_decode_matches_static_gpu() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::mla(128, 2, 4, 1024, 256, 32, 16, 16, 8, 16); // tpp 64 -> 4 pages
+    let w = Weights::random(&cfg, 13).unwrap();
+    let mut stat = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut paged = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, 64).unwrap();
+
+    // 70 single-token steps span 2 pages, exercising the block-table page
+    // boundary on the MLA expanded-KV store/attention path.
+    let tokens: Vec<u32> = (0..70u32).map(|i| (i * 37) % 1024 + 1).collect();
+    for (i, &t) in tokens.iter().enumerate() {
+        let s_next = stat.decode_step(&[t]).unwrap();
+        let p_next = paged.decode_step(&[t]).unwrap();
+        assert_eq!(
+            s_next, p_next,
+            "pos {i}: paged vs static MLA greedy token diverged"
+        );
+        let sl = stat.read_logits().unwrap();
+        let pl = paged.read_logits().unwrap();
+        assert_eq!(sl.len(), cfg.vocab_size);
+        let scale = sl.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = sl
+            .iter()
+            .zip(&pl)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d <= 1e-3 + 1e-3 * scale,
+            "pos {i}: paged vs static MLA logits max diff {d} (scale {scale})"
+        );
+    }
+}
+
+/// Paged chunked prefill crossing a page boundary (#78 C2 review fix): one
+/// step packs 80 rows (positions 0..79, spanning page 0 and page 1), then a
+/// second chunk continues past it — the block-table page crossing on the
+/// packed-prefill path must match sequential stepping.
+#[test]
+fn batched_paged_chunked_prefill_crosses_page_boundary() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256; tokens_per_page 64
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 72).unwrap();
+    let vocab = cfg.vocab_size;
+
+    let seq: Vec<u32> = (0..96u32).map(|i| (i * 61 + 7) % 1024 + 1).collect();
+
+    // One slot, 80 rows: the first chunk spans the 64-token page boundary.
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 80, tpp).unwrap();
+    let mut r = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(seq.len());
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+
+    // Chunk 1: positions 0..79 (pages 0 and 1).
+    let lens1: Vec<u32> = (0..80u32).collect();
+    let slots1: Vec<u32> = vec![0; 80];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..80], &lens1, &slots1, vocab);
+    for &row in &[63usize, 64, 79] {
+        assert_close(
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("boundary chunk1 row {row} (pos {row})"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "chunk1 greedy {row}"
+        );
+    }
+
+    // Chunk 2: positions 80..95 (page 1 only).
+    let lens2: Vec<u32> = (80..96u32).collect();
+    let slots2: Vec<u32> = vec![0; 16];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[80..96], &lens2, &slots2, vocab);
+    for &row in &[0usize, 15] {
+        let pos = 80 + row;
+        assert_close(
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("boundary chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "chunk2 greedy {row}"
+        );
+    }
+}
+
+/// Paged packed prefill in F16 mode (#78 C2/C3 review fix): the f16 paged
+/// branch of `run_kernels` with rows > slots (the server's prefill shape)
+/// must match sequential F16 stepping.
+#[test]
+fn batched_paged_f16_chunked_prefill_matches_sequential() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 73).unwrap();
+    let vocab = cfg.vocab_size;
+
+    let seq: Vec<u32> = (0..40u32).map(|i| (i * 13 + 5) % 1024 + 1).collect();
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 24, tpp).unwrap();
+    let mut r = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(seq.len());
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+
+    // Cross-path bound: batched (packed) vs single-sequence GEMMs accumulate
+    // in different orders, so f16 logits agree to ~1e-3 like the other f16
+    // batched-vs-single tests (0.1).
+    let check = |_row: usize, got: &[f32], want: &[f32], ctx: &str| {
+        let max = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 0.1, "{ctx}: f16 logits max diff {max}");
+    };
+    let lens1: Vec<u32> = (0..16u32).collect();
+    let slots1: Vec<u32> = vec![0; 16];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..16], &lens1, &slots1, vocab);
+    for &row in &[0usize, 15] {
+        check(
+            row,
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("f16 chunk1 row {row} (pos {row})"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "f16 chunk1 greedy {row}"
+        );
+    }
+    let lens2: Vec<u32> = (16..40u32).collect();
+    let slots2: Vec<u32> = vec![0; 24];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[16..40], &lens2, &slots2, vocab);
+    for &row in &[0usize, 23] {
+        let pos = 16 + row;
+        check(
+            row,
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("f16 chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "f16 chunk2 greedy {row}"
+        );
+    }
+}
+
+/// Paged packed prefill in MLA mode (#78 C2/C4 review fix): the MLA paged
+/// branch with rows > slots must match sequential MLA stepping.
+#[test]
+fn batched_paged_mla_chunked_prefill_matches_sequential() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::mla(128, 2, 4, 1024, 256, 32, 16, 16, 8, 16); // tpp 64
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 74).unwrap();
+    let vocab = cfg.vocab_size;
+
+    let seq: Vec<u32> = (0..40u32).map(|i| (i * 17 + 3) % 1024 + 1).collect();
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 24, tpp).unwrap();
+    let mut r = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(seq.len());
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+
+    // Cross-path bound (batched vs single-sequence GEMM order), f32.
+    let check = |_row: usize, got: &[f32], want: &[f32], ctx: &str| {
+        let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let max = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max <= 2e-3 + 2e-3 * scale,
+            "{ctx}: MLA logits max diff {max} (scale {scale})"
+        );
+    };
+    let lens1: Vec<u32> = (0..16u32).collect();
+    let slots1: Vec<u32> = vec![0; 16];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..16], &lens1, &slots1, vocab);
+    for &row in &[0usize, 15] {
+        check(
+            row,
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("mla chunk1 row {row} (pos {row})"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "mla chunk1 greedy {row}"
+        );
+    }
+    let lens2: Vec<u32> = (16..40u32).collect();
+    let slots2: Vec<u32> = vec![0; 24];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[16..40], &lens2, &slots2, vocab);
+    for &row in &[0usize, 23] {
+        let pos = 16 + row;
+        check(
+            row,
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("mla chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "mla chunk2 greedy {row}"
+        );
+    }
+}
+
+/// Paged chunked prefill (#78 C2): several prompt positions of one sequence
+/// packed into distinct rows of a single step must produce the same per-
+/// position logits and greedy tokens as sequential single-token stepping.
+/// Exercises the per-row table-offset refresh (`row != slot`) across two
+/// chunks with different row counts spanning a page boundary region.
+#[test]
+fn batched_paged_chunked_prefill_matches_sequential() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256; tokens_per_page 64
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 71).unwrap();
+    let vocab = cfg.vocab_size;
+
+    let seq: Vec<u32> = (0..24u32).map(|i| (i * 53 + 11) % 1024 + 1).collect();
+
+    // One slot, 16 rows: a prefill step may pack up to 16 positions at once,
+    // every one of them addressed through slot 0's block table.
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 16, tpp).unwrap();
+    let mut r = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+
+    // Sequential reference: capture the logits after each single step.
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(seq.len());
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+
+    // Chunk 1 (12 rows): intra-chunk causality — row `p` attends over exactly
+    // positions 0..=p because kv_store_paged stores all rows before attention.
+    let lens1: Vec<u32> = (0..12u32).collect();
+    let slots1: Vec<u32> = vec![0; 12];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..12], &lens1, &slots1, vocab);
+    for &row in &[5usize, 10, 11] {
+        assert_close(
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("chunk1 row {row} (pos {row})"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "chunk1 greedy row {row}"
+        );
+    }
+
+    // Chunk 2 (8 rows, different shape): rows cross into the next position
+    // range; offsets are refreshed for the new active set.
+    let lens2: Vec<u32> = (12..20u32).collect();
+    let slots2: Vec<u32> = vec![0; 8];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[12..20], &lens2, &slots2, vocab);
+    for &row in &[3usize, 7] {
+        let pos = 12 + row;
+        assert_close(
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "chunk2 greedy row {row} (pos {pos})"
+        );
     }
 }

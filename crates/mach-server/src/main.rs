@@ -8,7 +8,9 @@
 //! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
 //! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
-//! host weights: int4 or E4M3, dequantized to f16 on the device).
+//! host weights: int4 or E4M3, dequantized to f16 on the device),
+//! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
+//! MACH_TPP (KV page size in tokens, default 64).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
@@ -458,7 +460,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Q4 mode loads packed int4 weights directly (host RAM stays small) and
     // spawns the Q4 engine; f16/f32 and spec modes keep the f32 host load.
+    // Paged mode currently wires only the plain-Weights path: warn loudly when
+    // MACH_PAGED is combined with a storage-quantized / spec engine instead of
+    // silently serving in contiguous mode.
+    let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
     let (engine, engine_handle) = if q4 {
+        if paged_requested {
+            eprintln!(
+                "warning: MACH_PAGED is ignored in MACH_Q4 mode (paged Q4 wiring is a follow-up)"
+            );
+        }
         let wq4: WeightsQ4 =
             load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load q4 weights");
         println!(
@@ -469,6 +480,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
         (eng, handle)
     } else if fp8 {
+        if paged_requested {
+            eprintln!(
+                "warning: MACH_PAGED is ignored in MACH_FP8 mode (paged FP8 wiring is a follow-up)"
+            );
+        }
         let wfp8: WeightsFp8 =
             load_safetensors_fp8(&root.join(&model_name), &cfg, true).expect("load fp8 weights");
         println!(
@@ -479,6 +495,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_fp8(hip, cfg, wfp8)?;
         (eng, handle)
     } else if spec {
+        if paged_requested {
+            eprintln!(
+                "warning: MACH_PAGED is ignored in MACH_SPEC mode (paged spec wiring is a follow-up)"
+            );
+        }
         let w: Weights =
             load_safetensors(&root.join(&model_name), &cfg, true).expect("load target weights");
         println!(
@@ -511,6 +532,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let eng = if let Some(slots) = moe_slots {
             ServerEngine::with_offload(capacity, prefill_rows, slots)
+        } else if std::env::var("MACH_PAGED").is_ok_and(|v| v != "0") {
+            // Paged-KV engine: requests sharing a prompt prefix reuse the same
+            // physical KV pages (cross-request prefix sharing).
+            let tpp: usize = std::env::var("MACH_TPP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
+            if tpp == 0 || !cfg.max_seq_len.is_multiple_of(tpp) {
+                eprintln!(
+                    "MACH_TPP={tpp} is invalid: must be a non-zero divisor of max_seq_len {}",
+                    cfg.max_seq_len
+                );
+                std::process::exit(1);
+            }
+            ServerEngine::with_paged(capacity, prefill_rows, tpp)
         } else {
             ServerEngine::with_prefill_rows(capacity, prefill_rows)
         };

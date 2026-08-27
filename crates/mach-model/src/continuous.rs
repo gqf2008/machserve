@@ -73,6 +73,57 @@ struct FinishedSeq {
     stopped: bool,
 }
 
+/// Reuse registry entry: a request's content prefix whose pages may be
+/// aliased by later requests once materialized.
+#[derive(Debug)]
+struct PagedEntry {
+    /// Prompt tokens the entry covers (page-granular prefix match target).
+    prefix: Vec<u32>,
+    /// True once the pages hold their KV (prefill completed); only then may
+    /// later requests reuse them.
+    registered: bool,
+}
+
+/// Paged-KV engine bookkeeping: content-hash page builder + per-slot block
+/// tables + the materialization registry that gates cross-request reuse.
+struct PagedEngineState {
+    tokens_per_page: usize,
+    builder: crate::paged_kv::GpuPagedTableBuilder,
+    /// Per active slot: the block table installed on the model.
+    tables: Vec<Option<crate::paged_kv::PagedTable>>,
+    /// Registry parallel to `seqs` (indexed by slot).
+    entries: Vec<PagedEntry>,
+    /// Finished sequences whose pages persist in the pool (still reusable).
+    retired: Vec<PagedEntry>,
+    /// Cross-request reuse counters (prompt-token savings).
+    requests: usize,
+    reused_tokens: usize,
+    prompt_tokens: usize,
+}
+
+impl PagedEngineState {
+    /// Largest page-aligned `r` such that some materialized entry owns
+    /// `prompt[..r]` (its pages hold that KV). Reuse is therefore safe: the
+    /// builder's hash chain resolves the same pages.
+    fn find_reusable(&self, prompt: &[u32]) -> usize {
+        let mut best = 0usize;
+        for e in self.entries.iter().chain(self.retired.iter()) {
+            if !e.registered {
+                continue;
+            }
+            let mut r = 0usize;
+            while r + self.tokens_per_page <= e.prefix.len()
+                && r + self.tokens_per_page <= prompt.len()
+                && e.prefix[r..r + self.tokens_per_page] == prompt[r..r + self.tokens_per_page]
+            {
+                r += self.tokens_per_page;
+            }
+            best = best.max(r);
+        }
+        best
+    }
+}
+
 /// Continuous-batching engine over a fixed-capacity batched model.
 pub struct ContinuousModel {
     model: BatchedModel,
@@ -87,6 +138,32 @@ pub struct ContinuousModel {
     /// Agentic state reuse (opt-in): auto-saves anchors on finish and restores
     /// matching prefixes on add (incremental prefill).
     state_reuse: Option<StateReuse>,
+    /// Paged-KV mode (opt-in): page pool + per-slot block tables with
+    /// cross-request prefix sharing (delta-only past the reuse boundary).
+    paged: Option<PagedEngineState>,
+}
+
+/// Reuse statistics of a paged-KV engine (cross-request prompt sharing).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PagedReuseStats {
+    /// Requests admitted to the paged engine.
+    pub requests: usize,
+    /// Prompt tokens served from shared prefix pages (not recomputed).
+    pub reused_tokens: usize,
+    /// Total prompt tokens admitted.
+    pub prompt_tokens: usize,
+}
+
+impl PagedReuseStats {
+    /// Fraction of prompt tokens reused across requests (`0..=1`).
+    #[must_use]
+    pub fn reuse_ratio(&self) -> f32 {
+        if self.prompt_tokens == 0 {
+            0.0
+        } else {
+            self.reused_tokens as f32 / self.prompt_tokens as f32
+        }
+    }
 }
 
 unsafe impl Send for ContinuousModel {}
@@ -116,6 +193,7 @@ impl ContinuousModel {
             finished: Vec::new(),
             next_id: 1,
             state_reuse: None,
+            paged: None,
         })
     }
 
@@ -138,6 +216,7 @@ impl ContinuousModel {
             finished: Vec::new(),
             next_id: 1,
             state_reuse: None,
+            paged: None,
         })
     }
 
@@ -160,6 +239,7 @@ impl ContinuousModel {
             finished: Vec::new(),
             next_id: 1,
             state_reuse: None,
+            paged: None,
         })
     }
 
@@ -190,6 +270,7 @@ impl ContinuousModel {
             finished: Vec::new(),
             next_id: 1,
             state_reuse: None,
+            paged: None,
         })
     }
 
@@ -209,6 +290,60 @@ impl ContinuousModel {
         Ok(m)
     }
 
+    /// Builds a **paged-KV** continuous engine: the KV cache is addressed as a
+    /// page pool through per-slot block tables, and requests sharing a prefix
+    /// alias the same physical pages — the second request prefills only its
+    /// delta (positions past the reuse boundary), reading the shared KV from
+    /// the first request's pages. Reuse is gated by materialization: a
+    /// request's pages enter the content cache only after its prefill
+    /// completes, so a request can never read unwritten pages.
+    ///
+    /// `tokens_per_page` must divide `max_seq_len`. MLA paged mode requires
+    /// F32 (asserted by the underlying model ctor).
+    pub fn with_paged_prefill_rows(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        let pages = (cfg.max_seq_len / tokens_per_page) * capacity;
+        let paged = PagedEngineState {
+            tokens_per_page,
+            builder: crate::paged_kv::GpuPagedTableBuilder::new(pages as u32, tokens_per_page),
+            tables: (0..capacity).map(|_| None).collect(),
+            entries: (0..capacity)
+                .map(|_| PagedEntry {
+                    prefix: Vec::new(),
+                    registered: false,
+                })
+                .collect(),
+            retired: Vec::new(),
+            requests: 0,
+            reused_tokens: 0,
+            prompt_tokens: 0,
+        };
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+            paged: Some(paged),
+        })
+    }
+
     /// Maximum concurrent sequences.
     #[must_use]
     pub const fn capacity(&self) -> usize {
@@ -225,6 +360,16 @@ impl ContinuousModel {
     #[must_use]
     pub fn reuse_stats(&self) -> Option<ReuseStats> {
         self.state_reuse.as_ref().map(StateReuse::stats)
+    }
+
+    /// Cross-request prefix-reuse statistics of a paged engine, else `None`.
+    #[must_use]
+    pub fn paged_reuse_stats(&self) -> Option<PagedReuseStats> {
+        self.paged.as_ref().map(|pg| PagedReuseStats {
+            requests: pg.requests,
+            reused_tokens: pg.reused_tokens,
+            prompt_tokens: pg.prompt_tokens,
+        })
     }
 
     /// Number of anchors currently held (reuse mode only).
@@ -280,6 +425,52 @@ impl ContinuousModel {
                 .map_err(|e| Error::Model(format!("state-reuse restore failed: {e}")))?;
             len = reused.prefix_len;
             pending = prompt[reused.prefix_len..].iter().copied().collect();
+        }
+        if let Some(pg) = &mut self.paged {
+            let i32p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+            // Reuse only materialized pages (see PagedEngineState::find_reusable);
+            // otherwise compute everything into fresh pages (registered later
+            // when this request's prefill completes).
+            let mut r = pg.find_reusable(prompt);
+            if r == prompt.len() {
+                // Full-prefix reuse would leave an empty prefill queue with no
+                // first decode token (step() panics). Keep the last page: it
+                // is recomputed into the (identical-content) aliased page —
+                // benign — and the prefill produces the first token normally.
+                r -= pg.tokens_per_page;
+            }
+            let table = if r > 0 {
+                let (mut t, _reused) = pg
+                    .builder
+                    .build_table(&i32p)
+                    .map_err(|e| Error::Model(format!("paged build_table: {e}")))?;
+                pg.builder
+                    .pad_table(&mut t, self.model.max_pages_per_seq())
+                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
+                t
+            } else {
+                let mut t = pg
+                    .builder
+                    .build_table_fresh(&i32p)
+                    .map_err(|e| Error::Model(format!("paged build_table_fresh: {e}")))?;
+                pg.builder
+                    .pad_table(&mut t, self.model.max_pages_per_seq())
+                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
+                t
+            };
+            self.model
+                .set_block_table(slot, table.pages())
+                .map_err(|e| Error::Model(format!("set_block_table: {e}")))?;
+            pg.tables[slot] = Some(table);
+            pg.entries[slot] = PagedEntry {
+                prefix: prompt.to_vec(),
+                registered: false,
+            };
+            pg.requests += 1;
+            pg.prompt_tokens += prompt.len();
+            pg.reused_tokens += r;
+            len = r;
+            pending = prompt[r..].iter().copied().collect();
         }
         self.seqs[slot] = Some(SeqState {
             id,
@@ -405,6 +596,17 @@ impl ContinuousModel {
                 }
                 s.len += count;
                 if s.prompt.is_empty() {
+                    // Paged: prefill materialized — register this request's
+                    // pages under its content so later requests reuse them.
+                    // (A reused request re-registers its source's pages: the
+                    // builder no-ops on identical mappings.)
+                    if let Some(pg) = &mut self.paged {
+                        let i32p: Vec<i32> =
+                            s.all_tokens[..s.len].iter().map(|&t| t as i32).collect();
+                        let t = pg.tables[i].as_ref().expect("paged slot table");
+                        pg.builder.register_table(&i32p, t);
+                        pg.entries[i].registered = true;
+                    }
                     s.generated.push(last_out);
                     s.all_tokens.push(last_out);
                     s.logprobs.push(logprobs[start + count - 1]);
@@ -532,7 +734,11 @@ impl ContinuousModel {
         assert!(slot < self.active, "finish out of range");
         // State-reuse mode: leave a token-boundary anchor at the sequence end
         // so a later turn sharing this prefix skips it (incremental prefill).
-        if let Some(sr) = &mut self.state_reuse
+        // (Paged mode reads its KV through block tables — contiguous anchor
+        // snapshots do not apply; cross-request reuse is handled by the page
+        // registry instead.)
+        if self.paged.is_none()
+            && let Some(sr) = &mut self.state_reuse
             && let Some(s) = self.seqs[slot].as_ref()
             && !s.all_tokens.is_empty()
             && let Ok(anchor) = self
@@ -560,6 +766,40 @@ impl ContinuousModel {
             top_logprobs,
             stopped,
         });
+        // Retired-metadata cap, computed before the paged-borrow below.
+        let retired_cap = self.capacity().saturating_mul(4);
+        if let Some(pg) = &mut self.paged {
+            // Paged compaction: KV lives in pages addressed by the block
+            // tables, so moving a sequence means moving its table (the pages
+            // alias follows). The registry entry retires with the pages kept
+            // in the pool — later requests may still reuse them.
+            let empty = || PagedEntry {
+                prefix: Vec::new(),
+                registered: false,
+            };
+            let entry = std::mem::replace(&mut pg.entries[slot], empty());
+            for i in (slot + 1)..self.active {
+                let table = pg.tables[i].take().expect("active paged table");
+                self.model
+                    .set_block_table(i - 1, table.pages())
+                    .expect("paged compaction table copy");
+                pg.tables[i - 1] = Some(table);
+                pg.entries[i - 1] = std::mem::replace(&mut pg.entries[i], empty());
+                self.seqs[i - 1] = self.seqs[i].take();
+            }
+            self.seqs[self.active - 1] = None;
+            pg.tables[self.active - 1] = None;
+            pg.entries[self.active - 1] = empty();
+            pg.retired.push(entry);
+            // Bound the retired metadata: pages stay in the pool either way
+            // (no eviction yet), but dropping the oldest entries caps host
+            // memory growth on long-running servers.
+            if pg.retired.len() > retired_cap {
+                pg.retired.drain(0..(pg.retired.len() - retired_cap));
+            }
+            self.active -= 1;
+            return;
+        }
         // Compact: move every sequence above `slot` down by one, copying KV.
         for i in (slot + 1)..self.active {
             let from = i;

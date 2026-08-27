@@ -795,3 +795,17 @@
   (`with_paged_kv`,GPU 对拍通过) + 共享前缀块表构造器 + f16 分页内核 +
   cpu_engine 背压/有界记录。剩余:共享前缀页接入 decode + f16 分页接入 +
   真机 A/B(TTFT/TPOT)(见 docs/tokenspeed-alignment.md)。
+
+- **分页 KV 服务链闭环 + 真机 A/B(2026-08-27,#78 C1-C7,7900 XTX)**:
+  - C1 per-slot 块表(`set_block_table`):共享前缀物理页混叠,reuse logits == 全算
+    (64-token 页,B delta-only);
+  - C2 chunked prefill 分页:per-row 表偏移刷新,12/8 行两种形态 vs 逐 token 对拍;
+  - C3/C4 f16 / MLA 分页接线:运行期编译 4+2 内核(44 内核离线门禁),70 步跨页对拍;
+  - C5 服务链:`ContinuousModel::with_paged_prefill_rows`(物化水位门控复用 + 表搬移
+    压缩 + reuse 统计)+ `MACH_PAGED=1` HTTP e2e(输出 == 直接引擎,reused==64);
+  - C6 真机 A/B(paged_prefix_ab_bench,交错准入 + 热身):提示词 325→69(节省 78.8%
+    == 理论值)、端到端 2.84x、后续请求 TTFT 17.4→1.3ms(13.4x)、首请求公平对齐;
+  - C7 文档同步:tokenspeed-alignment 状态表/第 4 节勾选、README 性能地图、
+    benchmark-results-paged-prefix.md;
+  - 剩余:页池 LRU 驱逐(当前池满即拒)、真实模型同口径 A/B、scheduler_fsm 接入
+    continuous.rs(见 tokenspeed-alignment.md 接入计划)。

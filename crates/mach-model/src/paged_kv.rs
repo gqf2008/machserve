@@ -718,15 +718,19 @@ impl GpuPagedTableBuilder {
     /// allocating fresh pages for the tail. Returns the table and the number of
     /// prompt tokens covered by the reused prefix (the delta starts there).
     /// Errors when the page pool cannot satisfy the fresh demand.
+    ///
+    /// The content cache is **read-only** here: fresh tail pages are allocated
+    /// but NOT registered — registration happens in [`Self::register_table`]
+    /// once the pages actually hold their KV (the engine's materialization
+    /// gate). An eager insert would let a concurrent request alias pages whose
+    /// content is not written yet, and both requests would then clobber each
+    /// other's generated KV in the same physical page.
     pub fn build_table(&mut self, tokens: &[i32]) -> Result<(PagedTable, usize), Error> {
         let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
         let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
         let mut table = PagedTable::new();
         let mut reused_pages = 0usize;
         let mut allocating = false;
-        // Pages/hashes committed by THIS call, rolled back on pool exhaustion so
-        // a failed build never leaves cache entries pointing at unwritten pages.
-        let mut fresh_this_call: Vec<(String, u32)> = Vec::new();
         for h in &hashes {
             if !allocating {
                 if let Some(&page) = self.cache.get(h) {
@@ -737,26 +741,86 @@ impl GpuPagedTableBuilder {
                 allocating = true;
             }
             let Some(page) = self.allocator.alloc() else {
-                for (hash, page) in fresh_this_call {
-                    self.cache.remove(&hash);
+                // Roll back this call's fresh allocations (the leading reused
+                // pages are cache aliases and must not be freed).
+                for logical in (reused_pages..table.len()).rev() {
+                    if let Some(p) = table.get(logical) {
+                        self.allocator.free(p);
+                    }
+                }
+                return Err(Error::Model("page pool exhausted".into()));
+            };
+            table.append(page);
+        }
+        let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
+        Ok((table, reused_tokens))
+    }
+
+    /// Extends `table` with fresh pages up to `max_pages` logical entries —
+    /// the generated-KV region. Decode writes past the prompt's pages (at
+    /// position >= prompt_len) and attention addresses every position up to
+    /// `max_seq_len`, so every request needs its full-length table backed by
+    /// dedicated pages: repeating the last prompt page (or padding with a
+    /// shared page) would silently overwrite prompt KV. Rolls back appended
+    /// pages on pool exhaustion.
+    pub fn pad_table(&mut self, table: &mut PagedTable, max_pages: usize) -> Result<(), Error> {
+        let mut appended: Vec<u32> = Vec::new();
+        while table.len() < max_pages {
+            let Some(page) = self.allocator.alloc() else {
+                for p in &appended {
+                    self.allocator.free(*p);
+                }
+                return Err(Error::Model("page pool exhausted (pad)".into()));
+            };
+            appended.push(page);
+            table.append(page);
+        }
+        Ok(())
+    }
+
+    /// Allocates fresh pages for every token page of `tokens` **without
+    /// consulting or filling the content cache**. Callers whose reuse check
+    /// failed (the matching pages are not materialized yet) must build fresh:
+    /// the pages are aliases only for this request, and the content is
+    /// registered later via [`Self::register_table`] once the KV is written.
+    pub fn build_table_fresh(&mut self, tokens: &[i32]) -> Result<PagedTable, Error> {
+        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
+        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        let mut table = PagedTable::new();
+        let mut fresh_this_call: Vec<(String, u32)> = Vec::new();
+        for h in &hashes {
+            // Allocation-only: a cached page for this content may not hold KV
+            // yet, so we never alias it here (register_table decides when a
+            // page is reusable). Hashes are registered at materialization.
+            let Some(page) = self.allocator.alloc() else {
+                for (_hash, page) in fresh_this_call {
                     self.allocator.free(page);
                 }
                 return Err(Error::Model("page pool exhausted".into()));
             };
             fresh_this_call.push((h.clone(), page));
-            // A chained tail page whose key is already cached means a previous
-            // request registered the same content+offset — inserting would
-            // silently orphan its page. Unreachable today (no eviction/delete
-            // can split a chain here); guard it anyway for future changes.
-            debug_assert!(
-                !self.cache.contains_key(h),
-                "fresh tail page unexpectedly already cached"
-            );
-            self.cache.insert(h.clone(), page);
             table.append(page);
         }
-        let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
-        Ok((table, reused_tokens))
+        Ok(table)
+    }
+
+    /// Registers `table`'s pages under `tokens`' content hashes — call only
+    /// once the pages actually hold the KV (prefill materialized). Later
+    /// `build_table` calls reuse the chain from this point on. First writer
+    /// wins: when two requests computed the same content into *different*
+    /// fresh pages (both admitted before either materialized), only the first
+    /// registration maps the hash; the second request's duplicate pages stay
+    /// private to its own table (its table still addresses them directly), and
+    /// later reuse resolves to the registered ones.
+    pub fn register_table(&mut self, tokens: &[i32], table: &PagedTable) {
+        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
+        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        for (h, &logical) in hashes.iter().zip(table.pages()) {
+            if self.cache.contains_key(h) {
+                continue;
+            }
+            self.cache.insert(h.clone(), logical);
+        }
     }
 }
 
@@ -1155,9 +1219,11 @@ mod tests {
         let a_i32: Vec<i32> = a.iter().map(|&t| t as i32).collect();
         let b_i32: Vec<i32> = b.iter().map(|&t| t as i32).collect();
 
-        // 1) Table builder: B reuses A's two system pages.
+        // 1) Table builder: B reuses A's two system pages (A's content is
+        //    registered first — materialized pages are the only reusable ones).
         let mut bld = GpuPagedTableBuilder::new(16, 4);
         let (table_a, r_a) = bld.build_table(&a_i32).expect("A");
+        bld.register_table(&a_i32, &table_a);
         let (table_b, r_b) = bld.build_table(&b_i32).expect("B");
         assert_eq!(r_a, 0);
         assert_eq!(r_b, 8, "B reuses the 8-token system prefix");
@@ -1243,6 +1309,7 @@ mod tests {
             t
         };
         let (t_a, r_a) = b.build_table(&mk(100)).expect("A");
+        b.register_table(&mk(100), &t_a); // A materialized
         let (t_b, r_b) = b.build_table(&mk(200)).expect("B");
         let (t_c, r_c) = b.build_table(&mk(300)).expect("C");
         // First request: everything fresh.
@@ -1257,7 +1324,11 @@ mod tests {
         assert_eq!(t_c.get(1), t_a.get(1), "C shares page 1");
         assert_ne!(t_a.get(2), t_b.get(2), "tails differ");
         assert_ne!(t_b.get(2), t_c.get(2), "tails differ");
-        assert_eq!(b.cached_pages(), 5, "2 system + 3 tail pages");
+        assert_eq!(
+            b.cached_pages(),
+            3,
+            "only A's materialized pages are cached (2 system + 1 tail)"
+        );
     }
 
     #[test]
@@ -1265,16 +1336,25 @@ mod tests {
         // Pool holds 2 pages; the first request needs 3 (system 2 + tail 1).
         let mut b = GpuPagedTableBuilder::new(2, 4);
         assert!(b.build_table(&[1, 2, 3, 4, 5, 6, 7, 8, 9]).is_err());
-        // Rollback: no cache entry may point at an unwritten page.
+        // Nothing is cached by builds alone (registration is the materialized
+        // marker), so a failed build leaves the cache empty by construction.
         assert_eq!(b.cached_pages(), 0, "failed build must not cache pages");
-        // Rollback freed the pages: a 2-page request now succeeds and commits
-        // freshly allocated pages (it must NOT "reuse" the unwritten 0/1).
+        // The freed pages serve a 2-page request...
         let (t, r) = b
             .build_table(&[1, 2, 3, 4, 5, 6, 7, 8])
             .expect("2 pages fit after rollback");
         assert_eq!(r, 0, "no unwritten page reused");
         assert_eq!(t.len(), 2);
-        assert_eq!(b.cached_pages(), 2, "fresh pages committed");
+        assert_eq!(b.cached_pages(), 0, "unmaterialized pages are not reusable");
+        // ...and enter the cache only once materialized (register_table).
+        b.register_table(&[1, 2, 3, 4, 5, 6, 7, 8], &t);
+        assert_eq!(b.cached_pages(), 2, "registered pages");
+        // A later identical request now resolves the full chain.
+        let (t2, r2) = b
+            .build_table(&[1, 2, 3, 4, 5, 6, 7, 8])
+            .expect("cached rebuild");
+        assert_eq!(r2, 8, "materialized pages are reusable");
+        assert_eq!(t2.pages(), t.pages(), "identical content, identical pages");
     }
 
     #[test]
@@ -1385,6 +1465,10 @@ mod tests {
                         "pool not oversold (cached {} > {NUM_PAGES})",
                         b.cached_pages()
                     );
+                    // Materialize: register the built pages (the engine does
+                    // this when prefill completes), so later builds can reuse
+                    // them — the production flow under test.
+                    b.register_table(&tokens, &table);
 
                     // Shared consistency: rebuilding the same prompt right away
                     // must reproduce the identical block table — every page is

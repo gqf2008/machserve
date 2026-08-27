@@ -156,6 +156,10 @@ pub struct BatchedModel {
     mla_kv: *mut f32,
     mla_k_rope: *mut f32,
     mla_attn: *mut f32,
+    /// MLA paged path: expanded per-row k/v scratch (`[rows, heads*hd]` with
+    /// hd = nope + rope / `[rows, heads*v_hd]`) fed to `kv_store_paged_mla`.
+    mla_k_asm: *mut f32,
+    mla_v_asm: *mut f32,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
@@ -180,19 +184,31 @@ pub struct BatchedModel {
     /// Paged-KV mode: the KV caches are addressed as a page pool via per-slot
     /// block tables (`kv_store_paged` / `attn_decode_paged`) instead of the
     /// contiguous `[slot, max_seq, kv, dim]` layout. Enabled by
-    /// [`Self::with_paged_kv`]; the KV allocation itself is unchanged (a static
-    /// identity block-table mapping gives the same physical layout).
+    /// [`Self::with_paged_kv`]; the KV allocation itself is unchanged (the
+    /// default identity block-table mapping gives the same physical layout and
+    /// [`Self::set_block_table`] installs reuse-planner tables on top).
     paged: bool,
     /// Tokens per KV page (paged mode).
     tokens_per_page: usize,
     /// Pages per sequence (`max_seq / tokens_per_page`, divisibility required).
     max_pages_per_seq: usize,
     /// Device block tables: `[slots * max_pages_per_seq]` ints; slot `S`'s
-    /// logical page `L` sits at `[S*max_pages_per_seq + L]`. Static identity
-    /// mapping in this first integration (shared-prefix pages are a follow-up).
+    /// logical page `L` sits at `[S*max_pages_per_seq + L]`. Default is the
+    /// static identity mapping; `set_block_table` overwrites per-slot entries
+    /// (shared-prefix pages alias the same physical ids across slots).
     block_tables: *mut i32,
+    /// Host mirror of the device table region (one upload source per slot).
+    tables_host: Vec<i32>,
+    /// Pinned host mirror of the per-row table offsets, refilled per step
+    /// (`offsets[row] = slot[row] * max_pages_per_seq`; prefill rows may all
+    /// point at one slot's pages).
+    offsets_host: *mut i32,
+    /// True when the device offsets buffer may differ from the identity
+    /// mapping (an explicit step packed non-identity slots). `decode_step`
+    /// refreshes only when dirty — its rows are always identity.
+    offsets_dirty: bool,
     /// Device per-row table offsets: `[rows]` ints, `offset[row] = slots[row] *
-    /// max_pages_per_seq`, refreshed per decode step.
+    /// max_pages_per_seq`, refreshed per step.
     table_offsets: *mut i32,
 }
 
@@ -216,10 +232,10 @@ impl BatchedModel {
 
     /// Builds a batched model in **paged-KV** mode (dense F32): the KV caches
     /// are addressed via per-slot block tables (page pool) using
-    /// `kv_store_paged` / `attn_decode_paged`. This first integration uses a
-    /// static identity mapping — same physical layout as the contiguous path,
-    /// proving the paged decode path end-to-end; shared-prefix pages (the
-    /// reuse-planner payoff) and f16/MLA/prefill paged variants are follow-ups.
+    /// `kv_store_paged` / `attn_decode_paged`. The default mapping is the
+    /// static identity (same physical layout as the contiguous path); call
+    /// [`Self::set_block_table`] to install reuse-planner tables so sequences
+    /// share prefix physical pages. f16/MLA paged kernels remain follow-ups.
     pub fn with_paged_kv(
         hip: Arc<Hip>,
         cfg: Config,
@@ -227,25 +243,128 @@ impl BatchedModel {
         slots: usize,
         tokens_per_page: usize,
     ) -> Result<Self, Error> {
+        Self::with_paged_kv_rows(hip, cfg, w, slots, slots, tokens_per_page)
+    }
+
+    /// [`Self::with_paged_kv`] variant with an independent prefill row
+    /// capacity (`rows >= slots`): a prefill step may pack several prompt
+    /// positions of one sequence into distinct rows, each addressed through
+    /// the sequence's block table via per-row table offsets.
+    pub fn with_paged_kv_rows(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &Weights,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
         assert!(
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
-            "tokens_per_page must divide max_seq_len for the static identity mapping"
+            "tokens_per_page must divide max_seq_len"
         );
-        // The paged decode branch only dispatches dense F32 (see `decode_step`);
-        // f16/MLA would silently fall through to the contiguous kernels while
-        // still owning block tables. Reject them loudly at construction.
+        // The paged attention kernels stage the full per-row score array in
+        // dynamic shared memory: `(max_pages * tokens_per_page + 256) * 4` ==
+        // `(max_seq_len + 256) * 4` bytes. Enforce the 64 KiB device limit
+        // here so an unsupported context size fails at construction with a
+        // clear error, not with a cryptic launch failure mid-request. (The
+        // contiguous attention kernels share the same smem bound.)
+        let smem = (cfg.max_seq_len + 256) * 4;
+        if smem > 64 * 1024 {
+            return Err(Error::InvalidArgument(format!(
+                "max_seq_len {} needs {smem} bytes of attention smem (64 KiB device limit); \
+                 paged-KV mode supports contexts up to {} tokens",
+                cfg.max_seq_len,
+                (64 * 1024) / 4 - 256
+            )));
+        }
+        // The paged decode branch dispatches dense F32/F16 and MLA (F32); any
+        // other dtype would silently fall through to the contiguous kernels
+        // while still owning block tables. Reject loudly at construction.
         assert!(
-            cfg.dtype == ModelDType::F32,
-            "paged-KV mode supports dense F32 only (got {:?}); f16 paged kernels are follow-ups",
+            matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16),
+            "paged-KV mode supports dense F32/F16 only (got {:?})",
             cfg.dtype
         );
-        assert!(
-            cfg.kv_lora_rank == 0,
-            "paged-KV mode supports dense attention only (MLA paged kernels are follow-ups)"
-        );
-        let mut m = Self::build(hip, cfg, w, slots, slots, usize::MAX)?;
+        if cfg.kv_lora_rank > 0 {
+            assert!(
+                cfg.dtype == ModelDType::F32,
+                "paged-KV mode supports MLA in F32 only (got {:?})",
+                cfg.dtype
+            );
+        }
+        let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
         m.init_paged(tokens_per_page)?;
         Ok(m)
+    }
+
+    /// Pages per sequence in paged mode (`max_seq / tokens_per_page`).
+    #[must_use]
+    pub fn max_pages_per_seq(&self) -> usize {
+        self.max_pages_per_seq
+    }
+
+    /// Paged mode: replaces slot `slot`'s logical→physical block table with
+    /// `phys_pages` (logical page `L` → `phys_pages[L]`) and uploads the slot's
+    /// table region to the device. Table updates run between steps (before the
+    /// next `decode_step*`), and the upload is stream-ordered against them.
+    ///
+    /// This is the shared-prefix entry point: build tables with
+    /// [`GpuPagedTableBuilder`](crate::paged_kv::GpuPagedTableBuilder) so
+    /// concurrent requests alias the same physical prefix pages, then feed a
+    /// reused request only its delta (its first stored/decoded position starts
+    /// at the reuse boundary — the pages already hold that KV).
+    ///
+    /// Requirements: `!phys_pages.is_empty()`, `len <= max_pages_per_seq`, and
+    /// every id `< batch * max_pages_per_seq` (ids index the single shared pool
+    /// allocation). Entries past `phys_pages.len()` are padded by repeating the
+    /// last id so even a misaddressed read stays inside the pool; they must not
+    /// be addressed while the sequence length stays within the written range
+    /// (the kernels never do — they bound pages by position).
+    pub fn set_block_table(&mut self, slot: usize, phys_pages: &[u32]) -> Result<(), Error> {
+        if !self.paged {
+            return Err(Error::InvalidArgument(
+                "set_block_table requires paged mode (with_paged_kv)".into(),
+            ));
+        }
+        if slot >= self.batch {
+            return Err(Error::InvalidArgument(format!(
+                "slot {slot} out of range (batch {})",
+                self.batch
+            )));
+        }
+        let maxp = self.max_pages_per_seq;
+        let pool_pages = self.batch * maxp;
+        if phys_pages.is_empty() || phys_pages.len() > maxp {
+            return Err(Error::InvalidArgument(format!(
+                "block table length {} outside 1..={maxp}",
+                phys_pages.len()
+            )));
+        }
+        if let Some(&bad) = phys_pages.iter().find(|&&p| (p as usize) >= pool_pages) {
+            return Err(Error::InvalidArgument(format!(
+                "physical page {bad} out of pool range ({pool_pages} pages)"
+            )));
+        }
+        let start = slot * maxp;
+        for (i, &p) in phys_pages.iter().enumerate() {
+            self.tables_host[start + i] = p as i32;
+        }
+        // Pad trailing logical pages with the last valid id (never addressed
+        // while position-bounded; keeps any stray read inside the pool).
+        for t in self.tables_host[start + phys_pages.len()..start + maxp].iter_mut() {
+            *t = phys_pages[phys_pages.len() - 1] as i32;
+        }
+        // Stream-ordering note: this runs between steps, and hipMemcpy serializes
+        // against subsequent kernel launches on the engine stream.
+        let dst = unsafe { self.block_tables.add(start) };
+        hip::memcpy(
+            self.k.hip(),
+            dst as *mut core::ffi::c_void,
+            self.tables_host[start..start + maxp].as_ptr() as *const core::ffi::c_void,
+            maxp * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )?;
+        Ok(())
     }
 
     /// Builds a batched model from storage-Q4 weights (dense + MoE, F16): each
@@ -333,15 +452,16 @@ impl BatchedModel {
     }
 
     /// Enables paged-KV mode: allocates the static block tables and the
-    /// per-row table-offset buffers and fills them. Decode always runs with
-    /// `row == slot`, so both mappings are static and need no per-step refresh.
+    /// per-row table-offset buffers and fills them with the default identity
+    /// mapping. Decode always runs with `row == slot`, so both mappings are
+    /// static and need no per-step refresh.
     fn init_paged(&mut self, tokens_per_page: usize) -> Result<(), Error> {
         let max_pages = self.cfg.max_seq_len / tokens_per_page;
         self.paged = true;
         self.tokens_per_page = tokens_per_page;
         self.max_pages_per_seq = max_pages;
 
-        // Static identity mapping: slot S's logical page L -> S*max_pages + L.
+        // Default mapping (identity): slot S's logical page L -> S*max_pages + L.
         let mut tables: Vec<i32> = Vec::with_capacity(self.batch * max_pages);
         for s in 0..self.batch {
             let base = (s * max_pages) as i32;
@@ -349,19 +469,34 @@ impl BatchedModel {
                 tables.push(base + l as i32);
             }
         }
+        self.tables_host = tables;
+        // Paged MLA path: per-row expanded scratch consumed by
+        // kv_store_paged_mla (allocated only in paged mode — the contiguous
+        // MLA path assembles straight into its caches).
+        if self.cfg.kv_lora_rank > 0 {
+            let b = self.rows;
+            let heads = self.cfg.n_heads;
+            let hd = self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim;
+            let v_hd = self.cfg.v_head_dim;
+            self.mla_k_asm = self.dalloc(b * heads * hd * 4)?;
+            self.mla_v_asm = self.dalloc(b * heads * v_hd * 4)?;
+        }
         // Per-row offsets: row r -> r*max_pages (row == slot during decode).
         let mut offsets: Vec<i32> = Vec::with_capacity(self.rows);
         for r in 0..self.rows {
             offsets.push((r * max_pages) as i32);
         }
         let hip = self.k.hip();
-        let bt = hip::malloc(hip, tables.len() * 4)?;
+        let oh = hip::host_malloc(hip, offsets.len() * 4)?;
+        self.host_pins.push(oh);
+        self.offsets_host = oh as *mut i32;
+        let bt = hip::malloc(hip, self.tables_host.len() * 4)?;
         self.allocs.push(bt);
         hip::memcpy(
             hip,
             bt,
-            tables.as_ptr() as *const core::ffi::c_void,
-            tables.len() * 4,
+            self.tables_host.as_ptr() as *const core::ffi::c_void,
+            self.tables_host.len() * 4,
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
         )?;
         self.block_tables = bt as *mut i32;
@@ -505,6 +640,8 @@ impl BatchedModel {
             mla_kv: std::ptr::null_mut(),
             mla_k_rope: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
+            mla_k_asm: std::ptr::null_mut(),
+            mla_v_asm: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
@@ -518,6 +655,9 @@ impl BatchedModel {
             tokens_per_page: 0,
             max_pages_per_seq: 0,
             block_tables: std::ptr::null_mut(),
+            tables_host: Vec::new(),
+            offsets_host: std::ptr::null_mut(),
+            offsets_dirty: false,
             table_offsets: std::ptr::null_mut(),
         };
         m.alloc_buffers()?;
@@ -1289,12 +1429,50 @@ impl BatchedModel {
                 self.k.stream,
             )?;
         }
+        self.refresh_offsets_if_dirty()?;
         self.run_kernels(self.batch as i32, self.slots_dev, self.run_mask_dev, 0)?;
         let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
             *l += 1;
         }
         Ok(next)
+    }
+
+    /// Paged mode: refills the per-row table offsets for the next step's
+    /// active rows (`offsets[row] = slot[row] * pages_per_seq`) and uploads
+    /// them stream-ordered before the kernels. Prefill packing means `row ==
+    /// slot` no longer holds — every row addresses its sequence's pages via
+    /// this offset. No-op outside paged mode.
+    fn refresh_table_offsets(&mut self, slots: &[u32]) -> Result<(), Error> {
+        if !self.paged {
+            return Ok(());
+        }
+        debug_assert!(slots.len() <= self.rows, "active rows exceed capacity");
+        unsafe {
+            for (r, &s) in slots.iter().enumerate() {
+                *self.offsets_host.add(r) = (s as usize * self.max_pages_per_seq) as i32;
+            }
+            hip::memcpy_async(
+                self.k.hip(),
+                self.table_offsets as *mut core::ffi::c_void,
+                self.offsets_host as *const core::ffi::c_void,
+                slots.len() * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                self.k.stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `decode_step` fast path: refresh the offsets only when a previous
+    /// explicit step left them non-identity. `decode_step` always packs
+    /// rows == slots 0..batch, matching the initial identity upload.
+    fn refresh_offsets_if_dirty(&mut self) -> Result<(), Error> {
+        if self.offsets_dirty {
+            self.refresh_table_offsets(&(0..self.batch as u32).collect::<Vec<_>>())?;
+            self.offsets_dirty = false;
+        }
+        Ok(())
     }
 
     fn run_kernels(
@@ -1449,35 +1627,85 @@ impl BatchedModel {
                     rope,
                 )?;
                 let (kc, vc) = self.mla_kv_cache[li];
-                k.launch_mla_assemble_kv_batched(
-                    self.mla_kv,
-                    self.mla_k_rope,
-                    kc as *mut f32,
-                    vc as *mut f32,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    max_seq,
-                    heads,
-                    nope,
-                    rope,
-                    v_hd,
-                )?;
                 let scale = 1.0 / ((nope + rope) as f32).sqrt();
-                k.launch_mla_attn_decode_batched(
-                    self.q,
-                    kc as *const f32,
-                    vc as *const f32,
-                    self.mla_attn,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    heads,
-                    nope + rope,
-                    v_hd,
-                    scale,
-                    max_seq,
-                )?;
+                if self.paged {
+                    // Paged MLA: expand to per-row scratch, store through the
+                    // block tables into the per-head page pools, then batched
+                    // attention over them.
+                    let tpp = self.tokens_per_page as i32;
+                    let max_pages = self.max_pages_per_seq as i32;
+                    k.launch_mla_assemble_kv_rows(
+                        self.mla_kv,
+                        self.mla_k_rope,
+                        self.mla_k_asm,
+                        self.mla_v_asm,
+                        b,
+                        heads,
+                        nope,
+                        rope,
+                        v_hd,
+                    )?;
+                    k.launch_kv_store_paged_mla(
+                        self.mla_k_asm,
+                        self.mla_v_asm,
+                        kc as *mut f32,
+                        vc as *mut f32,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        heads,
+                        nope + rope,
+                        v_hd,
+                        tpp,
+                    )?;
+                    k.launch_attn_decode_paged_mla_batched(
+                        self.q,
+                        kc as *const f32,
+                        vc as *const f32,
+                        self.block_tables,
+                        self.mla_attn,
+                        self.pos_dev,
+                        self.table_offsets,
+                        b,
+                        heads,
+                        nope,
+                        rope,
+                        v_hd,
+                        scale,
+                        tpp,
+                        max_pages,
+                    )?;
+                } else {
+                    k.launch_mla_assemble_kv_batched(
+                        self.mla_kv,
+                        self.mla_k_rope,
+                        kc as *mut f32,
+                        vc as *mut f32,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        max_seq,
+                        heads,
+                        nope,
+                        rope,
+                        v_hd,
+                    )?;
+                    k.launch_mla_attn_decode_batched(
+                        self.q,
+                        kc as *const f32,
+                        vc as *const f32,
+                        self.mla_attn,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        heads,
+                        nope + rope,
+                        v_hd,
+                        scale,
+                        max_seq,
+                    )?;
+                }
                 gemm(
                     self.proj,
                     self.mla_attn,
@@ -1547,7 +1775,50 @@ impl BatchedModel {
                     c.rope_theta,
                 )?;
                 let (kc, vc) = self.kv_cache[li];
-                if f16 {
+                if f16 && self.paged {
+                    // Paged decode (F16 KV): store + attention through the
+                    // block tables; same addressing as the F32 paged branch.
+                    let tpp = self.tokens_per_page as i32;
+                    let max_pages = self.max_pages_per_seq as i32;
+                    k.launch_kv_store_paged_f16(
+                        self.k_buf,
+                        kc as *mut u16,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_kv_store_paged_f16(
+                        self.v_buf,
+                        vc as *mut u16,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_attn_decode_paged_f16_gqa(
+                        self.q,
+                        kc as *const u16,
+                        vc as *const u16,
+                        self.block_tables,
+                        self.attn,
+                        self.pos_dev,
+                        self.table_offsets,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        tpp,
+                        max_pages,
+                    )?;
+                } else if f16 {
                     k.launch_kv_store_batched_f16(
                         self.k_buf,
                         kc as *mut u16,
@@ -1609,15 +1880,11 @@ impl BatchedModel {
                     }
                 } else if self.paged {
                     // Paged decode (dense F32): KV store + attention go through
-                    // the block tables into the page pool. Static identity
-                    // mapping => same physical layout as the contiguous path.
-                    // Guard: this first integration assumes row == slot; a
-                    // continuous engine with slot reuse (slots[r] != r) must
-                    // switch to reuse-planner-driven block tables first.
-                    debug_assert!(
-                        (0..b).all(|r| unsafe { *self.slots_host.add(r as usize) } == r),
-                        "paged path requires row == slot (static block tables)"
-                    );
+                    // the per-slot block tables into the page pool. Rows are
+                    // addressed by per-row table offsets (`refresh_table_
+                    // offsets`), so prefill packing (several rows on one slot)
+                    // works alongside plain decode. `set_block_table` may
+                    // alias prefix physical pages across slots between steps.
                     let tpp = self.tokens_per_page as i32;
                     let max_pages = self.max_pages_per_seq as i32;
                     k.launch_kv_store_paged(
@@ -2093,6 +2360,8 @@ impl BatchedModel {
         for (r, &s) in slots.iter().enumerate() {
             self.last_row_by_slot[s as usize] = r;
         }
+        self.refresh_table_offsets(slots)?;
+        self.offsets_dirty = true;
         self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
         self.sampler
             .sample_batched(self.logits, params, counts, bias, self.cfg.vocab_size)
@@ -2386,9 +2655,22 @@ impl BatchedModel {
     /// operate on those, matching the sampled distribution). For the raw model
     /// output, read before sampling (or use a penalty-free greedy step).
     pub fn read_logits(&self) -> Result<Vec<f32>, Error> {
+        self.read_logits_rows(self.batch)
+    }
+
+    /// [`Self::read_logits`] for `n` forwarded rows: a prefill step packed
+    /// into more rows than slots writes `[rows, vocab]`, so row-level
+    /// inspection needs the active count, not the slot count.
+    pub fn read_logits_rows(&self, n: usize) -> Result<Vec<f32>, Error> {
+        if n > self.rows {
+            return Err(Error::InvalidArgument(format!(
+                "row count {n} exceeds capacity {}",
+                self.rows
+            )));
+        }
         self.k.sync()?;
-        let n = self.batch * self.cfg.vocab_size;
-        let mut out = vec![0.0f32; n];
+        let elems = n * self.cfg.vocab_size;
+        let mut out = vec![0.0f32; elems];
         hip::memcpy(
             self.k.hip(),
             out.as_mut_ptr() as *mut core::ffi::c_void,
