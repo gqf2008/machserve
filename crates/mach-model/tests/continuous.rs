@@ -4,6 +4,7 @@
 #![cfg(feature = "hip")]
 
 use mach_kernel_sys::hip;
+use mach_model::config::ModelDType;
 use mach_model::continuous::ContinuousModel;
 use mach_model::model::GpuModel;
 use mach_model::sampling::SamplingParams;
@@ -748,4 +749,254 @@ fn paged_engine_compaction_moves_tables() {
         gen_ref(&hip, cfg, &w, &a, 6),
         "writer output must be intact"
     );
+}
+
+// ---------- paged storage-quantized engines (#80 P3) ----------
+
+/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors
+/// copied) for the Q4 paged-engine test.
+fn to_q4(w: &Weights) -> mach_model::WeightsQ4 {
+    use mach_model::LayerWeightsQ4;
+    use mach_model::q4::Q4Tensor;
+    let q = |v: &[f32]| Q4Tensor::quantize(v);
+    mach_model::WeightsQ4 {
+        tok_emb: q(&w.tok_emb),
+        rms_final: w.rms_final.clone(),
+        lm_head: q(&w.lm_head),
+        layers: w
+            .layers
+            .iter()
+            .map(|l| LayerWeightsQ4 {
+                wq: q(&l.wq),
+                wk: q(&l.wk),
+                wv: q(&l.wv),
+                wo: q(&l.wo),
+                rms_attn: l.rms_attn.clone(),
+                wg: q(&l.wg),
+                wu: q(&l.wu),
+                wd: q(&l.wd),
+                rms_mlp: l.rms_mlp.clone(),
+                bq: l.bq.clone(),
+                bk: l.bk.clone(),
+                bv: l.bv.clone(),
+                q_norm: l.q_norm.clone(),
+                k_norm: l.k_norm.clone(),
+                mla_q_a: q(&l.mla_q_a),
+                mla_q_a_norm: l.mla_q_a_norm.clone(),
+                mla_q_b: q(&l.mla_q_b),
+                mla_q_rope: q(&l.mla_q_rope),
+                mla_kv_a: q(&l.mla_kv_a),
+                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                mla_kv_b: q(&l.mla_kv_b),
+                mla_o: q(&l.mla_o),
+                moe_router: l.moe_router.clone(),
+                moe_wg: q(&l.moe_wg),
+                moe_wu: q(&l.moe_wu),
+                moe_wd: q(&l.moe_wd),
+            })
+            .collect(),
+    }
+}
+
+/// Converts f32 weights to storage-FP8 (GEMM tensors E4M3-quantized with
+/// per-tensor scales) for the FP8 paged-engine test.
+fn to_fp8(w: &Weights) -> mach_model::WeightsFp8 {
+    use mach_model::LayerWeightsFp8;
+    use mach_model::fp8::Fp8Tensor;
+    let q = |v: &[f32]| Fp8Tensor::quantize(v);
+    mach_model::WeightsFp8 {
+        tok_emb: q(&w.tok_emb),
+        rms_final: w.rms_final.clone(),
+        lm_head: q(&w.lm_head),
+        layers: w
+            .layers
+            .iter()
+            .map(|l| LayerWeightsFp8 {
+                wq: q(&l.wq),
+                wk: q(&l.wk),
+                wv: q(&l.wv),
+                wo: q(&l.wo),
+                rms_attn: l.rms_attn.clone(),
+                wg: q(&l.wg),
+                wu: q(&l.wu),
+                wd: q(&l.wd),
+                rms_mlp: l.rms_mlp.clone(),
+                bq: l.bq.clone(),
+                bk: l.bk.clone(),
+                bv: l.bv.clone(),
+                q_norm: l.q_norm.clone(),
+                k_norm: l.k_norm.clone(),
+                mla_q_a: q(&l.mla_q_a),
+                mla_q_a_norm: l.mla_q_a_norm.clone(),
+                mla_q_b: q(&l.mla_q_b),
+                mla_q_rope: q(&l.mla_q_rope),
+                mla_kv_a: q(&l.mla_kv_a),
+                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                mla_kv_b: q(&l.mla_kv_b),
+                mla_o: q(&l.mla_o),
+                moe_router: l.moe_router.clone(),
+                moe_wg: q(&l.moe_wg),
+                moe_wu: q(&l.moe_wu),
+                moe_wd: q(&l.moe_wd),
+            })
+            .collect(),
+    }
+}
+
+/// Shared-prefix helper: A fully finishes first (materializing pages), then B
+/// is admitted and runs to completion. Returns outputs + reuse stats tokens.
+fn run_paged_two_requests(
+    eng: &mut ContinuousModel,
+    a: &[u32],
+    b: &[u32],
+) -> (Vec<Vec<u32>>, usize) {
+    let id_a = eng
+        .add(
+            a,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.is_done(id_a) {
+        eng.step().unwrap();
+    }
+    let id_b = eng
+        .add(
+            b,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    let reused = eng.paged_reuse_stats().expect("paged").reused_tokens;
+    (vec![eng.generated(id_a), eng.generated(id_b)], reused)
+}
+
+/// Contiguous counterpart of [`run_paged_two_requests`] (no reuse stats).
+fn run_contiguous_two_requests(
+    eng: &mut ContinuousModel,
+    a: &[u32],
+    b: &[u32],
+) -> (Vec<Vec<u32>>, usize) {
+    let id_a = eng
+        .add(
+            a,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.is_done(id_a) {
+        eng.step().unwrap();
+    }
+    let id_b = eng
+        .add(
+            b,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !eng.all_done() {
+        eng.step().unwrap();
+    }
+    (vec![eng.generated(id_a), eng.generated(id_b)], 0)
+}
+
+/// Storage-quantized paged engines (#80 P3): Q4 and FP8 device-f16 paths serve
+/// cross-request prefix reuse identically — the second shared-prefix request's
+/// output equals its own contiguous-engine run and the shared page is reused.
+#[test]
+fn paged_engine_quantized_reuses_shared_prefix() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny(); // max_seq 256; tpp 64
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let (a, b, prefix) = shared_prefix_prompt(tpp);
+
+    for quant in 0..2 {
+        match quant {
+            0 => {
+                let w = Weights::random(&cfg, 91).unwrap();
+                let wq = to_q4(&w);
+                let run = |paged: bool| -> (Vec<Vec<u32>>, usize) {
+                    if paged {
+                        let mut eng = ContinuousModel::with_paged_prefill_rows_q4(
+                            hip.clone(),
+                            cfg,
+                            &wq,
+                            2,
+                            2,
+                            tpp,
+                        )
+                        .unwrap();
+                        run_paged_two_requests(&mut eng, &a, &b)
+                    } else {
+                        let mut eng =
+                            ContinuousModel::with_prefill_rows_q4(hip.clone(), cfg, &wq, 2, 2)
+                                .unwrap();
+                        run_contiguous_two_requests(&mut eng, &a, &b)
+                    }
+                };
+                let (contig_out, _) = run(false);
+                let (paged_out, reused) = run(true);
+                assert_eq!(
+                    contig_out[0], paged_out[0],
+                    "Q4 writer output must be identical across engines"
+                );
+                assert_eq!(
+                    contig_out[1], paged_out[1],
+                    "Q4 reused output must equal contiguous"
+                );
+                assert!(prefix.len() >= tpp);
+                assert_eq!(reused, tpp, "Q4 engine reuses the shared page");
+            }
+            _ => {
+                let w = Weights::random(&cfg, 93).unwrap();
+                let wf = to_fp8(&w);
+                let run = |paged: bool| -> (Vec<Vec<u32>>, usize) {
+                    if paged {
+                        let mut eng = ContinuousModel::with_paged_prefill_rows_fp8(
+                            hip.clone(),
+                            cfg,
+                            &wf,
+                            2,
+                            2,
+                            tpp,
+                        )
+                        .unwrap();
+                        run_paged_two_requests(&mut eng, &a, &b)
+                    } else {
+                        let mut eng =
+                            ContinuousModel::with_prefill_rows_fp8(hip.clone(), cfg, &wf, 2, 2)
+                                .unwrap();
+                        run_contiguous_two_requests(&mut eng, &a, &b)
+                    }
+                };
+                let (contig_out, _) = run(false);
+                let (paged_out, reused) = run(true);
+                assert_eq!(
+                    contig_out[0], paged_out[0],
+                    "FP8 writer output must be identical across engines"
+                );
+                assert_eq!(
+                    contig_out[1], paged_out[1],
+                    "FP8 reused output must equal contiguous"
+                );
+                assert_eq!(reused, tpp, "FP8 engine reuses the shared page");
+            }
+        }
+    }
 }

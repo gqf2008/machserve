@@ -316,8 +316,82 @@ impl ContinuousModel {
             prefill_rows.max(capacity),
             tokens_per_page,
         )?;
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+            paged: Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        })
+    }
+
+    /// [`Self::with_paged_prefill_rows`] for storage-Q4 weights (device f16):
+    /// cross-request prefix reuse over the dequantized path.
+    pub fn with_paged_prefill_rows_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_q4(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+            paged: Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        })
+    }
+
+    /// [`Self::with_paged_prefill_rows`] for storage-FP8 weights (device f16).
+    pub fn with_paged_prefill_rows_fp8(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsFp8,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_fp8(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self {
+            model,
+            prefill_rows: prefill_rows.max(capacity),
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+            paged: Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        })
+    }
+
+    /// Shared paged-engine bookkeeping factory (page pool sized for the full
+    /// slot count; reuse counters zeroed).
+    fn paged_state(cfg: &Config, capacity: usize, tokens_per_page: usize) -> PagedEngineState {
         let pages = (cfg.max_seq_len / tokens_per_page) * capacity;
-        let paged = PagedEngineState {
+        PagedEngineState {
             tokens_per_page,
             builder: crate::paged_kv::GpuPagedTableBuilder::new(pages as u32, tokens_per_page),
             tables: (0..capacity).map(|_| None).collect(),
@@ -331,17 +405,7 @@ impl ContinuousModel {
             requests: 0,
             reused_tokens: 0,
             prompt_tokens: 0,
-        };
-        Ok(Self {
-            model,
-            prefill_rows: prefill_rows.max(capacity),
-            seqs: (0..capacity).map(|_| None).collect(),
-            active: 0,
-            finished: Vec::new(),
-            next_id: 1,
-            state_reuse: None,
-            paged: Some(paged),
-        })
+        }
     }
 
     /// Maximum concurrent sequences.

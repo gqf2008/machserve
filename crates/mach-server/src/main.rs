@@ -460,16 +460,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Q4 mode loads packed int4 weights directly (host RAM stays small) and
     // spawns the Q4 engine; f16/f32 and spec modes keep the f32 host load.
-    // Paged mode currently wires only the plain-Weights path: warn loudly when
-    // MACH_PAGED is combined with a storage-quantized / spec engine instead of
-    // silently serving in contiguous mode.
+    // Paged mode is wired for the plain-Weights and storage-quantized paths
+    // (device f16 served by the f16 paged kernels); MACH_SPEC remains
+    // contiguous-only (warned).
     let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
     let (engine, engine_handle) = if q4 {
-        if paged_requested {
-            eprintln!(
-                "warning: MACH_PAGED is ignored in MACH_Q4 mode (paged Q4 wiring is a follow-up)"
-            );
-        }
         let wq4: WeightsQ4 =
             load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load q4 weights");
         println!(
@@ -480,11 +475,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
         (eng, handle)
     } else if fp8 {
-        if paged_requested {
-            eprintln!(
-                "warning: MACH_PAGED is ignored in MACH_FP8 mode (paged FP8 wiring is a follow-up)"
-            );
-        }
         let wfp8: WeightsFp8 =
             load_safetensors_fp8(&root.join(&model_name), &cfg, true).expect("load fp8 weights");
         println!(

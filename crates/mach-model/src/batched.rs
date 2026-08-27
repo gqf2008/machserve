@@ -258,6 +258,50 @@ impl BatchedModel {
         rows: usize,
         tokens_per_page: usize,
     ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// [`Self::with_paged_kv_rows`] for storage-Q4 weights: each tensor is
+    /// dequantized to f16 on upload, so the wired f16 paged kernels serve the
+    /// device path directly.
+    pub fn with_paged_kv_rows_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build_q4(hip, cfg, w, slots, rows)?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// [`Self::with_paged_kv_rows`] for storage-FP8 weights: E4M3 tensors are
+    /// dequantized to f16 on upload; the f16 paged kernels serve the device.
+    pub fn with_paged_kv_rows_fp8(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsFp8,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build_fp8(hip, cfg, w, slots, rows)?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// Construction-time paged-mode guards shared by every build variant:
+    /// page geometry, attention smem bound, dtype coverage (dense F32/F16;
+    /// MLA stays F32-only) — fail loudly here rather than falling through to
+    /// contiguous kernels while owning block tables, or failing mid-request.
+    fn paged_guards(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
         assert!(
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
             "tokens_per_page must divide max_seq_len"
@@ -292,9 +336,7 @@ impl BatchedModel {
                 cfg.dtype
             );
         }
-        let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
-        m.init_paged(tokens_per_page)?;
-        Ok(m)
+        Ok(())
     }
 
     /// Pages per sequence in paged mode (`max_seq / tokens_per_page`).

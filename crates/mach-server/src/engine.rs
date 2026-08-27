@@ -315,8 +315,18 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model =
-            ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?;
+        let mut model = if let Some(tpp) = self.paged_tpp {
+            ContinuousModel::with_paged_prefill_rows_q4(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                tpp,
+            )?
+        } else {
+            ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?
+        };
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))
@@ -339,8 +349,18 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model =
-            ContinuousModel::with_prefill_rows_fp8(hip, cfg, &w, self.capacity, self.prefill_rows)?;
+        let mut model = if let Some(tpp) = self.paged_tpp {
+            ContinuousModel::with_paged_prefill_rows_fp8(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                tpp,
+            )?
+        } else {
+            ContinuousModel::with_prefill_rows_fp8(hip, cfg, &w, self.capacity, self.prefill_rows)?
+        };
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))
