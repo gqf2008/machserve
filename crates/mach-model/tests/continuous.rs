@@ -751,6 +751,76 @@ fn paged_engine_compaction_moves_tables() {
     );
 }
 
+/// Paged page-pool eviction (#80 P4): with a 2-slot / 8-page pool, three
+/// distinct-content requests (4 pages each) exceed the pool — the third
+/// admission must evict the oldest unreferenced retired entry instead of
+/// failing, and a later request reusing the evicted prefix falls back to full
+/// compute with correct output (no stale aliasing).
+#[test]
+fn paged_engine_evicts_cold_pages_under_pressure() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256, tpp 64 -> 4 pages/seq; pool = 2*4 = 8
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 55).unwrap();
+
+    // Each prompt fills the whole context (4 distinct content pages), so the
+    // 8-page pool is fully consumed by two requests; the third must evict.
+    let len = cfg.max_seq_len;
+    let mk = |base: u32| -> Vec<u32> { (0..len as u32).map(|i| (base + i) % 1024 + 1).collect() };
+    let prompts = [mk(0), mk(300), mk(600), mk(0)];
+
+    // Contiguous reference outputs.
+    let mut refs = Vec::new();
+    for prompt in &prompts {
+        let mut cm = ContinuousModel::with_prefill_rows(hip.clone(), cfg, &w, 2, len).unwrap();
+        let id = cm
+            .add(
+                prompt,
+                2,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !cm.is_done(id) {
+            cm.step().unwrap();
+        }
+        refs.push(cm.generated(id));
+    }
+
+    let mut eng =
+        ContinuousModel::with_paged_prefill_rows(hip.clone(), cfg, &w, 2, len, tpp).unwrap();
+    for (i, prompt) in prompts.iter().enumerate() {
+        let id = eng
+            .add(
+                prompt,
+                2,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !eng.is_done(id) {
+            eng.step().unwrap();
+        }
+        assert_eq!(
+            eng.generated(id),
+            refs[i],
+            "request {i} output must survive pool pressure/eviction"
+        );
+    }
+    let stats = eng.paged_reuse_stats().expect("paged");
+    assert_eq!(stats.requests, 4, "all four requests admitted");
+    assert_eq!(stats.reused_tokens, 0, "evicted prefix must not be reused");
+    assert_eq!(
+        stats.prompt_tokens,
+        4 * len,
+        "every prompt fully computed (no stale aliasing)"
+    );
+}
+
 // ---------- paged storage-quantized engines (#80 P3) ----------
 
 /// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors

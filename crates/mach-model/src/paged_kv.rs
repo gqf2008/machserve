@@ -828,6 +828,41 @@ impl GpuPagedTableBuilder {
         Ok(())
     }
 
+    /// Physical page registered for `hash`, if any (eviction support: lets the
+    /// engine decide whether a content page is still referenced by live
+    /// tables before freeing it).
+    #[must_use]
+    pub fn page_of(&self, hash: &str) -> Option<u32> {
+        self.cache.get(hash).copied()
+    }
+
+    /// Unregisters `hash` and returns its page to the pool. Call only when no
+    /// live table references the page (the engine checks before evicting).
+    /// Returns false when the hash was not registered.
+    pub fn evict_page(&mut self, hash: &str) -> bool {
+        if let Some(page) = self.cache.remove(hash) {
+            self.allocator.free(page);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Frees the freshly-allocated (non-reused) pages of a plan — used when a
+    /// later step (e.g. padding) fails after the plan itself succeeded, so
+    /// the partially-built table never leaks its pages.
+    pub fn free_plan_pages(&mut self, plan: &PagedTablePlan, table: &PagedTable) {
+        let reused_pages = plan.reused_tokens / self.tokens_per_page;
+        for page in table.pages().iter().skip(reused_pages) {
+            self.allocator.free(*page);
+        }
+    }
+
+    /// Returns a raw page to the pool (pads and other unregistered pages).
+    pub fn free_page(&mut self, page: u32) {
+        self.allocator.free(page);
+    }
+
     /// Allocates fresh pages for every token page of `tokens` **without
     /// consulting or filling the content cache**. Callers whose reuse check
     /// failed (the matching pages are not materialized yet) must build fresh:

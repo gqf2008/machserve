@@ -125,6 +125,40 @@ impl PagedEngineState {
         }
         best
     }
+
+    /// Evicts the oldest retired entry whose pages **no active table
+    /// references** (a page still aliased by a live request must stay): frees
+    /// its pages back to the pool and unregisters their content mappings, so
+    /// future plans allocate fresh pages instead of aliasing evicted ones.
+    /// Whole-entry eviction keeps the reuse contract sound — a partially
+    /// evicted chain would let requests skip prefill positions whose pages no
+    /// longer hold KV. Returns true when an entry was evicted.
+    fn evict_one_retired(&mut self) -> bool {
+        let referenced: std::collections::HashSet<u32> = self
+            .tables
+            .iter()
+            .flatten()
+            .flat_map(|t| t.pages().iter().copied())
+            .collect();
+        // Oldest first (the retired list is append-ordered).
+        for idx in 0..self.retired.len() {
+            let entry = &self.retired[idx];
+            let any_referenced = entry.chain.iter().any(|h| {
+                self.builder
+                    .page_of(h)
+                    .is_some_and(|p| referenced.contains(&p))
+            });
+            if any_referenced {
+                continue;
+            }
+            let entry = self.retired.remove(idx);
+            for h in &entry.chain {
+                self.builder.evict_page(h);
+            }
+            return true;
+        }
+        false
+    }
 }
 
 /// Continuous-batching engine over a fixed-capacity batched model.
@@ -509,14 +543,33 @@ impl ContinuousModel {
             }
             // One hash-chain computation per admission: plan() resolves and
             // allocates; the chain is stored for materialization-time
-            // registration without rehashing.
-            let mut plan = pg
-                .builder
-                .plan(&i32p, r > 0)
-                .map_err(|e| Error::Model(format!("paged plan: {e}")))?;
-            pg.builder
-                .pad_table(&mut plan.table, self.model.max_pages_per_seq())
-                .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
+            // registration without rehashing. Pool exhaustion evicts cold
+            // retired pages and retries (bounded: each eviction removes an
+            // entry; a failed plan/pad frees its own pages, so nothing leaks).
+            let plan = loop {
+                let mut p = match pg.builder.plan(&i32p, r > 0) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if pg.evict_one_retired() {
+                            continue;
+                        }
+                        return Err(Error::Model(format!("paged plan: {e}")));
+                    }
+                };
+                match pg
+                    .builder
+                    .pad_table(&mut p.table, self.model.max_pages_per_seq())
+                {
+                    Ok(()) => break p,
+                    Err(e) => {
+                        pg.builder.free_plan_pages(&p, &p.table);
+                        if pg.evict_one_retired() {
+                            continue;
+                        }
+                        return Err(Error::Model(format!("paged pad_table: {e}")));
+                    }
+                }
+            };
             self.model
                 .set_block_table(slot, plan.table.pages())
                 .map_err(|e| Error::Model(format!("set_block_table: {e}")))?;
@@ -833,6 +886,16 @@ impl ContinuousModel {
             // tables, so moving a sequence means moving its table (the pages
             // alias follows). The registry entry retires with the pages kept
             // in the pool — later requests may still reuse them.
+            // The finishing table's PAD pages (its generated-KV region) are
+            // not registered content: free them on retire so long-running
+            // pools never fill with orphaned pads (content pages stay for
+            // reuse; eviction handles them on demand).
+            if let Some(t) = pg.tables[slot].as_ref() {
+                let content_pages = pg.entries[slot].chain.len();
+                for &page in t.pages().iter().skip(content_pages) {
+                    pg.builder.free_page(page);
+                }
+            }
             let empty = || PagedEntry {
                 prefix: Vec::new(),
                 registered: false,
@@ -852,11 +915,14 @@ impl ContinuousModel {
             pg.tables[self.active - 1] = None;
             pg.entries[self.active - 1] = empty();
             pg.retired.push(entry);
-            // Bound the retired metadata: pages stay in the pool either way
-            // (no eviction yet), but dropping the oldest entries caps host
-            // memory growth on long-running servers.
-            if pg.retired.len() > retired_cap {
-                pg.retired.drain(0..(pg.retired.len() - retired_cap));
+            // Bound the retired metadata: pages stay in the pool either way,
+            // but dropping the oldest entries (via real eviction when
+            // unreferenced) caps host memory growth on long-running servers.
+            // Entries still aliased by live tables are kept until they free up.
+            while pg.retired.len() > retired_cap {
+                if !pg.evict_one_retired() {
+                    break;
+                }
             }
             self.active -= 1;
             return;
