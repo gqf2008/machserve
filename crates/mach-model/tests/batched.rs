@@ -6,6 +6,8 @@ use mach_kernel_sys::hip;
 use mach_model::batched::BatchedModel;
 use mach_model::config::ModelDType;
 use mach_model::model::GpuModel;
+use mach_model::paged_kv::GpuPagedTableBuilder;
+use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 
 /// Paged-KV decode must match the static (contiguous) decode on the GPU: the
@@ -305,5 +307,124 @@ fn batched_sequences_are_independent() {
         }
         assert_ne!(got[0], got[1], "different input tokens must diverge");
         prev = Some(got);
+    }
+}
+
+fn greedy_argmax(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
+        .map(|(i, _)| i as u32)
+        .unwrap()
+}
+
+fn assert_close(got: &[f32], want: &[f32], ctx: &str) {
+    let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    let d = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        d <= 1e-4 + 1e-4 * scale,
+        "{ctx}: logits max diff {d} (scale {scale})"
+    );
+}
+
+/// Shared-prefix block tables (#78 C1): two sequences whose tables (built by
+/// the content-hash `GpuPagedTableBuilder`) alias the same physical prefix
+/// page must produce results identical to full recompute — and the second
+/// sequence skips the shared prefix entirely (delta-only stores/decodes; the
+/// prefix K/V it reads were written by the first sequence).
+#[test]
+fn shared_prefix_paged_reuse_matches_full_compute() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::tiny(); // max_seq 256; tokens_per_page 64 -> 4 pages/seq
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 91).unwrap();
+    let vocab = cfg.vocab_size;
+
+    // Shared system-prompt page + distinct tails of EQUAL length (joint steps
+    // keep both rows active through the end) + fixed continuations.
+    let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 37 + 3) % 1024 + 1).collect();
+    let cont_a: Vec<u32> = vec![42, 99, 5, 250];
+    let cont_b: Vec<u32> = vec![300, 17, 8, 63];
+    let gen_tail = vec![7u32, 11, 13];
+    let seq_a: Vec<u32> = prefix
+        .iter()
+        .chain(&cont_a)
+        .chain(&gen_tail)
+        .copied()
+        .collect();
+    let seq_b: Vec<u32> = prefix
+        .iter()
+        .chain(&cont_b)
+        .chain(&gen_tail)
+        .copied()
+        .collect();
+
+    let mut m = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 2, tpp).unwrap();
+    let mut r0 = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, tpp).unwrap();
+    let mut r1 = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, tpp).unwrap();
+
+    // Content-hash tables: B must reuse exactly the shared prefix page(s).
+    let pool_pages = (2 * cfg.max_seq_len / tpp) as u32;
+    let mut builder = GpuPagedTableBuilder::new(pool_pages, tpp);
+    let as_i32 = |v: &[u32]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+    let (ta, _ra) = builder.build_table(&as_i32(&seq_a)).unwrap();
+    let (tb, rb) = builder.build_table(&as_i32(&seq_b)).unwrap();
+    assert_eq!(ta.len(), 2, "ceil((64+3+3)/64) pages");
+    assert_eq!(rb, tpp, "B reuses exactly the shared prefix page");
+    assert!(builder.cached_pages() >= 2, "both requests cached");
+    assert_eq!(ta.get(0), tb.get(0), "prefix physical page is aliased");
+    let union: std::collections::HashSet<u32> =
+        ta.pages().iter().chain(tb.pages()).copied().collect();
+    assert!(
+        union.len() < ta.len() + tb.len(),
+        "physical pages must be shared across the two tables"
+    );
+
+    m.set_block_table(0, ta.pages()).unwrap();
+    m.set_block_table(1, tb.pages()).unwrap();
+
+    // One forward over arbitrary rows; returns sampled tokens and the dense
+    // logits head (`n * vocab` entries, row-major by forwarded row).
+    let fwd =
+        |m: &mut BatchedModel, toks: &[u32], poss: &[u32], slts: &[u32]| -> (Vec<u32>, Vec<f32>) {
+            let mut params: Vec<SamplingParams> = (0..toks.len())
+                .map(|i| SamplingParams::greedy(1000 + i as u64))
+                .collect();
+            let counts = vec![Vec::<(u32, u32)>::new(); toks.len()];
+            let bias = vec![Vec::<(u32, f32)>::new(); toks.len()];
+            let (sampled, _, _) = m
+                .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias)
+                .unwrap();
+            let logits = m.read_logits().unwrap();
+            (sampled, logits[..toks.len() * vocab].to_vec())
+        };
+
+    // Phase 1: prefix on m is computed by sequence A alone (pages get their
+    // values once); references advance independently in their own pools.
+    for t in 0..tpp {
+        let pos = t as u32;
+        let _ = fwd(&mut m, &[seq_a[t]], &[pos], &[0]);
+        let _ = fwd(&mut r0, &[seq_a[t]], &[pos], &[0]);
+        let _ = fwd(&mut r1, &[seq_b[t]], &[pos], &[0]);
+    }
+
+    // Phase 2: joint deltas/continuations. Sequence B's rows address the
+    // prefix through B's table — the physical page written by A.
+    for j in tpp..seq_b.len() {
+        let pos = j as u32;
+        let (sm, lm) = fwd(&mut m, &[seq_a[j], seq_b[j]], &[pos, pos], &[0, 1]);
+        let (_, la) = fwd(&mut r0, &[seq_a[j]], &[pos], &[0]);
+        let (_, lb) = fwd(&mut r1, &[seq_b[j]], &[pos], &[0]);
+        let row_a = &lm[..vocab];
+        let row_b = &lm[vocab..2 * vocab];
+        assert_close(row_a, &la, &format!("shared-prefix slot A @pos {pos}"));
+        assert_close(row_b, &lb, &format!("aliased-prefix slot B @pos {pos}"));
+        assert_eq!(sm[0], greedy_argmax(&la), "greedy token A @pos {pos}");
+        assert_eq!(sm[1], greedy_argmax(&lb), "greedy token B @pos {pos}");
     }
 }
