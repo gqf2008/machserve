@@ -82,6 +82,9 @@ struct PagedEntry {
     /// True once the pages hold their KV (prefill completed); only then may
     /// later requests reuse them.
     registered: bool,
+    /// Precomputed content-hash chain of `prefix` (computed once at
+    /// admission; avoids rehashing when the content materializes).
+    chain: Vec<String>,
 }
 
 /// Paged-KV engine bookkeeping: content-hash page builder + per-slot block
@@ -399,6 +402,7 @@ impl ContinuousModel {
                 .map(|_| PagedEntry {
                     prefix: Vec::new(),
                     registered: false,
+                    chain: Vec::new(),
                 })
                 .collect(),
             retired: Vec::new(),
@@ -503,32 +507,24 @@ impl ContinuousModel {
                 // benign — and the prefill produces the first token normally.
                 r -= pg.tokens_per_page;
             }
-            let table = if r > 0 {
-                let (mut t, _reused) = pg
-                    .builder
-                    .build_table(&i32p)
-                    .map_err(|e| Error::Model(format!("paged build_table: {e}")))?;
-                pg.builder
-                    .pad_table(&mut t, self.model.max_pages_per_seq())
-                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
-                t
-            } else {
-                let mut t = pg
-                    .builder
-                    .build_table_fresh(&i32p)
-                    .map_err(|e| Error::Model(format!("paged build_table_fresh: {e}")))?;
-                pg.builder
-                    .pad_table(&mut t, self.model.max_pages_per_seq())
-                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
-                t
-            };
+            // One hash-chain computation per admission: plan() resolves and
+            // allocates; the chain is stored for materialization-time
+            // registration without rehashing.
+            let mut plan = pg
+                .builder
+                .plan(&i32p, r > 0)
+                .map_err(|e| Error::Model(format!("paged plan: {e}")))?;
+            pg.builder
+                .pad_table(&mut plan.table, self.model.max_pages_per_seq())
+                .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
             self.model
-                .set_block_table(slot, table.pages())
+                .set_block_table(slot, plan.table.pages())
                 .map_err(|e| Error::Model(format!("set_block_table: {e}")))?;
-            pg.tables[slot] = Some(table);
+            pg.tables[slot] = Some(plan.table);
             pg.entries[slot] = PagedEntry {
                 prefix: prompt.to_vec(),
                 registered: false,
+                chain: plan.chain,
             };
             pg.requests += 1;
             pg.prompt_tokens += prompt.len();
@@ -661,14 +657,14 @@ impl ContinuousModel {
                 s.len += count;
                 if s.prompt.is_empty() {
                     // Paged: prefill materialized — register this request's
-                    // pages under its content so later requests reuse them.
+                    // pages under its content so later requests reuse them,
+                    // using the chain computed once at admission (no rehash).
                     // (A reused request re-registers its source's pages: the
                     // builder no-ops on identical mappings.)
                     if let Some(pg) = &mut self.paged {
-                        let i32p: Vec<i32> =
-                            s.all_tokens[..s.len].iter().map(|&t| t as i32).collect();
+                        let chain = &pg.entries[i].chain;
                         let t = pg.tables[i].as_ref().expect("paged slot table");
-                        pg.builder.register_table(&i32p, t);
+                        pg.builder.register_chain(chain, t);
                         pg.entries[i].registered = true;
                     }
                     s.generated.push(last_out);
@@ -840,6 +836,7 @@ impl ContinuousModel {
             let empty = || PagedEntry {
                 prefix: Vec::new(),
                 registered: false,
+                chain: Vec::new(),
             };
             let entry = std::mem::replace(&mut pg.entries[slot], empty());
             for i in (slot + 1)..self.active {

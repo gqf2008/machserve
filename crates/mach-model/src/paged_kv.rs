@@ -684,6 +684,18 @@ impl PagedRef {
     }
 }
 
+/// Admission-time resolution result: the per-request block table, the reused
+/// prefix token count, and the precomputed content-hash chain (consumed by
+/// [`GpuPagedTableBuilder::register_plan`] at materialization — no rehash).
+pub struct PagedTablePlan {
+    /// Logical → physical block table (prompt pages only; pad separately).
+    pub table: PagedTable,
+    /// Prompt tokens covered by materialized, aliased prefix pages.
+    pub reused_tokens: usize,
+    /// Per-page content hashes (chain), in page order.
+    pub(crate) chain: Vec<String>,
+}
+
 /// GPU block-table builder: allocates physical page ids in a shared page pool,
 /// reusing pages already cached under the same content hash (a shared system
 /// prompt), and produces per-request logical->physical block tables that
@@ -726,13 +738,24 @@ impl GpuPagedTableBuilder {
     /// content is not written yet, and both requests would then clobber each
     /// other's generated KV in the same physical page.
     pub fn build_table(&mut self, tokens: &[i32]) -> Result<(PagedTable, usize), Error> {
+        let plan = self.plan(tokens, true)?;
+        let reused = plan.reused_tokens;
+        Ok((plan.table, reused))
+    }
+
+    /// One admission-time resolution: computes the content-hash chain **once**
+    /// for `tokens`, then either aliases materialized cached pages
+    /// (`allow_reuse`) or allocates fresh pages for every prompt page. The
+    /// returned plan carries the chain so [`Self::register_plan`] can register
+    /// the content at materialization **without rehashing**.
+    pub fn plan(&mut self, tokens: &[i32], allow_reuse: bool) -> Result<PagedTablePlan, Error> {
         let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
-        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
+        let chain = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
         let mut table = PagedTable::new();
         let mut reused_pages = 0usize;
         let mut allocating = false;
-        for h in &hashes {
-            if !allocating {
+        for h in &chain {
+            if !allocating && allow_reuse {
                 if let Some(&page) = self.cache.get(h) {
                     table.append(page);
                     reused_pages += 1;
@@ -753,7 +776,34 @@ impl GpuPagedTableBuilder {
             table.append(page);
         }
         let reused_tokens = (reused_pages * self.tokens_per_page).min(tokens.len());
-        Ok((table, reused_tokens))
+        Ok(PagedTablePlan {
+            table,
+            reused_tokens,
+            chain,
+        })
+    }
+
+    /// Registers a plan's pages under its (already computed) content chain —
+    /// call only once the pages hold their KV. No hashing.
+    pub fn register_plan(&mut self, plan: &PagedTablePlan, table: &PagedTable) {
+        self.register_chain(&plan.chain, table);
+    }
+
+    /// Registers `chain`'s pages — call only once the pages hold their KV
+    /// (prefill materialized). Later `build_table` calls reuse the chain from
+    /// this point on. First writer wins: when two requests computed the same
+    /// content into *different* fresh pages (both admitted before either
+    /// materialized), only the first registration maps the hash; the second
+    /// request's duplicate pages stay private to its own table (its table
+    /// still addresses them directly), and later reuse resolves to the
+    /// registered ones.
+    pub fn register_chain(&mut self, chain: &[String], table: &PagedTable) {
+        for (h, &logical) in chain.iter().zip(table.pages()) {
+            if self.cache.contains_key(h) {
+                continue;
+            }
+            self.cache.insert(h.clone(), logical);
+        }
     }
 
     /// Extends `table` with fresh pages up to `max_pages` logical entries —
@@ -784,24 +834,8 @@ impl GpuPagedTableBuilder {
     /// the pages are aliases only for this request, and the content is
     /// registered later via [`Self::register_table`] once the KV is written.
     pub fn build_table_fresh(&mut self, tokens: &[i32]) -> Result<PagedTable, Error> {
-        let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
-        let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
-        let mut table = PagedTable::new();
-        let mut fresh_this_call: Vec<(String, u32)> = Vec::new();
-        for h in &hashes {
-            // Allocation-only: a cached page for this content may not hold KV
-            // yet, so we never alias it here (register_table decides when a
-            // page is reusable). Hashes are registered at materialization.
-            let Some(page) = self.allocator.alloc() else {
-                for (_hash, page) in fresh_this_call {
-                    self.allocator.free(page);
-                }
-                return Err(Error::Model("page pool exhausted".into()));
-            };
-            fresh_this_call.push((h.clone(), page));
-            table.append(page);
-        }
-        Ok(table)
+        let plan = self.plan(tokens, false)?;
+        Ok(plan.table)
     }
 
     /// Registers `table`'s pages under `tokens`' content hashes — call only
@@ -815,12 +849,7 @@ impl GpuPagedTableBuilder {
     pub fn register_table(&mut self, tokens: &[i32], table: &PagedTable) {
         let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
         let hashes = crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]);
-        for (h, &logical) in hashes.iter().zip(table.pages()) {
-            if self.cache.contains_key(h) {
-                continue;
-            }
-            self.cache.insert(h.clone(), logical);
-        }
+        self.register_chain(&hashes, table);
     }
 }
 
