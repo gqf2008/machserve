@@ -472,6 +472,43 @@ fn batched_paged_f16_decode_matches_static_gpu() {
     }
 }
 
+/// Paged decode in MLA mode (#78 C4): the newly wired assemble-to-scratch /
+/// `kv_store_paged_mla` / `attn_decode_paged_mla_batched` path must track the
+/// static contiguous MLA path across a page boundary.
+#[test]
+fn batched_paged_mla_decode_matches_static_gpu() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = Config::mla(128, 2, 4, 1024, 256, 32, 16, 16, 8, 16); // tpp 64 -> 4 pages
+    let w = Weights::random(&cfg, 13).unwrap();
+    let mut stat = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut paged = BatchedModel::with_paged_kv(hip.clone(), cfg, &w, 1, 64).unwrap();
+
+    // 70 single-token steps span 2 pages, exercising the block-table page
+    // boundary on the MLA expanded-KV store/attention path.
+    let tokens: Vec<u32> = (0..70u32).map(|i| (i * 37) % 1024 + 1).collect();
+    for (i, &t) in tokens.iter().enumerate() {
+        let s_next = stat.decode_step(&[t]).unwrap();
+        let p_next = paged.decode_step(&[t]).unwrap();
+        assert_eq!(
+            s_next, p_next,
+            "pos {i}: paged vs static MLA greedy token diverged"
+        );
+        let sl = stat.read_logits().unwrap();
+        let pl = paged.read_logits().unwrap();
+        assert_eq!(sl.len(), cfg.vocab_size);
+        let scale = sl.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = sl
+            .iter()
+            .zip(&pl)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d <= 1e-3 + 1e-3 * scale,
+            "pos {i}: paged vs static MLA logits max diff {d} (scale {scale})"
+        );
+    }
+}
+
 /// Paged chunked prefill (#78 C2): several prompt positions of one sequence
 /// packed into distinct rows of a single step must produce the same per-
 /// position logits and greedy tokens as sequential single-token stepping.

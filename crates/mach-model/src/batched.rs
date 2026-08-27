@@ -156,6 +156,10 @@ pub struct BatchedModel {
     mla_kv: *mut f32,
     mla_k_rope: *mut f32,
     mla_attn: *mut f32,
+    /// MLA paged path: expanded per-row k/v scratch (`[rows, heads*hd]` with
+    /// hd = nope + rope / `[rows, heads*v_hd]`) fed to `kv_store_paged_mla`.
+    mla_k_asm: *mut f32,
+    mla_v_asm: *mut f32,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
@@ -254,18 +258,21 @@ impl BatchedModel {
             cfg.max_seq_len.is_multiple_of(tokens_per_page),
             "tokens_per_page must divide max_seq_len"
         );
-        // The paged decode branch dispatches dense F32 and F16 (the F16 paged
-        // kernels); MLA would silently fall through to the contiguous kernels
-        // while still owning block tables. Reject it loudly at construction.
+        // The paged decode branch dispatches dense F32/F16 and MLA (F32); any
+        // other dtype would silently fall through to the contiguous kernels
+        // while still owning block tables. Reject loudly at construction.
         assert!(
             matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16),
             "paged-KV mode supports dense F32/F16 only (got {:?})",
             cfg.dtype
         );
-        assert!(
-            cfg.kv_lora_rank == 0,
-            "paged-KV mode supports dense attention only (MLA paged kernels are follow-ups)"
-        );
+        if cfg.kv_lora_rank > 0 {
+            assert!(
+                cfg.dtype == ModelDType::F32,
+                "paged-KV mode supports MLA in F32 only (got {:?})",
+                cfg.dtype
+            );
+        }
         let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
         m.init_paged(tokens_per_page)?;
         Ok(m)
@@ -603,6 +610,8 @@ impl BatchedModel {
             mla_kv: std::ptr::null_mut(),
             mla_k_rope: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
+            mla_k_asm: std::ptr::null_mut(),
+            mla_v_asm: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
@@ -852,6 +861,10 @@ impl BatchedModel {
             self.mla_kv = self.dalloc(b * heads * (nope + v_hd) * 4)?;
             self.mla_k_rope = self.dalloc(b * rope * 4)?;
             self.mla_attn = self.dalloc(b * heads * v_hd * 4)?;
+            // Paged MLA path: per-row expanded scratch consumed by
+            // kv_store_paged_mla (the contiguous caches skip it).
+            self.mla_k_asm = self.dalloc(b * heads * (nope + rope) * 4)?;
+            self.mla_v_asm = self.dalloc(b * heads * v_hd * 4)?;
             // MLA KV caches are stored as f32 (expanded per-head layout).
             let k_bytes = self.batch * c.max_seq_len * heads * (nope + rope) * 4;
             let v_bytes = self.batch * c.max_seq_len * heads * v_hd * 4;
@@ -1576,35 +1589,85 @@ impl BatchedModel {
                     rope,
                 )?;
                 let (kc, vc) = self.mla_kv_cache[li];
-                k.launch_mla_assemble_kv_batched(
-                    self.mla_kv,
-                    self.mla_k_rope,
-                    kc as *mut f32,
-                    vc as *mut f32,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    max_seq,
-                    heads,
-                    nope,
-                    rope,
-                    v_hd,
-                )?;
                 let scale = 1.0 / ((nope + rope) as f32).sqrt();
-                k.launch_mla_attn_decode_batched(
-                    self.q,
-                    kc as *const f32,
-                    vc as *const f32,
-                    self.mla_attn,
-                    self.pos_dev,
-                    slots,
-                    b,
-                    heads,
-                    nope + rope,
-                    v_hd,
-                    scale,
-                    max_seq,
-                )?;
+                if self.paged {
+                    // Paged MLA: expand to per-row scratch, store through the
+                    // block tables into the per-head page pools, then batched
+                    // attention over them.
+                    let tpp = self.tokens_per_page as i32;
+                    let max_pages = self.max_pages_per_seq as i32;
+                    k.launch_mla_assemble_kv_rows(
+                        self.mla_kv,
+                        self.mla_k_rope,
+                        self.mla_k_asm,
+                        self.mla_v_asm,
+                        b,
+                        heads,
+                        nope,
+                        rope,
+                        v_hd,
+                    )?;
+                    k.launch_kv_store_paged_mla(
+                        self.mla_k_asm,
+                        self.mla_v_asm,
+                        kc as *mut f32,
+                        vc as *mut f32,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        heads,
+                        nope + rope,
+                        v_hd,
+                        tpp,
+                    )?;
+                    k.launch_attn_decode_paged_mla_batched(
+                        self.q,
+                        kc as *const f32,
+                        vc as *const f32,
+                        self.block_tables,
+                        self.mla_attn,
+                        self.pos_dev,
+                        self.table_offsets,
+                        b,
+                        heads,
+                        nope,
+                        rope,
+                        v_hd,
+                        scale,
+                        tpp,
+                        max_pages,
+                    )?;
+                } else {
+                    k.launch_mla_assemble_kv_batched(
+                        self.mla_kv,
+                        self.mla_k_rope,
+                        kc as *mut f32,
+                        vc as *mut f32,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        max_seq,
+                        heads,
+                        nope,
+                        rope,
+                        v_hd,
+                    )?;
+                    k.launch_mla_attn_decode_batched(
+                        self.q,
+                        kc as *const f32,
+                        vc as *const f32,
+                        self.mla_attn,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        heads,
+                        nope + rope,
+                        v_hd,
+                        scale,
+                        max_seq,
+                    )?;
+                }
                 gemm(
                     self.proj,
                     self.mla_attn,
