@@ -822,7 +822,8 @@
     真正接线(MACH_PAGED 不再静默忽略);
   - 验证:continuous 20/20(含并发部分末页、并发同 prompt 池不泄漏、
     驱逐压力)、batched 14/14、server 17/17(含 Q4 paged HTTP e2e)、
-    CPU lib 5 套件、离线门禁 44 内核。
+    CPU lib 5 套件、离线门禁 43 内核(R1 时实际清单即为 43,此处
+    原记 44 系误记,已在 R3 条目更正)。
 
 - **PR #81 三轮审查修复(2026-08-28,7900 XTX)**:code-review max 15 条
   findings 兑现,正确性优先——
@@ -878,6 +879,36 @@
     weights.rs From impl 移出类型定义区(修 rustdoc 错位)、
     PagedTablePlan.reused_pages 文档对齐恒等式、README 44→43 内核、
     tokenspeed-alignment 状态表驱逐落地/页级 LRU 剩余;
+  - 验证:CPU lib 184/184、fmt/clippy(-D warnings)/check×2 全绿;
+    GPU 面(7900 XTX,--test-threads 1):continuous 22/22、batched
+    14/14、mla 5/5、fp16 6/6、decode_slice 2/2、server 31+2(含
+    ignored Q4/FP8 HTTP e2e)、离线门禁 2/2(43 内核+计数断言)。
+
+- **PR #81 五轮审查修复(R4 复审,2026-08-28)**:复审 15 条兑现——
+  - **准入驱逐盲区(真缺陷)**:驱逐改逐 hash 收割(整条目 any-引用
+    跳过改为「条目内逐 hash 判定」,混有活跃共享 hash 的 retired 条目
+    其独占页可被释放),冷页不再被困在共享条目后面;认领计数表一次
+    构建 O(n)(原每删一条 O(n) 重建,SipHash 毫秒级引擎线程停顿);
+  - **FP8/Q4 From 转换逐专家化(真缺陷)**:from_weights(w, cfg) 按
+    num_experts 拆分 MoE 拼接张量逐专家量化(concat 各专家独立
+    scale),与 safetensors 加载器逐字节同产;原实现整张量单 scale,
+    一个离群专家压扁其余专家精度,测试验证的是真实加载不会产生的
+    量化形态;
+  - **整前缀命中单 token 回退**:r==len 时 r-=1(原回退整页,tpp 个
+    transformer forward 重算已写 KV 且 stats 少计);
+  - **reused_tokens 字段删除**:恒等于 reused_pages*tpp,保留即邀请
+    误用为 free 边界(字段自文档都在警告的事,直接消灭);引擎与
+    build_table 从页数派生;
+  - 文档/测试收敛:server paged 测试 post 闭包提取共享 helper;
+    full-pages-only 规则三处镜像点互引;roadmap R1 条目计数更正
+    (43,原 44 误记);
+  - **遗留(记录为后续项)**:页所有权/refcount 下沉 builder 或复用
+    kv_block_pool RAII(消除引擎层手工引用扫描);PageAllocator
+    世代号 owner 检测(free→realloc→陈旧 free 不可检测残差);
+    ALL_KERNELS 声明点宏化(成员关系机器校验,当前计数 pin 只防
+    列表↔断言漂移);引擎选择 Option<usize> 构造收敛(5 处 if-let);
+    ATTN_DECODE_PAGED_MLA 为有意保留的单序列 paged MLA 预留内核
+    (offline-gate-only 注释,43 计数含它)。
   - 验证:CPU lib 184/184、fmt/clippy(-D warnings)/check×2 全绿;
     GPU 面(7900 XTX,--test-threads 1):continuous 22/22、batched
     14/14、mla 5/5、fp16 6/6、decode_slice 2/2、server 31+2(含

@@ -117,29 +117,44 @@ impl PagedEngineState {
             .collect()
     }
 
+    /// Per-hash claim counts across the retired list: a hash is released
+    /// only by its last claimant, keeping every surviving entry's chain
+    /// resolvable (a dangling chain could make reuse look available where
+    /// the cache no longer resolves).
+    fn claimed_counts(&self) -> std::collections::HashMap<String, u32> {
+        let mut claimed: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for e in &self.retired {
+            for h in e.chain.iter() {
+                *claimed.entry(h.clone()).or_insert(0) += 1;
+            }
+        }
+        claimed
+    }
+
     /// Frees the freeable hashes of the retired entry at `idx` — mapped,
-    /// not claimed by any surviving retired entry (shared pages are released
-    /// by the last claimant, keeping every surviving chain resolvable), and
-    /// not aliased by a live table — and removes its metadata. Returns the
+    /// not claimed by any surviving retired entry, and not aliased by a
+    /// live table — and drops its metadata. `claimed` is the live claim
+    /// count table (this entry's own claims come off first). A fully
+    /// live-aliased entry is dropped as dead metadata only after its
+    /// unreclaimable hashes are skipped: each such page stays registered
+    /// and recoverable through the aliasing table's own entry. Returns the
     /// number of pages freed.
-    fn evict_retired_at(
+    fn evict_entry_at(
         &mut self,
         idx: usize,
         referenced: &std::collections::HashSet<u32>,
+        claimed: &mut std::collections::HashMap<String, u32>,
     ) -> usize {
         let entry = self.retired.remove(idx);
-        let claimed: std::collections::HashSet<&str> = self
-            .retired
-            .iter()
-            .flat_map(|e| e.chain.iter().map(String::as_str))
-            .collect();
         let mut freed = 0usize;
         for h in entry.chain.iter() {
+            let remaining = claimed.get_mut(h).expect("retired chain is counted");
+            *remaining -= 1;
             let freeable = self
                 .builder
                 .page_of(h)
                 .is_some_and(|p| !referenced.contains(&p));
-            if freeable && !claimed.contains(h.as_str()) && self.builder.evict_page(h) {
+            if *remaining == 0 && freeable && self.builder.evict_page(h) {
                 freed += 1;
             }
         }
@@ -147,32 +162,19 @@ impl PagedEngineState {
     }
 
     /// Evicts retired entries oldest-first until one page returns to the
-    /// pool. An entry whose pages are aliased by a live table must stay (a
-    /// page still in use cannot be freed); within an entry, each hash is
-    /// evicted only when no surviving retired entry claims it — a shared
-    /// page is released by its last claimant, and every surviving entry's
-    /// chain stays resolvable (a dangling chain could otherwise make reuse
-    /// look available where the cache no longer resolves). Entries left with
-    /// no resolvable hash — their pages went with an earlier co-owned
-    /// eviction — are dropped as dead metadata. Stops at the first freeing
-    /// eviction: colder entries stay cached for later reuse. Returns true
-    /// when at least one page was freed (a plan retry can make progress);
-    /// metadata-only drops do not count.
+    /// pool. Harvesting is per hash — unlike a whole-entry skip, an entry's
+    /// unique pages are freed even when other hashes of the same entry are
+    /// live-shared, so cold pages never stay trapped behind a shared one.
+    /// Stops at the first freeing eviction: colder entries beyond it stay
+    /// cached for later reuse. Entries whose every hash is unreclaimable
+    /// are dropped as dead metadata. Returns true when at least one page
+    /// was freed (a plan retry can make progress).
     fn evict_one_retired(&mut self) -> bool {
         let referenced = self.referenced_pages();
+        let mut claimed = self.claimed_counts();
         let mut freed = 0usize;
-        let mut idx = 0;
-        while idx < self.retired.len() {
-            let any_referenced = self.retired[idx].chain.iter().any(|h| {
-                self.builder
-                    .page_of(h)
-                    .is_some_and(|p| referenced.contains(&p))
-            });
-            if any_referenced {
-                idx += 1;
-                continue;
-            }
-            freed += self.evict_retired_at(idx, &referenced);
+        while !self.retired.is_empty() {
+            freed += self.evict_entry_at(0, &referenced, &mut claimed);
             if freed > 0 {
                 break;
             }
@@ -182,18 +184,17 @@ impl PagedEngineState {
         freed > 0
     }
 
-    /// Retired-cap fallback: frees the oldest entry's freeable pages (see
-    /// [`Self::evict_retired_at`]) and drops its metadata. Pages still
-    /// aliased by a live table stay registered and remain recoverable — the
-    /// aliasing table's own entry lists the same hashes, so eviction reaches
-    /// them again once that table finishes; nothing is orphaned beyond
-    /// eviction's reach. Returns true when a page was freed.
+    /// Retired-cap fallback: frees the oldest entry's freeable pages (same
+    /// per-hash rules as [`Self::evict_one_retired`]) and drops its
+    /// metadata, bounding the retired list when nothing can be reclaimed.
+    /// Returns true when a page was freed.
     fn force_evict_oldest(&mut self) -> bool {
         if self.retired.is_empty() {
             return false;
         }
         let referenced = self.referenced_pages();
-        self.evict_retired_at(0, &referenced) > 0
+        let mut claimed = self.claimed_counts();
+        self.evict_entry_at(0, &referenced, &mut claimed) > 0
     }
 }
 
@@ -584,14 +585,16 @@ impl ContinuousModel {
                     .pad_table(&mut p.table, self.model.max_pages_per_seq())
                 {
                     Ok(()) => {
-                        let mut r = p.reused_tokens;
+                        let mut r = p.reused_pages * pg.tokens_per_page;
                         if r == prompt.len() {
                             // Full-prefix reuse would leave an empty prefill
                             // queue with no first decode token (step() panics).
-                            // Keep the last page: it is recomputed into the
-                            // (identical-content) aliased page — benign — and
-                            // the prefill produces the first token normally.
-                            r -= pg.tokens_per_page;
+                            // Rewind exactly one token: it is recomputed into
+                            // the (identical-content) aliased page — benign —
+                            // and the one-row prefill produces the first token
+                            // normally (a whole-page rewind would pay tpp
+                            // transformer forwards re-computing written KV).
+                            r -= 1;
                         }
                         break (p, r);
                     }

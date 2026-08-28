@@ -706,10 +706,8 @@ impl PagedRef {
 pub struct PagedTablePlan {
     /// Logical → physical block table (prompt pages only; pad separately).
     pub table: PagedTable,
-    /// Prompt tokens covered by materialized, aliased prefix pages.
-    pub reused_tokens: usize,
-    /// Aliased prefix pages — the exact page count. `reused_tokens ==
-    /// reused_pages * tokens_per_page` always holds (only full pages alias);
+    /// Aliased prefix pages — the exact page count. The covered token count
+    /// is always `reused_pages * tokens_per_page` (only full pages alias);
     /// `free_plan_pages` uses this field as its fresh/aliased boundary.
     pub reused_pages: usize,
     /// Per-page content hashes (chain), in page order. Consumed by the
@@ -754,6 +752,9 @@ impl GpuPagedTableBuilder {
     /// prompt tokens covered by the reused prefix (the delta starts there).
     /// Errors when the page pool cannot satisfy the fresh demand.
     ///
+    /// Thin delegation over [`Self::plan`] (kept for tests); the production
+    /// admission path is [`Self::compute_chain`] + [`Self::plan_with_chain`].
+    ///
     /// The content cache is **read-only** here: fresh tail pages are allocated
     /// but NOT registered — registration happens in [`Self::register_chain`]
     /// once the pages actually hold their KV (the engine's materialization
@@ -762,7 +763,7 @@ impl GpuPagedTableBuilder {
     /// other's generated KV in the same physical page.
     pub fn build_table(&mut self, tokens: &[i32]) -> Result<(PagedTable, usize), Error> {
         let plan = self.plan(tokens, true)?;
-        let reused = plan.reused_tokens;
+        let reused = plan.reused_pages * self.tokens_per_page;
         Ok((plan.table, reused))
     }
 
@@ -780,6 +781,9 @@ impl GpuPagedTableBuilder {
     /// pages (`allow_reuse`) or allocates fresh pages for every prompt page.
     /// The returned plan carries the chain so [`Self::register_chain`] can
     /// register the content at materialization **without rehashing**.
+    /// Thin delegation over [`Self::compute_chain`] + [`Self::plan_with_chain`]
+    /// (kept for tests); the production admission path passes the chain
+    /// explicitly so eviction retries never rehash.
     ///
     /// Reuse covers **full prompt pages only**: a partial last page is always
     /// allocated fresh. An aliased partial page would be written by every
@@ -795,6 +799,11 @@ impl GpuPagedTableBuilder {
     /// aliasing, allocation, and rollback behavior without rehashing or
     /// copying the chain (shared `Arc`). `chain` must be `tokens`' own chain
     /// (the engine computes both together at admission).
+    ///
+    /// The full-pages-only reuse rule is mirrored by the engine at
+    /// materialization (registers `chain[..full_pages]` only) and at retire
+    /// (the unregistered partial page frees with the other unregistered
+    /// content) — keep the three sites in lockstep.
     pub fn plan_with_chain(
         &mut self,
         tokens: &[i32],
@@ -827,14 +836,8 @@ impl GpuPagedTableBuilder {
             };
             table.append(page);
         }
-        // Exact reused-token boundary: only full pages alias, so this equals
-        // `reused_pages * tokens_per_page` (no clamp — a partial final page
-        // is never in the aliased run). `free_plan_pages` must derive its
-        // fresh/aliased boundary from `reused_pages`, never from this field.
-        let reused_tokens = reused_pages * self.tokens_per_page;
         Ok(PagedTablePlan {
             table,
-            reused_tokens,
             reused_pages,
             chain,
         })
@@ -1660,7 +1663,7 @@ mod tests {
         // Nothing materialized: full fresh compute.
         let p0 = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(p0.reused_pages, 0);
-        assert_eq!(p0.reused_tokens, 0);
+        assert_eq!(p0.reused_pages, 0);
         assert_eq!(p0.table.len(), 2, "full page + partial page");
 
         // Register page 0's content only (prefill materialized).
@@ -1670,7 +1673,7 @@ mod tests {
         // partial page stays per-request fresh.
         let p1 = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(p1.reused_pages, 1, "only the materialized full page");
-        assert_eq!(p1.reused_tokens, 4, "one full page worth of tokens");
+        assert_eq!(p1.reused_pages, 1, "one full page aliases");
         assert_eq!(p1.table.get(0), p0.table.get(0), "page 0 aliased");
         assert_ne!(
             p1.table.get(1),
@@ -1773,7 +1776,7 @@ mod tests {
         assert!(b.page_of(&chain[0]).is_none());
         let after = b.plan(&tokens, true).unwrap();
         assert_eq!(after.reused_pages, 0, "evicted content must not be reused");
-        assert_eq!(after.reused_tokens, 0);
+        assert_eq!(after.reused_pages, 0);
         // Freed pages are recycled, not double-counted.
         assert_eq!(b.cached_pages(), 0);
     }

@@ -955,8 +955,8 @@ fn paged_engine_eviction_with_sibling_retired_entries() {
     assert_eq!(stats.requests, 6, "all six requests admitted");
     assert_eq!(
         stats.reused_tokens,
-        len - tpp,
-        "only f reuses (full prefix minus the kept last page)"
+        len - 1,
+        "only f reuses (full prefix minus the one rewound token)"
     );
 }
 
@@ -1146,7 +1146,7 @@ fn paged_engine_quantized_reuses_shared_prefix() {
         match quant {
             0 => {
                 let w = Weights::random(&cfg, 91).unwrap();
-                let wq = mach_model::WeightsQ4::from(&w);
+                let wq = mach_model::WeightsQ4::from_weights(&w, &cfg);
                 let run = |paged: bool| -> (Vec<Vec<u32>>, usize) {
                     if paged {
                         let mut eng = ContinuousModel::with_paged_prefill_rows_q4(
@@ -1181,7 +1181,7 @@ fn paged_engine_quantized_reuses_shared_prefix() {
             }
             _ => {
                 let w = Weights::random(&cfg, 93).unwrap();
-                let wf = mach_model::WeightsFp8::from(&w);
+                let wf = mach_model::WeightsFp8::from_weights(&w, &cfg);
                 let run = |paged: bool| -> (Vec<Vec<u32>>, usize) {
                     if paged {
                         let mut eng = ContinuousModel::with_paged_prefill_rows_fp8(
@@ -1256,9 +1256,11 @@ fn paged_engine_retired_cap_recovers_and_reuses() {
     let stats = eng.paged_reuse_stats().expect("paged");
     assert_eq!(stats.requests, 11);
     // r2..r9 reuse (8x), r10 full-computes after the cap drain, r11 reuses.
+    // Each full-prefix hit reuses every token but the one rewound for the
+    // first decode row.
     assert_eq!(
         stats.reused_tokens,
-        9 * (tpp),
+        9 * (2 * tpp - 1),
         "reuse before and after the cap drain"
     );
 }

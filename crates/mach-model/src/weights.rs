@@ -331,12 +331,32 @@ impl Weights {
     }
 }
 
-/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, norms/biases
-/// and the tiny router copied) — the same conversion the safetensors Q4
-/// loader applies, shared by tests and future re-quantization paths.
-impl From<&Weights> for WeightsQ4 {
-    fn from(w: &Weights) -> Self {
+impl WeightsQ4 {
+    /// Converts f32 weights to storage-Q4 (GEMM tensors quantized, norms/biases
+    /// and the tiny router copied) — the same conversion the safetensors Q4
+    /// loader applies, shared by tests and future re-quantization paths.
+    /// `cfg.num_experts` splits the concatenated MoE expert tensors so each
+    /// expert is quantized with its own groups (exactly what a checkpoint
+    /// load produces).
+    pub fn from_weights(w: &Weights, cfg: &Config) -> Self {
         let q = |v: &[f32]| crate::q4::Q4Tensor::quantize(v);
+        // MoE expert tensors are stored concatenated; the loader quantizes
+        // each expert separately (per-expert groups via `concat`), so split
+        // by `cfg.num_experts` here too — a whole-tensor quantize of the
+        // concatenation would let one outlier expert flatten every other.
+        let qm = |v: &[f32]| -> crate::q4::Q4Tensor {
+            let ne = cfg.num_experts;
+            if ne == 0 {
+                return q(v);
+            }
+            let per = v.len() / ne;
+            assert_eq!(per * ne, v.len(), "MoE tensor must split evenly per expert");
+            let mut out = crate::q4::Q4Tensor::default();
+            for e in 0..ne {
+                out = out.concat(&q(&v[e * per..(e + 1) * per]));
+            }
+            out
+        };
         Self {
             tok_emb: q(&w.tok_emb),
             rms_final: w.rms_final.clone(),
@@ -368,22 +388,40 @@ impl From<&Weights> for WeightsQ4 {
                     mla_kv_b: q(&l.mla_kv_b),
                     mla_o: q(&l.mla_o),
                     moe_router: l.moe_router.clone(),
-                    moe_wg: q(&l.moe_wg),
-                    moe_wu: q(&l.moe_wu),
-                    moe_wd: q(&l.moe_wd),
+                    moe_wg: qm(&l.moe_wg),
+                    moe_wu: qm(&l.moe_wu),
+                    moe_wd: qm(&l.moe_wd),
                 })
                 .collect(),
         }
     }
 }
 
-/// Converts f32 weights to storage-FP8 (GEMM tensors E4M3-quantized with
-/// per-tensor scales, norms/biases and the tiny router copied) — the same
-/// conversion the safetensors FP8 loader applies, shared by tests and future
-/// re-quantization paths.
-impl From<&Weights> for WeightsFp8 {
-    fn from(w: &Weights) -> Self {
+impl WeightsFp8 {
+    /// Converts f32 weights to storage-FP8 (GEMM tensors E4M3-quantized with
+    /// per-tensor scales, norms/biases and the tiny router copied) — the same
+    /// conversion the safetensors FP8 loader applies, shared by tests and
+    /// future re-quantization paths. `cfg.num_experts` splits the
+    /// concatenated MoE expert tensors so each expert is quantized with its
+    /// own per-expert scale and `block = expert size` (exactly what a
+    /// checkpoint load produces).
+    pub fn from_weights(w: &Weights, cfg: &Config) -> Self {
         let q = |v: &[f32]| crate::fp8::Fp8Tensor::quantize(v);
+        // Per-expert scales, mirroring the loader's concat of independently
+        // quantized expert tensors (see the Q4 sibling for the rationale).
+        let qm = |v: &[f32]| -> crate::fp8::Fp8Tensor {
+            let ne = cfg.num_experts;
+            if ne == 0 {
+                return q(v);
+            }
+            let per = v.len() / ne;
+            assert_eq!(per * ne, v.len(), "MoE tensor must split evenly per expert");
+            let mut out = crate::fp8::Fp8Tensor::default();
+            for e in 0..ne {
+                out = out.concat(&q(&v[e * per..(e + 1) * per]));
+            }
+            out
+        };
         Self {
             tok_emb: q(&w.tok_emb),
             rms_final: w.rms_final.clone(),
@@ -415,9 +453,9 @@ impl From<&Weights> for WeightsFp8 {
                     mla_kv_b: q(&l.mla_kv_b),
                     mla_o: q(&l.mla_o),
                     moe_router: l.moe_router.clone(),
-                    moe_wg: q(&l.moe_wg),
-                    moe_wu: q(&l.moe_wu),
-                    moe_wd: q(&l.moe_wd),
+                    moe_wg: qm(&l.moe_wg),
+                    moe_wu: qm(&l.moe_wu),
+                    moe_wd: qm(&l.moe_wd),
                 })
                 .collect(),
         }
