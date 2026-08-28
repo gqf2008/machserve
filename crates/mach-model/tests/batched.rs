@@ -898,8 +898,7 @@ mod paged_quantized_cpu_parity {
         let w = Weights::random(&cfg, 101).unwrap();
         let wq = WeightsQ4::from_weights(&w, &cfg);
         let wd = dequantize_q4(&wq);
-        let mut paged =
-            BatchedModel::with_paged_kv_rows_q4(hip, cfg, &wq, 1, 4, 8).unwrap();
+        let mut paged = BatchedModel::with_paged_kv_rows_q4(hip, cfg, &wq, 1, 4, 8).unwrap();
         // 20 tokens at tpp 8: crosses two page boundaries.
         let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
         assert_paged_matches_cpu(&mut paged, cfg, &wd, &prompt, 5e-2);
@@ -943,8 +942,7 @@ mod paged_quantized_cpu_parity {
         let w = Weights::random(&cfg, 103).unwrap();
         let wf = WeightsFp8::from_weights(&w, &cfg);
         let wd = dequantize_fp8(&wf);
-        let mut paged =
-            BatchedModel::with_paged_kv_rows_fp8(hip, cfg, &wf, 1, 4, 8).unwrap();
+        let mut paged = BatchedModel::with_paged_kv_rows_fp8(hip, cfg, &wf, 1, 4, 8).unwrap();
         let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
         assert_paged_matches_cpu(&mut paged, cfg, &wd, &prompt, 5e-2);
     }
