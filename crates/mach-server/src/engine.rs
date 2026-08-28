@@ -315,8 +315,18 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model =
-            ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?;
+        let mut model = if let Some(tpp) = self.paged_tpp {
+            ContinuousModel::with_paged_prefill_rows_q4(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                tpp,
+            )?
+        } else {
+            ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?
+        };
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))
@@ -339,8 +349,18 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model =
-            ContinuousModel::with_prefill_rows_fp8(hip, cfg, &w, self.capacity, self.prefill_rows)?;
+        let mut model = if let Some(tpp) = self.paged_tpp {
+            ContinuousModel::with_paged_prefill_rows_fp8(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                tpp,
+            )?
+        } else {
+            ContinuousModel::with_prefill_rows_fp8(hip, cfg, &w, self.capacity, self.prefill_rows)?
+        };
         Ok(std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || self.run(&mut model))
@@ -356,6 +376,12 @@ impl ServerEngine {
         dcfg: Config,
         dw: Weights,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
+        if self.paged_tpp.is_some() {
+            return Err(EngineError::InvalidRequest(
+                "Speculative mode does not support MACH_PAGED (paged spec wiring is a follow-up)"
+                    .into(),
+            ));
+        }
         let k = self.spec_k;
         let draft = BatchedModel::with_rows(hip.clone(), dcfg, &dw, self.capacity, self.capacity)?;
         let target = BatchedModel::with_rows(hip, cfg, &w, self.capacity, self.capacity * (k + 1))?;

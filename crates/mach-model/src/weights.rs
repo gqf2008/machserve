@@ -147,6 +147,7 @@ pub struct WeightsFp8 {
     pub lm_head: crate::fp8::Fp8Tensor,
     pub layers: Vec<LayerWeightsFp8>,
 }
+
 /// All model weights.
 #[derive(Debug, Clone)]
 pub struct Weights {
@@ -327,6 +328,131 @@ impl Weights {
                 + l.moe_wd.len();
         }
         n * 4
+    }
+}
+
+impl WeightsQ4 {
+    /// Converts f32 weights to storage-Q4 (GEMM tensors quantized, norms/biases
+    /// and the tiny router copied) — the same conversion the safetensors Q4
+    /// loader applies, shared by tests and future re-quantization paths.
+    /// `cfg.num_experts` splits the concatenated MoE expert tensors so each
+    /// expert is quantized with its own groups (exactly what a checkpoint
+    /// load produces).
+    pub fn from_weights(w: &Weights, cfg: &Config) -> Self {
+        let q = |v: &[f32]| crate::q4::Q4Tensor::quantize(v);
+        // MoE expert tensors are stored concatenated; the loader quantizes
+        // each expert separately (per-expert groups via `concat`), so split
+        // by `cfg.num_experts` here too — a whole-tensor quantize of the
+        // concatenation would let one outlier expert flatten every other.
+        let qm = |v: &[f32]| -> crate::q4::Q4Tensor {
+            let ne = cfg.num_experts;
+            if ne == 0 {
+                return q(v);
+            }
+            let per = v.len() / ne;
+            assert_eq!(per * ne, v.len(), "MoE tensor must split evenly per expert");
+            let parts: Vec<_> = (0..ne).map(|e| q(&v[e * per..(e + 1) * per])).collect();
+            crate::q4::Q4Tensor::concat_many(&parts)
+        };
+        Self {
+            tok_emb: q(&w.tok_emb),
+            rms_final: w.rms_final.clone(),
+            lm_head: q(&w.lm_head),
+            layers: w
+                .layers
+                .iter()
+                .map(|l| LayerWeightsQ4 {
+                    wq: q(&l.wq),
+                    wk: q(&l.wk),
+                    wv: q(&l.wv),
+                    wo: q(&l.wo),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: q(&l.wg),
+                    wu: q(&l.wu),
+                    wd: q(&l.wd),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: q(&l.mla_q_a),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: q(&l.mla_q_b),
+                    mla_q_rope: q(&l.mla_q_rope),
+                    mla_kv_a: q(&l.mla_kv_a),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: q(&l.mla_kv_b),
+                    mla_o: q(&l.mla_o),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: qm(&l.moe_wg),
+                    moe_wu: qm(&l.moe_wu),
+                    moe_wd: qm(&l.moe_wd),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl WeightsFp8 {
+    /// Converts f32 weights to storage-FP8 (GEMM tensors E4M3-quantized with
+    /// per-tensor scales, norms/biases and the tiny router copied) — the same
+    /// conversion the safetensors FP8 loader applies, shared by tests and
+    /// future re-quantization paths. `cfg.num_experts` splits the
+    /// concatenated MoE expert tensors so each expert is quantized with its
+    /// own per-expert scale and `block = expert size` (exactly what a
+    /// checkpoint load produces).
+    pub fn from_weights(w: &Weights, cfg: &Config) -> Self {
+        let q = |v: &[f32]| crate::fp8::Fp8Tensor::quantize(v);
+        // Per-expert scales, mirroring the loader's concat of independently
+        // quantized expert tensors (see the Q4 sibling for the rationale).
+        let qm = |v: &[f32]| -> crate::fp8::Fp8Tensor {
+            let ne = cfg.num_experts;
+            if ne == 0 {
+                return q(v);
+            }
+            let per = v.len() / ne;
+            assert_eq!(per * ne, v.len(), "MoE tensor must split evenly per expert");
+            let parts: Vec<_> = (0..ne).map(|e| q(&v[e * per..(e + 1) * per])).collect();
+            crate::fp8::Fp8Tensor::concat_many(&parts)
+        };
+        Self {
+            tok_emb: q(&w.tok_emb),
+            rms_final: w.rms_final.clone(),
+            lm_head: q(&w.lm_head),
+            layers: w
+                .layers
+                .iter()
+                .map(|l| LayerWeightsFp8 {
+                    wq: q(&l.wq),
+                    wk: q(&l.wk),
+                    wv: q(&l.wv),
+                    wo: q(&l.wo),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: q(&l.wg),
+                    wu: q(&l.wu),
+                    wd: q(&l.wd),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: q(&l.mla_q_a),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: q(&l.mla_q_b),
+                    mla_q_rope: q(&l.mla_q_rope),
+                    mla_kv_a: q(&l.mla_kv_a),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: q(&l.mla_kv_b),
+                    mla_o: q(&l.mla_o),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: qm(&l.moe_wg),
+                    moe_wu: qm(&l.moe_wu),
+                    moe_wd: qm(&l.moe_wd),
+                })
+                .collect(),
+        }
     }
 }
 

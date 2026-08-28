@@ -393,10 +393,11 @@ fn shared_prefix_paged_reuse_matches_full_compute() {
     let pool_pages = (2 * cfg.max_seq_len / tpp) as u32;
     let mut builder = GpuPagedTableBuilder::new(pool_pages, tpp);
     let as_i32 = |v: &[u32]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+    let chain_a = builder.compute_chain(&as_i32(&seq_a));
     let (ta, _ra) = builder.build_table(&as_i32(&seq_a)).unwrap();
     // Materialize A's pages (the engine registers content only after prefill
     // completes); B's build then resolves the shared prefix through the cache.
-    builder.register_table(&as_i32(&seq_a), &ta);
+    builder.register_chain(&chain_a, &ta);
     let (tb, rb) = builder.build_table(&as_i32(&seq_b)).unwrap();
     assert_eq!(ta.len(), 2, "ceil((64+3+3)/64) pages");
     assert_eq!(rb, tpp, "B reuses exactly the shared prefix page");
@@ -763,5 +764,186 @@ fn batched_paged_chunked_prefill_matches_sequential() {
             greedy_argmax(&ref_logits[pos]),
             "chunk2 greedy row {row} (pos {pos})"
         );
+    }
+}
+
+/// Paged quantized paths pinned to a dequantized-weight CPU reference
+/// (CLAUDE.md rule 3): both sides run the same int4/E4M3 weights — the GPU
+/// dequantizes to f16, the CPU reference to f32 — so a paged-addressing
+/// regression (shared by neither the contiguous GPU path nor a GPU-vs-GPU
+/// pairing) surfaces as a large logit diff. Quantization error itself
+/// cancels: only f16 rounding and GEMM order remain in the diff.
+mod paged_quantized_cpu_parity {
+    use super::*;
+    use mach_model::ref_model::RefModel;
+    use mach_model::weights::LayerWeights;
+    use mach_model::{WeightsFp8, WeightsQ4};
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn dequantize_q4(wq: &WeightsQ4) -> Weights {
+        Weights {
+            tok_emb: wq.tok_emb.dequantize(),
+            rms_final: wq.rms_final.clone(),
+            lm_head: wq.lm_head.dequantize(),
+            layers: wq
+                .layers
+                .iter()
+                .map(|l| LayerWeights {
+                    wq: l.wq.dequantize(),
+                    wk: l.wk.dequantize(),
+                    wv: l.wv.dequantize(),
+                    wo: l.wo.dequantize(),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: l.wg.dequantize(),
+                    wu: l.wu.dequantize(),
+                    wd: l.wd.dequantize(),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: l.mla_q_a.dequantize(),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: l.mla_q_b.dequantize(),
+                    mla_q_rope: l.mla_q_rope.dequantize(),
+                    mla_kv_a: l.mla_kv_a.dequantize(),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: l.mla_kv_b.dequantize(),
+                    mla_o: l.mla_o.dequantize(),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: l.moe_wg.dequantize(),
+                    moe_wu: l.moe_wu.dequantize(),
+                    moe_wd: l.moe_wd.dequantize(),
+                })
+                .collect(),
+        }
+    }
+
+    fn dequantize_fp8(wf: &WeightsFp8) -> Weights {
+        Weights {
+            tok_emb: wf.tok_emb.dequantize(),
+            rms_final: wf.rms_final.clone(),
+            lm_head: wf.lm_head.dequantize(),
+            layers: wf
+                .layers
+                .iter()
+                .map(|l| LayerWeights {
+                    wq: l.wq.dequantize(),
+                    wk: l.wk.dequantize(),
+                    wv: l.wv.dequantize(),
+                    wo: l.wo.dequantize(),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: l.wg.dequantize(),
+                    wu: l.wu.dequantize(),
+                    wd: l.wd.dequantize(),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: l.mla_q_a.dequantize(),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: l.mla_q_b.dequantize(),
+                    mla_q_rope: l.mla_q_rope.dequantize(),
+                    mla_kv_a: l.mla_kv_a.dequantize(),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: l.mla_kv_b.dequantize(),
+                    mla_o: l.mla_o.dequantize(),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: l.moe_wg.dequantize(),
+                    moe_wu: l.moe_wu.dequantize(),
+                    moe_wd: l.moe_wd.dequantize(),
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_paged_matches_cpu(
+        paged: &mut BatchedModel,
+        cfg: Config,
+        want: &Weights,
+        prompt: &[u32],
+        tol: f32,
+    ) {
+        let mut cpu = RefModel::new(cfg, want.clone());
+        for &t in prompt.iter() {
+            paged.decode_step(&[t]).unwrap();
+            let got = paged.read_logits().unwrap();
+            // RefModel is stateful: feed exactly the one new token and read
+            // its (last-position) logits.
+            let cpu_logits = cpu.forward(&[t]);
+            let d = max_abs_diff(&got, &cpu_logits);
+            let scale = cpu_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                d <= tol * (1.0 + scale),
+                "step {}: paged quantized vs dequantized CPU ref: max diff {d} (scale {scale})",
+                cpu.pos() - 1
+            );
+        }
+    }
+
+    #[test]
+    fn batched_paged_q4_matches_dequantized_reference() {
+        let Some(hip) = hip_ctx() else { return };
+        let mut cfg = Config::tiny();
+        cfg.dtype = ModelDType::F16;
+        let w = Weights::random(&cfg, 101).unwrap();
+        let wq = WeightsQ4::from_weights(&w, &cfg);
+        let wd = dequantize_q4(&wq);
+        let mut paged = BatchedModel::with_paged_kv_rows_q4(hip, cfg, &wq, 1, 4, 8).unwrap();
+        // 20 tokens at tpp 8: crosses two page boundaries.
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
+        assert_paged_matches_cpu(&mut paged, cfg, &wd, &prompt, 5e-2);
+    }
+
+    /// Control: the contiguous Q4 engine against the same CPU reference —
+    /// isolates whether a parity failure comes from the paged path or from
+    /// the reference setup itself.
+    #[test]
+    fn batched_contiguous_q4_matches_dequantized_reference() {
+        let Some(hip) = hip_ctx() else { return };
+        let mut cfg = Config::tiny();
+        cfg.dtype = ModelDType::F16;
+        let w = Weights::random(&cfg, 101).unwrap();
+        let wq = WeightsQ4::from_weights(&w, &cfg);
+        let wd = dequantize_q4(&wq);
+        let mut contig = BatchedModel::with_rows_q4(hip, cfg, &wq, 1, 4).unwrap();
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
+        assert_paged_matches_cpu(&mut contig, cfg, &wd, &prompt, 5e-2);
+    }
+
+    /// Control: the plain F16 engine on the unquantized f32 weights — if
+    /// this fails the same way, the divergence is the harness/reference
+    /// setup, not the Q4 upload path.
+    #[test]
+    fn batched_f16_matches_cpu_reference_control() {
+        let Some(hip) = hip_ctx() else { return };
+        let mut cfg = Config::tiny();
+        cfg.dtype = ModelDType::F16;
+        let w = Weights::random(&cfg, 101).unwrap();
+        let mut eng = BatchedModel::with_rows(hip, cfg, &w, 1, 4).unwrap();
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
+        assert_paged_matches_cpu(&mut eng, cfg, &w, &prompt, 5e-2);
+    }
+
+    #[test]
+    fn batched_paged_fp8_matches_dequantized_reference() {
+        let Some(hip) = hip_ctx() else { return };
+        let mut cfg = Config::tiny();
+        cfg.dtype = ModelDType::F16;
+        let w = Weights::random(&cfg, 103).unwrap();
+        let wf = WeightsFp8::from_weights(&w, &cfg);
+        let wd = dequantize_fp8(&wf);
+        let mut paged = BatchedModel::with_paged_kv_rows_fp8(hip, cfg, &wf, 1, 4, 8).unwrap();
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
+        assert_paged_matches_cpu(&mut paged, cfg, &wd, &prompt, 5e-2);
     }
 }

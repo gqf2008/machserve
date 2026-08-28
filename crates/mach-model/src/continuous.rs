@@ -73,15 +73,21 @@ struct FinishedSeq {
     stopped: bool,
 }
 
-/// Reuse registry entry: a request's content prefix whose pages may be
+/// Reuse registry entry: a request's content pages whose hashes may be
 /// aliased by later requests once materialized.
 #[derive(Debug)]
 struct PagedEntry {
-    /// Prompt tokens the entry covers (page-granular prefix match target).
-    prefix: Vec<u32>,
-    /// True once the pages hold their KV (prefill completed); only then may
-    /// later requests reuse them.
-    registered: bool,
+    /// Precomputed per-page content hashes of the prompt (computed once at
+    /// admission; reused verbatim at materialization and eviction — never
+    /// rehashed).
+    chain: std::sync::Arc<[String]>,
+    /// Full prompt pages (`prompt.len() / tokens_per_page`): the prefix of
+    /// `chain` that materialization registers. A partial last page is never
+    /// aliased (reuse covers full pages only), so registering its hash would
+    /// pin its page in the cache forever — unreachable for reuse, kept alive
+    /// at retire; left unregistered, it is freed at retire with the other
+    /// unregistered content.
+    full_pages: usize,
 }
 
 /// Paged-KV engine bookkeeping: content-hash page builder + per-slot block
@@ -102,25 +108,85 @@ struct PagedEngineState {
 }
 
 impl PagedEngineState {
-    /// Largest page-aligned `r` such that some materialized entry owns
-    /// `prompt[..r]` (its pages hold that KV). Reuse is therefore safe: the
-    /// builder's hash chain resolves the same pages.
-    fn find_reusable(&self, prompt: &[u32]) -> usize {
-        let mut best = 0usize;
-        for e in self.entries.iter().chain(self.retired.iter()) {
-            if !e.registered {
-                continue;
+    /// Pages referenced by live block tables (must never be freed).
+    fn referenced_pages(&self) -> std::collections::HashSet<u32> {
+        self.tables
+            .iter()
+            .flatten()
+            .flat_map(|t| t.pages().iter().copied())
+            .collect()
+    }
+
+    /// Per-hash claim counts across the retired list (full prompt pages
+    /// only — the never-registered partial page's hash is inert): a hash is
+    /// released only by its last claimant, keeping every surviving entry's
+    /// chain resolvable (a dangling chain could make reuse look available
+    /// where the cache no longer resolves).
+    fn claimed_counts(&self) -> std::collections::HashMap<String, u32> {
+        let mut claimed: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for e in &self.retired {
+            for h in e.chain[..e.full_pages].iter() {
+                *claimed.entry(h.clone()).or_insert(0) += 1;
             }
-            let mut r = 0usize;
-            while r + self.tokens_per_page <= e.prefix.len()
-                && r + self.tokens_per_page <= prompt.len()
-                && e.prefix[r..r + self.tokens_per_page] == prompt[r..r + self.tokens_per_page]
-            {
-                r += self.tokens_per_page;
-            }
-            best = best.max(r);
         }
-        best
+        claimed
+    }
+
+    /// Frees the freeable hashes of the retired entry at `idx` — mapped,
+    /// not claimed by any surviving retired entry, and not aliased by a
+    /// live table — and drops its metadata. `claimed` is the live claim
+    /// count table (this entry's own claims come off first). A fully
+    /// live-aliased entry is dropped as dead metadata only after its
+    /// unreclaimable hashes are skipped: each such page stays registered
+    /// and recoverable through the aliasing table's own entry. Returns the
+    /// number of pages freed.
+    fn evict_entry_at(
+        &mut self,
+        idx: usize,
+        referenced: &std::collections::HashSet<u32>,
+        claimed: &mut std::collections::HashMap<String, u32>,
+    ) -> usize {
+        let entry = self.retired.remove(idx);
+        let mut freed = 0usize;
+        for h in entry.chain[..entry.full_pages].iter() {
+            let remaining = claimed.get_mut(h).expect("retired chain is counted");
+            *remaining -= 1;
+            let freeable = self
+                .builder
+                .page_of(h)
+                .is_some_and(|p| !referenced.contains(&p));
+            if *remaining == 0 && freeable && self.builder.evict_page(h) {
+                freed += 1;
+            }
+        }
+        freed
+    }
+
+    /// Evicts retired entries oldest-first until one page returns to the
+    /// pool. Harvesting is per hash — unlike a whole-entry skip, an entry's
+    /// unique pages are freed even when other hashes of the same entry are
+    /// live-shared, so cold pages never stay trapped behind a shared one.
+    /// Stops at the first freeing eviction: colder entries beyond it stay
+    /// cached for later reuse. When nothing is freeable the whole list
+    /// drains as dead metadata (each live-aliased page stays registered and
+    /// recoverable through the aliasing table's own entry) and false is
+    /// returned. This also bounds the retired list, so the cap loop needs
+    /// no separate fallback. Returns true when at least one page was freed
+    /// (a plan retry can make progress).
+    fn evict_one_retired(&mut self) -> bool {
+        if self.retired.is_empty() {
+            return false;
+        }
+        let referenced = self.referenced_pages();
+        let mut claimed = self.claimed_counts();
+        let mut freed = 0usize;
+        while !self.retired.is_empty() {
+            freed += self.evict_entry_at(0, &referenced, &mut claimed);
+            if freed > 0 {
+                break;
+            }
+        }
+        freed > 0
     }
 }
 
@@ -169,6 +235,27 @@ impl PagedReuseStats {
 unsafe impl Send for ContinuousModel {}
 
 impl ContinuousModel {
+    /// Shared constructor tail: every builder-mode constructor differs only
+    /// in how `model` is built (and whether paged bookkeeping attaches) —
+    /// one place to add a field.
+    fn with_model(
+        model: BatchedModel,
+        prefill_rows: usize,
+        capacity: usize,
+        paged: Option<PagedEngineState>,
+    ) -> Self {
+        Self {
+            model,
+            prefill_rows,
+            seqs: (0..capacity).map(|_| None).collect(),
+            active: 0,
+            finished: Vec::new(),
+            next_id: 1,
+            state_reuse: None,
+            paged,
+        }
+    }
+
     /// Builds an engine with `capacity` concurrent sequence slots.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights, capacity: usize) -> Result<Self, Error> {
         Self::with_prefill_rows(hip, cfg, w, capacity, capacity)
@@ -185,16 +272,12 @@ impl ContinuousModel {
         prefill_rows: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_rows(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
-        Ok(Self {
+        Ok(Self::with_model(
             model,
-            prefill_rows: prefill_rows.max(capacity),
-            seqs: (0..capacity).map(|_| None).collect(),
-            active: 0,
-            finished: Vec::new(),
-            next_id: 1,
-            state_reuse: None,
-            paged: None,
-        })
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
     }
 
     /// Builds a continuous-batching engine from storage-Q4 weights: each GEMM
@@ -208,16 +291,12 @@ impl ContinuousModel {
         prefill_rows: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_rows_q4(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
-        Ok(Self {
+        Ok(Self::with_model(
             model,
-            prefill_rows: prefill_rows.max(capacity),
-            seqs: (0..capacity).map(|_| None).collect(),
-            active: 0,
-            finished: Vec::new(),
-            next_id: 1,
-            state_reuse: None,
-            paged: None,
-        })
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
     }
 
     /// Builds a continuous-batching engine from storage-FP8 weights: each GEMM
@@ -231,16 +310,12 @@ impl ContinuousModel {
         prefill_rows: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_rows_fp8(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
-        Ok(Self {
+        Ok(Self::with_model(
             model,
-            prefill_rows: prefill_rows.max(capacity),
-            seqs: (0..capacity).map(|_| None).collect(),
-            active: 0,
-            finished: Vec::new(),
-            next_id: 1,
-            state_reuse: None,
-            paged: None,
-        })
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
     }
 
     /// Builds a continuous-batching engine in MoE offload mode: experts stay in host
@@ -262,16 +337,12 @@ impl ContinuousModel {
             prefill_rows.max(capacity),
             expert_slots,
         )?;
-        Ok(Self {
+        Ok(Self::with_model(
             model,
-            prefill_rows: prefill_rows.max(capacity),
-            seqs: (0..capacity).map(|_| None).collect(),
-            active: 0,
-            finished: Vec::new(),
-            next_id: 1,
-            state_reuse: None,
-            paged: None,
-        })
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
     }
 
     /// Builds a continuous-batching engine in agentic state-reuse mode: every
@@ -316,32 +387,84 @@ impl ContinuousModel {
             prefill_rows.max(capacity),
             tokens_per_page,
         )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        ))
+    }
+
+    /// [`Self::with_paged_prefill_rows`] for storage-Q4 weights (device f16):
+    /// cross-request prefix reuse over the dequantized path.
+    pub fn with_paged_prefill_rows_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_q4(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        ))
+    }
+
+    /// [`Self::with_paged_prefill_rows`] for storage-FP8 weights (device f16).
+    pub fn with_paged_prefill_rows_fp8(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsFp8,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_fp8(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        ))
+    }
+
+    /// Shared paged-engine bookkeeping factory (page pool sized for the full
+    /// slot count; reuse counters zeroed).
+    fn paged_state(cfg: &Config, capacity: usize, tokens_per_page: usize) -> PagedEngineState {
         let pages = (cfg.max_seq_len / tokens_per_page) * capacity;
-        let paged = PagedEngineState {
+        PagedEngineState {
             tokens_per_page,
             builder: crate::paged_kv::GpuPagedTableBuilder::new(pages as u32, tokens_per_page),
             tables: (0..capacity).map(|_| None).collect(),
             entries: (0..capacity)
                 .map(|_| PagedEntry {
-                    prefix: Vec::new(),
-                    registered: false,
+                    chain: Vec::new().into(),
+                    full_pages: 0,
                 })
                 .collect(),
             retired: Vec::new(),
             requests: 0,
             reused_tokens: 0,
             prompt_tokens: 0,
-        };
-        Ok(Self {
-            model,
-            prefill_rows: prefill_rows.max(capacity),
-            seqs: (0..capacity).map(|_| None).collect(),
-            active: 0,
-            finished: Vec::new(),
-            next_id: 1,
-            state_reuse: None,
-            paged: Some(paged),
-        })
+        }
     }
 
     /// Maximum concurrent sequences.
@@ -428,43 +551,64 @@ impl ContinuousModel {
         }
         if let Some(pg) = &mut self.paged {
             let i32p: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-            // Reuse only materialized pages (see PagedEngineState::find_reusable);
-            // otherwise compute everything into fresh pages (registered later
-            // when this request's prefill completes).
-            let mut r = pg.find_reusable(prompt);
-            if r == prompt.len() {
-                // Full-prefix reuse would leave an empty prefill queue with no
-                // first decode token (step() panics). Keep the last page: it
-                // is recomputed into the (identical-content) aliased page —
-                // benign — and the prefill produces the first token normally.
-                r -= pg.tokens_per_page;
-            }
-            let table = if r > 0 {
-                let (mut t, _reused) = pg
+            // One hash-chain computation per admission: it feeds the plan and
+            // every eviction-retry attempt (pool pressure never rehashes).
+            // The reuse boundary `r` is the plan's actual alias count — the
+            // only source of truth. The cache holds exactly the materialized
+            // pages, so whatever the plan aliases is written KV; a stale
+            // registry entry can only cost a cache miss, never skip prefill
+            // positions whose pages do not hold KV. Pool exhaustion evicts
+            // cold retired pages and retries (bounded: a successful eviction
+            // freed at least one page; a failed plan/pad frees its own pages,
+            // so nothing leaks).
+            let chain = pg.builder.compute_chain(&i32p);
+            let (plan, r) = loop {
+                let mut p = match pg.builder.plan_with_chain(&i32p, chain.clone(), true) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if pg.evict_one_retired() {
+                            continue;
+                        }
+                        return Err(Error::Model(format!("paged plan: {e}")));
+                    }
+                };
+                match pg
                     .builder
-                    .build_table(&i32p)
-                    .map_err(|e| Error::Model(format!("paged build_table: {e}")))?;
-                pg.builder
-                    .pad_table(&mut t, self.model.max_pages_per_seq())
-                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
-                t
-            } else {
-                let mut t = pg
-                    .builder
-                    .build_table_fresh(&i32p)
-                    .map_err(|e| Error::Model(format!("paged build_table_fresh: {e}")))?;
-                pg.builder
-                    .pad_table(&mut t, self.model.max_pages_per_seq())
-                    .map_err(|e| Error::Model(format!("paged pad_table: {e}")))?;
-                t
+                    .pad_table(&mut p.table, self.model.max_pages_per_seq())
+                {
+                    Ok(()) => {
+                        let mut r = p.reused_pages * pg.tokens_per_page;
+                        if r == prompt.len() {
+                            // Full-prefix reuse would leave an empty prefill
+                            // queue with no first decode token (step() panics).
+                            // Rewind exactly one token: it is recomputed into
+                            // the (identical-content) aliased page — benign —
+                            // and the one-row prefill produces the first token
+                            // normally (a whole-page rewind would pay tpp
+                            // transformer forwards re-computing written KV).
+                            r -= 1;
+                        }
+                        break (p, r);
+                    }
+                    Err(e) => {
+                        pg.builder.free_plan_pages(&p, &p.table);
+                        if pg.evict_one_retired() {
+                            continue;
+                        }
+                        return Err(Error::Model(format!("paged pad_table: {e}")));
+                    }
+                }
             };
-            self.model
-                .set_block_table(slot, table.pages())
-                .map_err(|e| Error::Model(format!("set_block_table: {e}")))?;
-            pg.tables[slot] = Some(table);
+            // Install the table; on failure, release the plan's fresh pages
+            // exactly like a pad failure does (aliased pages are never freed).
+            if let Err(e) = self.model.set_block_table(slot, plan.table.pages()) {
+                pg.builder.free_plan_pages(&plan, &plan.table);
+                return Err(Error::Model(format!("set_block_table: {e}")));
+            }
+            pg.tables[slot] = Some(plan.table);
             pg.entries[slot] = PagedEntry {
-                prefix: prompt.to_vec(),
-                registered: false,
+                chain: plan.chain,
+                full_pages: plan.full_pages,
             };
             pg.requests += 1;
             pg.prompt_tokens += prompt.len();
@@ -597,15 +741,21 @@ impl ContinuousModel {
                 s.len += count;
                 if s.prompt.is_empty() {
                     // Paged: prefill materialized — register this request's
-                    // pages under its content so later requests reuse them.
+                    // pages under its content so later requests reuse them,
+                    // using the chain computed once at admission (no rehash).
                     // (A reused request re-registers its source's pages: the
                     // builder no-ops on identical mappings.)
                     if let Some(pg) = &mut self.paged {
-                        let i32p: Vec<i32> =
-                            s.all_tokens[..s.len].iter().map(|&t| t as i32).collect();
+                        // Register full prompt pages only: a partial last
+                        // page is never aliased, and a registered-but-
+                        // unreachable hash would pin its page in the cache
+                        // forever (kept alive at retire). The unregistered
+                        // partial page is freed at retire with the other
+                        // unregistered content.
+                        let full = pg.entries[i].full_pages;
+                        let chain = &pg.entries[i].chain[..full];
                         let t = pg.tables[i].as_ref().expect("paged slot table");
-                        pg.builder.register_table(&i32p, t);
-                        pg.entries[i].registered = true;
+                        pg.builder.register_chain(chain, t);
                     }
                     s.generated.push(last_out);
                     s.all_tokens.push(last_out);
@@ -773,9 +923,27 @@ impl ContinuousModel {
             // tables, so moving a sequence means moving its table (the pages
             // alias follows). The registry entry retires with the pages kept
             // in the pool — later requests may still reuse them.
+            // The finishing table's PAD pages (its generated-KV region) are
+            // not registered content: free them on retire so long-running
+            // pools never fill with orphaned pads. Content pages that LOST a
+            // first-writer-wins race (their hash now maps to a different
+            // physical page — a concurrent identical prompt registered first)
+            // are duplicates: free them too, or the pool shrinks permanently
+            // by one page per lost race.
+            if let Some(t) = pg.tables[slot].as_ref() {
+                let chain = &pg.entries[slot].chain;
+                for (i, &page) in t.pages().iter().enumerate() {
+                    let is_content = i < chain.len();
+                    let lost_race = is_content
+                        && chain.get(i).and_then(|h| pg.builder.page_of(h)) != Some(page);
+                    if !is_content || lost_race {
+                        pg.builder.free_page(page);
+                    }
+                }
+            }
             let empty = || PagedEntry {
-                prefix: Vec::new(),
-                registered: false,
+                chain: Vec::new().into(),
+                full_pages: 0,
             };
             let entry = std::mem::replace(&mut pg.entries[slot], empty());
             for i in (slot + 1)..self.active {
@@ -790,13 +958,19 @@ impl ContinuousModel {
             self.seqs[self.active - 1] = None;
             pg.tables[self.active - 1] = None;
             pg.entries[self.active - 1] = empty();
-            pg.retired.push(entry);
-            // Bound the retired metadata: pages stay in the pool either way
-            // (no eviction yet), but dropping the oldest entries caps host
-            // memory growth on long-running servers.
-            if pg.retired.len() > retired_cap {
-                pg.retired.drain(0..(pg.retired.len() - retired_cap));
+            // A short prompt (< one full page) registers nothing: its entry
+            // could never serve reuse nor free pages, so don't accumulate
+            // it as dead weight (its pages were already freed above).
+            if entry.full_pages > 0 {
+                pg.retired.push(entry);
             }
+            // Bound the retired metadata: evict what the pool can reclaim.
+            // When nothing is freeable, evict_one_retired drains the whole
+            // list as dead metadata — each live-aliased page stays
+            // registered and recoverable through the aliasing table's own
+            // entry, so overshoot is transient (the aliasing tables retire
+            // and re-enable eviction).
+            while pg.retired.len() > retired_cap && pg.evict_one_retired() {}
             self.active -= 1;
             return;
         }

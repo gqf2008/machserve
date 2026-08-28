@@ -7,11 +7,9 @@ use axum::http::{Request, StatusCode};
 use mach_kernel_sys::hip;
 use mach_model::config::ModelDType;
 use mach_model::continuous::ContinuousModel;
-use mach_model::fp8::Fp8Tensor;
-use mach_model::q4::Q4Tensor;
 use mach_model::sampling::SamplingParams;
 use mach_model::tokenizer::Tokenizer;
-use mach_model::{Config, LayerWeightsFp8, LayerWeightsQ4, Weights, WeightsFp8, WeightsQ4};
+use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 use mach_server::{AppState, ServerEngine, router};
 use tower::ServiceExt;
 
@@ -66,6 +64,20 @@ async fn completions_endpoint_matches_direct_engine() {
     };
     let app = router(state);
 
+    let got = post_completions(&app, prompt, max_new).await;
+    assert_eq!(got, want, "server output must equal direct engine run");
+}
+
+fn moe_cfg() -> Config {
+    let mut cfg = Config::tiny();
+    cfg.intermediate_size = 64;
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg
+}
+
+/// Posts one completions request and returns the served token ids.
+async fn post_completions(app: &axum::Router, prompt: Vec<u32>, max_new: usize) -> Vec<u32> {
     let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
     let resp = app
         .clone()
@@ -84,107 +96,12 @@ async fn completions_endpoint_matches_direct_engine() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
+    json["choices"][0]["tokens"]
         .as_array()
         .unwrap()
         .iter()
         .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
-    assert_eq!(got, want, "server output must equal direct engine run");
-}
-
-fn moe_cfg() -> Config {
-    let mut cfg = Config::tiny();
-    cfg.intermediate_size = 64;
-    cfg.num_experts = 4;
-    cfg.num_experts_per_tok = 2;
-    cfg
-}
-
-/// Converts f32 weights to storage-Q4 (GEMM tensors quantized, small tensors
-/// copied) for the Q4 server-path test.
-fn to_q4(w: &Weights) -> WeightsQ4 {
-    let q = |v: &[f32]| Q4Tensor::quantize(v);
-    WeightsQ4 {
-        tok_emb: q(&w.tok_emb),
-        rms_final: w.rms_final.clone(),
-        lm_head: q(&w.lm_head),
-        layers: w
-            .layers
-            .iter()
-            .map(|l| LayerWeightsQ4 {
-                wq: q(&l.wq),
-                wk: q(&l.wk),
-                wv: q(&l.wv),
-                wo: q(&l.wo),
-                rms_attn: l.rms_attn.clone(),
-                wg: q(&l.wg),
-                wu: q(&l.wu),
-                wd: q(&l.wd),
-                rms_mlp: l.rms_mlp.clone(),
-                bq: l.bq.clone(),
-                bk: l.bk.clone(),
-                bv: l.bv.clone(),
-                q_norm: l.q_norm.clone(),
-                k_norm: l.k_norm.clone(),
-                mla_q_a: q(&l.mla_q_a),
-                mla_q_a_norm: l.mla_q_a_norm.clone(),
-                mla_q_b: q(&l.mla_q_b),
-                mla_q_rope: q(&l.mla_q_rope),
-                mla_kv_a: q(&l.mla_kv_a),
-                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
-                mla_kv_b: q(&l.mla_kv_b),
-                mla_o: q(&l.mla_o),
-                moe_router: l.moe_router.clone(),
-                moe_wg: q(&l.moe_wg),
-                moe_wu: q(&l.moe_wu),
-                moe_wd: q(&l.moe_wd),
-            })
-            .collect(),
-    }
-}
-
-/// Converts f32 weights to storage-FP8 (GEMM tensors quantized with per-tensor
-/// scales, small tensors copied) for the FP8 server-path test.
-fn to_fp8(w: &Weights) -> WeightsFp8 {
-    let q = |v: &[f32]| Fp8Tensor::quantize(v);
-    WeightsFp8 {
-        tok_emb: q(&w.tok_emb),
-        rms_final: w.rms_final.clone(),
-        lm_head: q(&w.lm_head),
-        layers: w
-            .layers
-            .iter()
-            .map(|l| LayerWeightsFp8 {
-                wq: q(&l.wq),
-                wk: q(&l.wk),
-                wv: q(&l.wv),
-                wo: q(&l.wo),
-                rms_attn: l.rms_attn.clone(),
-                wg: q(&l.wg),
-                wu: q(&l.wu),
-                wd: q(&l.wd),
-                rms_mlp: l.rms_mlp.clone(),
-                bq: l.bq.clone(),
-                bk: l.bk.clone(),
-                bv: l.bv.clone(),
-                q_norm: l.q_norm.clone(),
-                k_norm: l.k_norm.clone(),
-                mla_q_a: q(&l.mla_q_a),
-                mla_q_a_norm: l.mla_q_a_norm.clone(),
-                mla_q_b: q(&l.mla_q_b),
-                mla_q_rope: q(&l.mla_q_rope),
-                mla_kv_a: q(&l.mla_kv_a),
-                mla_kv_a_norm: l.mla_kv_a_norm.clone(),
-                mla_kv_b: q(&l.mla_kv_b),
-                mla_o: q(&l.mla_o),
-                moe_router: l.moe_router.clone(),
-                moe_wg: q(&l.moe_wg),
-                moe_wu: q(&l.moe_wu),
-                moe_wd: q(&l.moe_wd),
-            })
-            .collect(),
-    }
+        .collect::<Vec<u32>>()
 }
 
 #[tokio::test]
@@ -224,30 +141,7 @@ async fn completions_endpoint_moe_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(got, want, "server MoE output must equal direct engine run");
 }
 
@@ -262,7 +156,7 @@ async fn completions_endpoint_q4_matches_direct_engine() {
     let mut cfg = moe_cfg();
     cfg.dtype = ModelDType::F16;
     let w = Weights::random(&cfg, 91).unwrap();
-    let wq4 = to_q4(&w);
+    let wq4 = WeightsQ4::from_weights(&w, &cfg);
     let prompt = vec![5u32, 9, 3];
     let max_new = 4usize;
 
@@ -294,30 +188,7 @@ async fn completions_endpoint_q4_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(
         got, want,
         "server Q4 output must equal direct Q4 engine run"
@@ -335,7 +206,7 @@ async fn completions_endpoint_fp8_matches_direct_engine() {
     let mut cfg = moe_cfg();
     cfg.dtype = ModelDType::F16;
     let w = Weights::random(&cfg, 91).unwrap();
-    let wfp8 = to_fp8(&w);
+    let wfp8 = WeightsFp8::from_weights(&w, &cfg);
     let prompt = vec![5u32, 9, 3];
     let max_new = 4usize;
 
@@ -367,30 +238,7 @@ async fn completions_endpoint_fp8_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(
         got, want,
         "server FP8 output must equal direct FP8 engine run"
@@ -1212,30 +1060,7 @@ async fn completions_endpoint_mla_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(got, want, "server MLA output must equal direct engine run");
 }
 
@@ -1300,37 +1125,9 @@ async fn completions_endpoint_paged_shared_prefix_matches_direct_engine() {
     };
     let app = router(state);
 
-    let app_ref = &app;
-    let post = |prompt: Vec<u32>, max_new: usize| async move {
-        let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-        let resp = app_ref
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        json["choices"][0]["tokens"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap() as u32)
-            .collect::<Vec<u32>>()
-    };
-
     // First request writes the shared prefix pages; the second reuses them.
-    let got_a = post(a, 3).await;
-    let got_b = post(b, 3).await;
+    let got_a = post_completions(&app, a, 3).await;
+    let got_b = post_completions(&app, b, 3).await;
     assert_eq!(
         got_a, want_a,
         "paged HTTP output A must equal direct engine"
@@ -1349,4 +1146,81 @@ async fn completions_endpoint_paged_shared_prefix_matches_direct_engine() {
         stats.reused_tokens, tpp,
         "prompt-token savings must equal the shared prefix"
     );
+}
+
+/// Paged Q4 serving (#80 review fix): the MACH_Q4=1 MACH_PAGED=1
+/// configuration — `ServerEngine::with_paged` + `spawn_q4` — must serve
+/// cross-request prefix reuse over the dequantized f16 path.
+#[tokio::test]
+async fn completions_endpoint_q4_paged_reuses_shared_prefix() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny(); // max_seq 256
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 63).unwrap();
+    let wq4 = WeightsQ4::from_weights(&w, &cfg);
+
+    let prefix: Vec<u32> = (0..tpp as u32).map(|i| (i * 37 + 3) % 1024 + 1).collect();
+    let d_a: Vec<u32> = vec![42, 99];
+    let d_b: Vec<u32> = vec![300, 17, 8];
+    let a: Vec<u32> = prefix.iter().chain(&d_a).copied().collect();
+    let b: Vec<u32> = prefix.iter().chain(&d_b).copied().collect();
+
+    // Reference: the same prompts through the direct paged Q4 engine.
+    let mut cm =
+        ContinuousModel::with_paged_prefill_rows_q4(hip.clone(), cfg, &wq4, 4, 4, tpp).unwrap();
+    let id_a = cm
+        .add(
+            &a,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.is_done(id_a) {
+        cm.step().unwrap();
+    }
+    let id_b = cm
+        .add(
+            &b,
+            3,
+            None,
+            Vec::new(),
+            Vec::new(),
+            SamplingParams::default(),
+        )
+        .unwrap();
+    while !cm.all_done() {
+        cm.step().unwrap();
+    }
+    let want_a = cm.generated(id_a);
+    let want_b = cm.generated(id_b);
+
+    // Server path: paged engine over spawn_q4 (the Q4 paged branch).
+    let engine = ServerEngine::with_paged(4, 4, tpp);
+    let stats_handle = engine.clone();
+    let _handle = engine.clone().spawn_q4(hip, cfg, wq4).unwrap();
+    let state = AppState {
+        engine,
+        model: "tiny-q4".into(),
+        tok: None,
+    };
+    let app = router(state);
+
+    let got_a = post_completions(&app, a, 3).await;
+    let got_b = post_completions(&app, b, 3).await;
+    assert_eq!(
+        got_a, want_a,
+        "Q4 paged HTTP output A must equal direct engine"
+    );
+    assert_eq!(
+        got_b, want_b,
+        "Q4 paged reused HTTP output B must equal direct engine"
+    );
+    let stats = stats_handle
+        .paged_reuse_stats()
+        .expect("paged Q4 engine reports reuse stats");
+    assert_eq!(stats.reused_tokens, tpp, "Q4 server reuses the shared page");
 }

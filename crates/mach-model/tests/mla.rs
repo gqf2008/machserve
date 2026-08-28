@@ -159,6 +159,61 @@ fn mla_batched_matches_cpu_reference() {
     }
 }
 
+/// Paged MLA path pinned to the CPU reference: the fused `kv_store_paged_mla`
+/// store and `attn_decode_paged_mla_batched` attention must reproduce the
+/// reference logits through the block table, including across a page
+/// boundary (tpp 8 with 11 steps crosses from page 0 into page 1). This is
+/// the only CPU-parity cover for the rewritten paged MLA store — the other
+/// paged MLA tests compare GPU vs GPU (static), where a shared addressing
+/// regression would pass both sides.
+#[cfg(feature = "hip")]
+#[test]
+fn mla_paged_matches_cpu_reference() {
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+
+    let hip = match hip::hip() {
+        Ok(h) => match hip::device_count() {
+            Ok(n) if n > 0 => h,
+            _ => {
+                eprintln!("skipping HIP test: no device");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("skipping HIP test: {e}");
+            return;
+        }
+    };
+
+    let cfg = mla_cfg(); // max_seq_len 64 -> tpp 8 divides it
+    let w = Weights::random(&cfg, 17).unwrap();
+    let tpp = 8usize;
+    let batch = 2usize;
+    let seqs: Vec<Vec<u32>> = vec![
+        vec![5, 9, 3, 200, 7, 11, 42, 77, 13, 250, 1],
+        vec![200, 7, 11, 5, 9, 3, 99, 12, 64, 8, 240],
+    ];
+
+    let mut paged = BatchedModel::with_paged_kv(hip, cfg, &w, batch, tpp).unwrap();
+    for step in 0..seqs[0].len() {
+        let tokens: Vec<u32> = seqs.iter().map(|s| s[step]).collect();
+        paged.decode_step(&tokens).unwrap();
+        let got = paged.read_logits().unwrap();
+        for s in 0..batch {
+            let mut cpu = RefModel::new(cfg, w.clone());
+            let cpu_logits = cpu.forward(&seqs[s][..=step]);
+            let row = &got[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
+            let max = max_abs_diff(row, &cpu_logits);
+            let scale = cpu_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                max <= 2e-3 + 2e-3 * scale,
+                "step {step} seq {s} MLA paged GPU vs CPU: max diff {max} (scale {scale})"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "hip")]
 #[test]
 fn mla_batched_f16_matches_f32() {

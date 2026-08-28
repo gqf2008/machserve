@@ -194,6 +194,34 @@ impl Q4Tensor {
         v.extend(other.dequantize());
         Self::quantize(&v)
     }
+
+    /// Single-pass append of `parts` in order, O(total) bytes — folding
+    /// [`Self::concat`] instead re-clones the growing prefix per part
+    /// (O(n²) over many MoE experts). Byte/scale-identical to that fold
+    /// **iff every part is group-aligned** — the only shape real
+    /// checkpoints hit (expert sizes are [`Q4_GROUP`] multiples);
+    /// otherwise both re-quantize, but scale grouping can differ from the
+    /// sequential fold (see the `concat_many_matches_concat_fold` test).
+    pub fn concat_many(parts: &[Self]) -> Self {
+        if parts.is_empty() {
+            return Self::default();
+        }
+        let n: usize = parts.iter().map(|p| p.n).sum();
+        if parts.iter().all(|p| p.n.is_multiple_of(Q4_GROUP)) {
+            let mut q = Vec::with_capacity(n / 2);
+            let mut scales = Vec::with_capacity(n / Q4_GROUP);
+            for p in parts {
+                q.extend_from_slice(&p.q);
+                scales.extend_from_slice(&p.scales);
+            }
+            return Self { q, scales, n };
+        }
+        let mut v = Vec::with_capacity(n);
+        for p in parts {
+            v.extend(p.dequantize());
+        }
+        Self::quantize(&v)
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +279,24 @@ mod tests {
         assert_eq!(c.q, want.q);
         assert_eq!(c.scales, want.scales);
         assert_eq!(c.n, want.n);
+    }
+
+    /// concat_many must be byte-identical to the loader's sequential concat
+    /// fold whenever every part is group-aligned — the only shape real MoE
+    /// checkpoints produce (expert sizes are Q4_GROUP multiples).
+    #[test]
+    fn concat_many_matches_concat_fold_when_aligned() {
+        let cases: &[&[usize]] = &[&[8, 8], &[32, 64, 16], &[128], &[4, 4, 4, 4]];
+        for parts in cases {
+            let tensors: Vec<Q4Tensor> = parts
+                .iter()
+                .map(|&n| Q4Tensor::quantize(&wave(n, 0.07)))
+                .collect();
+            let folded = tensors.iter().fold(Q4Tensor::default(), |a, b| a.concat(b));
+            let many = Q4Tensor::concat_many(&tensors);
+            assert_eq!(many.q, folded.q, "parts {parts:?}: packed bytes");
+            assert_eq!(many.scales, folded.scales, "parts {parts:?}: scales");
+            assert_eq!(many.n, folded.n, "parts {parts:?}: n");
+        }
     }
 }

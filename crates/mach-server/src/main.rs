@@ -10,9 +10,14 @@
 //! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
 //! host weights: int4 or E4M3, dequantized to f16 on the device),
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
-//! MACH_TPP (KV page size in tokens, default 64).
+//! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
+//! engage paged KV — plain, Q4 and FP8 non-MLA). Limitations: paged KV serves
+//! MLA models in F32 only (quantized MLA warns and falls back to continuous),
+//! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
+#[cfg(feature = "hip")]
+use mach_model::batched::BatchedModel;
 #[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
@@ -160,6 +165,50 @@ fn estimate_vram(
         est += dfb + (dkv * dcfg.n_layers) as u64;
     }
     est
+}
+
+/// Pure validation of a raw `MACH_TPP` value against `cfg` — testable
+/// without touching process env (see `parse_paged_tpp` for the fatal
+/// wrapper). Missing/non-numeric values fall back to the default 64
+/// (non-numeric warns); `0` and non-divisors of `max_seq_len` are fatal.
+fn validate_paged_tpp(
+    cfg: &mach_model::config::Config,
+    raw: Option<&str>,
+) -> Result<usize, String> {
+    let tpp: usize = match raw {
+        None => 64,
+        Some(v) => match v.parse() {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("warning: MACH_TPP={v} is not a number; using default 64");
+                64
+            }
+        },
+    };
+    if tpp == 0 || !cfg.max_seq_len.is_multiple_of(tpp) {
+        return Err(format!(
+            "MACH_TPP={tpp} is invalid: must be a non-zero divisor of max_seq_len {}",
+            cfg.max_seq_len
+        ));
+    }
+    Ok(tpp)
+}
+
+/// Parses and validates `MACH_TPP` for a branch that actually engages paged
+/// KV (`MACH_PAGED` already checked by the caller). Runs BEFORE any weight
+/// load: a bad value fails fast instead of aborting after the multi-minute
+/// load. The MACH_SPEC / MoE-offload branches ignore MACH_PAGED (warned)
+/// and never call this, so a stale value must not abort them. Returns
+/// `None` (after reporting) for a fatal configuration — the caller degrades.
+#[cfg(feature = "hip")]
+fn parse_paged_tpp(cfg: &Config) -> Option<usize> {
+    match validate_paged_tpp(cfg, std::env::var("MACH_TPP").ok().as_deref()) {
+        Ok(tpp) => Some(tpp),
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// One-shot diagnostic report (`mach-server doctor`): OS/host, HIP/GPU/VRAM,
@@ -460,38 +509,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Q4 mode loads packed int4 weights directly (host RAM stays small) and
     // spawns the Q4 engine; f16/f32 and spec modes keep the f32 host load.
-    // Paged mode currently wires only the plain-Weights path: warn loudly when
-    // MACH_PAGED is combined with a storage-quantized / spec engine instead of
-    // silently serving in contiguous mode.
+    // Paged mode is wired for the plain-Weights and storage-quantized paths
+    // (device f16 served by the f16 paged kernels); MACH_SPEC remains
+    // contiguous-only (warned).
     let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
-    let (engine, engine_handle) = if q4 {
-        if paged_requested {
+    // Resolve paged engagement BEFORE any weight load: a stale/invalid
+    // MACH_TPP or a paged-incompatible checkpoint must fail fast (or degrade
+    // with a warning) up front, not abort after the multi-minute load.
+    // Paged KV serves MLA in F32 only; the quantized branches always serve
+    // KV in device f16, so quantized MLA never qualifies. MACH_SPEC and
+    // MoE-offload ignore MACH_PAGED (warned in-branch) and skip this. The
+    // model-side paged_guards stay the authoritative last-resort checks.
+    let paged_tpp = if paged_requested && !spec && moe_slots.is_none() {
+        if cfg.kv_lora_rank > 0 && (q4 || fp8) {
+            // Quantized builds force device dtype F16 (build_q4/build_fp8),
+            // so a quantized MLA checkpoint can never qualify for paged KV
+            // (MLA is F32-only). Warn and degrade before the load.
             eprintln!(
-                "warning: MACH_PAGED is ignored in MACH_Q4 mode (paged Q4 wiring is a follow-up)"
+                "warning: MACH_PAGED is unsupported with this model/mode combination (paged KV serves MLA in F32 only); serving continuous"
             );
+            None
+        } else {
+            match parse_paged_tpp(&cfg) {
+                Some(tpp) => match BatchedModel::check_paged_support(&cfg, tpp) {
+                    Ok(()) => Some(tpp),
+                    // The authoritative model-side checks (page geometry,
+                    // attention smem, dtype coverage) degrade up front —
+                    // never abort after the multi-minute weight load.
+                    Err(e) => {
+                        eprintln!("warning: MACH_PAGED unsupported: {e}; serving continuous");
+                        None
+                    }
+                },
+                None => None, // invalid MACH_TPP: already reported and exited
+            }
         }
+    } else {
+        None
+    };
+    let (engine, engine_handle) = if q4 {
         let wq4: WeightsQ4 =
             load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load q4 weights");
         println!(
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage Q4; host weights stay packed int4, device dequantizes to f16)",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
         );
-        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let eng = match paged_tpp {
+            Some(tpp) => ServerEngine::with_paged(capacity, prefill_rows, tpp),
+            None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
+        };
         let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
         (eng, handle)
     } else if fp8 {
-        if paged_requested {
-            eprintln!(
-                "warning: MACH_PAGED is ignored in MACH_FP8 mode (paged FP8 wiring is a follow-up)"
-            );
-        }
         let wfp8: WeightsFp8 =
             load_safetensors_fp8(&root.join(&model_name), &cfg, true).expect("load fp8 weights");
         println!(
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage FP8; host weights stay packed E4M3, device dequantizes to f16)",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
         );
-        let eng = ServerEngine::with_prefill_rows(capacity, prefill_rows);
+        let eng = match paged_tpp {
+            Some(tpp) => ServerEngine::with_paged(capacity, prefill_rows, tpp),
+            None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
+        };
         let handle = eng.clone().spawn_fp8(hip, cfg, wfp8)?;
         (eng, handle)
     } else if spec {
@@ -531,21 +610,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
         );
         let eng = if let Some(slots) = moe_slots {
-            ServerEngine::with_offload(capacity, prefill_rows, slots)
-        } else if std::env::var("MACH_PAGED").is_ok_and(|v| v != "0") {
-            // Paged-KV engine: requests sharing a prompt prefix reuse the same
-            // physical KV pages (cross-request prefix sharing).
-            let tpp: usize = std::env::var("MACH_TPP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(64);
-            if tpp == 0 || !cfg.max_seq_len.is_multiple_of(tpp) {
+            if paged_requested {
                 eprintln!(
-                    "MACH_TPP={tpp} is invalid: must be a non-zero divisor of max_seq_len {}",
-                    cfg.max_seq_len
+                    "warning: MACH_PAGED is ignored in MoE-offload mode (paged offload wiring is a follow-up)"
                 );
-                std::process::exit(1);
             }
+            ServerEngine::with_offload(capacity, prefill_rows, slots)
+        } else if let Some(tpp) = paged_tpp {
             ServerEngine::with_paged(capacity, prefill_rows, tpp)
         } else {
             ServerEngine::with_prefill_rows(capacity, prefill_rows)
@@ -815,5 +886,26 @@ mod tests {
         // (2 bytes/weight): the weight term must be x2, or the preflight can
         // pass while the upload OOMs (regression).
         assert_eq!(fp8 - base, 1_000_000);
+    }
+}
+
+/// Ungated: `validate_paged_tpp` is pure cfg logic, so CPU CI covers it.
+#[cfg(test)]
+mod paged_tpp_tests {
+    use super::*;
+
+    #[test]
+    fn validate_paged_tpp_defaults_warnings_and_fatals() {
+        let cfg = mach_model::config::Config::tiny(); // max_seq_len 256
+        // Missing env: default 64 (divides 256).
+        assert_eq!(validate_paged_tpp(&cfg, None).unwrap(), 64);
+        // Non-numeric: warned fallback to 64 (not fatal).
+        assert_eq!(validate_paged_tpp(&cfg, Some("64x")).unwrap(), 64);
+        // Zero: fatal.
+        assert!(validate_paged_tpp(&cfg, Some("0")).is_err());
+        // Non-divisor: fatal.
+        assert!(validate_paged_tpp(&cfg, Some("48")).is_err());
+        // Valid custom value.
+        assert_eq!(validate_paged_tpp(&cfg, Some("128")).unwrap(), 128);
     }
 }

@@ -156,10 +156,6 @@ pub struct BatchedModel {
     mla_kv: *mut f32,
     mla_k_rope: *mut f32,
     mla_attn: *mut f32,
-    /// MLA paged path: expanded per-row k/v scratch (`[rows, heads*hd]` with
-    /// hd = nope + rope / `[rows, heads*v_hd]`) fed to `kv_store_paged_mla`.
-    mla_k_asm: *mut f32,
-    mla_v_asm: *mut f32,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
@@ -235,7 +231,9 @@ impl BatchedModel {
     /// `kv_store_paged` / `attn_decode_paged`. The default mapping is the
     /// static identity (same physical layout as the contiguous path); call
     /// [`Self::set_block_table`] to install reuse-planner tables so sequences
-    /// share prefix physical pages. f16/MLA paged kernels remain follow-ups.
+    /// share prefix physical pages. Dense F16 and MLA (F32) paged kernels are
+    /// wired too (`with_paged_kv_rows` dtype variants; fused
+    /// `kv_store_paged_mla`).
     pub fn with_paged_kv(
         hip: Arc<Hip>,
         cfg: Config,
@@ -258,10 +256,57 @@ impl BatchedModel {
         rows: usize,
         tokens_per_page: usize,
     ) -> Result<Self, Error> {
-        assert!(
-            cfg.max_seq_len.is_multiple_of(tokens_per_page),
-            "tokens_per_page must divide max_seq_len"
-        );
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// [`Self::with_paged_kv_rows`] for storage-Q4 weights: each tensor is
+    /// dequantized to f16 on upload, so the wired f16 paged kernels serve the
+    /// device path directly.
+    pub fn with_paged_kv_rows_q4(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build_q4(hip, cfg, w, slots, rows)?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// [`Self::with_paged_kv_rows`] for storage-FP8 weights: E4M3 tensors are
+    /// dequantized to f16 on upload; the f16 paged kernels serve the device.
+    pub fn with_paged_kv_rows_fp8(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsFp8,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build_fp8(hip, cfg, w, slots, rows)?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// Construction-time paged-mode guards shared by every build variant:
+    /// page geometry, attention smem bound, dtype coverage (dense F32/F16;
+    /// MLA stays F32-only) — fail loudly (as `Err`, not a panic) here rather
+    /// than falling through to contiguous kernels while owning block tables,
+    /// or failing mid-request.
+    fn paged_guards(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
+        if tokens_per_page == 0 || !cfg.max_seq_len.is_multiple_of(tokens_per_page) {
+            return Err(Error::InvalidArgument(format!(
+                "tokens_per_page {tokens_per_page} must be a non-zero divisor of max_seq_len {}",
+                cfg.max_seq_len
+            )));
+        }
         // The paged attention kernels stage the full per-row score array in
         // dynamic shared memory: `(max_pages * tokens_per_page + 256) * 4` ==
         // `(max_seq_len + 256) * 4` bytes. Enforce the 64 KiB device limit
@@ -280,21 +325,29 @@ impl BatchedModel {
         // The paged decode branch dispatches dense F32/F16 and MLA (F32); any
         // other dtype would silently fall through to the contiguous kernels
         // while still owning block tables. Reject loudly at construction.
-        assert!(
-            matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16),
-            "paged-KV mode supports dense F32/F16 only (got {:?})",
-            cfg.dtype
-        );
-        if cfg.kv_lora_rank > 0 {
-            assert!(
-                cfg.dtype == ModelDType::F32,
+        if !matches!(cfg.dtype, ModelDType::F32 | ModelDType::F16) {
+            return Err(Error::InvalidArgument(format!(
+                "paged-KV mode supports dense F32/F16 only (got {:?})",
+                cfg.dtype
+            )));
+        }
+        if cfg.kv_lora_rank > 0 && cfg.dtype != ModelDType::F32 {
+            return Err(Error::InvalidArgument(format!(
                 "paged-KV mode supports MLA in F32 only (got {:?})",
                 cfg.dtype
-            );
+            )));
         }
-        let mut m = Self::build(hip, cfg, w, slots, rows, usize::MAX)?;
-        m.init_paged(tokens_per_page)?;
-        Ok(m)
+        Ok(())
+    }
+
+    /// Authoritative pre-flight for paged-KV support: the same checks
+    /// [`Self::paged_guards`] enforces at construction (page geometry,
+    /// attention-smem bound, dtype coverage), exposed so callers (the
+    /// server's pre-load gate) validate a model/mode combination BEFORE the
+    /// multi-minute weight load instead of hand-copying the constraints.
+    /// Pure `cfg` logic — CPU-runnable.
+    pub fn check_paged_support(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
+        Self::paged_guards(cfg, tokens_per_page)
     }
 
     /// Pages per sequence in paged mode (`max_seq / tokens_per_page`).
@@ -470,17 +523,6 @@ impl BatchedModel {
             }
         }
         self.tables_host = tables;
-        // Paged MLA path: per-row expanded scratch consumed by
-        // kv_store_paged_mla (allocated only in paged mode — the contiguous
-        // MLA path assembles straight into its caches).
-        if self.cfg.kv_lora_rank > 0 {
-            let b = self.rows;
-            let heads = self.cfg.n_heads;
-            let hd = self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim;
-            let v_hd = self.cfg.v_head_dim;
-            self.mla_k_asm = self.dalloc(b * heads * hd * 4)?;
-            self.mla_v_asm = self.dalloc(b * heads * v_hd * 4)?;
-        }
         // Per-row offsets: row r -> r*max_pages (row == slot during decode).
         let mut offsets: Vec<i32> = Vec::with_capacity(self.rows);
         for r in 0..self.rows {
@@ -640,8 +682,6 @@ impl BatchedModel {
             mla_kv: std::ptr::null_mut(),
             mla_k_rope: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
-            mla_k_asm: std::ptr::null_mut(),
-            mla_v_asm: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
@@ -1629,25 +1669,15 @@ impl BatchedModel {
                 let (kc, vc) = self.mla_kv_cache[li];
                 let scale = 1.0 / ((nope + rope) as f32).sqrt();
                 if self.paged {
-                    // Paged MLA: expand to per-row scratch, store through the
-                    // block tables into the per-head page pools, then batched
-                    // attention over them.
+                    // Paged MLA: one fused kernel expands kv + shared k_rope
+                    // on the fly while storing through the block tables into
+                    // the per-head page pools, then batched attention over
+                    // them (no intermediate scratch roundtrip).
                     let tpp = self.tokens_per_page as i32;
                     let max_pages = self.max_pages_per_seq as i32;
-                    k.launch_mla_assemble_kv_rows(
+                    k.launch_kv_store_paged_mla(
                         self.mla_kv,
                         self.mla_k_rope,
-                        self.mla_k_asm,
-                        self.mla_v_asm,
-                        b,
-                        heads,
-                        nope,
-                        rope,
-                        v_hd,
-                    )?;
-                    k.launch_kv_store_paged_mla(
-                        self.mla_k_asm,
-                        self.mla_v_asm,
                         kc as *mut f32,
                         vc as *mut f32,
                         self.pos_dev,
@@ -1655,7 +1685,8 @@ impl BatchedModel {
                         self.block_tables,
                         b,
                         heads,
-                        nope + rope,
+                        nope,
+                        rope,
                         v_hd,
                         tpp,
                     )?;
@@ -2695,5 +2726,34 @@ impl Drop for BatchedModel {
         for &p in &self.host_pins {
             let _ = hip::host_free(hip, p);
         }
+    }
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod paged_support_tests {
+    use super::*;
+
+    /// The pre-flight must mirror `paged_guards` exactly — the server's
+    /// pre-load gate degrades on these same conditions.
+    #[test]
+    fn check_paged_support_mirrors_paged_guards() {
+        let cfg = Config::tiny(); // max_seq_len 256; dense F32
+        assert!(BatchedModel::check_paged_support(&cfg, 64).is_ok());
+
+        // Page geometry: zero and non-divisor tpp are rejected.
+        assert!(BatchedModel::check_paged_support(&cfg, 0).is_err());
+        assert!(BatchedModel::check_paged_support(&cfg, 48).is_err());
+
+        // Attention-smem bound: max_seq_len beyond 16128 tokens.
+        let mut big = Config::tiny();
+        big.max_seq_len = 32768;
+        assert!(BatchedModel::check_paged_support(&big, 64).is_err());
+
+        // MLA is F32-only: F16 MLA rejected, F32 MLA accepted.
+        let mut mla = Config::mla(128, 2, 4, 1024, 256, 32, 16, 16, 8, 16);
+        mla.dtype = ModelDType::F16;
+        assert!(BatchedModel::check_paged_support(&mla, 64).is_err());
+        mla.dtype = ModelDType::F32;
+        assert!(BatchedModel::check_paged_support(&mla, 64).is_ok());
     }
 }

@@ -30,7 +30,7 @@
 | MoE（Kimi-K3 / flashinfer tactics） | MoE 全链路：router + 分组 GEMM + 连续批处理 + HTTP | ✅ 已对齐 |
 | 连续批处理 / 请求生命周期 | `continuous.rs`（prefill/decode 混合、EOS、槽位压缩） | 🟡 功能对齐，无显式 FSM |
 | Agentic state reuse | `state_reuse.rs`（token 边界锚点 + 增量 prefill，dense/moe/mla 对拍） | 🟡 同会话多轮复用；**不跨请求** |
-| **分页 KV + 块表 + LCM 块池** | `kv_block_pool.rs`（LCM 放置 + 块表 + RAII）+ `with_paged_kv`（per-slot 块表，f16/MLA 分页内核已接线，chunked prefill 按行寻址）；服务链 `MACH_PAGED=1` 可跑 | ✅ **GPU 已接入 + 真机 A/B（见第 4 节）**；剩余：页池驱逐/LRU（当前池满即拒） |
+| **分页 KV + 块表 + LCM 块池** | `kv_block_pool.rs`（LCM 放置 + 块表 + RAII）+ `with_paged_kv`（per-slot 块表，f16/MLA 分页内核已接线，chunked prefill 按行寻址）；服务链 `MACH_PAGED=1` 可跑 | ✅ **GPU 已接入 + 真机 A/B（见第 4 节）**；页池驱逐已落地（#80/#81，整条目驱逐+引用守卫）；剩余：页级 LRU 粒度驱逐 |
 | **全局前缀缓存（SHA-256 前缀哈希链 + matcher）** | `prefix_cache.rs` + `reuse_planner.rs` + `prefix_kv.rs` CPU 参考已实现（复用 logits == 全算逐位一致）；GPU 侧 `GpuPagedTableBuilder` 内容哈希页复用 + `ContinuousModel` 物化水位门控（C5a） | ✅ **GPU 服务链已闭环 + 真机 A/B**（78.8% 提示词节省、后续请求 TTFT 13.4x，见 `docs/benchmark-results-paged-prefix.md`）；剩余：真实模型同口径 A/B |
 | **调度器 FSM（7 状态 + 事件 + Retracted/WriteBack/LoadBack）** | `scheduler_fsm.rs` 已移植（7 状态 + 12 事件，非法迁移 panic） | 🟡 已实现，未接入 `continuous.rs` |
 | KV 缓存事件（PD 跨节点） | 无（单节点） | ⏸ 单卡目标暂不需要 |
@@ -68,7 +68,8 @@
 ### 接入计划（后续批次）
 
 - ✅ 把 `BlockTable` 接到 `batched.rs` 的 KV 布局：静态槽位 → 分页表（#78 C1-C4，
-  `with_paged_kv` / `with_paged_kv_rows`；长上下文按需分配/驱逐的页池 LRU 仍待做）。
+  `with_paged_kv` / `with_paged_kv_rows`；长上下文按需分配已落地,页池
+  整条目驱逐已落地（#80/#81）,页级 LRU 粒度驱逐待做）。
 - ✅ 用内容哈希页复用做跨请求前缀共享：`ContinuousModel::with_paged_prefill_rows` +
   `MACH_PAGED=1`，真机 TTFT/TPOT 已记录（`docs/benchmark-results-paged-prefix.md`，
   78.8% 提示词节省 ≈ FreeToken 65–80% 带）。
@@ -100,7 +101,8 @@
     HTTP e2e（输出 == 直接引擎）；
   - **真机 A/B 完成**：5 请求共享 64-token 页 → 提示词节省 78.8%（== 理论值）、
     端到端 2.84x、后续请求 TTFT 13.4x（`docs/benchmark-results-paged-prefix.md`）；
-  - 剩余：页池驱逐/LRU（当前容量=capacity×pages，满即拒）、真实模型同口径
+  - 剩余：页级 LRU 粒度驱逐（整条目驱逐已落地，#80/#81；池容量
+    =capacity×pages，驱逐+引用守卫+池满重试）、真实模型同口径
     A/B、`scheduler_fsm` 替换 `continuous.rs` 隐式生命周期（见接入计划）
 - [x] owning-ref 索引 + 容量驱逐：`PrefixCacheIndex` 持 `CacheBlockRef`（块被索引钉住，
       释放请求 plan 不会误释放仍被复用的块；上游 `prefix_index` 语义）；`PrefixKvCache`
