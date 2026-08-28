@@ -708,14 +708,15 @@ pub struct PagedTablePlan {
     pub table: PagedTable,
     /// Prompt tokens covered by materialized, aliased prefix pages.
     pub reused_tokens: usize,
-    /// Aliased prefix pages (exact page count — `reused_tokens` clamps a
-    /// partial final page, which `free_plan_pages` must not misread).
+    /// Aliased prefix pages — the exact page count. `reused_tokens ==
+    /// reused_pages * tokens_per_page` always holds (only full pages alias);
+    /// `free_plan_pages` uses this field as its fresh/aliased boundary.
     pub reused_pages: usize,
     /// Per-page content hashes (chain), in page order. Consumed by the
     /// hip-gated engine (`continuous`) at materialization and eviction, so
     /// the CPU-only face sees no reader.
     #[cfg_attr(not(feature = "hip"), allow(dead_code))]
-    pub(crate) chain: Vec<String>,
+    pub(crate) chain: std::sync::Arc<[String]>,
 }
 
 /// GPU block-table builder: allocates physical page ids in a shared page pool,
@@ -770,9 +771,9 @@ impl GpuPagedTableBuilder {
     /// it to [`Self::plan_with_chain`] — including every eviction-retry
     /// attempt, so pool pressure never triggers a rehash.
     #[must_use]
-    pub fn compute_chain(&self, tokens: &[i32]) -> Vec<String> {
+    pub fn compute_chain(&self, tokens: &[i32]) -> std::sync::Arc<[String]> {
         let pages: Vec<&[i32]> = tokens.chunks(self.tokens_per_page).collect();
-        crate::prefix_cache::compute_prefix_hashes(&pages, "", &[])
+        crate::prefix_cache::compute_prefix_hashes(&pages, "", &[]).into()
     }
 
     /// One admission-time resolution: either aliases materialized cached
@@ -787,17 +788,17 @@ impl GpuPagedTableBuilder {
     /// other's generated KV at the same offsets.
     pub fn plan(&mut self, tokens: &[i32], allow_reuse: bool) -> Result<PagedTablePlan, Error> {
         let chain = self.compute_chain(tokens);
-        self.plan_with_chain(tokens, &chain, allow_reuse)
+        self.plan_with_chain(tokens, chain, allow_reuse)
     }
 
     /// [`Self::plan`] over a precomputed [`Self::compute_chain`] chain: same
-    /// aliasing, allocation, and rollback behavior without rehashing. `chain`
-    /// must be `tokens`' own chain (the engine computes both together at
-    /// admission).
+    /// aliasing, allocation, and rollback behavior without rehashing or
+    /// copying the chain (shared `Arc`). `chain` must be `tokens`' own chain
+    /// (the engine computes both together at admission).
     pub fn plan_with_chain(
         &mut self,
         tokens: &[i32],
-        chain: &[String],
+        chain: std::sync::Arc<[String]>,
         allow_reuse: bool,
     ) -> Result<PagedTablePlan, Error> {
         // Only the leading FULL pages may be aliased (see plan's doc above).
@@ -835,7 +836,7 @@ impl GpuPagedTableBuilder {
             table,
             reused_tokens,
             reused_pages,
-            chain: chain.to_vec(),
+            chain,
         })
     }
 
@@ -1657,7 +1658,7 @@ mod tests {
         let chain = b.compute_chain(&tokens);
 
         // Nothing materialized: full fresh compute.
-        let p0 = b.plan_with_chain(&tokens, &chain, true).unwrap();
+        let p0 = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(p0.reused_pages, 0);
         assert_eq!(p0.reused_tokens, 0);
         assert_eq!(p0.table.len(), 2, "full page + partial page");
@@ -1667,7 +1668,7 @@ mod tests {
 
         // Re-plan: exactly the one materialized full page aliases; the
         // partial page stays per-request fresh.
-        let p1 = b.plan_with_chain(&tokens, &chain, true).unwrap();
+        let p1 = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(p1.reused_pages, 1, "only the materialized full page");
         assert_eq!(p1.reused_tokens, 4, "one full page worth of tokens");
         assert_eq!(p1.table.get(0), p0.table.get(0), "page 0 aliased");
@@ -1687,8 +1688,8 @@ mod tests {
         let tokens = [7i32; 8];
         let chain = b.compute_chain(&tokens);
 
-        let pa = b.plan_with_chain(&tokens, &chain, false).unwrap();
-        let pb = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        let pa = b.plan_with_chain(&tokens, chain.clone(), false).unwrap();
+        let pb = b.plan_with_chain(&tokens, chain.clone(), false).unwrap();
         assert_ne!(
             pa.table.get(0),
             pb.table.get(0),
@@ -1712,18 +1713,18 @@ mod tests {
         let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
         let chain = b.compute_chain(&tokens);
 
-        let pa = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        let pa = b.plan_with_chain(&tokens, chain.clone(), false).unwrap();
         b.register_chain(&chain, &pa.table);
         let page0 = pa.table.get(0).unwrap();
 
-        let pb = b.plan_with_chain(&tokens, &chain, true).unwrap();
+        let pb = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(pb.reused_pages, 2, "both materialized pages alias");
         b.free_plan_pages(&pb, &pb.table);
 
         assert_eq!(b.page_of(&chain[0]), Some(page0), "alias survives");
         assert_eq!(b.page_of(&chain[1]), pa.table.get(1), "alias survives");
         // The freed fresh page comes back; the aliased pages do not.
-        let recycled = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        let recycled = b.plan_with_chain(&tokens, chain.clone(), false).unwrap();
         assert_eq!(recycled.reused_pages, 0);
         for p in recycled.table.pages() {
             assert!(
@@ -1740,7 +1741,7 @@ mod tests {
         let mut b = GpuPagedTableBuilder::new(6, 4);
         let mut t = {
             let c = b.compute_chain(&[1, 2, 3, 4]);
-            let p = b.plan_with_chain(&[1, 2, 3, 4], &c, false).unwrap();
+            let p = b.plan_with_chain(&[1, 2, 3, 4], c.clone(), false).unwrap();
             p.table
         };
         let before = t.len();
@@ -1762,11 +1763,11 @@ mod tests {
         let mut b = GpuPagedTableBuilder::new(16, 4);
         let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
         let chain = b.compute_chain(&tokens);
-        let p = b.plan_with_chain(&tokens, &chain, false).unwrap();
+        let p = b.plan_with_chain(&tokens, chain.clone(), false).unwrap();
         b.register_chain(&chain, &p.table);
         assert_eq!(b.plan(&tokens, true).unwrap().reused_pages, 2);
 
-        for h in &chain {
+        for h in chain.iter() {
             assert!(b.evict_page(h), "registered hash must evict");
         }
         assert!(b.page_of(&chain[0]).is_none());

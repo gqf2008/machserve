@@ -859,3 +859,26 @@
     mla 5/5(含新增 paged MLA 对拍 CPU 参考)、fp16 6/6、decode_slice
     2/2、server 全绿(含 ignored Q4/FP8 HTTP e2e)、离线门禁 2/2
     (43 内核 + 计数断言)。
+
+- **PR #81 四轮审查修复(R3 复审,2026-08-28)**:复审 15 条兑现——
+  - 驱逐保冷(freed>0 即停):evict_one_retired 一次池压事件不再清空
+    整个冷缓存(原实现一次排空全部可驱逐条目,复用经济性归零),改
+    「逐条目驱逐直到一页归还」;共享 helper evict_retired_at 消除与
+    force_evict_oldest 的 20 行重复;
+  - 部分末页不再永久钉页:物化只注册整页哈希(PagedEntry.full_pages),
+    未注册的部分页在 retire 时随其他未注册内容一并释放(原实现每个
+    不同短 prompt 永久占死一个注册但永不可复用的池页);
+  - paged 校验前置:MLA/TPP 兼容性判定提升到权重加载之前(量化 MLA
+    或 F16-MLA + MACH_PAGED 告警降级、坏 MACH_TPP 快速失败),不再
+    出现「加载数分钟后 exit(1)」;MACH_TPP 非数字值告警并回退默认
+    (文档与行为一致);SPEC/MoE 忽略 MACH_PAGED 的语义不变;
+  - 链克隆消除:PagedTablePlan/PagedEntry.chain 改 Arc<[String]>,
+    准入与每次驱逐重试零拷贝共享;
+  - 收敛与文档:ContinuousModel 7 处构造尾部收敛为 with_model 单点、
+    weights.rs From impl 移出类型定义区(修 rustdoc 错位)、
+    PagedTablePlan.reused_pages 文档对齐恒等式、README 44→43 内核、
+    tokenspeed-alignment 状态表驱逐落地/页级 LRU 剩余;
+  - 验证:CPU lib 184/184、fmt/clippy(-D warnings)/check×2 全绿;
+    GPU 面(7900 XTX,--test-threads 1):continuous 22/22、batched
+    14/14、mla 5/5、fp16 6/6、decode_slice 2/2、server 31+2(含
+    ignored Q4/FP8 HTTP e2e)、离线门禁 2/2(43 内核+计数断言)。
