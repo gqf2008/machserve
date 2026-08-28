@@ -194,6 +194,32 @@ impl Q4Tensor {
         v.extend(other.dequantize());
         Self::quantize(&v)
     }
+
+    /// Single-pass equivalent of folding [`Self::concat`] over `parts` in
+    /// order — the fold re-clones the growing prefix per part (O(n²) bytes
+    /// over many MoE experts). Group-aligned parts append bytes/scales
+    /// directly; otherwise falls back to quantize(dequantize-all) like
+    /// [`Self::concat`].
+    pub fn concat_many(parts: &[Self]) -> Self {
+        if parts.is_empty() {
+            return Self::default();
+        }
+        let n: usize = parts.iter().map(|p| p.n).sum();
+        if parts.iter().all(|p| p.n.is_multiple_of(Q4_GROUP)) {
+            let mut q = Vec::with_capacity(n / 2);
+            let mut scales = Vec::with_capacity(n / Q4_GROUP);
+            for p in parts {
+                q.extend_from_slice(&p.q);
+                scales.extend_from_slice(&p.scales);
+            }
+            return Self { q, scales, n };
+        }
+        let mut v = Vec::with_capacity(n);
+        for p in parts {
+            v.extend(p.dequantize());
+        }
+        Self::quantize(&v)
+    }
 }
 
 #[cfg(test)]

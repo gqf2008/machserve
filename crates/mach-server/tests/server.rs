@@ -64,30 +64,7 @@ async fn completions_endpoint_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(got, want, "server output must equal direct engine run");
 }
 
@@ -164,30 +141,7 @@ async fn completions_endpoint_moe_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(got, want, "server MoE output must equal direct engine run");
 }
 
@@ -234,30 +188,7 @@ async fn completions_endpoint_q4_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(
         got, want,
         "server Q4 output must equal direct Q4 engine run"
@@ -307,30 +238,7 @@ async fn completions_endpoint_fp8_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(
         got, want,
         "server FP8 output must equal direct FP8 engine run"
@@ -1152,30 +1060,7 @@ async fn completions_endpoint_mla_matches_direct_engine() {
     };
     let app = router(state);
 
-    let body = serde_json::json!({ "prompt": prompt, "max_tokens": max_new });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let got: Vec<u32> = json["choices"][0]["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap() as u32)
-        .collect();
+    let got = post_completions(&app, prompt, max_new).await;
     assert_eq!(got, want, "server MLA output must equal direct engine run");
 }
 

@@ -351,11 +351,8 @@ impl WeightsQ4 {
             }
             let per = v.len() / ne;
             assert_eq!(per * ne, v.len(), "MoE tensor must split evenly per expert");
-            let mut out = crate::q4::Q4Tensor::default();
-            for e in 0..ne {
-                out = out.concat(&q(&v[e * per..(e + 1) * per]));
-            }
-            out
+            let parts: Vec<_> = (0..ne).map(|e| q(&v[e * per..(e + 1) * per])).collect();
+            crate::q4::Q4Tensor::concat_many(&parts)
         };
         Self {
             tok_emb: q(&w.tok_emb),
@@ -416,11 +413,8 @@ impl WeightsFp8 {
             }
             let per = v.len() / ne;
             assert_eq!(per * ne, v.len(), "MoE tensor must split evenly per expert");
-            let mut out = crate::fp8::Fp8Tensor::default();
-            for e in 0..ne {
-                out = out.concat(&q(&v[e * per..(e + 1) * per]));
-            }
-            out
+            let parts: Vec<_> = (0..ne).map(|e| q(&v[e * per..(e + 1) * per])).collect();
+            crate::fp8::Fp8Tensor::concat_many(&parts)
         };
         Self {
             tok_emb: q(&w.tok_emb),

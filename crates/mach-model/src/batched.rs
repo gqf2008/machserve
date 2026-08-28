@@ -231,7 +231,9 @@ impl BatchedModel {
     /// `kv_store_paged` / `attn_decode_paged`. The default mapping is the
     /// static identity (same physical layout as the contiguous path); call
     /// [`Self::set_block_table`] to install reuse-planner tables so sequences
-    /// share prefix physical pages. f16/MLA paged kernels remain follow-ups.
+    /// share prefix physical pages. Dense F16 and MLA (F32) paged kernels are
+    /// wired too (`with_paged_kv_rows` dtype variants; fused
+    /// `kv_store_paged_mla`).
     pub fn with_paged_kv(
         hip: Arc<Hip>,
         cfg: Config,

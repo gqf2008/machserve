@@ -509,6 +509,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "warning: MACH_PAGED is unsupported with this model/mode combination (paged KV serves MLA in F32 only); serving continuous"
             );
             None
+        } else if (cfg.max_seq_len + 256) * 4 > 64 * 1024 {
+            // Same attention-smem bound `paged_guards` enforces (the paged
+            // kernels stage the per-row score array in dynamic shared
+            // memory): degrade up front instead of aborting after the
+            // multi-minute weight load.
+            eprintln!(
+                "warning: MACH_PAGED needs {} bytes of attention smem for max_seq_len {} (64 KiB device limit, contexts up to {} tokens); serving continuous",
+                (cfg.max_seq_len + 256) * 4,
+                cfg.max_seq_len,
+                64 * 1024 / 4 - 256
+            );
+            None
         } else {
             Some(parse_paged_tpp(&cfg))
         }

@@ -1663,7 +1663,6 @@ mod tests {
         // Nothing materialized: full fresh compute.
         let p0 = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(p0.reused_pages, 0);
-        assert_eq!(p0.reused_pages, 0);
         assert_eq!(p0.table.len(), 2, "full page + partial page");
 
         // Register page 0's content only (prefill materialized).
@@ -1673,7 +1672,6 @@ mod tests {
         // partial page stays per-request fresh.
         let p1 = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(p1.reused_pages, 1, "only the materialized full page");
-        assert_eq!(p1.reused_pages, 1, "one full page aliases");
         assert_eq!(p1.table.get(0), p0.table.get(0), "page 0 aliased");
         assert_ne!(
             p1.table.get(1),
@@ -1776,7 +1774,6 @@ mod tests {
         assert!(b.page_of(&chain[0]).is_none());
         let after = b.plan(&tokens, true).unwrap();
         assert_eq!(after.reused_pages, 0, "evicted content must not be reused");
-        assert_eq!(after.reused_pages, 0);
         // Freed pages are recycled, not double-counted.
         assert_eq!(b.cached_pages(), 0);
     }

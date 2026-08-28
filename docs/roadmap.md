@@ -864,7 +864,7 @@
 - **PR #81 四轮审查修复(R3 复审,2026-08-28)**:复审 15 条兑现——
   - 驱逐保冷(freed>0 即停):evict_one_retired 一次池压事件不再清空
     整个冷缓存(原实现一次排空全部可驱逐条目,复用经济性归零),改
-    「逐条目驱逐直到一页归还」;共享 helper evict_retired_at 消除与
+    「逐条目驱逐直到一页归还」;共享 helper evict_entry_at 消除与
     force_evict_oldest 的 20 行重复;
   - 部分末页不再永久钉页:物化只注册整页哈希(PagedEntry.full_pages),
     未注册的部分页在 retire 时随其他未注册内容一并释放(原实现每个
@@ -876,7 +876,7 @@
   - 链克隆消除:PagedTablePlan/PagedEntry.chain 改 Arc<[String]>,
     准入与每次驱逐重试零拷贝共享;
   - 收敛与文档:ContinuousModel 7 处构造尾部收敛为 with_model 单点、
-    weights.rs From impl 移出类型定义区(修 rustdoc 错位)、
+    weights.rs 转换函数移出类型定义区(修 rustdoc 错位)、
     PagedTablePlan.reused_pages 文档对齐恒等式、README 44→43 内核、
     tokenspeed-alignment 状态表驱逐落地/页级 LRU 剩余;
   - 验证:CPU lib 184/184、fmt/clippy(-D warnings)/check×2 全绿;
@@ -913,3 +913,33 @@
     GPU 面(7900 XTX,--test-threads 1):continuous 22/22、batched
     14/14、mla 5/5、fp16 6/6、decode_slice 2/2、server 31+2(含
     ignored Q4/FP8 HTTP e2e)、离线门禁 2/2(43 内核+计数断言)。
+
+- **PR #81 六轮审查修复(R5 复审,2026-08-28)**:复审 14 条,无正确性
+  破坏(驱逐/认领机制、整页复用规则、plan/pad/free 路径、融合内核
+  索引、r-=1 回退全部独立追迹通过)——
+  - 前置门补 attention-smem 界:max_seq_len>16128 的 MACH_PAGED 配置
+    告警降级(原 paged_guards 在多分钟加载后才 Err);
+  - 死代码回退删除:force_evict_oldest 在收割式 evict_one_retired 下
+    不可达(后者仅在空表时返回 false),删除并让 evict_one_retired
+    兼任 retired 上限封顶(空表早退);
+  - born-dead 条目不入册:短 prompt(<一整页)退休不再累积死元数据
+    (其条目永远无法服务复用也无法释放页面);
+  - concat_many:Q4Tensor/Fp8Tensor 单遍预分配拼接,from_weights 逐
+    专家组合 O(ne²)→O(n);
+  - **量化分页路径 CPU 对拍(规则 3)**:paged-q4/fp8 对照 dequantized
+    权重的 CPU 参考,20 token 跨 2 页边界,实测 diff ~2e-3(f16 舍入
+    水平,量化误差完全对消);附 f16 控制组与连续 q4 对照;修复
+    harness 对有状态 RefModel 的误用(整前缀重复消费致步 1 即 0.7
+    假阳性——参考须每步只喂增量 token);
+  - 文档/收敛:with_paged_kv 陈旧 follow-up 表述更正(f16/MLA 已接线)、
+    roadmap 符号名修正(evict_entry_at/from_weights)、server.rs
+    completions 内联块全量收敛至 post_completions、paged_kv 测试重复
+    断言清理;
+  - 不采纳(记录理由):add() 的 plan/pad Err 防御分支保留(守护池
+    尺寸不变量,删除使未来改动静默失护);build_table/plan 测试薄
+    委托保留(纯委托生产路径,无独立语义);分支历史英文标题不改写
+    (squash merge 落库标题为中文+issue 号);
+  - 验证:CPU lib 184/184、fmt/clippy(-D warnings)/check×2 全绿;
+    GPU(7900 XTX,--test-threads 1):batched 18/18(含 4 个新对拍)、
+    continuous 22/22、mla 5/5、fp16 6/6、decode_slice 2/2、server
+    31+2、离线门禁 2/2(43 内核+计数断言)。

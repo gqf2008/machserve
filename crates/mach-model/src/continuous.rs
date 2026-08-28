@@ -166,10 +166,16 @@ impl PagedEngineState {
     /// unique pages are freed even when other hashes of the same entry are
     /// live-shared, so cold pages never stay trapped behind a shared one.
     /// Stops at the first freeing eviction: colder entries beyond it stay
-    /// cached for later reuse. Entries whose every hash is unreclaimable
-    /// are dropped as dead metadata. Returns true when at least one page
-    /// was freed (a plan retry can make progress).
+    /// cached for later reuse. When nothing is freeable the whole list
+    /// drains as dead metadata (each live-aliased page stays registered and
+    /// recoverable through the aliasing table's own entry) and false is
+    /// returned. This also bounds the retired list, so the cap loop needs
+    /// no separate fallback. Returns true when at least one page was freed
+    /// (a plan retry can make progress).
     fn evict_one_retired(&mut self) -> bool {
+        if self.retired.is_empty() {
+            return false;
+        }
         let referenced = self.referenced_pages();
         let mut claimed = self.claimed_counts();
         let mut freed = 0usize;
@@ -179,22 +185,11 @@ impl PagedEngineState {
                 break;
             }
         }
+        // Hygiene: entries left with no resolvable hash (never materialized
+        // content) can neither serve reuse nor free pages later.
         self.retired
             .retain(|e| e.chain.iter().any(|h| self.builder.page_of(h).is_some()));
         freed > 0
-    }
-
-    /// Retired-cap fallback: frees the oldest entry's freeable pages (same
-    /// per-hash rules as [`Self::evict_one_retired`]) and drops its
-    /// metadata, bounding the retired list when nothing can be reclaimed.
-    /// Returns true when a page was freed.
-    fn force_evict_oldest(&mut self) -> bool {
-        if self.retired.is_empty() {
-            return false;
-        }
-        let referenced = self.referenced_pages();
-        let mut claimed = self.claimed_counts();
-        self.evict_entry_at(0, &referenced, &mut claimed) > 0
     }
 }
 
@@ -966,22 +961,19 @@ impl ContinuousModel {
             self.seqs[self.active - 1] = None;
             pg.tables[self.active - 1] = None;
             pg.entries[self.active - 1] = empty();
-            pg.retired.push(entry);
-            // Bound the retired metadata: evict what the pool can reclaim;
-            // when nothing is freeable, force-evict the oldest entry's
-            // freeable pages and drop its metadata — each live-aliased page
-            // stays registered and recoverable through the aliasing table's
-            // own entry (no orphaned, unreachable pages), and overshoot is
-            // transient (the aliasing tables retire and re-enable eviction).
-            while pg.retired.len() > retired_cap {
-                if pg.evict_one_retired() {
-                    continue;
-                }
-                if pg.force_evict_oldest() {
-                    continue;
-                }
-                break;
+            // A short prompt (< one full page) registers nothing: its entry
+            // could never serve reuse nor free pages, so don't accumulate
+            // it as dead weight (its pages were already freed above).
+            if entry.full_pages > 0 {
+                pg.retired.push(entry);
             }
+            // Bound the retired metadata: evict what the pool can reclaim.
+            // When nothing is freeable, evict_one_retired drains the whole
+            // list as dead metadata — each live-aliased page stays
+            // registered and recoverable through the aliasing table's own
+            // entry, so overshoot is transient (the aliasing tables retire
+            // and re-enable eviction).
+            while pg.retired.len() > retired_cap && pg.evict_one_retired() {}
             self.active -= 1;
             return;
         }
