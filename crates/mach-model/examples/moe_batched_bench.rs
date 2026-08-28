@@ -8,12 +8,18 @@
 //!
 //! Run: cargo run -p mach-model --release --features hip --example moe_batched_bench
 
+#[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
+#[cfg(feature = "hip")]
 use mach_model::batched::BatchedModel;
+#[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
+#[cfg(feature = "hip")]
 use mach_model::{Config, Weights};
+#[cfg(feature = "hip")]
 use std::time::Instant;
 
+#[cfg(feature = "hip")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let h = match hip::hip() {
         Ok(h) => h,
@@ -69,4 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch as f64 / per_step * 1e3
     );
     Ok(())
+}
+
+#[cfg(not(feature = "hip"))]
+fn main() {
+    eprintln!("moe_batched_bench requires the `hip` feature");
 }
