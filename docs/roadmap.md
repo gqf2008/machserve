@@ -943,3 +943,31 @@
     GPU(7900 XTX,--test-threads 1):batched 18/18(含 4 个新对拍)、
     continuous 22/22、mla 5/5、fp16 6/6、decode_slice 2/2、server
     31+2、离线门禁 2/2(43 内核+计数断言)。
+
+- **PR #81 七轮审查修复(R6 复审,2026-08-28)**:最终轮 12 条(无正确性
+  破坏;r-=1 共享写回候选经核实为前提有误——旧整页回退重写的正是被
+  别名的最后一整页且更宽,严格非回归)——
+  - 前置门接权威检查:BatchedModel::check_paged_support 公开(薄包
+    paged_guards),main.rs 加载前直接调用并删除手抄 smem/MLA 字面量
+    (消除两处同义门禁的漂移面);量化 MLA 的 pre-load 降级单独保留
+    (编码 build_q4/fp8 强制 F16 的跨 crate 不变式);
+  - parse_paged_tpp 拆出纯校验 validate_paged_tpp(cfg, raw)(无 env/
+    exit 副作用,CPU 可测)+ 薄 exit 包装;
+  - full_pages 挂上 PagedTablePlan:整页复用规则的三处镜像收敛为
+    builder 单一事实源,引擎不再自行整除;
+  - 驱逐簿记切片 chain[..full_pages]:永不注册的部分页哈希不再进认领
+    表(死键清理,两循环失配 panic 面缩小);
+  - 死代码 retain 清扫删除(认领计数不变式下永不触发);
+  - spawn_spec 补 MACH_PAGED 守卫(与 spawn_q4/fp8 对齐,API 边界不再
+    静默忽略);
+  - concat_many 文档限定折叠等价条件(当且仅当全段对齐)+ q4/fp8
+    折叠等价性质测试;校验层补测(validate_paged_tpp 5 断言、
+    check_paged_support 镜像 paged_guards 四分支);
+  - 不采纳(记录理由):claimed_counts 增量维护与页所有权 refcount
+    下沉(同一后续架构项);step() 零 prefill 行准入(消除 r-=1 与
+    state_reuse 双补丁点,连 scheduler_fsm 接入一起做);量化测试
+    Q4/FP8 分支泛型去重(跨无公共 trait 的两类型,闭包体操不值);
+  - 验证:CPU lib mach-model 168/mach-server bin+lib 3、fmt/clippy
+    (-D warnings)/check×2 全绿;GPU(7900 XTX,--test-threads 1):
+    continuous 22/22、batched 18/18、mla 5/5、fp16 6/6、decode_slice
+    2/2、server 32+2、离线门禁 2/2(43 内核+计数断言)。

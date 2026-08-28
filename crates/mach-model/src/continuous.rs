@@ -117,14 +117,15 @@ impl PagedEngineState {
             .collect()
     }
 
-    /// Per-hash claim counts across the retired list: a hash is released
-    /// only by its last claimant, keeping every surviving entry's chain
-    /// resolvable (a dangling chain could make reuse look available where
-    /// the cache no longer resolves).
+    /// Per-hash claim counts across the retired list (full prompt pages
+    /// only — the never-registered partial page's hash is inert): a hash is
+    /// released only by its last claimant, keeping every surviving entry's
+    /// chain resolvable (a dangling chain could make reuse look available
+    /// where the cache no longer resolves).
     fn claimed_counts(&self) -> std::collections::HashMap<String, u32> {
         let mut claimed: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for e in &self.retired {
-            for h in e.chain.iter() {
+            for h in e.chain[..e.full_pages].iter() {
                 *claimed.entry(h.clone()).or_insert(0) += 1;
             }
         }
@@ -147,7 +148,7 @@ impl PagedEngineState {
     ) -> usize {
         let entry = self.retired.remove(idx);
         let mut freed = 0usize;
-        for h in entry.chain.iter() {
+        for h in entry.chain[..entry.full_pages].iter() {
             let remaining = claimed.get_mut(h).expect("retired chain is counted");
             *remaining -= 1;
             let freeable = self
@@ -185,10 +186,6 @@ impl PagedEngineState {
                 break;
             }
         }
-        // Hygiene: entries left with no resolvable hash (never materialized
-        // content) can neither serve reuse nor free pages later.
-        self.retired
-            .retain(|e| e.chain.iter().any(|h| self.builder.page_of(h).is_some()));
         freed > 0
     }
 }
@@ -611,7 +608,7 @@ impl ContinuousModel {
             pg.tables[slot] = Some(plan.table);
             pg.entries[slot] = PagedEntry {
                 chain: plan.chain,
-                full_pages: prompt.len() / pg.tokens_per_page,
+                full_pages: plan.full_pages,
             };
             pg.requests += 1;
             pg.prompt_tokens += prompt.len();

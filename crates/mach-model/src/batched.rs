@@ -340,6 +340,16 @@ impl BatchedModel {
         Ok(())
     }
 
+    /// Authoritative pre-flight for paged-KV support: the same checks
+    /// [`Self::paged_guards`] enforces at construction (page geometry,
+    /// attention-smem bound, dtype coverage), exposed so callers (the
+    /// server's pre-load gate) validate a model/mode combination BEFORE the
+    /// multi-minute weight load instead of hand-copying the constraints.
+    /// Pure `cfg` logic — CPU-runnable.
+    pub fn check_paged_support(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
+        Self::paged_guards(cfg, tokens_per_page)
+    }
+
     /// Pages per sequence in paged mode (`max_seq / tokens_per_page`).
     #[must_use]
     pub fn max_pages_per_seq(&self) -> usize {
@@ -2716,5 +2726,34 @@ impl Drop for BatchedModel {
         for &p in &self.host_pins {
             let _ = hip::host_free(hip, p);
         }
+    }
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod paged_support_tests {
+    use super::*;
+
+    /// The pre-flight must mirror `paged_guards` exactly — the server's
+    /// pre-load gate degrades on these same conditions.
+    #[test]
+    fn check_paged_support_mirrors_paged_guards() {
+        let cfg = Config::tiny(); // max_seq_len 256; dense F32
+        assert!(BatchedModel::check_paged_support(&cfg, 64).is_ok());
+
+        // Page geometry: zero and non-divisor tpp are rejected.
+        assert!(BatchedModel::check_paged_support(&cfg, 0).is_err());
+        assert!(BatchedModel::check_paged_support(&cfg, 48).is_err());
+
+        // Attention-smem bound: max_seq_len beyond 16128 tokens.
+        let mut big = Config::tiny();
+        big.max_seq_len = 32768;
+        assert!(BatchedModel::check_paged_support(&big, 64).is_err());
+
+        // MLA is F32-only: F16 MLA rejected, F32 MLA accepted.
+        let mut mla = Config::mla(128, 2, 4, 1024, 256, 32, 16, 16, 8, 16);
+        mla.dtype = ModelDType::F16;
+        assert!(BatchedModel::check_paged_support(&mla, 64).is_err());
+        mla.dtype = ModelDType::F32;
+        assert!(BatchedModel::check_paged_support(&mla, 64).is_ok());
     }
 }

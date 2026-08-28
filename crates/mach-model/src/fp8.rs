@@ -290,11 +290,14 @@ impl Fp8Tensor {
         Self::quantize(&v)
     }
 
-    /// Single-pass equivalent of folding [`Self::concat`] over `parts` in
-    /// order — the fold re-clones the growing prefix per part (O(n²) bytes
-    /// over many MoE experts). Parts sharing `block` with block-aligned `n`
-    /// append bytes/scales directly; otherwise falls back to
-    /// quantize(dequantize-all) like [`Self::concat`].
+    /// Single-pass append of `parts` in order, O(total) bytes — folding
+    /// [`Self::concat`] instead re-clones the growing prefix per part
+    /// (O(n²) over many MoE experts). Byte/scale-identical to that fold
+    /// **iff every part is block-aligned with a common block** — the only
+    /// shape real checkpoints hit (per-expert quantize sets
+    /// `block = expert size`); otherwise both re-quantize, but scale
+    /// grouping can differ from the sequential fold (see the
+    /// `concat_many_matches_concat_fold` test).
     pub fn concat_many(parts: &[Self]) -> Self {
         if parts.is_empty() {
             return Self::default();
@@ -467,5 +470,27 @@ mod tests {
         (0..n)
             .map(|i| ((i as f64) * k).sin() as f32 * 4.0)
             .collect()
+    }
+
+    /// concat_many must be byte-identical to the loader's sequential concat
+    /// fold whenever every part shares its block (per-expert quantize sets
+    /// `block = expert size` — the only shape real MoE checkpoints produce).
+    #[test]
+    fn concat_many_matches_concat_fold_when_aligned() {
+        let cases: &[&[usize]] = &[&[8, 8], &[32, 64, 16], &[128], &[4, 4, 4, 4]];
+        for parts in cases {
+            let tensors: Vec<Fp8Tensor> = parts
+                .iter()
+                .map(|&n| Fp8Tensor::quantize(&wave(n, 0.07)))
+                .collect();
+            let folded = tensors
+                .iter()
+                .fold(Fp8Tensor::default(), |a, b| a.concat(b));
+            let many = Fp8Tensor::concat_many(&tensors);
+            assert_eq!(many.q, folded.q, "parts {parts:?}: packed bytes");
+            assert_eq!(many.scales, folded.scales, "parts {parts:?}: scales");
+            assert_eq!(many.block, folded.block, "parts {parts:?}: block");
+            assert_eq!(many.n, folded.n, "parts {parts:?}: n");
+        }
     }
 }

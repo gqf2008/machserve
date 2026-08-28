@@ -706,6 +706,11 @@ impl PagedRef {
 pub struct PagedTablePlan {
     /// Logical → physical block table (prompt pages only; pad separately).
     pub table: PagedTable,
+    /// Full prompt pages (`tokens.len() / tokens_per_page`): the registerable
+    /// prefix of `chain` and the engine's single source for the full-pages-
+    /// only reuse rule — materialization registers `chain[..full_pages]`,
+    /// and retire bookkeeping covers the same prefix.
+    pub full_pages: usize,
     /// Aliased prefix pages — the exact page count. The covered token count
     /// is always `reused_pages * tokens_per_page` (only full pages alias);
     /// `free_plan_pages` uses this field as its fresh/aliased boundary.
@@ -838,6 +843,7 @@ impl GpuPagedTableBuilder {
         }
         Ok(PagedTablePlan {
             table,
+            full_pages,
             reused_pages,
             chain,
         })

@@ -17,6 +17,8 @@
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
+use mach_model::batched::BatchedModel;
+#[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
 use mach_model::loader::{load_safetensors, load_safetensors_fp8, load_safetensors_q4};
@@ -165,33 +167,48 @@ fn estimate_vram(
     est
 }
 
-/// Parses and validates `MACH_TPP` for a branch that actually engages paged
-/// KV (`MACH_PAGED` already checked by the caller). Runs BEFORE any weight
-/// load: a bad value fails fast instead of aborting after the multi-minute
-/// load. Non-numeric values fall back to the default with a warning;
-/// `0` and non-divisors of `max_seq_len` are fatal. The MACH_SPEC /
-/// MoE-offload branches ignore MACH_PAGED (warned) and never call this, so
-/// a stale value must not abort them.
-#[cfg(feature = "hip")]
-fn parse_paged_tpp(cfg: &Config) -> usize {
-    let tpp: usize = match std::env::var("MACH_TPP") {
-        Ok(v) => match v.parse() {
+/// Pure validation of a raw `MACH_TPP` value against `cfg` — testable
+/// without touching process env (see `parse_paged_tpp` for the fatal
+/// wrapper). Missing/non-numeric values fall back to the default 64
+/// (non-numeric warns); `0` and non-divisors of `max_seq_len` are fatal.
+fn validate_paged_tpp(
+    cfg: &mach_model::config::Config,
+    raw: Option<&str>,
+) -> Result<usize, String> {
+    let tpp: usize = match raw {
+        None => 64,
+        Some(v) => match v.parse() {
             Ok(t) => t,
             Err(_) => {
                 eprintln!("warning: MACH_TPP={v} is not a number; using default 64");
                 64
             }
         },
-        Err(_) => 64,
     };
     if tpp == 0 || !cfg.max_seq_len.is_multiple_of(tpp) {
-        eprintln!(
+        return Err(format!(
             "MACH_TPP={tpp} is invalid: must be a non-zero divisor of max_seq_len {}",
             cfg.max_seq_len
-        );
-        std::process::exit(1);
+        ));
     }
-    tpp
+    Ok(tpp)
+}
+
+/// Parses and validates `MACH_TPP` for a branch that actually engages paged
+/// KV (`MACH_PAGED` already checked by the caller). Runs BEFORE any weight
+/// load: a bad value fails fast instead of aborting after the multi-minute
+/// load. The MACH_SPEC / MoE-offload branches ignore MACH_PAGED (warned)
+/// and never call this, so a stale value must not abort them. Returns
+/// `None` (after reporting) for a fatal configuration — the caller degrades.
+#[cfg(feature = "hip")]
+fn parse_paged_tpp(cfg: &Config) -> Option<usize> {
+    match validate_paged_tpp(cfg, std::env::var("MACH_TPP").ok().as_deref()) {
+        Ok(tpp) => Some(tpp),
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// One-shot diagnostic report (`mach-server doctor`): OS/host, HIP/GPU/VRAM,
@@ -504,25 +521,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MoE-offload ignore MACH_PAGED (warned in-branch) and skip this. The
     // model-side paged_guards stay the authoritative last-resort checks.
     let paged_tpp = if paged_requested && !spec && moe_slots.is_none() {
-        if cfg.kv_lora_rank > 0 && ((q4 || fp8) || cfg.dtype != ModelDType::F32) {
+        if cfg.kv_lora_rank > 0 && (q4 || fp8) {
+            // Quantized builds force device dtype F16 (build_q4/build_fp8),
+            // so a quantized MLA checkpoint can never qualify for paged KV
+            // (MLA is F32-only). Warn and degrade before the load.
             eprintln!(
                 "warning: MACH_PAGED is unsupported with this model/mode combination (paged KV serves MLA in F32 only); serving continuous"
             );
             None
-        } else if (cfg.max_seq_len + 256) * 4 > 64 * 1024 {
-            // Same attention-smem bound `paged_guards` enforces (the paged
-            // kernels stage the per-row score array in dynamic shared
-            // memory): degrade up front instead of aborting after the
-            // multi-minute weight load.
-            eprintln!(
-                "warning: MACH_PAGED needs {} bytes of attention smem for max_seq_len {} (64 KiB device limit, contexts up to {} tokens); serving continuous",
-                (cfg.max_seq_len + 256) * 4,
-                cfg.max_seq_len,
-                64 * 1024 / 4 - 256
-            );
-            None
         } else {
-            Some(parse_paged_tpp(&cfg))
+            match parse_paged_tpp(&cfg) {
+                Some(tpp) => match BatchedModel::check_paged_support(&cfg, tpp) {
+                    Ok(()) => Some(tpp),
+                    // The authoritative model-side checks (page geometry,
+                    // attention smem, dtype coverage) degrade up front —
+                    // never abort after the multi-minute weight load.
+                    Err(e) => {
+                        eprintln!("warning: MACH_PAGED unsupported: {e}; serving continuous");
+                        None
+                    }
+                },
+                None => None, // invalid MACH_TPP: already reported and exited
+            }
         }
     } else {
         None
@@ -866,5 +886,26 @@ mod tests {
         // (2 bytes/weight): the weight term must be x2, or the preflight can
         // pass while the upload OOMs (regression).
         assert_eq!(fp8 - base, 1_000_000);
+    }
+}
+
+/// Ungated: `validate_paged_tpp` is pure cfg logic, so CPU CI covers it.
+#[cfg(test)]
+mod paged_tpp_tests {
+    use super::*;
+
+    #[test]
+    fn validate_paged_tpp_defaults_warnings_and_fatals() {
+        let cfg = mach_model::config::Config::tiny(); // max_seq_len 256
+        // Missing env: default 64 (divides 256).
+        assert_eq!(validate_paged_tpp(&cfg, None).unwrap(), 64);
+        // Non-numeric: warned fallback to 64 (not fatal).
+        assert_eq!(validate_paged_tpp(&cfg, Some("64x")).unwrap(), 64);
+        // Zero: fatal.
+        assert!(validate_paged_tpp(&cfg, Some("0")).is_err());
+        // Non-divisor: fatal.
+        assert!(validate_paged_tpp(&cfg, Some("48")).is_err());
+        // Valid custom value.
+        assert_eq!(validate_paged_tpp(&cfg, Some("128")).unwrap(), 128);
     }
 }
