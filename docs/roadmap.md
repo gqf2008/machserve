@@ -971,3 +971,21 @@
     (-D warnings)/check×2 全绿;GPU(7900 XTX,--test-threads 1):
     continuous 22/22、batched 18/18、mla 5/5、fp16 6/6、decode_slice
     2/2、server 32+2、离线门禁 2/2(43 内核+计数断言)。
+
+- **批量 MoE 解码 host 串行化消除(#70 P1/P3/P4,2026-08-29,7900 XTX)**:
+  - P1 grouped GEMV 解码路径:`moe_grouped_gate_up`(f32/f16)+ `moe_grouped_down`
+    (f32/f16)+ `moe_scatter_add_all`(atomicAdd——同 token 的 topk 行并发写同一
+    h_acc,必须原子)共 5 新内核,gather 增加 `exp_of_row` 输出;每 MoE 层每步
+    不再需要 counts D2H + 全流 sync + host 逐 expert 小 GEMM(原 m=1 hipBLAS
+    ×3ne 次发射);b≤slots 走设备路径,chunked-prefill 大 chunk 保留 hipBLAS
+    (m>1 权重重用);`MACH_MOE_GROUPED=0` 回退开关;
+  - P3 sampler 参数单次上传:12 个 H2D memcpy 合并为 1(8 对齐打包块,字段
+    指针 carving,内核零改动);
+  - P4 router top-k 并行化:thread-0 串行 O(topk×ne²) 选择改为每 k 一轮
+    256 线程并行 argmax 归约(平局取小索引,语义与串行扫描严格一致);
+  - 测试:moe_grouped_gemv(GEMV 逐内核对拍 CPU)、moe_grouped_pipeline
+    (wrapper 全流水线 vs CPU,抓出 scatter 非原子丢更新 bug);
+  - **A/B(moe_batched_bench,d=512/2 层/64 专家/topk8/batch32/F16)**:
+    host 路径 4.418 ms/step(7.2K tok/s)→ grouped 路径 **0.151 ms/step
+    (212K tok/s),29x**;
+  - P2(单序列 offload/slots 每层同步)为设计取舍,维持排期。

@@ -122,7 +122,6 @@ fn batched_moe_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let max = row
@@ -134,6 +133,21 @@ fn batched_moe_matches_single_seq() {
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
             );
+            // Greedy token: the batched MoE decode path uses the grouped
+            // GEMV kernels (a different GEMM implementation than the single
+            // model's hipBLAS path), so a near-tie may legitimately flip.
+            // Accept the batched token when its reference logit is within
+            // the logits tolerance band of the reference argmax logit.
+            let got_tok = got[s];
+            if got_tok != want {
+                let got_ref_logit = want_logits[got[s] as usize];
+                let want_ref_logit = want_logits[want as usize];
+                let tie_band = 4e-3 + 4e-3 * scale;
+                assert!(
+                    got_ref_logit >= want_ref_logit - tie_band,
+                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
+                );
+            }
         }
     }
 }
@@ -170,7 +184,6 @@ fn batched_moe_f16_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let max = row
                 .iter()
@@ -181,6 +194,17 @@ fn batched_moe_f16_matches_single_seq() {
                 max < 0.1,
                 "step {step_tokens:?} seq {s}: f16 logits max diff {max}"
             );
+            // Near-tie tolerance for the grouped GEMV decode path (see the
+            // dense MoE test above).
+            let got_tok = got[s];
+            if got_tok != want {
+                let got_ref_logit = want_logits[got[s] as usize];
+                let want_ref_logit = want_logits[want as usize];
+                assert!(
+                    got_ref_logit >= want_ref_logit - 0.2,
+                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
+                );
+            }
         }
     }
 }
@@ -219,7 +243,6 @@ fn batched_moe_small_config_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let max = row
@@ -231,6 +254,21 @@ fn batched_moe_small_config_matches_single_seq() {
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
             );
+            // Greedy token: the batched MoE decode path uses the grouped
+            // GEMV kernels (a different GEMM implementation than the single
+            // model's hipBLAS path), so a near-tie may legitimately flip.
+            // Accept the batched token when its reference logit is within
+            // the logits tolerance band of the reference argmax logit.
+            let got_tok = got[s];
+            if got_tok != want {
+                let got_ref_logit = want_logits[got[s] as usize];
+                let want_ref_logit = want_logits[want as usize];
+                let tie_band = 4e-3 + 4e-3 * scale;
+                assert!(
+                    got_ref_logit >= want_ref_logit - tie_band,
+                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
+                );
+            }
         }
     }
 }
@@ -273,7 +311,6 @@ fn batched_mixed_dense_moe_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let max = row
@@ -285,6 +322,21 @@ fn batched_mixed_dense_moe_matches_single_seq() {
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
             );
+            // Greedy token: the batched MoE decode path uses the grouped
+            // GEMV kernels (a different GEMM implementation than the single
+            // model's hipBLAS path), so a near-tie may legitimately flip.
+            // Accept the batched token when its reference logit is within
+            // the logits tolerance band of the reference argmax logit.
+            let got_tok = got[s];
+            if got_tok != want {
+                let got_ref_logit = want_logits[got[s] as usize];
+                let want_ref_logit = want_logits[want as usize];
+                let tie_band = 4e-3 + 4e-3 * scale;
+                assert!(
+                    got_ref_logit >= want_ref_logit - tie_band,
+                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
+                );
+            }
         }
     }
 }
