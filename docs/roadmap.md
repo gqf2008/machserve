@@ -1032,9 +1032,12 @@
     拷贝流 + 事件(router_done/gpu_part_done):ids/weights/xn2 D2H 只等
     router,CPU 专家计算与 GPU-resident GEMM 重叠;x D2H 与残差 H2D 等
     accumulate;offload 路径 gpu_n 只依赖 budget,GPU 部分提前入队;
+    读回缓冲 pinned 化(hipMemcpyAsync 对非 pinned 内存回退同步拷贝,
+    审查 R2 发现后修复);
     A/B(合成 d=512/2 层/16 专家/topk4):slots=8 均衡分割 2.487 →
-    **2.271 ms/step(-8.7%)**,重度 CPU 回退场景 +4%(同步开销),slots
-    大时中性;真机 30B 未测(加载成本,待验证);
+    **2.119 ms/step(-14.8%,含 pinned 化)**;pinned 化前的中间测量
+    2.271(-8.7%),重度 CPU 回退场景当时 +4%(同步开销,已随 pinned
+    化消除),slots 大时中性;真机 30B 未测(加载成本,待验证);
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
     --test-threads 1)全量套件;fp64 参考 5/5(含双放置不变性);离线
     门禁 48 内核+计数断言;
