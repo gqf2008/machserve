@@ -343,8 +343,8 @@ fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
 #[test]
 fn prefetch_begin_waits_for_previous_step_last_layer_read() {
     use mach_kernel_sys::hip;
-    use mach_model::prefill_buffered::PrefetchEngine;
     use mach_model::Weights;
+    use mach_model::prefill_buffered::PrefetchEngine;
 
     let Some(h) = hip_ctx() else { return };
     let cfg = moe_cfg(); // layer 0 dense, layers 1..3 routed MoE -> odd (3)

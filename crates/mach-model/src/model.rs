@@ -1419,7 +1419,10 @@ impl GpuModel {
         // concurrently with the host-side transfers and CPU experts.
         let hip = self.k.hip();
         unsafe {
-            hip::check(hip, (hip.api.hip_event_record)(self.router_done, self.k.stream))?;
+            hip::check(
+                hip,
+                (hip.api.hip_event_record)(self.router_done, self.k.stream),
+            )?;
         }
 
         // GPU-resident part: first gpu_n routed experts, existing gather+GEMM.
@@ -1499,7 +1502,9 @@ impl GpuModel {
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
                 s,
             )?;
-            unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
 
             let host_w = self
                 .host_w
@@ -1527,7 +1532,10 @@ impl GpuModel {
             // finished under the CPU work.
             let mut xh = vec![0.0f32; d as usize];
             unsafe {
-                hip::check(hip, (hip.api.hip_stream_wait_event)(s, self.gpu_part_done, 0))?;
+                hip::check(
+                    hip,
+                    (hip.api.hip_stream_wait_event)(s, self.gpu_part_done, 0),
+                )?;
             }
             hip::memcpy_async(
                 hip,
@@ -1537,7 +1545,9 @@ impl GpuModel {
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
                 s,
             )?;
-            unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
             for kk in 0..d as usize {
                 xh[kk] += residual[kk];
             }
@@ -1549,7 +1559,9 @@ impl GpuModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 s,
             )?;
-            unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
         }
         Ok(())
     }
@@ -1669,7 +1681,10 @@ impl GpuModel {
         // stream — the GPU-resident GEMMs below overlap the CPU fallback.
         let hip = self.k.hip();
         unsafe {
-            hip::check(hip, (hip.api.hip_event_record)(self.router_done, self.k.stream))?;
+            hip::check(
+                hip,
+                (hip.api.hip_event_record)(self.router_done, self.k.stream),
+            )?;
         }
         let s = self.xfer_stream;
         unsafe {
@@ -1694,7 +1709,9 @@ impl GpuModel {
             hip::HIP_MEMCPY_DEVICE_TO_HOST,
             s,
         )?;
-        unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+        unsafe {
+            hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+        }
 
         let host_w = self
             .host_w
@@ -1799,7 +1816,9 @@ impl GpuModel {
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
                 s,
             )?;
-            unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
             let mut residual = vec![0.0f32; d_us];
             for (e, w) in &cpu {
                 let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
@@ -1812,7 +1831,10 @@ impl GpuModel {
             }
             let mut xh = vec![0.0f32; d_us];
             unsafe {
-                hip::check(hip, (hip.api.hip_stream_wait_event)(s, self.gpu_part_done, 0))?;
+                hip::check(
+                    hip,
+                    (hip.api.hip_stream_wait_event)(s, self.gpu_part_done, 0),
+                )?;
             }
             hip::memcpy_async(
                 hip,
@@ -1822,7 +1844,9 @@ impl GpuModel {
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
                 s,
             )?;
-            unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
             for kk in 0..d_us {
                 xh[kk] += residual[kk];
             }
@@ -1834,7 +1858,9 @@ impl GpuModel {
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
                 s,
             )?;
-            unsafe { hip::check(hip, (hip.api.hip_stream_synchronize)(s))?; }
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
         }
         Ok(())
     }
