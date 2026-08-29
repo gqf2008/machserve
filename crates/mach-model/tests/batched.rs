@@ -97,6 +97,28 @@ fn moe_cfg() -> Config {
     cfg
 }
 
+/// Greedy-token check for tests whose batched path uses a different GEMM
+/// implementation (grouped GEMV) than the single-sequence reference
+/// (hipBLAS): a near-tie may legitimately flip, so the batched token is
+/// accepted when its reference logit is within `tie_band` of the reference
+/// argmax logit. NOTE: with `tie_band = 2 * logits_tolerance` this is
+/// implied by the logits-diff assertion above (a flip with a reference gap
+/// beyond the band would also break the logits bound) — the check is
+/// defense-in-depth for future tolerance edits, not an independent oracle.
+/// The ROUTER tie-break itself is pinned directly by
+/// `moe_router_batched_matches_serial_topk` in kernels.rs.
+fn assert_greedy_compatible(got: u32, want: u32, want_logits: &[f32], ctx: &str, tie_band: f32) {
+    if got == want {
+        return;
+    }
+    let got_ref_logit = want_logits[got as usize];
+    let want_ref_logit = want_logits[want as usize];
+    assert!(
+        got_ref_logit >= want_ref_logit - tie_band,
+        "{ctx}: greedy token {got} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
+    );
+}
+
 #[test]
 fn batched_moe_matches_single_seq() {
     let Some(hip) = hip_ctx() else { return };
@@ -122,7 +144,6 @@ fn batched_moe_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let max = row
@@ -133,6 +154,13 @@ fn batched_moe_matches_single_seq() {
             assert!(
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
+            );
+            assert_greedy_compatible(
+                got[s],
+                want,
+                &want_logits,
+                &format!("step {step_tokens:?} seq {s}"),
+                4e-3 + 4e-3 * scale,
             );
         }
     }
@@ -170,7 +198,6 @@ fn batched_moe_f16_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let max = row
                 .iter()
@@ -181,7 +208,153 @@ fn batched_moe_f16_matches_single_seq() {
                 max < 0.1,
                 "step {step_tokens:?} seq {s}: f16 logits max diff {max}"
             );
+            // Near-tie tolerance for the grouped GEMV decode path (see the
+            // dense MoE test above); f16 noise -> flat wider band.
+            assert_greedy_compatible(got[s], want, &want_logits, "f16", 0.2);
         }
+    }
+}
+
+/// Grouped-GEMV decode pinned to the CPU reference (an implementation that
+/// shares no code with the GPU path): the strongest oracle for the new MoE
+/// kernels — stronger than the near-tie token bands, which only bound how
+/// far a flip may drift. f32 everywhere: rounding differences are GEMM-order
+/// only, so the standard tolerance applies.
+#[test]
+fn batched_moe_grouped_matches_cpu_reference() {
+    use mach_model::ref_model::RefModel;
+
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 141).unwrap();
+    let mut paged = BatchedModel::new(hip, cfg, &w, 1).unwrap();
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 29 + 7) % 1024 + 1).collect();
+    let mut cpu = RefModel::new(cfg, w);
+    for (i, &t) in prompt.iter().enumerate() {
+        paged.decode_step(&[t]).unwrap();
+        let got = paged.read_logits().unwrap();
+        // RefModel is stateful (internal KV cache + pos counter): feed only
+        // the incremental token, matching the GPU side's per-step advance.
+        let want = cpu.forward(&[t]);
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= 2e-3 + 2e-3 * scale,
+            "step {i}: grouped MoE vs CPU ref: max diff {diff} (scale {scale})"
+        );
+    }
+}
+
+/// The MACH_MOE_GROUPED=0 fallback (hipBLAS host loop) must produce the same
+/// logits as the grouped GEMV path: driven directly through
+/// `decode_step_explicit`'s `decode_only` flag (which is exactly the runtime
+/// switch the env var sets), no env manipulation needed.
+#[test]
+fn moe_grouped_fallback_matches_grouped() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 151).unwrap();
+    let mut grouped = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut fallback = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 17 + 3) % 1024 + 1).collect();
+    for (i, &t) in prompt.iter().enumerate() {
+        let mut p1 = [SamplingParams::greedy(0)];
+        let mut p2 = [SamplingParams::greedy(0)];
+        let g = grouped
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p1,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                true,
+            )
+            .unwrap();
+        let f = fallback
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p2,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                false,
+            )
+            .unwrap();
+        let g_logits = grouped.read_logits().unwrap();
+        let f_logits = fallback.read_logits().unwrap();
+        let scale = g_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = g_logits
+            .iter()
+            .zip(&f_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= 2e-3 + 2e-3 * scale,
+            "step {i}: grouped vs hipBLAS fallback: max diff {diff} (scale {scale})"
+        );
+        assert_eq!(g.0[0], f.0[0], "step {i}: greedy tokens must match");
+    }
+}
+
+/// f16 variant of the fallback-vs-grouped pin. The grouped f16 kernels round
+/// weights to f16 but keep activations f32; the hipBLAS f16 fallback
+/// (gemm_batched_f16) additionally rounds activations and results to f16 per
+/// layer — so the two paths drift by per-layer f16 rounding, bounded here at
+/// the same 0.1 band as `batched_moe_f16_matches_single_seq`. Both engines
+/// share the same f16 router, so expert selection is identical and only the
+/// arithmetic may differ (tokens are NOT asserted equal).
+#[test]
+fn moe_grouped_fallback_matches_grouped_f16() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 161).unwrap();
+    let mut grouped = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut fallback = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 23 + 5) % 1024 + 1).collect();
+    for (i, &t) in prompt.iter().enumerate() {
+        let mut p1 = [SamplingParams::greedy(0)];
+        let mut p2 = [SamplingParams::greedy(0)];
+        grouped
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p1,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                true,
+            )
+            .unwrap();
+        fallback
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p2,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                false,
+            )
+            .unwrap();
+        let g_logits = grouped.read_logits().unwrap();
+        let f_logits = fallback.read_logits().unwrap();
+        let scale = g_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = g_logits
+            .iter()
+            .zip(&f_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff < 0.1,
+            "step {i}: grouped vs hipBLAS fallback (f16): max diff {diff} (scale {scale})"
+        );
     }
 }
 
@@ -219,7 +392,6 @@ fn batched_moe_small_config_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let max = row
@@ -230,6 +402,13 @@ fn batched_moe_small_config_matches_single_seq() {
             assert!(
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
+            );
+            assert_greedy_compatible(
+                got[s],
+                want,
+                &want_logits,
+                &format!("step {step_tokens:?} seq {s}"),
+                4e-3 + 4e-3 * scale,
             );
         }
     }
@@ -273,7 +452,6 @@ fn batched_mixed_dense_moe_matches_single_seq() {
                 .max_by(|(i, a), (j, b)| a.partial_cmp(b).unwrap().then_with(|| j.cmp(i)))
                 .map(|(i, _)| i as u32)
                 .unwrap();
-            assert_eq!(got[s], want, "step {step_tokens:?} seq {s}: greedy token");
             let row = &got_logits[s * cfg.vocab_size..(s + 1) * cfg.vocab_size];
             let scale = want_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let max = row
@@ -284,6 +462,13 @@ fn batched_mixed_dense_moe_matches_single_seq() {
             assert!(
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
+            );
+            assert_greedy_compatible(
+                got[s],
+                want,
+                &want_logits,
+                &format!("step {step_tokens:?} seq {s}"),
+                4e-3 + 4e-3 * scale,
             );
         }
     }
@@ -347,7 +532,7 @@ fn fwd_rows(
     let counts = vec![Vec::<(u32, u32)>::new(); toks.len()];
     let bias = vec![Vec::<(u32, f32)>::new(); toks.len()];
     let (sampled, _, _) = m
-        .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias)
+        .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias, true)
         .unwrap();
     let logits = m.read_logits_rows(toks.len()).unwrap();
     (sampled, logits[..toks.len() * vocab].to_vec())

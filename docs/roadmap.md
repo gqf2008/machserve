@@ -971,3 +971,40 @@
     (-D warnings)/check×2 全绿;GPU(7900 XTX,--test-threads 1):
     continuous 22/22、batched 18/18、mla 5/5、fp16 6/6、decode_slice
     2/2、server 32+2、离线门禁 2/2(43 内核+计数断言)。
+
+- **批量 MoE 解码 host 串行化消除(#70 P1/P3/P4,2026-08-29,7900 XTX)**:
+  - P1 grouped GEMV 解码路径:`moe_grouped_gate_up`(f32/f16)+ `moe_grouped_down`
+    (f32/f16)+ `moe_scatter_all`(确定性:row_pos 输入序映射 + 固定 k 序累加,
+    无原子、跨运行可复现)+ `moe_gather_rows_tokenmajor`(token 主序,零
+    调度,grouped 路径免 memsets/count/prefix)共 6 新内核,gather 增加
+    `exp_of_row`/`row_pos` 输出;每 MoE 层每步不再需要 counts D2H + 全流
+    sync + host 逐 expert 小 GEMM(原 m=1 hipBLAS ×3ne 次发射);
+    decode_only 显式路由(调用方已知 prefill/decode,小 prefill chunk 不
+    误走 GEMV),chunked-prefill 大 chunk 保留 hipBLAS(m>1 权重重用);
+    `MACH_MOE_GROUPED=0` 回退开关;
+  - P3 sampler 参数上传收敛:12 个 H2D memcpy 从独立分配改为按字段 n 行
+    从 8 对齐打包块内拷贝(单分配对;整块单次上传曾尝试但按容量缩放,
+    n≪capacity 时每步 ~34MB 反而回退,已放弃);
+  - P4 router top-k 并行化:thread-0 串行 O(topk²·ne) 选择改为每 k 一轮
+    256 线程并行 argmax 归约(平局取小索引,语义与串行扫描严格一致);
+  - 测试:moe_grouped_gemv(GEMV 逐内核对拍 CPU,f32 结果先于 f16 覆盖
+    取回)、moe_grouped_pipeline(wrapper 全流水线 vs CPU,抓出 scatter
+    非原子丢更新 bug)、paged 位级对拍恢复;MoE 对拍 greedy token 改
+    near-tie 兼容断言(不同 GEMM 实现的合法翻转);
+  - **A/B(moe_batched_bench,d=512/2 层/64 专家/topk8/batch32/F16)**:
+    host 路径 4.867 ms/step(6.6K tok/s)→ grouped 路径 **0.124 ms/step
+    (258K tok/s),39x**(R4 复核,同方法论);
+  - 验证:fmt/clippy(-D warnings)/check×2 全绿;GPU(7900 XTX,
+    --test-threads 1)batched 21/21(含新增 CPU 参考与 hipBLAS 回退
+    两个对拍 oracle + f16 回退变体)、continuous 22/22、moe 2/2、
+    gpu_tests 4/4(含恢复的 paged 对拍、router 直接对拍)、lib
+    183/183(+9 ignored)、离线门禁 49 内核+计数断言;
+  - P2(单序列 offload/slots 每层同步)为设计取舍,维持排期;已知限制:
+    mixed 步(任一 prefill 行)整步走 hipBLAS、buffered 模型的 decode 仍
+    逐层等 prefetch 流;f16 激活舍入差异:grouped 内核权重 f16/激活 f32,
+    hipBLAS 回退逐层把激活与结果舍入 f16(grouped 反而更准),契约已写入
+    内核文档并由 f16 回退对拍(0.1 带)钉住;残余:gather/count/prefix
+    的每层调度可进一步收敛为 token-major 恒等布局(已落地 token-major
+    gather,count/prefix 仅 prefill 路径使用);MACH_MOE_GROUPED 在
+    mach-model 内解析(其余 MACH_* 旋钮在 server main.rs,属已知差异,
+    已在 main.rs 环境文档注明)。

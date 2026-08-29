@@ -86,6 +86,7 @@ fn main() {
             &mut rp,
             &vec![Vec::new(); plen],
             &vec![Vec::new(); plen],
+            false,
         )
         .unwrap();
     let mut rnext = t_ref
@@ -96,6 +97,7 @@ fn main() {
             &mut [SamplingParams::greedy(0)],
             &vec![Vec::new(); 1],
             &vec![Vec::new(); 1],
+            true,
         )
         .unwrap()
         .0[0];
@@ -112,6 +114,7 @@ fn main() {
                 &mut p,
                 &vec![Vec::new(); 1],
                 &vec![Vec::new(); 1],
+                true,
             )
             .unwrap()
             .0[0];

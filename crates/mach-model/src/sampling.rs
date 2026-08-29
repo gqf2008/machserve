@@ -606,40 +606,115 @@ impl BatchedSampler {
             pins.push(p);
             Ok(p)
         };
-        let temp_dev = dalloc(capacity * 4)? as *mut f32;
-        let topk_dev = dalloc(capacity * 4)? as *mut i32;
-        let topp_dev = dalloc(capacity * 4)? as *mut f32;
-        let seed_dev = dalloc(capacity * 8)? as *mut u64;
         let out_dev = dalloc(capacity * 4)? as *mut i32;
         let logprobs_dev = dalloc(capacity * 4)? as *mut f32;
-        let presence_dev = dalloc(capacity * 4)? as *mut f32;
-        let freq_dev = dalloc(capacity * 4)? as *mut f32;
-        let pen_tokens_dev = dalloc(capacity * MAX_PEN * 4)? as *mut i32;
-        let pen_counts_dev = dalloc(capacity * MAX_PEN * 4)? as *mut i32;
-        let pen_count_dev = dalloc(capacity * 4)? as *mut i32;
-        let bias_tokens_dev = dalloc(capacity * MAX_BIAS * 4)? as *mut i32;
-        let bias_vals_dev = dalloc(capacity * MAX_BIAS * 4)? as *mut f32;
-        let bias_count_dev = dalloc(capacity * 4)? as *mut i32;
         let topk_inv_t_dev = dalloc(capacity * 4)? as *mut f32;
         let topk_tok_dev = dalloc(capacity * MAX_TOPK * 4)? as *mut i32;
         let topk_lp_dev = dalloc(capacity * MAX_TOPK * 4)? as *mut f32;
-        let temp_host = pall(capacity * 4)? as *mut f32;
-        let topk_host = pall(capacity * 4)? as *mut i32;
-        let topp_host = pall(capacity * 4)? as *mut f32;
-        let seed_host = pall(capacity * 8)? as *mut u64;
         let out_host = pall(capacity * 4)? as *mut i32;
         let logprobs_host = pall(capacity * 4)? as *mut f32;
-        let presence_host = pall(capacity * 4)? as *mut f32;
-        let freq_host = pall(capacity * 4)? as *mut f32;
-        let pen_tokens_host = pall(capacity * MAX_PEN * 4)? as *mut i32;
-        let pen_counts_host = pall(capacity * MAX_PEN * 4)? as *mut i32;
-        let pen_count_host = pall(capacity * 4)? as *mut i32;
-        let bias_tokens_host = pall(capacity * MAX_BIAS * 4)? as *mut i32;
-        let bias_vals_host = pall(capacity * MAX_BIAS * 4)? as *mut f32;
-        let bias_count_host = pall(capacity * 4)? as *mut i32;
         let topk_inv_t_host = pall(capacity * 4)? as *mut f32;
         let topk_tok_host = pall(capacity * MAX_TOPK * 4)? as *mut i32;
         let topk_lp_host = pall(capacity * MAX_TOPK * 4)? as *mut f32;
+        // Packed H2D parameter block: every per-step parameter field lives at
+        // a fixed (8-aligned) offset in ONE pinned-host staging area mirrored
+        // by ONE device buffer (a single allocation pair). Uploads are
+        // per-field `n`-row copies — a whole-block copy would transfer
+        // `capacity` rows per step (~34MB at prefill-rows capacity) and
+        // dominate n≪capacity decode steps (see `sample_batched`). The typed
+        // field pointers below are carved at their offsets, so the kernels
+        // are unchanged.
+        let align8 = |o: usize| (o + 7) & !7;
+        let mut off = 0usize;
+        let temp_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let topk_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let topp_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let seed_off = {
+            let o = align8(off);
+            off = o + capacity * 8;
+            o
+        };
+        let presence_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let freq_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let pen_tokens_off = {
+            let o = align8(off);
+            off = o + capacity * MAX_PEN * 4;
+            o
+        };
+        let pen_counts_off = {
+            let o = align8(off);
+            off = o + capacity * MAX_PEN * 4;
+            o
+        };
+        let pen_count_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let bias_tokens_off = {
+            let o = align8(off);
+            off = o + capacity * MAX_BIAS * 4;
+            o
+        };
+        let bias_vals_off = {
+            let o = align8(off);
+            off = o + capacity * MAX_BIAS * 4;
+            o
+        };
+        let bias_count_off = {
+            let o = align8(off);
+            off = o + capacity * 4;
+            o
+        };
+        let params_bytes = align8(off);
+        let params_dev = dalloc(params_bytes)?;
+        let params_pin = pall(params_bytes)?;
+        // SAFETY: every offset is < params_bytes (layout sums above), so the
+        // carved typed pointers stay inside the two packed allocations.
+        let temp_dev = unsafe { params_dev.add(temp_off) } as *mut f32;
+        let temp_host = unsafe { params_pin.add(temp_off) } as *mut f32;
+        let topk_dev = unsafe { params_dev.add(topk_off) } as *mut i32;
+        let topp_dev = unsafe { params_dev.add(topp_off) } as *mut f32;
+        let seed_dev = unsafe { params_dev.add(seed_off) } as *mut u64;
+        let presence_dev = unsafe { params_dev.add(presence_off) } as *mut f32;
+        let freq_dev = unsafe { params_dev.add(freq_off) } as *mut f32;
+        let pen_tokens_dev = unsafe { params_dev.add(pen_tokens_off) } as *mut i32;
+        let pen_counts_dev = unsafe { params_dev.add(pen_counts_off) } as *mut i32;
+        let pen_count_dev = unsafe { params_dev.add(pen_count_off) } as *mut i32;
+        let bias_tokens_dev = unsafe { params_dev.add(bias_tokens_off) } as *mut i32;
+        let bias_vals_dev = unsafe { params_dev.add(bias_vals_off) } as *mut f32;
+        let bias_count_dev = unsafe { params_dev.add(bias_count_off) } as *mut i32;
+        let topk_host = unsafe { params_pin.add(topk_off) } as *mut i32;
+        let topp_host = unsafe { params_pin.add(topp_off) } as *mut f32;
+        let seed_host = unsafe { params_pin.add(seed_off) } as *mut u64;
+        let presence_host = unsafe { params_pin.add(presence_off) } as *mut f32;
+        let freq_host = unsafe { params_pin.add(freq_off) } as *mut f32;
+        let pen_tokens_host = unsafe { params_pin.add(pen_tokens_off) } as *mut i32;
+        let pen_counts_host = unsafe { params_pin.add(pen_counts_off) } as *mut i32;
+        let pen_count_host = unsafe { params_pin.add(pen_count_off) } as *mut i32;
+        let bias_tokens_host = unsafe { params_pin.add(bias_tokens_off) } as *mut i32;
+        let bias_vals_host = unsafe { params_pin.add(bias_vals_off) } as *mut f32;
+        let bias_count_host = unsafe { params_pin.add(bias_count_off) } as *mut i32;
         Ok(Self {
             hip,
             stream,
@@ -727,6 +802,11 @@ impl BatchedSampler {
                 }
             }
         }
+        // Per-field `n`-row uploads from the packed staging block. The
+        // fields sit at fixed offsets, so this is 12 small memcpys — a
+        // whole-block copy would transfer `capacity` rows per step
+        // (~34MB at prefill-rows capacity) and dominate n≪capacity
+        // decode steps, which is exactly the hot case this sampler serves.
         hip::memcpy_async(
             &self.hip,
             self.temp_dev as *mut core::ffi::c_void,

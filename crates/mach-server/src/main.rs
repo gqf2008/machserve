@@ -14,6 +14,8 @@
 //! engage paged KV — plain, Q4 and FP8 non-MLA). Limitations: paged KV serves
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
+//! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
+//! GEMV device path — A/B switch and ops lever, parsed by mach-model).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
@@ -171,6 +173,8 @@ fn estimate_vram(
 /// without touching process env (see `parse_paged_tpp` for the fatal
 /// wrapper). Missing/non-numeric values fall back to the default 64
 /// (non-numeric warns); `0` and non-divisors of `max_seq_len` are fatal.
+// Only the hip path calls this; kept un-gated so the CPU test below covers it.
+#[cfg_attr(not(feature = "hip"), allow(dead_code))]
 fn validate_paged_tpp(
     cfg: &mach_model::config::Config,
     raw: Option<&str>,

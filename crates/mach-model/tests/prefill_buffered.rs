@@ -220,6 +220,7 @@ fn buffered_prefill_matches_resident_batched() {
             &mut params,
             &empty_counts(),
             &empty_bias(),
+            false,
         )
         .expect("prefill step");
         m.read_logits().expect("read logits")

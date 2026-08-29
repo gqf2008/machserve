@@ -28,7 +28,15 @@ fn prefill_chunked(m: &mut BatchedModel, slot: u32, prompt: &[u32]) -> Result<()
         let mut p = vec![SamplingParams::greedy(0); take];
         let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); take];
         let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); take];
-        m.decode_step_explicit(&prompt[pos..pos + take], &lens, &slots, &mut p, &ec, &eb)?;
+        m.decode_step_explicit(
+            &prompt[pos..pos + take],
+            &lens,
+            &slots,
+            &mut p,
+            &ec,
+            &eb,
+            false, // prefill chunk: hipBLAS host loop (m>1 rows per expert)
+        )?;
         pos += take;
     }
     Ok(())
@@ -86,6 +94,7 @@ impl SpeculativeDecoder {
                 &mut p,
                 &vec![Vec::new(); 1],
                 &vec![Vec::new(); 1],
+                true,
             )?;
             c.push(out.0[0]);
         }
@@ -104,6 +113,7 @@ impl SpeculativeDecoder {
             &mut vp,
             &vec![Vec::new(); self.k + 1],
             &vec![Vec::new(); self.k + 1],
+            true,
         )?;
         let pred = vout.0;
         // 3. Accept the longest prefix c[0..a-1] matching the target argmax.
@@ -124,6 +134,7 @@ impl SpeculativeDecoder {
                 &mut p,
                 &vec![Vec::new(); 1],
                 &vec![Vec::new(); 1],
+                true,
             )?;
         }
         self.len += advance.len();
@@ -242,7 +253,7 @@ impl SpeculativeBatch {
             let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); m];
             let out = self
                 .draft
-                .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
+                .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb, true)?;
             for (si, &s) in active_idx.iter().enumerate() {
                 c[s].push(out.0[si]);
             }
@@ -269,7 +280,7 @@ impl SpeculativeBatch {
         let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); m * (self.k + 1)];
         let out = self
             .target
-            .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
+            .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb, true)?;
         // pred per active sequence: pred[si][j] = guess for position
         // len[s] + j.
         let mut accepted: Vec<Option<Vec<u32>>> = vec![None; n];
@@ -306,7 +317,7 @@ impl SpeculativeBatch {
             let ec: Vec<Vec<(u32, u32)>> = vec![Vec::new(); toks.len()];
             let eb: Vec<Vec<(u32, f32)>> = vec![Vec::new(); toks.len()];
             self.draft
-                .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb)?;
+                .decode_step_explicit(&toks, &lens, &slots, &mut p, &ec, &eb, true)?;
         }
         for &s in &active_idx {
             let seq = accepted[s].as_ref().expect("active produced tokens");

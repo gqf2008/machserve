@@ -79,6 +79,7 @@ fn main() {
             &mut params,
             &vec![Vec::new(); ids.len()],
             &vec![Vec::new(); ids.len()],
+            false,
         )
         .expect("prefill");
     let mut tok_id = sampled[ids.len() - 1];
@@ -93,6 +94,7 @@ fn main() {
                 &mut p,
                 &vec![Vec::new(); 1],
                 &vec![Vec::new(); 1],
+                true,
             )
             .expect("gen")
             .0[0];

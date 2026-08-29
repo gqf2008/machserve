@@ -706,6 +706,11 @@ impl ContinuousModel {
         let (sampled, logprobs, topk) = if tokens.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else {
+            // Decode-only steps are exactly the rows with no prefill work;
+            // the batched MoE path uses this to pick its device-side grouped
+            // GEMV kernels (per-row, launch-cheap) vs the hipBLAS host loop
+            // (per-expert weight reuse for multi-row prefill chunks).
+            let decode_only = rows.iter().all(|&(_, _, wp)| !wp);
             let out = self.model.decode_step_explicit(
                 &tokens,
                 &lens,
@@ -713,6 +718,7 @@ impl ContinuousModel {
                 &mut params,
                 &row_counts,
                 &row_bias,
+                decode_only,
             )?;
             // The sampler advanced each row's seed one RNG step (rows of one
             // sequence start from the same seed); the last row's value is the
