@@ -2232,26 +2232,10 @@ impl BatchedModel {
                                     ),
                                 )?;
                             }
-                            // Full-layer expert weights (prefetch ping-pong or
-                            // resident); sliced per expert in the loop below.
-                            // Wait for the prefetch stream first: the H2D
-                            // copy runs on the separate stream and the
-                            // counts sync above only orders the compute one.
-                            if buffered {
-                                self.prefetch
-                                    .as_ref()
-                                    .expect("prefetch engine")
-                                    .weights_ready(li, self.k.stream)?;
-                            }
-                            let (wg_base, wu_base, wd_base) = if buffered {
-                                self.prefetch
-                                    .as_ref()
-                                    .expect("prefetch engine")
-                                    .weights(li)
-                                    .expect("buffered MoE layer")
-                            } else {
-                                (lw.moe_wg, lw.moe_wu, lw.moe_wd)
-                            };
+                            // `wg_base`/`wu_base`/`wd_base` and the prefetch
+                            // wait come from the shared block above the
+                            // grouped/prefill split; the loop slices per
+                            // expert below.
                             // Per-expert grouped GEMMs (counts known on host after the
                             // single D2H read; no per-expert sync). The running base
                             // mirrors the device prefix-sum output.

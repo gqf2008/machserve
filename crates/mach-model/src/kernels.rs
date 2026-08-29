@@ -1692,6 +1692,11 @@ extern "C" __global__ void moe_grouped_gate_up(
 
 /// fp16-weight variant of [`MOE_GROUPED_GATE_UP`]: weights stream as f16
 /// (half the bandwidth), math accumulates in f32 like the hipBLAS f16 path.
+/// CONTRACT: activations are read as f32 and never rounded to f16 — unlike
+/// the hipBLAS f16 path, which casts activations (and results) to f16 per
+/// layer. The grouped path is therefore the higher-precision variant; the
+/// two paths diverge by per-layer f16 rounding, pinned by
+/// `moe_grouped_fallback_matches_grouped_f16`.
 const MOE_GROUPED_GATE_UP_F16: &str = r#"
 __device__ inline float f16_bits_to_f32(unsigned short u) {
     union { _Float16 h; unsigned short u; } c;
@@ -1750,7 +1755,8 @@ extern "C" __global__ void moe_grouped_down(
 }
 "#;
 
-/// fp16-weight variant of [`MOE_GROUPED_DOWN`].
+/// fp16-weight variant of [`MOE_GROUPED_DOWN`]. Same activation-rounding
+/// contract as [`MOE_GROUPED_GATE_UP_F16`]: f32 activations, f16 weights.
 const MOE_GROUPED_DOWN_F16: &str = r#"
 __device__ inline float f16_bits_to_f32(unsigned short u) {
     union { _Float16 h; unsigned short u; } c;

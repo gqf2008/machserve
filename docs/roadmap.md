@@ -995,13 +995,16 @@
     host 路径 4.867 ms/step(6.6K tok/s)→ grouped 路径 **0.124 ms/step
     (258K tok/s),39x**(R4 复核,同方法论);
   - 验证:fmt/clippy(-D warnings)/check×2 全绿;GPU(7900 XTX,
-    --test-threads 1)batched 20/20(含新增 CPU 参考与 hipBLAS 回退
-    两个对拍 oracle)、continuous 22/22、moe 2/2、gpu_tests 4/4
-    (含恢复的 paged 对拍、router 直接对拍)、lib 183/183(+9 ignored)、
-    离线门禁 49 内核+计数断言;
+    --test-threads 1)batched 21/21(含新增 CPU 参考与 hipBLAS 回退
+    两个对拍 oracle + f16 回退变体)、continuous 22/22、moe 2/2、
+    gpu_tests 4/4(含恢复的 paged 对拍、router 直接对拍)、lib
+    183/183(+9 ignored)、离线门禁 49 内核+计数断言;
   - P2(单序列 offload/slots 每层同步)为设计取舍,维持排期;已知限制:
     mixed 步(任一 prefill 行)整步走 hipBLAS、buffered 模型的 decode 仍
-    逐层等 prefetch 流;残余:gather/count/prefix 的每层调度可进一步
-    收敛为 token-major 恒等布局(已落地 token-major gather,count/prefix
-    仅 prefill 路径使用);MACH_MOE_GROUPED 在 mach-model 内解析(其余
-    MACH_* 旋钮在 server main.rs,属已知差异,已在 main.rs 环境文档注明)。
+    逐层等 prefetch 流;f16 激活舍入差异:grouped 内核权重 f16/激活 f32,
+    hipBLAS 回退逐层把激活与结果舍入 f16(grouped 反而更准),契约已写入
+    内核文档并由 f16 回退对拍(0.1 带)钉住;残余:gather/count/prefix
+    的每层调度可进一步收敛为 token-major 恒等布局(已落地 token-major
+    gather,count/prefix 仅 prefill 路径使用);MACH_MOE_GROUPED 在
+    mach-model 内解析(其余 MACH_* 旋钮在 server main.rs,属已知差异,
+    已在 main.rs 环境文档注明)。

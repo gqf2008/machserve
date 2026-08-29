@@ -302,6 +302,62 @@ fn moe_grouped_fallback_matches_grouped() {
     }
 }
 
+/// f16 variant of the fallback-vs-grouped pin. The grouped f16 kernels round
+/// weights to f16 but keep activations f32; the hipBLAS f16 fallback
+/// (gemm_batched_f16) additionally rounds activations and results to f16 per
+/// layer — so the two paths drift by per-layer f16 rounding, bounded here at
+/// the same 0.1 band as `batched_moe_f16_matches_single_seq`. Both engines
+/// share the same f16 router, so expert selection is identical and only the
+/// arithmetic may differ (tokens are NOT asserted equal).
+#[test]
+fn moe_grouped_fallback_matches_grouped_f16() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 161).unwrap();
+    let mut grouped = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut fallback = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 23 + 5) % 1024 + 1).collect();
+    for (i, &t) in prompt.iter().enumerate() {
+        let mut p1 = [SamplingParams::greedy(0)];
+        let mut p2 = [SamplingParams::greedy(0)];
+        grouped
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p1,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                true,
+            )
+            .unwrap();
+        fallback
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p2,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                false,
+            )
+            .unwrap();
+        let g_logits = grouped.read_logits().unwrap();
+        let f_logits = fallback.read_logits().unwrap();
+        let scale = g_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = g_logits
+            .iter()
+            .zip(&f_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff < 0.1,
+            "step {i}: grouped vs hipBLAS fallback (f16): max diff {diff} (scale {scale})"
+        );
+    }
+}
+
 #[test]
 fn batched_moe_small_config_matches_single_seq() {
     let Some(hip) = hip_ctx() else { return };
