@@ -239,3 +239,208 @@ fn buffered_prefill_matches_resident_batched() {
         "buffered prefill must match sequential full-resident bitwise (max diff {max})"
     );
 }
+
+/// Cross-step regression for the ping-pong slot race: with an ODD MoE layer
+/// count (3 here: layers 1..3 routed), step N+1's `prefetch(0)` writes the
+/// same slot step N's LAST MoE layer reads. `begin()` must wait for that
+/// compute before overwriting, or the fast grouped-GEMV decode path lets the
+/// new copy overtake the previous step's last read and the last layer's
+/// logits corrupt. Many decode steps, compared bitwise against the resident
+/// model after EVERY step. The pre-fix engine corrupts only when the copy
+/// happens to overtake the read (timing-dependent, wider with the larger
+/// expert pool below), so this is a stress net — the fix makes the ordering
+/// deterministic by construction.
+#[cfg(feature = "hip")]
+#[test]
+fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
+    use mach_model::Weights;
+    use mach_model::batched::BatchedModel;
+    use mach_model::sampling::SamplingParams;
+
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    // Wider race window: slower prefetch copies (bigger expert pool) against
+    // the fast grouped decode compute.
+    cfg.moe_intermediate_size = 256;
+    cfg.num_experts = 12;
+    let mut w = Weights::random(&cfg, 42).unwrap();
+    // Layer 0 dense, layers 1..3 routed MoE -> odd MoE layer count (3).
+    w.layers[0].moe_router.clear();
+    w.layers[0].moe_wg.clear();
+    w.layers[0].moe_wu.clear();
+    w.layers[0].moe_wd.clear();
+
+    let n_rows = 8usize;
+    let empty_counts = || vec![Vec::<(u32, u32)>::new(); n_rows];
+    let empty_bias = || vec![Vec::<(u32, f32)>::new(); n_rows];
+
+    let mut resident =
+        BatchedModel::new(hip.clone(), cfg, &w, n_rows).expect("full-resident batched");
+    let mut buffered = BatchedModel::with_prefill_buffer(hip.clone(), cfg, &w, n_rows, n_rows)
+        .expect("buffered prefill");
+
+    for i in 0..32u32 {
+        let tokens: Vec<u32> = (0..n_rows as u32)
+            .map(|r| ((i * 7 + r) * 37 + 5) % cfg.vocab_size as u32)
+            .collect();
+        let lens = vec![i; n_rows];
+        let slots: Vec<u32> = (0..n_rows as u32).collect();
+        let mut pa = vec![SamplingParams::greedy(1); n_rows];
+        let mut pb = vec![SamplingParams::greedy(1); n_rows];
+        resident
+            .decode_step_explicit(
+                &tokens,
+                &lens,
+                &slots,
+                &mut pa,
+                &empty_counts(),
+                &empty_bias(),
+                true,
+            )
+            .expect("resident step");
+        buffered
+            .decode_step_explicit(
+                &tokens,
+                &lens,
+                &slots,
+                &mut pb,
+                &empty_counts(),
+                &empty_bias(),
+                true,
+            )
+            .expect("buffered step");
+        let a = resident.read_logits().expect("read resident logits");
+        let b = buffered.read_logits().expect("read buffered logits");
+        let max = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            max, 0.0,
+            "step {i}: buffered decode must match resident bitwise (max diff {max})"
+        );
+    }
+}
+
+/// DETERMINISTIC cross-step slot-safety regression (engine-level): step 2's
+/// `begin()` must not let `prefetch(0)` overwrite ping-pong slot 0 while step
+/// 1's LAST MoE layer is still reading it (odd MoE layer count -> slot 0 IS
+/// the last layer's slot). Step 1's last-layer compute is a LONG kernel
+/// (~8ms) standing in for the grouped GEMVs still in flight when step 2's
+/// `begin()` runs. The assertion is on EVENT ORDER: step 2's layer-0 weights
+/// event (`prefetch_ev[0]`) must not fire until the previous step's last
+/// layer compute finished. A watch stream waits on that event: with the
+/// `begin()` wait it passes only after the probe; without it the copies
+/// complete in ~120us and the wait passes immediately — an order-of-
+/// magnitude gap either way.
+///
+/// NOTE on why this is event-order, not content: on this platform kernels
+/// already running do NOT observe concurrent H2D copy writes (stale L1/L2),
+/// so a probe racing the copies reads the old data regardless — only the
+/// event ordering discriminates.
+#[cfg(feature = "hip")]
+#[test]
+fn prefetch_begin_waits_for_previous_step_last_layer_read() {
+    use mach_kernel_sys::hip;
+    use mach_model::prefill_buffered::PrefetchEngine;
+    use mach_model::Weights;
+
+    let Some(h) = hip_ctx() else { return };
+    let cfg = moe_cfg(); // layer 0 dense, layers 1..3 routed MoE -> odd (3)
+    let w = Weights::random(&cfg, 43).unwrap();
+    let engine = PrefetchEngine::new(h.clone(), cfg, &w).expect("prefetch engine");
+
+    // The engine owns the prefetch stream; the layers' compute is driven on
+    // a test stream (the one `layer_end`/`weights_ready` accept).
+    let mut stream = std::ptr::null_mut();
+    unsafe { hip::check(&h, (h.api.hip_stream_create)(&mut stream)).unwrap() };
+
+    // Step 1: prefetch layers 0..2, "compute" each on the test stream. The
+    // last MoE layer's compute is a LONG kernel: one probe streams
+    // `reps * pool` (~3GB, ~140ms) — the previous step's last-layer read
+    // stays in flight long after step 2's begin() runs. (A content check
+    // against a concurrent overwrite would NOT detect the race on this
+    // platform: kernels already running do not observe concurrent H2D copy
+    // writes — the copies are still ordered wrong, which the event-order
+    // assertion below catches deterministically.)
+    engine.begin().unwrap();
+    let (wg_slot, _, _) = engine.weights(3).expect("last MoE layer slot");
+    let pool = cfg.num_experts * cfg.expert_size() * cfg.d_model * 4;
+    let n_floats = (pool / 4) as i32;
+    let blocks = (n_floats as u32).div_ceil(256).max(1);
+    let reps = 200_000i32;
+    let dst0 = hip::malloc(&h, pool).unwrap() as *mut f32;
+    let probe_kern = hip::HipKernelModule::compile(
+        "gfx1100",
+        r#"extern "C" __global__ void probe_read(
+            const float* __restrict__ src,
+            float* __restrict__ dst,
+            int n, int reps) {
+            int t = blockIdx.x * blockDim.x + threadIdx.x;
+            float acc = 0.f;
+            int stride = gridDim.x * blockDim.x;
+            for (int r = 0; r < reps; r++) {
+                int off = (r * 7919) % n; // rotating offset defeats hoisting
+                for (int i = t; i < n; i += stride) {
+                    acc += src[(i + off) % n];
+                }
+            }
+            dst[t] = acc;
+        }"#,
+        "probe_read",
+    )
+    .expect("compile probe_read");
+    let sp: *const f32 = wg_slot;
+    let dp: *mut f32 = dst0;
+    let mut p = vec![
+        &sp as *const *const f32 as *mut core::ffi::c_void,
+        &dp as *const *mut f32 as *mut core::ffi::c_void,
+        &n_floats as *const i32 as *mut core::ffi::c_void,
+        &reps as *const i32 as *mut core::ffi::c_void,
+    ];
+    for li in 1..4usize {
+        engine.layer_begin(li).unwrap();
+        if li == 3 {
+            // Within-step ordering first (the engine's weights_ready wait),
+            // then the long in-flight read of slot 0.
+            engine.weights_ready(3, stream).unwrap();
+            probe_kern
+                .launch([blocks, 1, 1], [256, 1, 1], &mut p, stream)
+                .unwrap();
+        }
+        engine.layer_end(li, stream).unwrap();
+    }
+
+    // Step 2's begin(): the cross-step boundary under test. The assertion is
+    // on EVENT ORDER, not content: step 2's layer-0 weights event
+    // (`prefetch_ev[0]`) must NOT fire until the previous step's last-layer
+    // compute (the probe) finished. A watch stream waits on that event: with
+    // the fix it passes only after the probe (~140ms later); without it the
+    // copies complete in ~12us and the wait passes immediately — a
+    // 4-orders-of-magnitude gap.
+    let mut watch = std::ptr::null_mut();
+    unsafe { hip::check(&h, (h.api.hip_stream_create)(&mut watch)).unwrap() };
+    let t_begin = std::time::Instant::now();
+    engine.begin().unwrap();
+    // wait prefetch_ev[0]: layer 0 IS the first MoE layer (rank 0) in this
+    // config — its weights event is recorded by step 2's begin().
+    engine.weights_ready(0, watch).unwrap();
+    unsafe { hip::check(&h, (h.api.hip_stream_synchronize)(watch)).unwrap() };
+    let waited = t_begin.elapsed();
+    unsafe { hip::check(&h, (h.api.hip_stream_destroy)(watch)).unwrap() };
+
+    // Drain the probe (and the event chain behind it).
+    unsafe { hip::check(&h, (h.api.hip_stream_synchronize)(stream)).unwrap() };
+    hip::free(&h, dst0 as *mut core::ffi::c_void).unwrap();
+    unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
+
+    // The assertion: the watch (on prefetch_ev[0]) must have been held until
+    // the probe ended. With the fix it is (probe >= ~8ms at reps=200k);
+    // without it the copies complete in ~120us — an order-of-magnitude gap.
+    assert!(
+        waited > std::time::Duration::from_millis(2),
+        "prefetch(0) must wait for the previous step's last layer compute \
+         (prefetch_ev[0] fired after only {waited:?} — the begin() wait is missing)"
+    );
+}
