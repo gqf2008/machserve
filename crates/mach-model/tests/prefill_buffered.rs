@@ -255,7 +255,7 @@ fn buffered_prefill_matches_resident_batched() {
 /// therefore a cross-platform integration net (on platforms where the copy
 /// is visible to in-flight kernels it discriminates); the deterministic
 /// event-order assertion in `prefetch_begin_waits_for_previous_step_last_
-/// layer_read` is the判别 mechanism on this machine.
+/// layer_read` is the discriminating mechanism on this machine.
 #[cfg(feature = "hip")]
 #[test]
 fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
