@@ -137,12 +137,6 @@ pub struct BatchedModel {
     xg: *mut f32,
     gw: *mut f32,
     row_idx: *mut i32,
-    /// Grouped-row expert ids written by `moe_gather_rows` (decode-path
-    /// grouped GEMV reads them to pick weights — no host counts needed).
-    exp_of_row_dev: *mut i32,
-    /// Input-order grouped-position map (`row_pos[i]` = grouped slot of
-    /// routed row i; deterministic scatter reads it in fixed k order).
-    row_pos_dev: *mut i32,
     h_acc: *mut f32,
     gate_all: *mut f32,
     up_all: *mut f32,
@@ -679,8 +673,6 @@ impl BatchedModel {
             xg: std::ptr::null_mut(),
             gw: std::ptr::null_mut(),
             row_idx: std::ptr::null_mut(),
-            exp_of_row_dev: std::ptr::null_mut(),
-            row_pos_dev: std::ptr::null_mut(),
             h_acc: std::ptr::null_mut(),
             gate_all: std::ptr::null_mut(),
             up_all: std::ptr::null_mut(),
@@ -975,8 +967,6 @@ impl BatchedModel {
                 self.xg = self.dalloc(cap * d * 4)?;
                 self.gw = self.dalloc(cap * 4)?;
                 self.row_idx = self.dalloc(cap * 4)? as *mut i32;
-                self.exp_of_row_dev = self.dalloc(cap * 4)? as *mut i32;
-                self.row_pos_dev = self.dalloc(cap * 4)? as *mut i32;
                 self.h_acc = self.dalloc(b * d * 4)?;
                 // Expert scratch must cover the wider of dense/MoE widths.
                 let moe_w = c.intermediate_size.max(c.expert_size());
@@ -2100,19 +2090,11 @@ impl BatchedModel {
                             (lw.moe_wg, lw.moe_wu, lw.moe_wd)
                         };
                         if grouped {
-                            k.launch_moe_gather_rows_tokenmajor(
-                                self.xn2,
-                                self.exp_ids,
-                                self.exp_w,
-                                self.xg,
-                                self.gw,
-                                self.row_idx,
-                                self.exp_of_row_dev,
-                                self.row_pos_dev,
-                                b,
-                                topk,
-                                d,
-                            )?;
+                            // No gather launch: the token-major layout is the
+                            // identity — gate_up/down read x + ids directly
+                            // (row r's token is r / topk), scatter_all
+                            // computes row positions inline. 4 launches per
+                            // MoE layer.
                             let rows_total = b * topk;
                             // Full-layer expert weights for this layer.
                             let (wg16, wu16, wd16) = if f16 {
@@ -2126,8 +2108,8 @@ impl BatchedModel {
                                 )
                             };
                             k.launch_moe_grouped_gate_up(
-                                self.xg,
-                                self.exp_of_row_dev,
+                                self.xn2,
+                                self.exp_ids,
                                 wg_base,
                                 wu_base,
                                 wg16,
@@ -2137,6 +2119,7 @@ impl BatchedModel {
                                 rows_total,
                                 einter,
                                 d,
+                                topk,
                                 f16,
                             )?;
                             k.launch_silu_mul(
@@ -2147,7 +2130,7 @@ impl BatchedModel {
                             )?;
                             k.launch_moe_grouped_down(
                                 self.eh_all,
-                                self.exp_of_row_dev,
+                                self.exp_ids,
                                 wd_base,
                                 wd16,
                                 self.down_all,
@@ -2158,8 +2141,7 @@ impl BatchedModel {
                             )?;
                             k.launch_moe_scatter_all(
                                 self.h_acc,
-                                self.row_pos_dev,
-                                self.gw,
+                                self.exp_w,
                                 self.down_all,
                                 b,
                                 topk,
@@ -2200,8 +2182,6 @@ impl BatchedModel {
                                 self.xg,
                                 self.gw,
                                 self.row_idx,
-                                self.exp_of_row_dev,
-                                self.row_pos_dev,
                                 b,
                                 topk,
                                 d,
