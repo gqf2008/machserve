@@ -337,7 +337,7 @@ fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
 /// the verified mechanism is the cross-step wait itself, not a specific slot
 /// parity: `begin()` must wait for the previous step's last MoE layer
 /// (rank 3) compute event before issuing the copies. Step 1's last-layer
-/// compute is a LONG kernel (~8ms) standing in for the grouped GEMVs still in
+/// compute is a LONG kernel (~40ms) standing in for the grouped GEMVs still in
 /// flight when step 2's `begin()` runs. The assertion is on EVENT ORDER:
 /// step 2's layer-0 weights event (`prefetch_ev[0]`) must not fire until the
 /// previous step's last layer compute finished. A watch stream waits on that
@@ -357,7 +357,7 @@ fn prefetch_begin_waits_for_previous_step_last_layer_read() {
     use mach_model::prefill_buffered::PrefetchEngine;
 
     let Some(h) = hip_ctx() else { return };
-    let cfg = moe_cfg(); // layer 0 dense, layers 1..3 routed MoE -> odd (3)
+    let cfg = moe_cfg(); // four MoE layers (layers 0..3): the cross-step wait is parity-independent
     let w = Weights::random(&cfg, 43).unwrap();
     let engine = PrefetchEngine::new(h.clone(), cfg, &w).expect("prefetch engine");
 
@@ -368,7 +368,7 @@ fn prefetch_begin_waits_for_previous_step_last_layer_read() {
 
     // Step 1: prefetch layers 0..2, "compute" each on the test stream. The
     // last MoE layer's compute is a LONG kernel: one probe streams
-    // `reps * pool` (~3GB, ~140ms) — the previous step's last-layer read
+    // `reps * pool` (~14.7GB, ~40ms) — the previous step's last-layer read
     // stays in flight long after step 2's begin() runs. (A content check
     // against a concurrent overwrite would NOT detect the race on this
     // platform: kernels already running do not observe concurrent H2D copy
@@ -426,7 +426,7 @@ fn prefetch_begin_waits_for_previous_step_last_layer_read() {
     // on EVENT ORDER, not content: step 2's layer-0 weights event
     // (`prefetch_ev[0]`) must NOT fire until the previous step's last-layer
     // compute (the probe) finished. A watch stream waits on that event: with
-    // the fix it passes only after the probe (~8ms later); without it the
+    // the fix it passes only after the probe (~40ms later); without it the
     // copies complete in ~120us and the wait passes immediately — an
     // order-of-magnitude gap.
     let mut watch = std::ptr::null_mut();
@@ -446,7 +446,7 @@ fn prefetch_begin_waits_for_previous_step_last_layer_read() {
     unsafe { hip::check(&h, (h.api.hip_stream_destroy)(stream)).unwrap() };
 
     // The assertion: the watch (on prefetch_ev[0]) must have been held until
-    // the probe ended. With the fix it is (probe >= ~8ms at reps=200k);
+    // the probe ended. With the fix it is (probe ~40ms at reps=200k);
     // without it the copies complete in ~120us — an order-of-magnitude gap
     // either way. The 1ms threshold is coupled to the probe's duration (a
     // fixed hiprtc compile; current margin ~8x on both sides) — if a future
