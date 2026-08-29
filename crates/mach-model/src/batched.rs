@@ -2075,13 +2075,31 @@ impl BatchedModel {
                     if !buffered && self.expert_slots < ne as usize {
                         self.forward_moe_cpu_batched(li, ne, topk, b, d, einter)?;
                     } else {
+                        // Buffered prefill: the weights were prefetched on the
+                        // separate stream while this layer computed; wait for
+                        // them before either MoE path reads them. The wait is
+                        // stream-ordered, so doing it above the grouped/prefill
+                        // split is a numeric no-op (both branches share it).
+                        if buffered {
+                            self.prefetch
+                                .as_ref()
+                                .expect("prefetch engine")
+                                .weights_ready(li, self.k.stream)?;
+                        }
+                        // Full-layer expert weights for this layer (prefetch
+                        // ping-pong buffer or resident), shared by the grouped
+                        // GEMV decode path and the hipBLAS prefill path (the
+                        // latter slices per expert).
+                        let (wg_base, wu_base, wd_base) = if buffered {
+                            self.prefetch
+                                .as_ref()
+                                .expect("prefetch engine")
+                                .weights(li)
+                                .expect("buffered MoE layer")
+                        } else {
+                            (lw.moe_wg, lw.moe_wu, lw.moe_wd)
+                        };
                         if grouped {
-                            // Device-only decode path: token-major gather (rows
-                            // keep input order — no counts, no prefix sum, no
-                            // atomic placement, no memsets), then per-row GEMV
-                            // gate+up, SiLU, down, deterministic scatter. The
-                            // hipBLAS prefill path below keeps the expert-major
-                            // prelude because it slices per expert.
                             k.launch_moe_gather_rows_tokenmajor(
                                 self.xn2,
                                 self.exp_ids,
@@ -2096,33 +2114,7 @@ impl BatchedModel {
                                 d,
                             )?;
                             let rows_total = b * topk;
-                            // Buffered prefill: the weights were prefetched on the
-                            // separate stream while this layer computed; wait for
-                            // them before the grouped GEMMs read them.
-                            if buffered {
-                                self.prefetch
-                                    .as_ref()
-                                    .expect("prefetch engine")
-                                    .weights_ready(li, self.k.stream)?;
-                            }
-                            // Full-layer expert weights for this layer (prefetch
-                            // ping-pong buffer or resident), shared by both the
-                            // grouped-GEMV decode path and the hipBLAS prefill
-                            // path (which then slices per expert).
-                            let (wg_base, wu_base, wd_base) = if buffered {
-                                self.prefetch
-                                    .as_ref()
-                                    .expect("prefetch engine")
-                                    .weights(li)
-                                    .expect("buffered MoE layer")
-                            } else {
-                                (lw.moe_wg, lw.moe_wu, lw.moe_wd)
-                            };
-                            // Grouped decode path: gate+up GEMV, SiLU, down GEMV,
-                            // whole-range scatter — one launch each, no counts
-                            // readback, no sync, no host loop. h_acc needs no
-                            // memset: the deterministic scatter WRITES every
-                            // element.
+                            // Full-layer expert weights for this layer.
                             let (wg16, wu16, wd16) = if f16 {
                                 let l = self.layers_f16[li];
                                 (l.moe_wg, l.moe_wu, l.moe_wd)

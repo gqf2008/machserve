@@ -173,6 +173,8 @@ fn estimate_vram(
 /// without touching process env (see `parse_paged_tpp` for the fatal
 /// wrapper). Missing/non-numeric values fall back to the default 64
 /// (non-numeric warns); `0` and non-divisors of `max_seq_len` are fatal.
+// Only the hip path calls this; kept un-gated so the CPU test below covers it.
+#[cfg_attr(not(feature = "hip"), allow(dead_code))]
 fn validate_paged_tpp(
     cfg: &mach_model::config::Config,
     raw: Option<&str>,

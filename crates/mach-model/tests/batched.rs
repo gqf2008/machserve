@@ -215,6 +215,93 @@ fn batched_moe_f16_matches_single_seq() {
     }
 }
 
+/// Grouped-GEMV decode pinned to the CPU reference (an implementation that
+/// shares no code with the GPU path): the strongest oracle for the new MoE
+/// kernels — stronger than the near-tie token bands, which only bound how
+/// far a flip may drift. f32 everywhere: rounding differences are GEMM-order
+/// only, so the standard tolerance applies.
+#[test]
+fn batched_moe_grouped_matches_cpu_reference() {
+    use mach_model::ref_model::RefModel;
+
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 141).unwrap();
+    let mut paged = BatchedModel::new(hip, cfg, &w, 1).unwrap();
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 29 + 7) % 1024 + 1).collect();
+    let mut cpu = RefModel::new(cfg, w);
+    for (i, &t) in prompt.iter().enumerate() {
+        paged.decode_step(&[t]).unwrap();
+        let got = paged.read_logits().unwrap();
+        // RefModel is stateful (internal KV cache + pos counter): feed only
+        // the incremental token, matching the GPU side's per-step advance.
+        let want = cpu.forward(&[t]);
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= 2e-3 + 2e-3 * scale,
+            "step {i}: grouped MoE vs CPU ref: max diff {diff} (scale {scale})"
+        );
+    }
+}
+
+/// The MACH_MOE_GROUPED=0 fallback (hipBLAS host loop) must produce the same
+/// logits as the grouped GEMV path: driven directly through
+/// `decode_step_explicit`'s `decode_only` flag (which is exactly the runtime
+/// switch the env var sets), no env manipulation needed.
+#[test]
+fn moe_grouped_fallback_matches_grouped() {
+    let Some(hip) = hip_ctx() else { return };
+    let cfg = moe_cfg();
+    let w = Weights::random(&cfg, 151).unwrap();
+    let mut grouped = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut fallback = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let prompt: Vec<u32> = (0..12u32).map(|i| (i * 17 + 3) % 1024 + 1).collect();
+    for (i, &t) in prompt.iter().enumerate() {
+        let mut p1 = [SamplingParams::greedy(0)];
+        let mut p2 = [SamplingParams::greedy(0)];
+        let g = grouped
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p1,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                true,
+            )
+            .unwrap();
+        let f = fallback
+            .decode_step_explicit(
+                &[t],
+                &[(i) as u32],
+                &[0],
+                &mut p2,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                false,
+            )
+            .unwrap();
+        let g_logits = grouped.read_logits().unwrap();
+        let f_logits = fallback.read_logits().unwrap();
+        let scale = g_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = g_logits
+            .iter()
+            .zip(&f_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= 2e-3 + 2e-3 * scale,
+            "step {i}: grouped vs hipBLAS fallback: max diff {diff} (scale {scale})"
+        );
+        assert_eq!(g.0[0], f.0[0], "step {i}: greedy tokens must match");
+    }
+}
+
 #[test]
 fn batched_moe_small_config_matches_single_seq() {
     let Some(hip) = hip_ctx() else { return };

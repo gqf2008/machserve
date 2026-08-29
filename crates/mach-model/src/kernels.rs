@@ -1563,7 +1563,14 @@ extern "C" __global__ void moe_router_batched(
             __syncthreads();
         }
         if (threadIdx.x == 0) {
-            ids[k] = bidx[0];
+            // Degenerate rows (all -inf/NaN logits: no thread finds a
+            // candidate, besti stays -1) must not emit a negative expert id —
+            // the grouped GEMV kernels read `wg[exp_of_row[r]]` and would go
+            // OOB. Clamp to a valid id; the row's output is garbage either
+            // way (NaN upstream), but memory access stays in-bounds.
+            int sel = bidx[0];
+            if (sel < 0) sel = 0;
+            ids[k] = sel;
             norm += bval[0];
         }
         __syncthreads();
@@ -1686,7 +1693,7 @@ extern "C" __global__ void moe_grouped_gate_up(
 /// fp16-weight variant of [`MOE_GROUPED_GATE_UP`]: weights stream as f16
 /// (half the bandwidth), math accumulates in f32 like the hipBLAS f16 path.
 const MOE_GROUPED_GATE_UP_F16: &str = r#"
-__device__ inline float moe_f16_bits(unsigned short u) {
+__device__ inline float f16_bits_to_f32(unsigned short u) {
     union { _Float16 h; unsigned short u; } c;
     c.u = u;
     return (float)c.h;
@@ -1711,8 +1718,8 @@ extern "C" __global__ void moe_grouped_gate_up_f16(
         float ag = 0.f, au = 0.f;
         for (int k = 0; k < d; k++) {
             float xv = x[k];
-            ag += xv * moe_f16_bits(wgr[k]);
-            au += xv * moe_f16_bits(wur[k]);
+            ag += xv * f16_bits_to_f32(wgr[k]);
+            au += xv * f16_bits_to_f32(wur[k]);
         }
         gate_all[(long long)r * einter + o] = ag;
         up_all[(long long)r * einter + o] = au;
@@ -1745,7 +1752,7 @@ extern "C" __global__ void moe_grouped_down(
 
 /// fp16-weight variant of [`MOE_GROUPED_DOWN`].
 const MOE_GROUPED_DOWN_F16: &str = r#"
-__device__ inline float moe_f16_bits_d(unsigned short u) {
+__device__ inline float f16_bits_to_f32(unsigned short u) {
     union { _Float16 h; unsigned short u; } c;
     c.u = u;
     return (float)c.h;
@@ -1766,7 +1773,7 @@ extern "C" __global__ void moe_grouped_down_f16(
     const unsigned short* wd_r =
         wd + ((long long)e * d + o) * einter;
     float acc = 0.f;
-    for (int k = 0; k < einter; k++) acc += eh_r[k] * moe_f16_bits_d(wd_r[k]);
+    for (int k = 0; k < einter; k++) acc += eh_r[k] * f16_bits_to_f32(wd_r[k]);
     down_all[idx] = acc;
 }
 "#;
@@ -4113,6 +4120,9 @@ mod gpu_tests {
             )
             .unwrap()
         };
+        // SAFETY: `cp` re-exposes the host vectors as byte slices with exact
+        // lengths (the same data the CPU references are built from), and the
+        // destination device buffers were sized to those exact lengths above.
         unsafe {
             cp(
                 dq,
@@ -4521,6 +4531,8 @@ mod gpu_tests {
             )
             .unwrap();
         };
+        // SAFETY: `cp` re-exposes the host vectors as byte slices with exact
+        // lengths; the destination device buffers were sized to match.
         unsafe {
             cp(
                 dx,
