@@ -2074,207 +2074,58 @@ impl BatchedModel {
                     let buffered = self.prefetch.is_some();
                     if !buffered && self.expert_slots < ne as usize {
                         self.forward_moe_cpu_batched(li, ne, topk, b, d, einter)?;
-                    } else if grouped {
-                        // Device-only decode path: token-major gather (rows
-                        // keep input order — no counts, no prefix sum, no
-                        // atomic placement, no memsets), then per-row GEMV
-                        // gate+up, SiLU, down, deterministic scatter. The
-                        // hipBLAS prefill path below keeps the expert-major
-                        // prelude because it slices per expert.
-                        k.launch_moe_gather_rows_tokenmajor(
-                            self.xn2,
-                            self.exp_ids,
-                            self.exp_w,
-                            self.xg,
-                            self.gw,
-                            self.row_idx,
-                            self.exp_of_row_dev,
-                            self.row_pos_dev,
-                            b,
-                            topk,
-                            d,
-                        )?;
-                        let rows_total = b * topk;
-                        // Buffered prefill: the weights were prefetched on the
-                        // separate stream while this layer computed; wait for
-                        // them before the grouped GEMMs read them.
-                        if buffered {
-                            self.prefetch
-                                .as_ref()
-                                .expect("prefetch engine")
-                                .weights_ready(li, self.k.stream)?;
-                        }
-                        // Full-layer expert weights for this layer (prefetch
-                        // ping-pong buffer or resident), shared by both the
-                        // grouped-GEMV decode path and the hipBLAS prefill
-                        // path (which then slices per expert).
-                        let (wg_base, wu_base, wd_base) = if buffered {
-                            self.prefetch
-                                .as_ref()
-                                .expect("prefetch engine")
-                                .weights(li)
-                                .expect("buffered MoE layer")
-                        } else {
-                            (lw.moe_wg, lw.moe_wu, lw.moe_wd)
-                        };
-                        // Grouped decode path: gate+up GEMV, SiLU, down GEMV,
-                        // whole-range scatter — one launch each, no counts
-                        // readback, no sync, no host loop. h_acc needs no
-                        // memset: the deterministic scatter WRITES every
-                        // element.
-                        let (wg16, wu16, wd16) = if f16 {
-                            let l = self.layers_f16[li];
-                            (l.moe_wg, l.moe_wu, l.moe_wd)
-                        } else {
-                            (
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                            )
-                        };
-                        k.launch_moe_grouped_gate_up(
-                            self.xg,
-                            self.exp_of_row_dev,
-                            wg_base,
-                            wu_base,
-                            wg16,
-                            wu16,
-                            self.gate_all,
-                            self.up_all,
-                            rows_total,
-                            einter,
-                            d,
-                            f16,
-                        )?;
-                        k.launch_silu_mul(
-                            self.up_all,
-                            self.gate_all,
-                            self.eh_all,
-                            rows_total * einter,
-                        )?;
-                        k.launch_moe_grouped_down(
-                            self.eh_all,
-                            self.exp_of_row_dev,
-                            wd_base,
-                            wd16,
-                            self.down_all,
-                            rows_total,
-                            d,
-                            einter,
-                            f16,
-                        )?;
-                        k.launch_moe_scatter_all(
-                            self.h_acc,
-                            self.row_pos_dev,
-                            self.gw,
-                            self.down_all,
-                            b,
-                            topk,
-                            d,
-                        )?;
                     } else {
-                        // Prefill chunk: expert-major prelude — counts on
-                        // device, exclusive prefix sum, atomic-placement
-                        // gather, then the per-expert host GEMM loop
-                        // (hipBLAS batch counts are host-side).
-                        unsafe {
-                            hip::check(
-                                self.k.hip(),
-                                (self.k.hip().api.hip_memset)(
-                                    self.counts_dev as *mut _,
-                                    0,
-                                    (ne as usize) * 4,
-                                ),
+                        if grouped {
+                            // Device-only decode path: token-major gather (rows
+                            // keep input order — no counts, no prefix sum, no
+                            // atomic placement, no memsets), then per-row GEMV
+                            // gate+up, SiLU, down, deterministic scatter. The
+                            // hipBLAS prefill path below keeps the expert-major
+                            // prelude because it slices per expert.
+                            k.launch_moe_gather_rows_tokenmajor(
+                                self.xn2,
+                                self.exp_ids,
+                                self.exp_w,
+                                self.xg,
+                                self.gw,
+                                self.row_idx,
+                                self.exp_of_row_dev,
+                                self.row_pos_dev,
+                                b,
+                                topk,
+                                d,
                             )?;
-                            hip::check(
-                                self.k.hip(),
-                                (self.k.hip().api.hip_memset)(
-                                    self.moe_pos_dev as *mut _,
-                                    0,
-                                    (ne as usize) * 4,
-                                ),
-                            )?;
-                        }
-                        k.launch_moe_count_experts(self.exp_ids, self.counts_dev, b, topk)?;
-                        // GPU-side exclusive prefix sum -> gather offsets.
-                        k.launch_moe_prefix_sum(self.counts_dev, self.offsets_dev, ne)?;
-                        k.launch_moe_gather_rows(
-                            self.xn2,
-                            self.exp_ids,
-                            self.exp_w,
-                            self.offsets_dev,
-                            self.moe_pos_dev,
-                            self.xg,
-                            self.gw,
-                            self.row_idx,
-                            self.exp_of_row_dev,
-                            self.row_pos_dev,
-                            b,
-                            topk,
-                            d,
-                        )?;
-                        // The per-expert counts are read back once per
-                        // layer for the host GEMM loop.
-                        hip::memcpy_async(
-                            self.k.hip(),
-                            self.counts_host as *mut core::ffi::c_void,
-                            self.counts_dev as *const core::ffi::c_void,
-                            (ne as usize) * 4,
-                            hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                            self.k.stream,
-                        )?;
-                        // Make the async counts readback visible to the host loop.
-                        self.k.sync()?;
-                        let counts: Vec<i32> = (0..ne)
-                            .map(|e| unsafe { *self.counts_host.add(e as usize) })
-                            .collect();
-                        // h_acc accumulation base for the segment scatters.
-                        unsafe {
-                            hip::check(
-                                self.k.hip(),
-                                (self.k.hip().api.hip_memset)(
-                                    self.h_acc as *mut _,
-                                    0,
-                                    (b as usize) * (d as usize) * 4,
-                                ),
-                            )?;
-                        }
-                        // Full-layer expert weights (prefetch ping-pong or
-                        // resident); sliced per expert in the loop below.
-                        let (wg_base, wu_base, wd_base) = if buffered {
-                            self.prefetch
-                                .as_ref()
-                                .expect("prefetch engine")
-                                .weights(li)
-                                .expect("buffered MoE layer")
-                        } else {
-                            (lw.moe_wg, lw.moe_wu, lw.moe_wd)
-                        };
-                        // Per-expert grouped GEMMs (counts known on host after the
-                        // single D2H read; no per-expert sync). The running base
-                        // mirrors the device prefix-sum output.
-                        let d_usize = d as usize;
-                        let einter_usize = einter as usize;
-                        let mut base = 0usize;
-                        for (e, &cnt) in counts.iter().enumerate() {
-                            let base_e = base;
-                            base += cnt as usize;
-                            if cnt <= 0 {
-                                continue;
+                            let rows_total = b * topk;
+                            // Buffered prefill: the weights were prefetched on the
+                            // separate stream while this layer computed; wait for
+                            // them before the grouped GEMMs read them.
+                            if buffered {
+                                self.prefetch
+                                    .as_ref()
+                                    .expect("prefetch engine")
+                                    .weights_ready(li, self.k.stream)?;
                             }
-                            let base = base_e;
-                            let xg_e = unsafe { self.xg.add(base * d_usize) };
-                            let down_e = unsafe { self.down_all.add(base * d_usize) };
-                            let wg32 = unsafe { wg_base.add(e * einter_usize * d_usize) };
-                            let wu32 = unsafe { wu_base.add(e * einter_usize * d_usize) };
-                            let wd32 = unsafe { wd_base.add(e * d_usize * einter_usize) };
+                            // Full-layer expert weights for this layer (prefetch
+                            // ping-pong buffer or resident), shared by both the
+                            // grouped-GEMV decode path and the hipBLAS prefill
+                            // path (which then slices per expert).
+                            let (wg_base, wu_base, wd_base) = if buffered {
+                                self.prefetch
+                                    .as_ref()
+                                    .expect("prefetch engine")
+                                    .weights(li)
+                                    .expect("buffered MoE layer")
+                            } else {
+                                (lw.moe_wg, lw.moe_wu, lw.moe_wd)
+                            };
+                            // Grouped decode path: gate+up GEMV, SiLU, down GEMV,
+                            // whole-range scatter — one launch each, no counts
+                            // readback, no sync, no host loop. h_acc needs no
+                            // memset: the deterministic scatter WRITES every
+                            // element.
                             let (wg16, wu16, wd16) = if f16 {
                                 let l = self.layers_f16[li];
-                                (
-                                    unsafe { l.moe_wg.add(e * einter_usize * d_usize) },
-                                    unsafe { l.moe_wu.add(e * einter_usize * d_usize) },
-                                    unsafe { l.moe_wd.add(e * d_usize * einter_usize) },
-                                )
+                                (l.moe_wg, l.moe_wu, l.moe_wd)
                             } else {
                                 (
                                     std::ptr::null_mut(),
@@ -2282,48 +2133,208 @@ impl BatchedModel {
                                     std::ptr::null_mut(),
                                 )
                             };
-                            let gemm_e = |out: *mut f32,
-                                          x: *const f32,
-                                          w32: *mut f32,
-                                          w16: *mut u16,
-                                          n: i32,
-                                          kk: i32|
-                             -> Result<(), Error> {
-                                if f16 {
-                                    k.gemm_batched_f16(
-                                        out,
-                                        x,
-                                        w16,
-                                        cnt,
-                                        n,
-                                        kk,
-                                        self.xh_moe,
-                                        self.yh_moe,
-                                    )
-                                } else {
-                                    k.gemm_batched(out, x, w32, cnt, n, kk)
-                                }
-                            };
-                            gemm_e(self.gate_all, xg_e, wg32, wg16, einter, d)?;
-                            gemm_e(self.up_all, xg_e, wu32, wu16, einter, d)?;
+                            k.launch_moe_grouped_gate_up(
+                                self.xg,
+                                self.exp_of_row_dev,
+                                wg_base,
+                                wu_base,
+                                wg16,
+                                wu16,
+                                self.gate_all,
+                                self.up_all,
+                                rows_total,
+                                einter,
+                                d,
+                                f16,
+                            )?;
                             k.launch_silu_mul(
                                 self.up_all,
                                 self.gate_all,
                                 self.eh_all,
-                                cnt * einter,
+                                rows_total * einter,
                             )?;
-                            gemm_e(down_e, self.eh_all, wd32, wd16, d, einter)?;
-                            k.launch_moe_scatter_add(
+                            k.launch_moe_grouped_down(
+                                self.eh_all,
+                                self.exp_of_row_dev,
+                                wd_base,
+                                wd16,
+                                self.down_all,
+                                rows_total,
+                                d,
+                                einter,
+                                f16,
+                            )?;
+                            k.launch_moe_scatter_all(
                                 self.h_acc,
-                                unsafe { self.row_idx.add(base) },
-                                unsafe { self.gw.add(base) },
-                                down_e,
-                                cnt,
+                                self.row_pos_dev,
+                                self.gw,
+                                self.down_all,
+                                b,
+                                topk,
                                 d,
                             )?;
+                        } else {
+                            // Prefill chunk: expert-major prelude — counts on
+                            // device, exclusive prefix sum, atomic-placement
+                            // gather, then the per-expert host GEMM loop
+                            // (hipBLAS batch counts are host-side).
+                            unsafe {
+                                hip::check(
+                                    self.k.hip(),
+                                    (self.k.hip().api.hip_memset)(
+                                        self.counts_dev as *mut _,
+                                        0,
+                                        (ne as usize) * 4,
+                                    ),
+                                )?;
+                                hip::check(
+                                    self.k.hip(),
+                                    (self.k.hip().api.hip_memset)(
+                                        self.moe_pos_dev as *mut _,
+                                        0,
+                                        (ne as usize) * 4,
+                                    ),
+                                )?;
+                            }
+                            k.launch_moe_count_experts(self.exp_ids, self.counts_dev, b, topk)?;
+                            // GPU-side exclusive prefix sum -> gather offsets.
+                            k.launch_moe_prefix_sum(self.counts_dev, self.offsets_dev, ne)?;
+                            k.launch_moe_gather_rows(
+                                self.xn2,
+                                self.exp_ids,
+                                self.exp_w,
+                                self.offsets_dev,
+                                self.moe_pos_dev,
+                                self.xg,
+                                self.gw,
+                                self.row_idx,
+                                self.exp_of_row_dev,
+                                self.row_pos_dev,
+                                b,
+                                topk,
+                                d,
+                            )?;
+                            // The per-expert counts are read back once per
+                            // layer for the host GEMM loop.
+                            hip::memcpy_async(
+                                self.k.hip(),
+                                self.counts_host as *mut core::ffi::c_void,
+                                self.counts_dev as *const core::ffi::c_void,
+                                (ne as usize) * 4,
+                                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                                self.k.stream,
+                            )?;
+                            // Make the async counts readback visible to the host loop.
+                            self.k.sync()?;
+                            let counts: Vec<i32> = (0..ne)
+                                .map(|e| unsafe { *self.counts_host.add(e as usize) })
+                                .collect();
+                            // h_acc accumulation base for the segment scatters.
+                            unsafe {
+                                hip::check(
+                                    self.k.hip(),
+                                    (self.k.hip().api.hip_memset)(
+                                        self.h_acc as *mut _,
+                                        0,
+                                        (b as usize) * (d as usize) * 4,
+                                    ),
+                                )?;
+                            }
+                            // Full-layer expert weights (prefetch ping-pong or
+                            // resident); sliced per expert in the loop below.
+                            // Wait for the prefetch stream first: the H2D
+                            // copy runs on the separate stream and the
+                            // counts sync above only orders the compute one.
+                            if buffered {
+                                self.prefetch
+                                    .as_ref()
+                                    .expect("prefetch engine")
+                                    .weights_ready(li, self.k.stream)?;
+                            }
+                            let (wg_base, wu_base, wd_base) = if buffered {
+                                self.prefetch
+                                    .as_ref()
+                                    .expect("prefetch engine")
+                                    .weights(li)
+                                    .expect("buffered MoE layer")
+                            } else {
+                                (lw.moe_wg, lw.moe_wu, lw.moe_wd)
+                            };
+                            // Per-expert grouped GEMMs (counts known on host after the
+                            // single D2H read; no per-expert sync). The running base
+                            // mirrors the device prefix-sum output.
+                            let d_usize = d as usize;
+                            let einter_usize = einter as usize;
+                            let mut base = 0usize;
+                            for (e, &cnt) in counts.iter().enumerate() {
+                                let base_e = base;
+                                base += cnt as usize;
+                                if cnt <= 0 {
+                                    continue;
+                                }
+                                let base = base_e;
+                                let xg_e = unsafe { self.xg.add(base * d_usize) };
+                                let down_e = unsafe { self.down_all.add(base * d_usize) };
+                                let wg32 = unsafe { wg_base.add(e * einter_usize * d_usize) };
+                                let wu32 = unsafe { wu_base.add(e * einter_usize * d_usize) };
+                                let wd32 = unsafe { wd_base.add(e * d_usize * einter_usize) };
+                                let (wg16, wu16, wd16) = if f16 {
+                                    let l = self.layers_f16[li];
+                                    (
+                                        unsafe { l.moe_wg.add(e * einter_usize * d_usize) },
+                                        unsafe { l.moe_wu.add(e * einter_usize * d_usize) },
+                                        unsafe { l.moe_wd.add(e * d_usize * einter_usize) },
+                                    )
+                                } else {
+                                    (
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                let gemm_e = |out: *mut f32,
+                                              x: *const f32,
+                                              w32: *mut f32,
+                                              w16: *mut u16,
+                                              n: i32,
+                                              kk: i32|
+                                 -> Result<(), Error> {
+                                    if f16 {
+                                        k.gemm_batched_f16(
+                                            out,
+                                            x,
+                                            w16,
+                                            cnt,
+                                            n,
+                                            kk,
+                                            self.xh_moe,
+                                            self.yh_moe,
+                                        )
+                                    } else {
+                                        k.gemm_batched(out, x, w32, cnt, n, kk)
+                                    }
+                                };
+                                gemm_e(self.gate_all, xg_e, wg32, wg16, einter, d)?;
+                                gemm_e(self.up_all, xg_e, wu32, wu16, einter, d)?;
+                                k.launch_silu_mul(
+                                    self.up_all,
+                                    self.gate_all,
+                                    self.eh_all,
+                                    cnt * einter,
+                                )?;
+                                gemm_e(down_e, self.eh_all, wd32, wd16, d, einter)?;
+                                k.launch_moe_scatter_add(
+                                    self.h_acc,
+                                    unsafe { self.row_idx.add(base) },
+                                    unsafe { self.gw.add(base) },
+                                    down_e,
+                                    cnt,
+                                    d,
+                                )?;
+                            }
                         }
+                        k.launch_add(self.x, self.h_acc, b * d)?;
                     }
-                    k.launch_add(self.x, self.h_acc, b * d)?;
                 }
                 // topk == 0: MoE contributes nothing (matches ref_model).
             } else {

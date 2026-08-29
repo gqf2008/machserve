@@ -198,6 +198,14 @@ mod hip_impl {
 
         /// Issues the prefetch of the first MoE layer (no dependencies). Called
         /// once per forward, before the layer loop.
+        ///
+        /// KNOWN LIMITATION (pre-existing): at a forward boundary the new
+        /// prefetch(0) may overwrite the ping-pong slot the previous
+        /// forward's LAST MoE layer still reads — the only cross-step waits
+        /// chain to `compute_ev[n-2]`, not the last layer's read. Fires for
+        /// odd MoE layer counts when the copy overtakes the read (wider
+        /// with the faster grouped-GEMV decode path). Fix would require a
+        /// step-boundary event wait; tracked as a follow-up.
         pub fn begin(&self) -> Result<(), Error> {
             self.prefetch(0)
         }
