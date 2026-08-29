@@ -246,10 +246,16 @@ fn buffered_prefill_matches_resident_batched() {
 /// compute before overwriting, or the fast grouped-GEMV decode path lets the
 /// new copy overtake the previous step's last read and the last layer's
 /// logits corrupt. Many decode steps, compared bitwise against the resident
-/// model after EVERY step. The pre-fix engine corrupts only when the copy
-/// happens to overtake the read (timing-dependent, wider with the larger
-/// expert pool below), so this is a stress net — the fix makes the ordering
-/// deterministic by construction.
+/// model after EVERY step.
+///
+/// NOTE: on THIS platform a pre-fix engine never corrupts here — kernels
+/// already running do not observe concurrent H2D copy writes (stale L1/L2,
+/// see the deterministic test's NOTE), so the copies can never visibly
+/// overtake the read regardless of timing or expert-pool size. This test is
+/// therefore a cross-platform integration net (on platforms where the copy
+/// is visible to in-flight kernels it discriminates); the deterministic
+/// event-order assertion in `prefetch_begin_waits_for_previous_step_last_
+/// layer_read` is the判别 mechanism on this machine.
 #[cfg(feature = "hip")]
 #[test]
 fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
@@ -259,8 +265,9 @@ fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
 
     let Some(hip) = hip_ctx() else { return };
     let mut cfg = moe_cfg();
-    // Wider race window: slower prefetch copies (bigger expert pool) against
-    // the fast grouped decode compute.
+    // Realistic decode shape (larger expert pool) — not a race-window
+    // widening: on this platform the window is invisible either way (see the
+    // NOTE above).
     cfg.moe_intermediate_size = 256;
     cfg.num_experts = 12;
     let mut w = Weights::random(&cfg, 42).unwrap();
@@ -324,16 +331,19 @@ fn buffered_decode_cross_step_odd_moe_layers_matches_resident() {
 }
 
 /// DETERMINISTIC cross-step slot-safety regression (engine-level): step 2's
-/// `begin()` must not let `prefetch(0)` overwrite ping-pong slot 0 while step
-/// 1's LAST MoE layer is still reading it (odd MoE layer count -> slot 0 IS
-/// the last layer's slot). Step 1's last-layer compute is a LONG kernel
-/// (~8ms) standing in for the grouped GEMVs still in flight when step 2's
-/// `begin()` runs. The assertion is on EVENT ORDER: step 2's layer-0 weights
-/// event (`prefetch_ev[0]`) must not fire until the previous step's last
-/// layer compute finished. A watch stream waits on that event: with the
-/// `begin()` wait it passes only after the probe; without it the copies
-/// complete in ~120us and the wait passes immediately — an order-of-
-/// magnitude gap either way.
+/// `begin()` must not let `prefetch(0)` overwrite a ping-pong slot while step
+/// 1's LAST MoE layer is still reading it. The config below has FOUR routed
+/// MoE layers (layers 0..3 — the test does not clear layer 0's router), so
+/// the verified mechanism is the cross-step wait itself, not a specific slot
+/// parity: `begin()` must wait for the previous step's last MoE layer
+/// (rank 3) compute event before issuing the copies. Step 1's last-layer
+/// compute is a LONG kernel (~8ms) standing in for the grouped GEMVs still in
+/// flight when step 2's `begin()` runs. The assertion is on EVENT ORDER:
+/// step 2's layer-0 weights event (`prefetch_ev[0]`) must not fire until the
+/// previous step's last layer compute finished. A watch stream waits on that
+/// event: with the `begin()` wait it passes only after the probe; without it
+/// the copies complete in ~120us and the wait passes immediately — an
+/// order-of-magnitude gap either way.
 ///
 /// NOTE on why this is event-order, not content: on this platform kernels
 /// already running do NOT observe concurrent H2D copy writes (stale L1/L2),
@@ -416,9 +426,9 @@ fn prefetch_begin_waits_for_previous_step_last_layer_read() {
     // on EVENT ORDER, not content: step 2's layer-0 weights event
     // (`prefetch_ev[0]`) must NOT fire until the previous step's last-layer
     // compute (the probe) finished. A watch stream waits on that event: with
-    // the fix it passes only after the probe (~140ms later); without it the
-    // copies complete in ~12us and the wait passes immediately — a
-    // 4-orders-of-magnitude gap.
+    // the fix it passes only after the probe (~8ms later); without it the
+    // copies complete in ~120us and the wait passes immediately — an
+    // order-of-magnitude gap.
     let mut watch = std::ptr::null_mut();
     unsafe { hip::check(&h, (h.api.hip_stream_create)(&mut watch)).unwrap() };
     let t_begin = std::time::Instant::now();
@@ -437,9 +447,13 @@ fn prefetch_begin_waits_for_previous_step_last_layer_read() {
 
     // The assertion: the watch (on prefetch_ev[0]) must have been held until
     // the probe ended. With the fix it is (probe >= ~8ms at reps=200k);
-    // without it the copies complete in ~120us — an order-of-magnitude gap.
+    // without it the copies complete in ~120us — an order-of-magnitude gap
+    // either way. The 1ms threshold is coupled to the probe's duration (a
+    // fixed hiprtc compile; current margin ~8x on both sides) — if a future
+    // driver/ISA change speeds the probe up dramatically, re-check the
+    // probe's actual duration before lowering the reps.
     assert!(
-        waited > std::time::Duration::from_millis(2),
+        waited > std::time::Duration::from_millis(1),
         "prefetch(0) must wait for the previous step's last layer compute \
          (prefetch_ev[0] fired after only {waited:?} — the begin() wait is missing)"
     );

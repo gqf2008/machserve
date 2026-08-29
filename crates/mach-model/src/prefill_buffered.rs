@@ -214,9 +214,10 @@ mod hip_impl {
         /// waits on `compute_ev[k-1]`), so without this wait the new copy can
         /// overtake the previous forward's last read — the window widens with
         /// the fast grouped-GEMV decode path. Waiting on the last layer's
-        /// event covers every count (a superset of the even-count need), and
-        /// the events are pre-recorded at construction, so the first call
-        /// returns immediately.
+        /// event covers every count (a superset of the even-count need). On
+        /// the first call `compute_ev[last]` has never been recorded, which
+        /// per HIP acts as already-completed, so it returns immediately (no
+        /// pre-recording is needed or done).
         pub fn begin(&self) -> Result<(), Error> {
             let last = self.moe_layers.len() - 1;
             let ev = self.compute_ev[last];
