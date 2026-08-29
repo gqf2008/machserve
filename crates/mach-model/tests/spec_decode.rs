@@ -44,6 +44,7 @@ fn plain_greedy(
         &mut gp,
         &vec![Vec::new(); prompt.len()],
         &vec![Vec::new(); prompt.len()],
+        true,
     )
     .unwrap();
     let first = m
@@ -54,6 +55,7 @@ fn plain_greedy(
             &mut [SamplingParams::greedy(0)],
             &vec![Vec::new(); 1],
             &vec![Vec::new(); 1],
+            true,
         )
         .unwrap()
         .0[0];
@@ -70,6 +72,7 @@ fn plain_greedy(
                 &mut p,
                 &vec![Vec::new(); 1],
                 &vec![Vec::new(); 1],
+                true,
             )
             .unwrap()
             .0[0];
@@ -224,6 +227,7 @@ fn plain_greedy_eos(
         &mut gp,
         &vec![Vec::new(); prompt.len()],
         &vec![Vec::new(); prompt.len()],
+        true,
     )
     .unwrap();
     let mut rnext = m
@@ -234,6 +238,7 @@ fn plain_greedy_eos(
             &mut [SamplingParams::greedy(0)],
             &vec![Vec::new(); 1],
             &vec![Vec::new(); 1],
+            true,
         )
         .unwrap()
         .0[0];
@@ -252,6 +257,7 @@ fn plain_greedy_eos(
                 &mut p,
                 &vec![Vec::new(); 1],
                 &vec![Vec::new(); 1],
+                true,
             )
             .unwrap()
             .0[0];

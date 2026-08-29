@@ -83,11 +83,11 @@ thirdparty/        第三方参考代码(占位)
 | V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
 | QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
 | **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**实测 0.29x(净负,暂停)** | GPU 测试全绿 |
-| **MoE**(P3at-P3az) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP | 全回归绿;真实 Qwen2.5-MoE 待验证 |
+| **MoE**(P3at-P3az, #70) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP;批量解码 grouped GEMV 设备路径(每层 5 发射,免 counts D2H/sync/host 循环)+ router 并行 top-k + sampler 单块上传 | 全回归绿;**A/B(7900 XTX,2 层/64 专家/topk8/batch32/F16):4.42→0.151 ms/step(29x,7.2K→212K tok/s)**;真实 Qwen2.5-MoE 待验证 |
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
 | **存储级 Q4**(#16/#20/#24/#25/#27/#30) | 8B 主机内存 48GB→~5GB,`MACH_Q4=1` 服务,加载 13x 加速 | Qwen3-8B 真机验证 + GPU 对拍 |
 | **FP8** | 计算级关闭(hipBLAS 拒绝 fp8);存储级 E4M3→f16 路径已合入(#38) | P3aq 探针 + 真机对拍 |
-| **分页 KV + 跨请求前缀共享**(#52-#68) | 分页 decode 接入 batched.rs(`with_paged_kv`,7900 XTX 对拍);F32/F16/MLA 分页内核全接线(43 内核门禁);服务链 `MACH_PAGED=1` 可跑(含页池驱逐, #80/#81);**真机 A/B(2026-08-27):5 请求共享 64-token 系统提示 → 提示词节省 78.8%(== 理论值)、端到端 2.84x、后续请求 TTFT 13.4x** | 全回归绿 + [docs/benchmark-results-paged-prefix.md](docs/benchmark-results-paged-prefix.md) |
+| **分页 KV + 跨请求前缀共享**(#52-#68) | 分页 decode 接入 batched.rs(`with_paged_kv`,7900 XTX 对拍);F32/F16/MLA 分页内核全接线(48 内核门禁);服务链 `MACH_PAGED=1` 可跑(含页池驱逐, #80/#81);**真机 A/B(2026-08-27):5 请求共享 64-token 系统提示 → 提示词节省 78.8%(== 理论值)、端到端 2.84x、后续请求 TTFT 13.4x** | 全回归绿 + [docs/benchmark-results-paged-prefix.md](docs/benchmark-results-paged-prefix.md) |
 
 ## 安装与排障（个人用户从这里开始）
 

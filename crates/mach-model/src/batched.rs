@@ -140,6 +140,9 @@ pub struct BatchedModel {
     /// Grouped-row expert ids written by `moe_gather_rows` (decode-path
     /// grouped GEMV reads them to pick weights — no host counts needed).
     exp_of_row_dev: *mut i32,
+    /// Input-order grouped-position map (`row_pos[i]` = grouped slot of
+    /// routed row i; deterministic scatter reads it in fixed k order).
+    row_pos_dev: *mut i32,
     h_acc: *mut f32,
     gate_all: *mut f32,
     up_all: *mut f32,
@@ -673,6 +676,7 @@ impl BatchedModel {
             gw: std::ptr::null_mut(),
             row_idx: std::ptr::null_mut(),
             exp_of_row_dev: std::ptr::null_mut(),
+            row_pos_dev: std::ptr::null_mut(),
             h_acc: std::ptr::null_mut(),
             gate_all: std::ptr::null_mut(),
             up_all: std::ptr::null_mut(),
@@ -968,6 +972,7 @@ impl BatchedModel {
                 self.gw = self.dalloc(cap * 4)?;
                 self.row_idx = self.dalloc(cap * 4)? as *mut i32;
                 self.exp_of_row_dev = self.dalloc(cap * 4)? as *mut i32;
+                self.row_pos_dev = self.dalloc(cap * 4)? as *mut i32;
                 self.h_acc = self.dalloc(b * d * 4)?;
                 // Expert scratch must cover the wider of dense/MoE widths.
                 let moe_w = c.intermediate_size.max(c.expert_size());
@@ -1482,7 +1487,13 @@ impl BatchedModel {
             )?;
         }
         self.refresh_offsets_if_dirty()?;
-        self.run_kernels(self.batch as i32, self.slots_dev, self.run_mask_dev, 0)?;
+        self.run_kernels(
+            self.batch as i32,
+            self.slots_dev,
+            self.run_mask_dev,
+            true,
+            0,
+        )?;
         let next = self.sample(self.batch)?;
         for l in self.lens.iter_mut() {
             *l += 1;
@@ -1532,6 +1543,7 @@ impl BatchedModel {
         count: i32,
         slots: *const i32,
         run_mask: *const i32,
+        decode_only: bool,
         num_runs: i32,
     ) -> Result<(), Error> {
         let c = self.cfg;
@@ -2051,7 +2063,7 @@ impl BatchedModel {
                     // (they serialized every MoE layer of every decode step on
                     // the host). Larger chunked-prefill steps keep the hipBLAS
                     // path, where m>1 rows per expert make weight reuse pay.
-                    let grouped = self.moe_grouped && b <= self.lens.len() as i32;
+                    let grouped = self.moe_grouped && decode_only && b as usize <= self.lens.len();
                     // Buffered prefill: run the grouped GEMMs from the
                     // weights prefetched on the separate stream. Placement is a
                     // numeric no-op, so output matches the full-resident path.
@@ -2091,6 +2103,7 @@ impl BatchedModel {
                             self.gw,
                             self.row_idx,
                             self.exp_of_row_dev,
+                            self.row_pos_dev,
                             b,
                             topk,
                             d,
@@ -2105,19 +2118,33 @@ impl BatchedModel {
                                 .expect("prefetch engine")
                                 .weights_ready(li, self.k.stream)?;
                         }
+                        // Full-layer expert weights for this layer (prefetch
+                        // ping-pong buffer or resident), shared by both the
+                        // grouped-GEMV decode path and the hipBLAS prefill
+                        // path (which then slices per expert).
+                        let (wg_base, wu_base, wd_base) = if buffered {
+                            self.prefetch
+                                .as_ref()
+                                .expect("prefetch engine")
+                                .weights(li)
+                                .expect("buffered MoE layer")
+                        } else {
+                            (lw.moe_wg, lw.moe_wu, lw.moe_wd)
+                        };
+                        unsafe {
+                            hip::check(
+                                self.k.hip(),
+                                (self.k.hip().api.hip_memset)(
+                                    self.h_acc as *mut _,
+                                    0,
+                                    (b as usize) * (d as usize) * 4,
+                                ),
+                            )?;
+                        }
                         if grouped {
                             // Device-only decode path: gate+up GEMV, SiLU,
                             // down GEMV, whole-range scatter — one launch
                             // each, no counts readback, no sync, no host loop.
-                            let (wg_base, wu_base, wd_base) = if buffered {
-                                self.prefetch
-                                    .as_ref()
-                                    .expect("prefetch engine")
-                                    .weights(li)
-                                    .expect("buffered MoE layer")
-                            } else {
-                                (lw.moe_wg, lw.moe_wu, lw.moe_wd)
-                            };
                             let (wg16, wu16, wd16) = if f16 {
                                 let l = self.layers_f16[li];
                                 (l.moe_wg, l.moe_wu, l.moe_wd)
@@ -2128,16 +2155,6 @@ impl BatchedModel {
                                     std::ptr::null_mut(),
                                 )
                             };
-                            unsafe {
-                                hip::check(
-                                    self.k.hip(),
-                                    (self.k.hip().api.hip_memset)(
-                                        self.h_acc as *mut _,
-                                        0,
-                                        (b as usize) * (d as usize) * 4,
-                                    ),
-                                )?;
-                            }
                             k.launch_moe_grouped_gate_up(
                                 self.xg,
                                 self.exp_of_row_dev,
@@ -2169,12 +2186,13 @@ impl BatchedModel {
                                 einter,
                                 f16,
                             )?;
-                            k.launch_moe_scatter_add_all(
+                            k.launch_moe_scatter_all(
                                 self.h_acc,
-                                self.row_idx,
+                                self.row_pos_dev,
                                 self.gw,
                                 self.down_all,
-                                rows_total,
+                                b,
+                                topk,
                                 d,
                             )?;
                         } else {
@@ -2191,28 +2209,9 @@ impl BatchedModel {
                             )?;
                             // Make the async counts readback visible to the host loop.
                             self.k.sync()?;
-                            // Buffered prefill: the weights were prefetched on the
-                            // separate stream while this layer computed; wait for
-                            // them before the grouped GEMMs read them.
-                            if buffered {
-                                self.prefetch
-                                    .as_ref()
-                                    .expect("prefetch engine")
-                                    .weights_ready(li, self.k.stream)?;
-                            }
                             let counts: Vec<i32> = (0..ne)
                                 .map(|e| unsafe { *self.counts_host.add(e as usize) })
                                 .collect();
-                            unsafe {
-                                hip::check(
-                                    self.k.hip(),
-                                    (self.k.hip().api.hip_memset)(
-                                        self.h_acc as *mut _,
-                                        0,
-                                        (b as usize) * (d as usize) * 4,
-                                    ),
-                                )?;
-                            }
                             // Per-expert grouped GEMMs (counts known on host after the
                             // single D2H read; no per-expert sync). The running base
                             // mirrors the device prefix-sum output.
@@ -2228,15 +2227,6 @@ impl BatchedModel {
                                 let base = base_e;
                                 let xg_e = unsafe { self.xg.add(base * d_usize) };
                                 let down_e = unsafe { self.down_all.add(base * d_usize) };
-                                let (wg_base, wu_base, wd_base) = if buffered {
-                                    self.prefetch
-                                        .as_ref()
-                                        .expect("prefetch engine")
-                                        .weights(li)
-                                        .expect("buffered MoE layer")
-                                } else {
-                                    (lw.moe_wg, lw.moe_wu, lw.moe_wd)
-                                };
                                 let wg32 = unsafe { wg_base.add(e * einter_usize * d_usize) };
                                 let wu32 = unsafe { wu_base.add(e * einter_usize * d_usize) };
                                 let wd32 = unsafe { wd_base.add(e * d_usize * einter_usize) };
@@ -2405,6 +2395,7 @@ impl BatchedModel {
         self.cfg.max_seq_len
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_step_explicit(
         &mut self,
         tokens: &[u32],
@@ -2413,6 +2404,7 @@ impl BatchedModel {
         params: &mut [SamplingParams],
         counts: &[Vec<(u32, u32)>],
         bias: &[Vec<(u32, f32)>],
+        decode_only: bool,
     ) -> Result<SampleOutput, Error> {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
@@ -2498,7 +2490,13 @@ impl BatchedModel {
         }
         self.refresh_table_offsets(slots)?;
         self.offsets_dirty = true;
-        self.run_kernels(n as i32, self.slots_dev, self.run_mask_dev, num_runs as i32)?;
+        self.run_kernels(
+            n as i32,
+            self.slots_dev,
+            self.run_mask_dev,
+            decode_only,
+            num_runs as i32,
+        )?;
         self.sampler
             .sample_batched(self.logits, params, counts, bias, self.cfg.vocab_size)
     }

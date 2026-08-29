@@ -192,6 +192,7 @@ fn run_mode(
                 &mut [SamplingParams::greedy(1)],
                 &[Vec::new()],
                 &[Vec::new()],
+                true,
             )
             .unwrap();
         tokens.push(out.0[0]);
@@ -225,6 +226,7 @@ fn prefill(
         &mut params,
         &vec![Vec::new(); n],
         &vec![Vec::new(); n],
+        false,
     )?;
     Ok(out.0[n - 1])
 }

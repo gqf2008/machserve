@@ -14,6 +14,8 @@
 //! engage paged KV — plain, Q4 and FP8 non-MLA). Limitations: paged KV serves
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
+//! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
+//! GEMV device path — A/B switch and ops lever, parsed by mach-model).
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]

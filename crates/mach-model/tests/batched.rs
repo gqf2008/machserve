@@ -97,6 +97,24 @@ fn moe_cfg() -> Config {
     cfg
 }
 
+/// Greedy-token check for tests whose batched path uses a different GEMM
+/// implementation (grouped GEMV) than the single-sequence reference
+/// (hipBLAS): a near-tie may legitimately flip, so the batched token is
+/// accepted when its reference logit is within `tie_band` of the reference
+/// argmax logit. `tie_band` should scale with the numeric noise of the
+/// comparison (e.g. `4e-3 + 4e-3 * scale` for f32, `0.2` flat for f16).
+fn assert_greedy_compatible(got: u32, want: u32, want_logits: &[f32], ctx: &str, tie_band: f32) {
+    if got == want {
+        return;
+    }
+    let got_ref_logit = want_logits[got as usize];
+    let want_ref_logit = want_logits[want as usize];
+    assert!(
+        got_ref_logit >= want_ref_logit - tie_band,
+        "{ctx}: greedy token {got} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
+    );
+}
+
 #[test]
 fn batched_moe_matches_single_seq() {
     let Some(hip) = hip_ctx() else { return };
@@ -133,21 +151,13 @@ fn batched_moe_matches_single_seq() {
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
             );
-            // Greedy token: the batched MoE decode path uses the grouped
-            // GEMV kernels (a different GEMM implementation than the single
-            // model's hipBLAS path), so a near-tie may legitimately flip.
-            // Accept the batched token when its reference logit is within
-            // the logits tolerance band of the reference argmax logit.
-            let got_tok = got[s];
-            if got_tok != want {
-                let got_ref_logit = want_logits[got[s] as usize];
-                let want_ref_logit = want_logits[want as usize];
-                let tie_band = 4e-3 + 4e-3 * scale;
-                assert!(
-                    got_ref_logit >= want_ref_logit - tie_band,
-                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
-                );
-            }
+            assert_greedy_compatible(
+                got[s],
+                want,
+                &want_logits,
+                &format!("step {step_tokens:?} seq {s}"),
+                4e-3 + 4e-3 * scale,
+            );
         }
     }
 }
@@ -195,16 +205,8 @@ fn batched_moe_f16_matches_single_seq() {
                 "step {step_tokens:?} seq {s}: f16 logits max diff {max}"
             );
             // Near-tie tolerance for the grouped GEMV decode path (see the
-            // dense MoE test above).
-            let got_tok = got[s];
-            if got_tok != want {
-                let got_ref_logit = want_logits[got[s] as usize];
-                let want_ref_logit = want_logits[want as usize];
-                assert!(
-                    got_ref_logit >= want_ref_logit - 0.2,
-                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
-                );
-            }
+            // dense MoE test above); f16 noise -> flat wider band.
+            assert_greedy_compatible(got[s], want, &want_logits, "f16", 0.2);
         }
     }
 }
@@ -254,21 +256,13 @@ fn batched_moe_small_config_matches_single_seq() {
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
             );
-            // Greedy token: the batched MoE decode path uses the grouped
-            // GEMV kernels (a different GEMM implementation than the single
-            // model's hipBLAS path), so a near-tie may legitimately flip.
-            // Accept the batched token when its reference logit is within
-            // the logits tolerance band of the reference argmax logit.
-            let got_tok = got[s];
-            if got_tok != want {
-                let got_ref_logit = want_logits[got[s] as usize];
-                let want_ref_logit = want_logits[want as usize];
-                let tie_band = 4e-3 + 4e-3 * scale;
-                assert!(
-                    got_ref_logit >= want_ref_logit - tie_band,
-                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
-                );
-            }
+            assert_greedy_compatible(
+                got[s],
+                want,
+                &want_logits,
+                &format!("step {step_tokens:?} seq {s}"),
+                4e-3 + 4e-3 * scale,
+            );
         }
     }
 }
@@ -322,21 +316,13 @@ fn batched_mixed_dense_moe_matches_single_seq() {
                 max <= 2e-3 + 2e-3 * scale,
                 "step {step_tokens:?} seq {s}: logits max diff {max} (scale {scale})"
             );
-            // Greedy token: the batched MoE decode path uses the grouped
-            // GEMV kernels (a different GEMM implementation than the single
-            // model's hipBLAS path), so a near-tie may legitimately flip.
-            // Accept the batched token when its reference logit is within
-            // the logits tolerance band of the reference argmax logit.
-            let got_tok = got[s];
-            if got_tok != want {
-                let got_ref_logit = want_logits[got[s] as usize];
-                let want_ref_logit = want_logits[want as usize];
-                let tie_band = 4e-3 + 4e-3 * scale;
-                assert!(
-                    got_ref_logit >= want_ref_logit - tie_band,
-                    "step {step_tokens:?} seq {s}: greedy token {got_tok} != {want} and is not a near-tie (ref logit {got_ref_logit} vs {want_ref_logit})"
-                );
-            }
+            assert_greedy_compatible(
+                got[s],
+                want,
+                &want_logits,
+                &format!("step {step_tokens:?} seq {s}"),
+                4e-3 + 4e-3 * scale,
+            );
         }
     }
 }
@@ -399,7 +385,7 @@ fn fwd_rows(
     let counts = vec![Vec::<(u32, u32)>::new(); toks.len()];
     let bias = vec![Vec::<(u32, f32)>::new(); toks.len()];
     let (sampled, _, _) = m
-        .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias)
+        .decode_step_explicit(toks, poss, slts, &mut params, &counts, &bias, true)
         .unwrap();
     let logits = m.read_logits_rows(toks.len()).unwrap();
     (sampled, logits[..toks.len() * vocab].to_vec())

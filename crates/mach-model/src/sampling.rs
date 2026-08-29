@@ -561,13 +561,6 @@ pub struct BatchedSampler {
     topk_inv_t_dev: *mut f32,
     topk_tok_dev: *mut i32,
     topk_lp_dev: *mut f32,
-    /// Packed H2D parameter block (device mirror of `params_host`): every
-    /// per-step parameter field lives at a fixed offset in ONE device
-    /// buffer, uploaded with a single memcpy per step.
-    params_dev: *mut core::ffi::c_void,
-    /// Pinned host staging for `params_dev` (same layout).
-    params_pin: *mut core::ffi::c_void,
-    params_bytes: usize,
     temp_host: *mut f32,
     topk_host: *mut i32,
     topp_host: *mut f32,
@@ -719,7 +712,6 @@ impl BatchedSampler {
         let bias_tokens_host = unsafe { params_pin.add(bias_tokens_off) } as *mut i32;
         let bias_vals_host = unsafe { params_pin.add(bias_vals_off) } as *mut f32;
         let bias_count_host = unsafe { params_pin.add(bias_count_off) } as *mut i32;
-        // temp keeps a dedicated pair (written above; carved for symmetry).
         Ok(Self {
             hip,
             stream,
@@ -727,9 +719,6 @@ impl BatchedSampler {
             topk_kernel,
             temp_dev,
             topk_dev,
-            params_dev,
-            params_pin,
-            params_bytes,
             topp_dev,
             seed_dev,
             out_dev,
@@ -810,14 +799,104 @@ impl BatchedSampler {
                 }
             }
         }
-        // One packed-block upload covers every parameter field (see the
-        // layout comment in [`Self::new`]); kernels only read the first
-        // `n` rows of each field, so trailing capacity rows are harmless.
+        // Per-field `n`-row uploads from the packed staging block. The
+        // fields sit at fixed offsets, so this is 12 small memcpys — a
+        // whole-block copy would transfer `capacity` rows per step
+        // (~34MB at prefill-rows capacity) and dominate n≪capacity
+        // decode steps, which is exactly the hot case this sampler serves.
         hip::memcpy_async(
             &self.hip,
-            self.params_dev,
-            self.params_pin,
-            self.params_bytes,
+            self.temp_dev as *mut core::ffi::c_void,
+            self.temp_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.topk_dev as *mut core::ffi::c_void,
+            self.topk_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.topp_dev as *mut core::ffi::c_void,
+            self.topp_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.seed_dev as *mut core::ffi::c_void,
+            self.seed_host as *const core::ffi::c_void,
+            n * 8,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.presence_dev as *mut core::ffi::c_void,
+            self.presence_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.freq_dev as *mut core::ffi::c_void,
+            self.freq_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.pen_tokens_dev as *mut core::ffi::c_void,
+            self.pen_tokens_host as *const core::ffi::c_void,
+            n * MAX_PEN * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.pen_counts_dev as *mut core::ffi::c_void,
+            self.pen_counts_host as *const core::ffi::c_void,
+            n * MAX_PEN * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.pen_count_dev as *mut core::ffi::c_void,
+            self.pen_count_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.bias_tokens_dev as *mut core::ffi::c_void,
+            self.bias_tokens_host as *const core::ffi::c_void,
+            n * MAX_BIAS * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.bias_vals_dev as *mut core::ffi::c_void,
+            self.bias_vals_host as *const core::ffi::c_void,
+            n * MAX_BIAS * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.stream,
+        )?;
+        hip::memcpy_async(
+            &self.hip,
+            self.bias_count_dev as *mut core::ffi::c_void,
+            self.bias_count_host as *const core::ffi::c_void,
+            n * 4,
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.stream,
         )?;

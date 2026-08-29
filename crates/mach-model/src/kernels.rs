@@ -1605,6 +1605,7 @@ extern "C" __global__ void moe_gather_rows(
     float* __restrict__ gw,
     int* __restrict__ row_idx,
     int* __restrict__ exp_of_row,
+    int* __restrict__ row_pos,
     int batch, int topk, int d) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * topk;
@@ -1617,6 +1618,7 @@ extern "C" __global__ void moe_gather_rows(
         row_idx[dst] = t;
         gw[dst] = w[i];
         exp_of_row[dst] = e;
+        row_pos[i] = dst;
         const float* src = x + (long long)t * d;
         float* dstp = xg + (long long)dst * d;
         for (int c = 0; c < d; c++) dstp[c] = src[c];
@@ -1769,26 +1771,33 @@ extern "C" __global__ void moe_grouped_down_f16(
 }
 "#;
 
-/// Whole-grouped-range variant of [`MOE_SCATTER_ADD`] for the decode path:
-/// no per-expert segmentation (and therefore no host-side counts) — one
-/// launch scatters every routed row's contribution back to its token. The
-/// same token's `topk` rows hit the same addresses CONCURRENTLY, so the
-/// accumulation must be atomic (the segmented kernel was safe by construction:
-/// one token appears at most once per expert segment).
-const MOE_SCATTER_ADD_ALL: &str = r#"
-extern "C" __global__ void moe_scatter_add_all(
+/// Whole-grouped-range scatter for the decode path, in DETERMINISTIC token
+/// order: one thread per `(token, out-dim)` accumulates the token's `topk`
+/// expert contributions in fixed `k` order via `row_pos` (the input-order
+/// grouped-position map `moe_gather_rows` writes). A whole-range atomicAdd
+/// scatter was tried first and rejected: float atomics make the accumulation
+/// order scheduler-dependent, so identical greedy requests could sample
+/// different tokens across runs — breaking the repo's reproducibility
+/// contract. Writes (not accumulates): h_acc must be pre-zeroed or the
+/// caller treats the write as the full MoE contribution.
+const MOE_SCATTER_ALL: &str = r#"
+extern "C" __global__ void moe_scatter_all(
     float* __restrict__ h_acc,
-    const int* __restrict__ row_idx,
+    const int* __restrict__ row_pos,
     const float* __restrict__ gw,
     const float* __restrict__ down,
-    int rows, int d) {
+    int b, int topk, int d) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)rows * d;
+    long long total = (long long)b * d;
     if ((long long)i < total) {
-        int j = i / d;
-        int c = i % d;
-        int t = row_idx[j];
-        atomicAdd(&h_acc[(long long)t * d + c], gw[j] * down[(long long)j * d + c]);
+        int t = (int)(i / d);
+        int c = (int)(i % d);
+        float acc = 0.f;
+        for (int k = 0; k < topk; k++) {
+            int j = row_pos[t * topk + k];
+            acc += gw[j] * down[(long long)j * d + c];
+        }
+        h_acc[(long long)t * d + c] = acc;
     }
 }
 "#;
@@ -1869,7 +1878,7 @@ pub struct HipKernels {
     moe_grouped_gate_up_f16: HipKernelModule,
     moe_grouped_down: HipKernelModule,
     moe_grouped_down_f16: HipKernelModule,
-    moe_scatter_add_all: HipKernelModule,
+    moe_scatter_all: HipKernelModule,
 }
 
 // SAFETY: a HipKernels instance is confined to one engine thread by its
@@ -2023,7 +2032,7 @@ impl HipKernels {
                 MOE_GROUPED_DOWN_F16,
                 "moe_grouped_down_f16",
             )?,
-            moe_scatter_add_all: compile_cached(&arch, MOE_SCATTER_ADD_ALL, "moe_scatter_add_all")?,
+            moe_scatter_all: compile_cached(&arch, MOE_SCATTER_ALL, "moe_scatter_all")?,
         };
         if std::env::var_os("MACH_COMPILE_PROGRESS").is_some() {
             let n = KERNEL_CACHE
@@ -3562,6 +3571,7 @@ impl HipKernels {
         gw: *mut f32,
         row_idx: *mut i32,
         exp_of_row: *mut i32,
+        row_pos: *mut i32,
         batch: i32,
         topk: i32,
         d: i32,
@@ -3575,6 +3585,7 @@ impl HipKernels {
         let gwp = gw;
         let rip = row_idx;
         let eop = exp_of_row;
+        let rpp = row_pos;
         let mut p = vec![
             &xp as *const *const f32 as *mut core::ffi::c_void,
             &idp as *const *const i32 as *mut core::ffi::c_void,
@@ -3585,6 +3596,7 @@ impl HipKernels {
             &gwp as *const *mut f32 as *mut core::ffi::c_void,
             &rip as *const *mut i32 as *mut core::ffi::c_void,
             &eop as *const *mut i32 as *mut core::ffi::c_void,
+            &rpp as *const *mut i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
             &topk as *const i32 as *mut core::ffi::c_void,
             &d as *const i32 as *mut core::ffi::c_void,
@@ -3619,8 +3631,9 @@ impl HipKernels {
         let gap = gate_all;
         let uap = up_all;
         let ytiles = (einter as u32).div_ceil(256).max(1);
-        // The f32 and f16 kernels take DIFFERENT parameter lists (two
-        // weight pointers each) — build the matching vector per variant.
+        // The f32 and f16 kernels have identical parameter LISTS but the
+        // weight pointers differ in type — build the matching vector per
+        // variant.
         let kern;
         let mut p: Vec<*mut core::ffi::c_void>;
         if f16 {
@@ -3707,33 +3720,37 @@ impl HipKernels {
         Ok(kern.launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
-    /// Whole-grouped-range scatter-add for the decode path (no per-expert
-    /// segmentation, hence no host-side counts).
-    pub fn launch_moe_scatter_add_all(
+    /// Whole-token-range scatter for the decode path, in deterministic
+    /// token order (fixed `k` accumulation via `row_pos` — no atomics, no
+    /// host-side counts; run-to-run reproducible).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_scatter_all(
         &self,
         h_acc: *mut f32,
-        row_idx: *const i32,
+        row_pos: *const i32,
         gw: *const f32,
         down: *const f32,
-        rows: i32,
+        b: i32,
+        topk: i32,
         d: i32,
     ) -> Result<(), Error> {
         let hp = h_acc;
-        let rip = row_idx;
+        let rpp = row_pos;
         let gwp = gw;
         let dp = down;
         let mut p = vec![
             &hp as *const *mut f32 as *mut core::ffi::c_void,
-            &rip as *const *const i32 as *mut core::ffi::c_void,
+            &rpp as *const *const i32 as *mut core::ffi::c_void,
             &gwp as *const *const f32 as *mut core::ffi::c_void,
             &dp as *const *const f32 as *mut core::ffi::c_void,
-            &rows as *const i32 as *mut core::ffi::c_void,
+            &b as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
             &d as *const i32 as *mut core::ffi::c_void,
         ];
-        let total = rows * d;
+        let total = b * d;
         let blocks = (total as u32).div_ceil(256).max(1);
         Ok(self
-            .moe_scatter_add_all
+            .moe_scatter_all
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
@@ -3863,7 +3880,7 @@ mod offline_tests {
         MOE_GROUPED_GATE_UP_F16,
         MOE_GROUPED_DOWN,
         MOE_GROUPED_DOWN_F16,
-        MOE_SCATTER_ADD_ALL,
+        MOE_SCATTER_ALL,
         KV_STORE_PAGED,
         ATTN_DECODE_PAGED,
         KV_STORE_PAGED_F16,
@@ -3900,8 +3917,9 @@ mod offline_tests {
         }
     }
 }
-/// GPU parity: the paged kernels (`kv_store_paged` / `attn_decode_paged`) must
-/// produce bit-identical results to the contiguous kernels on the device.
+/// GPU parity tests (feature-gated; raw module launches for kernels the
+/// model-level tests exercise only transitively — paged-vs-contiguous
+/// bit-parity, grouped MoE GEMV vs CPU, and the full grouped pipeline).
 #[cfg(all(test, feature = "hip"))]
 mod gpu_tests {
     use super::*;
@@ -4069,25 +4087,9 @@ mod gpu_tests {
                 stream,
             )
             .unwrap();
-        // f16 gate/up (weights f16, math f32-accumulated).
-        let mut p_gu_f16 = vec![
-            &dq as *const *mut std::ffi::c_void as *mut _,
-            &de as *const *mut std::ffi::c_void as *mut _,
-            &dwg16 as *const *mut std::ffi::c_void as *mut _,
-            &dwu16 as *const *mut std::ffi::c_void as *mut _,
-            &dg as *const *mut std::ffi::c_void as *mut _,
-            &du as *const *mut std::ffi::c_void as *mut _,
-            &einter_i as *const i32 as *mut _,
-            &d_i as *const i32 as *mut _,
-        ];
-        gate_up16
-            .launch(
-                [rows as u32, (einter as u32).div_ceil(256).max(1), 1],
-                [256, 1, 1],
-                &mut p_gu_f16,
-                stream,
-            )
-            .unwrap();
+        // Fetch + assert the f32 results BEFORE the f16 launch overwrites
+        // the shared dg/du output buffers — otherwise the "f32" assertions
+        // would silently validate the f16 kernel.
         let mut got_gate = vec![0f32; want_gate.len()];
         let mut got_up = vec![0f32; want_up.len()];
         let fetch = |dst: *mut std::ffi::c_void, out: &mut Vec<f32>| {
@@ -4122,6 +4124,25 @@ mod gpu_tests {
             du_diff <= 1e-4 + 1e-4 * scale_u,
             "f32 up diff {du_diff} (scale {scale_u})"
         );
+        // f16 gate/up (weights f16, math f32-accumulated).
+        let mut p_gu_f16 = vec![
+            &dq as *const *mut std::ffi::c_void as *mut _,
+            &de as *const *mut std::ffi::c_void as *mut _,
+            &dwg16 as *const *mut std::ffi::c_void as *mut _,
+            &dwu16 as *const *mut std::ffi::c_void as *mut _,
+            &dg as *const *mut std::ffi::c_void as *mut _,
+            &du as *const *mut std::ffi::c_void as *mut _,
+            &einter_i as *const i32 as *mut _,
+            &d_i as *const i32 as *mut _,
+        ];
+        gate_up16
+            .launch(
+                [rows as u32, (einter as u32).div_ceil(256).max(1), 1],
+                [256, 1, 1],
+                &mut p_gu_f16,
+                stream,
+            )
+            .unwrap();
 
         // Down: f32 then f16 (eh = the exact f32 gate output).
         let rows_i32 = rows as i32;
@@ -4244,6 +4265,7 @@ mod gpu_tests {
         let gw = hip::malloc(&h, bytes(rows)).unwrap();
         let row_idx = hip::malloc(&h, ibytes(rows)).unwrap() as *mut i32;
         let exp_of_row = hip::malloc(&h, ibytes(rows)).unwrap() as *mut i32;
+        let row_pos = hip::malloc(&h, ibytes(rows)).unwrap() as *mut i32;
         let gate = hip::malloc(&h, bytes(rows * einter)).unwrap();
         let up = hip::malloc(&h, bytes(rows * einter)).unwrap();
         let eh = hip::malloc(&h, bytes(rows * einter)).unwrap();
@@ -4319,6 +4341,7 @@ mod gpu_tests {
             gw as *mut f32,
             row_idx,
             exp_of_row,
+            row_pos,
             b_i,
             topk_i,
             d_i,
@@ -4358,12 +4381,13 @@ mod gpu_tests {
             false,
         )
         .unwrap();
-        k.launch_moe_scatter_add_all(
+        k.launch_moe_scatter_all(
             hacc as *mut f32,
-            row_idx as *const i32,
+            row_pos as *const i32,
             gw as *const f32,
             down as *const f32,
-            rows_i,
+            b_i,
+            topk_i,
             d_i,
         )
         .unwrap();
@@ -4388,5 +4412,289 @@ mod gpu_tests {
             diff <= 1e-4 + 1e-4 * scale,
             "grouped pipeline diff {diff} (scale {scale})"
         );
+    }
+
+    /// GPU parity: the paged kernels (`kv_store_paged` / `attn_decode_paged`) must
+    /// produce bit-identical results to the contiguous kernels on the device.
+    #[test]
+    fn paged_attn_and_store_match_contiguous_gpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let arch = "gfx1100";
+        let attn_c =
+            hip::HipKernelModule::compile(arch, ATTN_DECODE_BATCHED, "attn_decode_batched")
+                .expect("compile attn contig");
+        let attn_p = hip::HipKernelModule::compile(arch, ATTN_DECODE_PAGED, "attn_decode_paged")
+            .expect("compile attn paged");
+        let store_c = hip::HipKernelModule::compile(arch, KV_STORE_BATCHED, "kv_store_batched")
+            .expect("compile store contig");
+        let store_p = hip::HipKernelModule::compile(arch, KV_STORE_PAGED, "kv_store_paged")
+            .expect("compile store paged");
+
+        let batch = 1usize;
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let max_seq = 12usize;
+        let tpp = 4usize;
+        let max_pages = 3usize;
+        let pos: i32 = 11; // last position (spans all 3 pages)
+        let mut rng = lcg(7);
+
+        // q, a K/V row to store, and the contiguous prefix KV.
+        let q: Vec<f32> = (0..batch * n_heads * head_dim).map(|_| rng()).collect();
+        let kv_row: Vec<f32> = (0..batch * n_kv_heads * head_dim).map(|_| rng()).collect();
+        let kvn = max_seq * n_kv_heads * head_dim;
+        let mut kc = vec![0.0f32; kvn];
+        let mut vc = vec![0.0f32; kvn];
+        for p in 0..max_seq {
+            for kvh in 0..n_kv_heads {
+                for dd in 0..head_dim {
+                    kc[(p * n_kv_heads + kvh) * head_dim + dd] = rng();
+                    vc[(p * n_kv_heads + kvh) * head_dim + dd] = rng();
+                }
+            }
+        }
+        // Page pools hold the same KV arranged by page.
+        let pooln = max_pages * tpp * n_kv_heads * head_dim;
+        let mut k_pool = vec![0.0f32; pooln];
+        let mut v_pool = vec![0.0f32; pooln];
+        for p in 0..max_seq {
+            let (page, off) = (p / tpp, p % tpp);
+            for kvh in 0..n_kv_heads {
+                for dd in 0..head_dim {
+                    k_pool[((page * tpp + off) * n_kv_heads + kvh) * head_dim + dd] =
+                        kc[(p * n_kv_heads + kvh) * head_dim + dd];
+                    v_pool[((page * tpp + off) * n_kv_heads + kvh) * head_dim + dd] =
+                        vc[(p * n_kv_heads + kvh) * head_dim + dd];
+                }
+            }
+        }
+        let block_tables: Vec<i32> = vec![0, 1, 2];
+        let table_offsets: Vec<i32> = vec![0];
+        let pos_buf: Vec<i32> = vec![pos];
+        let slots: Vec<i32> = vec![0];
+
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let ibytes = |n: usize| n * std::mem::size_of::<i32>();
+        let dq = hip::malloc(&h, bytes(q.len())).unwrap();
+        let dkc = hip::malloc(&h, bytes(kc.len())).unwrap();
+        let dvc = hip::malloc(&h, bytes(vc.len())).unwrap();
+        let dkrow = hip::malloc(&h, bytes(kv_row.len())).unwrap();
+        let dk_pool = hip::malloc(&h, bytes(k_pool.len())).unwrap();
+        let dv_pool = hip::malloc(&h, bytes(v_pool.len())).unwrap();
+        let dout_c = hip::malloc(&h, bytes(q.len())).unwrap();
+        let dout_p = hip::malloc(&h, bytes(q.len())).unwrap();
+        let dpos = hip::malloc(&h, ibytes(pos_buf.len())).unwrap();
+        let dslots = hip::malloc(&h, ibytes(slots.len())).unwrap();
+        let dtables = hip::malloc(&h, ibytes(block_tables.len())).unwrap();
+        let doffs = hip::malloc(&h, ibytes(table_offsets.len())).unwrap();
+        // The contiguous store writes into a scratch cache; page store into pools.
+        let dstore_c = hip::malloc(&h, bytes(kc.len())).unwrap();
+
+        let cp = |dst: *mut std::ffi::c_void, src: &[f32]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                bytes(src.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap()
+        };
+        let cpi = |dst: *mut std::ffi::c_void, src: &[i32]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                ibytes(src.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap()
+        };
+        cp(dq, &q);
+        cp(dkc, &kc);
+        cp(dvc, &vc);
+        cp(dkrow, &kv_row);
+        cp(dk_pool, &k_pool);
+        cp(dv_pool, &v_pool);
+        cpi(dpos, &pos_buf);
+        cpi(dslots, &slots);
+        cpi(dtables, &block_tables);
+        cpi(doffs, &table_offsets);
+
+        let qp = dq;
+        let kcp = dkc;
+        let vcp = dvc;
+        let kpoolp = dk_pool;
+        let vpoolp = dv_pool;
+        let dtp = dtables;
+        let doffp = doffs;
+        let posp = dpos;
+        let slotp = dslots;
+        let stream = std::ptr::null_mut();
+
+        // Contiguous attention launch.
+        let mut p1: Vec<*mut std::ffi::c_void> = vec![
+            &qp as *const *mut std::ffi::c_void as *mut _,
+            &kcp as *const *mut std::ffi::c_void as *mut _,
+            &vcp as *const *mut std::ffi::c_void as *mut _,
+            &dout_c as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &slotp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_heads as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(1.0f32 / (head_dim as f32).sqrt()) as *const f32 as *mut _,
+            &(max_seq as i32) as *const i32 as *mut _,
+        ];
+        let shared_c = ((max_seq + 256) * 4) as u32;
+        attn_c
+            .launch_shmem(
+                [(batch * n_heads) as u32, 1, 1],
+                [256, 1, 1],
+                &mut p1,
+                stream,
+                shared_c,
+            )
+            .expect("launch attn contig");
+
+        // Paged attention launch.
+        let mut p2: Vec<*mut std::ffi::c_void> = vec![
+            &qp as *const *mut std::ffi::c_void as *mut _,
+            &kpoolp as *const *mut std::ffi::c_void as *mut _,
+            &vpoolp as *const *mut std::ffi::c_void as *mut _,
+            &dtp as *const *mut std::ffi::c_void as *mut _,
+            &dout_p as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &doffp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_heads as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(1.0f32 / (head_dim as f32).sqrt()) as *const f32 as *mut _,
+            &(tpp as i32) as *const i32 as *mut _,
+            &(max_pages as i32) as *const i32 as *mut _,
+        ];
+        let shared_p = ((max_pages * tpp + 256) * 4) as u32;
+        attn_p
+            .launch_shmem(
+                [(batch * n_heads) as u32, 1, 1],
+                [256, 1, 1],
+                &mut p2,
+                stream,
+                shared_p,
+            )
+            .expect("launch attn paged");
+
+        // Contiguous store: writes kv_row into dstore_c at slot 0, pos.
+        let mut p3: Vec<*mut std::ffi::c_void> = vec![
+            &dkrow as *const *mut std::ffi::c_void as *mut _,
+            &dstore_c as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &slotp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(max_seq as i32) as *const i32 as *mut _,
+        ];
+        store_c
+            .launch(
+                [((batch * n_kv_heads * head_dim) as u32).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                &mut p3,
+                stream,
+            )
+            .expect("launch store contig");
+
+        // Paged store: writes kv_row into dk_pool at (page, off) for pos.
+        let mut p4: Vec<*mut std::ffi::c_void> = vec![
+            &dkrow as *const *mut std::ffi::c_void as *mut _,
+            &dk_pool as *const *mut std::ffi::c_void as *mut _,
+            &posp as *const *mut std::ffi::c_void as *mut _,
+            &doffp as *const *mut std::ffi::c_void as *mut _,
+            &dtp as *const *mut std::ffi::c_void as *mut _,
+            &(batch as i32) as *const i32 as *mut _,
+            &(n_kv_heads as i32) as *const i32 as *mut _,
+            &(head_dim as i32) as *const i32 as *mut _,
+            &(tpp as i32) as *const i32 as *mut _,
+        ];
+        store_p
+            .launch(
+                [((batch * n_kv_heads * head_dim) as u32).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                &mut p4,
+                stream,
+            )
+            .expect("launch store paged");
+
+        unsafe {
+            hip::check(&h, (h.api.hip_device_synchronize)()).unwrap();
+        }
+
+        let mut out_c = vec![0.0f32; q.len()];
+        let mut out_p = vec![0.0f32; q.len()];
+        hip::memcpy(
+            &h,
+            out_c.as_mut_ptr() as *mut _,
+            dout_c as *const _,
+            bytes(q.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            out_p.as_mut_ptr() as *mut _,
+            dout_p as *const _,
+            bytes(q.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        assert_eq!(
+            out_c, out_p,
+            "paged attention must be bit-identical to contiguous on GPU"
+        );
+
+        // Store parity: the contiguous slot-(0,pos) row == paged (page,off) row.
+        let mut store_c = vec![0.0f32; kv_row.len()];
+        let mut store_p = vec![0.0f32; kv_row.len()];
+        hip::memcpy(
+            &h,
+            store_c.as_mut_ptr() as *mut _,
+            unsafe { dstore_c.add((pos as usize * n_kv_heads * head_dim) * 4) } as *const _,
+            bytes(kv_row.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        let (page, off) = ((pos as usize) / tpp, (pos as usize) % tpp);
+        hip::memcpy(
+            &h,
+            store_p.as_mut_ptr() as *mut _,
+            // SAFETY: `dk_pool` is the page pool buffer; the (page, off)
+            // offset for position `pos` stays within the allocated
+            // `[max_pages, tpp, kv_heads, head_dim]` extent.
+            unsafe { dk_pool.add(((page * tpp + off) * n_kv_heads * head_dim) * 4) } as *const _,
+            bytes(kv_row.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        assert_eq!(
+            store_c, store_p,
+            "paged store must write the same row as contiguous store"
+        );
+
+        for p in [
+            dq, dkc, dvc, dkrow, dk_pool, dv_pool, dout_c, dout_p, dpos, dslots, dtables, doffs,
+            dstore_c,
+        ] {
+            hip::free(&h, p).unwrap();
+        }
     }
 }
