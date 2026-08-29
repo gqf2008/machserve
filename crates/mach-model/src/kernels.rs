@@ -1802,6 +1802,39 @@ extern "C" __global__ void moe_scatter_all(
 }
 "#;
 
+/// Decode-path token-major gather: routed rows stay in input order
+/// (`dst = i`), so the grouped GEMV kernels read `exp_of_row[i]` directly —
+/// no per-expert counts, no prefix sum, no atomic placement, no memsets.
+/// The hipBLAS prefill path keeps the expert-major gather (it slices per
+/// expert); this variant exists because the grouped kernels are
+/// row-order-agnostic.
+const MOE_GATHER_ROWS_TOKENMAJOR: &str = r#"
+extern "C" __global__ void moe_gather_rows_tokenmajor(
+    const float* __restrict__ x,
+    const int* __restrict__ ids,
+    const float* __restrict__ w,
+    float* __restrict__ xg,
+    float* __restrict__ gw,
+    int* __restrict__ row_idx,
+    int* __restrict__ exp_of_row,
+    int* __restrict__ row_pos,
+    int batch, int topk, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * topk;
+    if (i < total) {
+        int t = i / topk;
+        int e = ids[i];
+        row_idx[i] = t;
+        gw[i] = w[i];
+        exp_of_row[i] = e;
+        row_pos[i] = i;
+        const float* src = x + (long long)t * d;
+        float* dstp = xg + (long long)i * d;
+        for (int c = 0; c < d; c++) dstp[c] = src[c];
+    }
+}
+"#;
+
 /// Exclusive prefix sum over `counts[ne]` -> `offsets[ne]` (single block;
 /// `ne <= 256` covers all real MoE expert counts). GPU-side replacement for
 /// the host round-trip that computed gather offsets.
@@ -1872,6 +1905,7 @@ pub struct HipKernels {
     moe_router_batched: HipKernelModule,
     moe_count: HipKernelModule,
     moe_gather_rows: HipKernelModule,
+    moe_gather_rows_tokenmajor: HipKernelModule,
     moe_scatter_add: HipKernelModule,
     moe_prefix_sum: HipKernelModule,
     moe_grouped_gate_up: HipKernelModule,
@@ -2018,6 +2052,11 @@ impl HipKernels {
             moe_router_batched: compile_cached(&arch, MOE_ROUTER_BATCHED, "moe_router_batched")?,
             moe_count: compile_cached(&arch, MOE_COUNT_EXPERTS, "moe_count_experts")?,
             moe_gather_rows: compile_cached(&arch, MOE_GATHER_ROWS, "moe_gather_rows")?,
+            moe_gather_rows_tokenmajor: compile_cached(
+                &arch,
+                MOE_GATHER_ROWS_TOKENMAJOR,
+                "moe_gather_rows_tokenmajor",
+            )?,
             moe_scatter_add: compile_cached(&arch, MOE_SCATTER_ADD, "moe_scatter_add")?,
             moe_prefix_sum: compile_cached(&arch, MOE_PREFIX_SUM, "moe_prefix_sum")?,
             moe_grouped_gate_up: compile_cached(&arch, MOE_GROUPED_GATE_UP, "moe_grouped_gate_up")?,
@@ -3523,6 +3562,10 @@ impl HipKernels {
             &topk as *const i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
         ];
+        // The parallel top-k reduce uses fixed 256-thread shared arrays
+        // (`bval[256]`/`bidx[256]` in the kernel) — this launch size is part
+        // of the kernel contract; a future tuning pass must resize the
+        // shared arrays together with this block size.
         Ok(self.moe_router_batched.launch_shmem(
             [batch as u32, 1, 1],
             [256, 1, 1],
@@ -3606,6 +3649,54 @@ impl HipKernels {
         Ok(self
             .moe_gather_rows
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Decode-path token-major gather (see [`MOE_GATHER_ROWS_TOKENMAJOR`]):
+    /// rows keep input order — no offsets/pos, no atomics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_gather_rows_tokenmajor(
+        &self,
+        x: *const f32,
+        ids: *const i32,
+        w: *const f32,
+        xg: *mut f32,
+        gw: *mut f32,
+        row_idx: *mut i32,
+        exp_of_row: *mut i32,
+        row_pos: *mut i32,
+        batch: i32,
+        topk: i32,
+        d: i32,
+    ) -> Result<(), Error> {
+        let xp = x;
+        let idp = ids;
+        let wp = w;
+        let xgp = xg;
+        let gwp = gw;
+        let rip = row_idx;
+        let eop = exp_of_row;
+        let rpp = row_pos;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &idp as *const *const i32 as *mut core::ffi::c_void,
+            &wp as *const *const f32 as *mut core::ffi::c_void,
+            &xgp as *const *mut f32 as *mut core::ffi::c_void,
+            &gwp as *const *mut f32 as *mut core::ffi::c_void,
+            &rip as *const *mut i32 as *mut core::ffi::c_void,
+            &eop as *const *mut i32 as *mut core::ffi::c_void,
+            &rpp as *const *mut i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = batch * topk;
+        let blocks = (total as u32).div_ceil(256).max(1);
+        Ok(self.moe_gather_rows_tokenmajor.launch(
+            [blocks, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
     }
 
     /// Decode-path grouped MoE gate+up GEMV (one launch for all routed rows;
@@ -3874,6 +3965,7 @@ mod offline_tests {
         MOE_ROUTER_BATCHED,
         MOE_COUNT_EXPERTS,
         MOE_GATHER_ROWS,
+        MOE_GATHER_ROWS_TOKENMAJOR,
         MOE_SCATTER_ADD,
         MOE_PREFIX_SUM,
         MOE_GROUPED_GATE_UP,
@@ -3899,7 +3991,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            48,
+            49,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
@@ -3948,18 +4040,9 @@ mod gpu_tests {
             eprintln!("skipping: no HIP device");
             return;
         }
-        let arch = "gfx1100";
-        let gate_up =
-            hip::HipKernelModule::compile(arch, MOE_GROUPED_GATE_UP, "moe_grouped_gate_up")
-                .expect("compile gate_up");
-        let gate_up16 =
-            hip::HipKernelModule::compile(arch, MOE_GROUPED_GATE_UP_F16, "moe_grouped_gate_up_f16")
-                .expect("compile gate_up f16");
-        let down = hip::HipKernelModule::compile(arch, MOE_GROUPED_DOWN, "moe_grouped_down")
-            .expect("compile down");
-        let down16 =
-            hip::HipKernelModule::compile(arch, MOE_GROUPED_DOWN_F16, "moe_grouped_down_f16")
-                .expect("compile down f16");
+        // Production wrappers (module selection + param construction are what
+        // the engine calls; the pipeline test covers the full wiring).
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
 
         let rows = 6usize;
         let ne = 4usize;
@@ -4015,6 +4098,10 @@ mod gpu_tests {
         let dwd16 = hip::malloc(&h, hbytes(wd16.len())).unwrap();
         let dg = hip::malloc(&h, bytes(want_gate.len())).unwrap();
         let du = hip::malloc(&h, bytes(want_up.len())).unwrap();
+        // Separate f16 gate/up outputs: the f32 results must stay intact for
+        // the f32-down reference (and be fetched before any overwrite).
+        let dg16 = hip::malloc(&h, bytes(want_gate.len())).unwrap();
+        let du16 = hip::malloc(&h, bytes(want_up.len())).unwrap();
         let dd = hip::malloc(&h, bytes(want_down.len())).unwrap();
         let cp = |dst: *mut std::ffi::c_void, src: &[u8]| {
             hip::memcpy(
@@ -4063,33 +4150,25 @@ mod gpu_tests {
                 std::slice::from_raw_parts(wd16.as_ptr() as *const u8, hbytes(wd16.len())),
             );
         }
-        let stream = std::ptr::null_mut();
         let einter_i = einter as i32;
         let d_i = d as i32;
-        // kernelParams entries point AT each argument's storage — the same
-        // `&local as *const T as *mut _` pattern the engine wrappers use.
-        // f32 gate/up.
-        let mut p_gu_f32 = vec![
-            &dq as *const *mut std::ffi::c_void as *mut _,
-            &de as *const *mut std::ffi::c_void as *mut _,
-            &dwg as *const *mut std::ffi::c_void as *mut _,
-            &dwu as *const *mut std::ffi::c_void as *mut _,
-            &dg as *const *mut std::ffi::c_void as *mut _,
-            &du as *const *mut std::ffi::c_void as *mut _,
-            &einter_i as *const i32 as *mut _,
-            &d_i as *const i32 as *mut _,
-        ];
-        gate_up
-            .launch(
-                [rows as u32, (einter as u32).div_ceil(256).max(1), 1],
-                [256, 1, 1],
-                &mut p_gu_f32,
-                stream,
-            )
-            .unwrap();
-        // Fetch + assert the f32 results BEFORE the f16 launch overwrites
-        // the shared dg/du output buffers — otherwise the "f32" assertions
-        // would silently validate the f16 kernel.
+        let rows_i32 = rows as i32;
+        // f32 gate/up through the production wrapper.
+        k.launch_moe_grouped_gate_up(
+            dq as *const f32,
+            de as *const i32,
+            dwg as *const f32,
+            dwu as *const f32,
+            std::ptr::null(),
+            std::ptr::null(),
+            dg as *mut f32,
+            du as *mut f32,
+            rows_i32,
+            einter_i,
+            d_i,
+            false,
+        )
+        .unwrap();
         let mut got_gate = vec![0f32; want_gate.len()];
         let mut got_up = vec![0f32; want_up.len()];
         let fetch = |dst: *mut std::ffi::c_void, out: &mut Vec<f32>| {
@@ -4124,40 +4203,78 @@ mod gpu_tests {
             du_diff <= 1e-4 + 1e-4 * scale_u,
             "f32 up diff {du_diff} (scale {scale_u})"
         );
-        // f16 gate/up (weights f16, math f32-accumulated).
-        let mut p_gu_f16 = vec![
-            &dq as *const *mut std::ffi::c_void as *mut _,
-            &de as *const *mut std::ffi::c_void as *mut _,
-            &dwg16 as *const *mut std::ffi::c_void as *mut _,
-            &dwu16 as *const *mut std::ffi::c_void as *mut _,
-            &dg as *const *mut std::ffi::c_void as *mut _,
-            &du as *const *mut std::ffi::c_void as *mut _,
-            &einter_i as *const i32 as *mut _,
-            &d_i as *const i32 as *mut _,
-        ];
-        gate_up16
-            .launch(
-                [rows as u32, (einter as u32).div_ceil(256).max(1), 1],
-                [256, 1, 1],
-                &mut p_gu_f16,
-                stream,
-            )
-            .unwrap();
+        // f16 gate/up into SEPARATE output buffers (dg/du keep the exact f32
+        // results for the down references), asserted against the f16-rounded
+        // CPU reference (loose bound for weight rounding).
+        let mut want_gate16 = vec![0f32; rows * einter];
+        let mut want_up16 = vec![0f32; rows * einter];
+        for r in 0..rows {
+            let e = exp_of_row[r] as usize;
+            for o in 0..einter {
+                let mut ag = 0f32;
+                let mut au = 0f32;
+                for k in 0..d {
+                    let wg = crate::fp16::f16_to_f32(wg16[(e * einter + o) * d + k]);
+                    let wu = crate::fp16::f16_to_f32(wu16[(e * einter + o) * d + k]);
+                    ag += xg[r * d + k] * wg;
+                    au += xg[r * d + k] * wu;
+                }
+                want_gate16[r * einter + o] = ag;
+                want_up16[r * einter + o] = au;
+            }
+        }
+        k.launch_moe_grouped_gate_up(
+            dq as *const f32,
+            de as *const i32,
+            std::ptr::null(),
+            std::ptr::null(),
+            dwg16 as *const u16,
+            dwu16 as *const u16,
+            dg16 as *mut f32,
+            du16 as *mut f32,
+            rows_i32,
+            einter_i,
+            d_i,
+            true,
+        )
+        .unwrap();
+        let mut got_gate16 = vec![0f32; want_gate16.len()];
+        let mut got_up16 = vec![0f32; want_up16.len()];
+        fetch(dg16, &mut got_gate16);
+        fetch(du16, &mut got_up16);
+        let scale_g16 = want_gate16.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let dg16_diff = got_gate16
+            .iter()
+            .zip(&want_gate16)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let du16_diff = got_up16
+            .iter()
+            .zip(&want_up16)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            dg16_diff <= 2e-2 * (1.0 + scale_g16),
+            "f16 gate diff {dg16_diff} (scale {scale_g16})"
+        );
+        assert!(
+            du16_diff <= 2e-2 * (1.0 + scale_u),
+            "f16 up diff {du16_diff} (scale {scale_u})"
+        );
 
-        // Down: f32 then f16 (eh = the exact f32 gate output).
-        let rows_i32 = rows as i32;
-        let mut p_down_f32 = vec![
-            &dg as *const *mut std::ffi::c_void as *mut _,
-            &de as *const *mut std::ffi::c_void as *mut _,
-            &dwd as *const *mut std::ffi::c_void as *mut _,
-            &dd as *const *mut std::ffi::c_void as *mut _,
-            &rows_i32 as *const i32 as *mut _,
-            &d_i as *const i32 as *mut _,
-            &einter_i as *const i32 as *mut _,
-        ];
-        let blocks_down = ((rows * d) as u32).div_ceil(256).max(1);
-        down.launch([blocks_down, 1, 1], [256, 1, 1], &mut p_down_f32, stream)
-            .unwrap();
+        // Down: f32 then f16, both with eh = the EXACT f32 gate (dg).
+        k.launch_moe_grouped_down(
+            dg as *const f32,
+            de as *const i32,
+            dwd as *const f32,
+            std::ptr::null(),
+            dd as *mut f32,
+            rows_i32,
+            d_i,
+            einter_i,
+            false,
+        )
+        .unwrap();
         let mut got_down = vec![0f32; want_down.len()];
         fetch(dd, &mut got_down);
         let scale_d = want_down.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -4171,18 +4288,18 @@ mod gpu_tests {
             "f32 down diff {dd_diff} (scale {scale_d})"
         );
         // f16 down (eh = exact f32 gate from the f32 run).
-        let mut p_down_f16 = vec![
-            &dg as *const *mut std::ffi::c_void as *mut _,
-            &de as *const *mut std::ffi::c_void as *mut _,
-            &dwd16 as *const *mut std::ffi::c_void as *mut _,
-            &dd as *const *mut std::ffi::c_void as *mut _,
-            &rows_i32 as *const i32 as *mut _,
-            &d_i as *const i32 as *mut _,
-            &einter_i as *const i32 as *mut _,
-        ];
-        down16
-            .launch([blocks_down, 1, 1], [256, 1, 1], &mut p_down_f16, stream)
-            .unwrap();
+        k.launch_moe_grouped_down(
+            dg as *const f32,
+            de as *const i32,
+            std::ptr::null(),
+            dwd16 as *const u16,
+            dd as *mut f32,
+            rows_i32,
+            d_i,
+            einter_i,
+            true,
+        )
+        .unwrap();
         fetch(dd, &mut got_down);
         let dd16_diff = got_down
             .iter()
@@ -4194,13 +4311,136 @@ mod gpu_tests {
             dd16_diff <= 2e-2 * (1.0 + scale_d),
             "f16 down diff {dd16_diff} (scale {scale_d})"
         );
+        // Release all device buffers (module convention: free what we
+        // allocate — the paged parity test does the same).
+        for p in [
+            dq, de, dwg, dwu, dwd, dwg16, dwu16, dwd16, dg, du, dg16, du16, dd,
+        ] {
+            hip::free(&h, p).unwrap();
+        }
     }
 
-    /// Full grouped decode pipeline through the ENGINE WRAPPERS (memsets ->
-    /// count -> prefix -> gather -> gate/up GEMV -> SiLU -> down GEMV ->
-    /// whole-range scatter) vs a direct CPU computation — exactly the
-    /// launches the batched decode path fires per MoE layer, against a
-    /// reference that shares no code with either implementation.
+    /// Parallel router top-k vs a serial scan: crafted logits with EXACT
+    /// ties exercise the smallest-index tie-break the parallel reduction
+    /// must reproduce (no other test launches `moe_router_batched` — the
+    /// engine tests exercise it only transitively).
+    #[test]
+    fn moe_router_batched_matches_serial_topk() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let ne = 8usize;
+        let topk = 4usize;
+        let batch = 2usize;
+        // Every value appears exactly twice -> hard ties: the smallest index
+        // must win each tie in both the scan and the parallel reduce.
+        let logits: Vec<f32> = (0..batch * ne)
+            .map(|i| ((i / 2) % 4) as f32 - 1.0)
+            .collect();
+        let e = |v: f32| v.exp();
+        let mut want_ids: Vec<Vec<usize>> = Vec::new();
+        let mut want_w: Vec<Vec<f32>> = Vec::new();
+        for s in 0..batch {
+            let row = &logits[s * ne..(s + 1) * ne];
+            let probs: Vec<f32> = row.iter().map(|&v| e(v)).collect();
+            let total: f32 = probs.iter().sum();
+            let probs: Vec<f32> = probs.iter().map(|&p| p / total).collect();
+            let mut ids = Vec::with_capacity(topk);
+            let mut norm = 0f32;
+            for _ in 0..topk {
+                let mut best = usize::MAX;
+                let mut bestv = f32::NEG_INFINITY;
+                for (i, &p) in probs.iter().enumerate() {
+                    if ids.contains(&i) {
+                        continue;
+                    }
+                    if p > bestv || (p == bestv && i < best) {
+                        bestv = probs[i];
+                        best = i;
+                    }
+                }
+                ids.push(best);
+                norm += probs[best];
+            }
+            want_ids.push(ids.clone());
+            want_w.push(ids.iter().map(|&i| probs[i] / norm).collect());
+        }
+
+        let ibytes = |n: usize| n * std::mem::size_of::<i32>();
+        let fbytes = |n: usize| n * std::mem::size_of::<f32>();
+        let dlogits = hip::malloc(&h, fbytes(logits.len())).unwrap();
+        let dids = hip::malloc(&h, ibytes(batch * topk)).unwrap() as *mut i32;
+        let dw = hip::malloc(&h, fbytes(batch * topk)).unwrap();
+        hip::memcpy(
+            &h,
+            dlogits,
+            logits.as_ptr() as *const std::ffi::c_void,
+            fbytes(logits.len()),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        k.launch_moe_router_batched(
+            dlogits as *const f32,
+            dids,
+            dw as *mut f32,
+            ne as i32,
+            topk as i32,
+            batch as i32,
+        )
+        .unwrap();
+        k.sync().unwrap();
+        let mut got_ids = vec![0i32; batch * topk];
+        let mut got_w = vec![0f32; batch * topk];
+        hip::memcpy(
+            &h,
+            got_ids.as_mut_ptr() as *mut std::ffi::c_void,
+            dids as *const std::ffi::c_void,
+            ibytes(batch * topk),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            got_w.as_mut_ptr() as *mut std::ffi::c_void,
+            dw as *const std::ffi::c_void,
+            fbytes(batch * topk),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        for s in 0..batch {
+            let got_row: Vec<usize> = got_ids[s * topk..(s + 1) * topk]
+                .iter()
+                .map(|&v| v as usize)
+                .collect();
+            assert_eq!(
+                &got_row[..],
+                want_ids[s].as_slice(),
+                "router ids seq {s} (tie-break: smallest index)"
+            );
+            for (j, &g) in got_w[s * topk..(s + 1) * topk].iter().enumerate() {
+                assert!(
+                    (g - want_w[s][j]).abs() < 1e-6,
+                    "router weight seq {s} k={j}: {g} vs {}",
+                    want_w[s][j]
+                );
+            }
+        }
+        hip::free(&h, dlogits).unwrap();
+        hip::free(&h, dids as *mut std::ffi::c_void).unwrap();
+        hip::free(&h, dw).unwrap();
+    }
+
+    /// Full grouped decode pipeline through the ENGINE WRAPPERS (gather ->
+    /// gate/up GEMV -> SiLU -> down GEMV -> deterministic scatter) vs a
+    /// direct CPU computation — exactly the launches the batched decode path
+    /// fires per MoE layer, against a reference that shares no code with
+    /// either implementation.
     #[test]
     fn moe_grouped_pipeline_wrappers_match_cpu() {
         let Ok(h) = hip::hip() else {
@@ -4258,9 +4498,6 @@ mod gpu_tests {
         let dx = hip::malloc(&h, bytes(x.len())).unwrap();
         let de = hip::malloc(&h, ibytes(ids.len())).unwrap() as *mut i32;
         let dw = hip::malloc(&h, bytes(w.len())).unwrap();
-        let counts = hip::malloc(&h, ibytes(ne)).unwrap() as *mut i32;
-        let pos = hip::malloc(&h, ibytes(ne)).unwrap() as *mut i32;
-        let offsets = hip::malloc(&h, ibytes(ne)).unwrap() as *mut i32;
         let xg = hip::malloc(&h, bytes(rows * d)).unwrap();
         let gw = hip::malloc(&h, bytes(rows)).unwrap();
         let row_idx = hip::malloc(&h, ibytes(rows)).unwrap() as *mut i32;
@@ -4310,33 +4547,15 @@ mod gpu_tests {
                 std::slice::from_raw_parts(wd32.as_ptr() as *const u8, bytes(wd32.len())),
             );
         }
-        unsafe {
-            hip::check(
-                k.hip(),
-                (k.hip().api.hip_memset)(counts as *mut _, 0, ne * 4),
-            )
-            .unwrap();
-            hip::check(k.hip(), (k.hip().api.hip_memset)(pos as *mut _, 0, ne * 4)).unwrap();
-            hip::check(
-                k.hip(),
-                (k.hip().api.hip_memset)(hacc as *mut _, 0, b * d * 4),
-            )
-            .unwrap();
-        }
         let b_i = b as i32;
         let topk_i = topk as i32;
-        let ne_i = ne as i32;
         let d_i = d as i32;
         let einter_i = einter as i32;
         let rows_i = rows as i32;
-        k.launch_moe_count_experts(de, counts, b_i, topk_i).unwrap();
-        k.launch_moe_prefix_sum(counts, offsets, ne_i).unwrap();
-        k.launch_moe_gather_rows(
+        k.launch_moe_gather_rows_tokenmajor(
             dx as *const f32,
-            de,
+            de as *const i32,
             dw as *const f32,
-            offsets,
-            pos,
             xg as *mut f32,
             gw as *mut f32,
             row_idx,
@@ -4412,6 +4631,27 @@ mod gpu_tests {
             diff <= 1e-4 + 1e-4 * scale,
             "grouped pipeline diff {diff} (scale {scale})"
         );
+        // Release every device allocation (module convention).
+        for p in [
+            dx,
+            de as *mut std::ffi::c_void,
+            dw,
+            xg,
+            gw,
+            row_idx as *mut std::ffi::c_void,
+            exp_of_row as *mut std::ffi::c_void,
+            row_pos as *mut std::ffi::c_void,
+            gate,
+            up,
+            eh,
+            down,
+            hacc,
+            dwg,
+            dwu,
+            dwd,
+        ] {
+            hip::free(&h, p).unwrap();
+        }
     }
 
     /// GPU parity: the paged kernels (`kv_store_paged` / `attn_decode_paged`) must

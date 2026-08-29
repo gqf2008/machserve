@@ -44,7 +44,7 @@ fn plain_greedy(
         &mut gp,
         &vec![Vec::new(); prompt.len()],
         &vec![Vec::new(); prompt.len()],
-        true,
+        false, // prefill: hipBLAS path
     )
     .unwrap();
     let first = m
@@ -227,7 +227,7 @@ fn plain_greedy_eos(
         &mut gp,
         &vec![Vec::new(); prompt.len()],
         &vec![Vec::new(); prompt.len()],
-        true,
+        false, // prefill: hipBLAS path
     )
     .unwrap();
     let mut rnext = m

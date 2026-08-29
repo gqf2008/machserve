@@ -35,7 +35,7 @@ fn prefill_chunked(m: &mut BatchedModel, slot: u32, prompt: &[u32]) -> Result<()
             &mut p,
             &ec,
             &eb,
-            true,
+            false, // prefill chunk: hipBLAS host loop (m>1 rows per expert)
         )?;
         pos += take;
     }

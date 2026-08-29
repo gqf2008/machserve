@@ -618,9 +618,12 @@ impl BatchedSampler {
         let topk_lp_host = pall(capacity * MAX_TOPK * 4)? as *mut f32;
         // Packed H2D parameter block: every per-step parameter field lives at
         // a fixed (8-aligned) offset in ONE pinned-host staging area mirrored
-        // by ONE device buffer — a step uploads the whole block with a single
-        // memcpy instead of twelve. The typed field pointers below are carved
-        // at their offsets, so the kernels are unchanged.
+        // by ONE device buffer (a single allocation pair). Uploads are
+        // per-field `n`-row copies — a whole-block copy would transfer
+        // `capacity` rows per step (~34MB at prefill-rows capacity) and
+        // dominate n≪capacity decode steps (see `sample_batched`). The typed
+        // field pointers below are carved at their offsets, so the kernels
+        // are unchanged.
         let align8 = |o: usize| (o + 7) & !7;
         let mut off = 0usize;
         let temp_off = {

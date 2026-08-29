@@ -101,8 +101,12 @@ fn moe_cfg() -> Config {
 /// implementation (grouped GEMV) than the single-sequence reference
 /// (hipBLAS): a near-tie may legitimately flip, so the batched token is
 /// accepted when its reference logit is within `tie_band` of the reference
-/// argmax logit. `tie_band` should scale with the numeric noise of the
-/// comparison (e.g. `4e-3 + 4e-3 * scale` for f32, `0.2` flat for f16).
+/// argmax logit. NOTE: with `tie_band = 2 * logits_tolerance` this is
+/// implied by the logits-diff assertion above (a flip with a reference gap
+/// beyond the band would also break the logits bound) — the check is
+/// defense-in-depth for future tolerance edits, not an independent oracle.
+/// The ROUTER tie-break itself is pinned directly by
+/// `moe_router_batched_matches_serial_topk` in kernels.rs.
 fn assert_greedy_compatible(got: u32, want: u32, want_logits: &[f32], ctx: &str, tie_band: f32) {
     if got == want {
         return;
