@@ -12,7 +12,7 @@ use crate::kernels::HipKernels;
 use crate::moe_offload;
 use crate::sampling::{BatchedSampler, SampleOutput, SamplingParams};
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
-use mach_kernel_sys::hip::{self, Hip};
+use mach_kernel_sys::hip::{self, Hip, HipEvent};
 use std::sync::Arc;
 
 /// Per-layer device weight pointers (same layout as the single-seq model).
@@ -86,6 +86,88 @@ struct Q4ExpertDev {
     wu_s: *mut f32,
     wd_q: *mut u8,
     wd_s: *mut f32,
+}
+
+/// Step profiler state (`MACH_STEP_PROFILE=1`): per-layer event pairs
+/// bracketing [layer start, attention done, MoE done] plus the whole-step
+/// pair. `profile_report` prints the per-step phase breakdown after the
+/// sampling sync.
+struct ProfState {
+    hip: std::sync::Arc<Hip>,
+    /// `[layer] -> (layer_start, attn_done, moe_done)`.
+    events: Vec<(HipEvent, HipEvent, HipEvent)>,
+    /// Whole-step (start, end).
+    step_events: (HipEvent, HipEvent),
+    /// Decoded-step counter for the report line.
+    step: usize,
+}
+
+impl ProfState {
+    fn new(n_layers: usize, hip: &std::sync::Arc<Hip>) -> Result<Self, crate::Error> {
+        let mk = || -> Result<HipEvent, crate::Error> {
+            let mut e = std::ptr::null_mut();
+            unsafe { hip::check(hip, (hip.api.hip_event_create)(&mut e))? };
+            Ok(e)
+        };
+        let mut events = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            events.push((mk()?, mk()?, mk()?));
+        }
+        Ok(Self {
+            hip: hip.clone(),
+            events,
+            step_events: (mk()?, mk()?),
+            step: 0,
+        })
+    }
+
+    /// Prints the per-step phase breakdown (call after the step's sync):
+    /// per-layer event pairs give attention vs MoE vs other, plus the
+    /// whole-step wall time from the step event pair.
+    fn report(&mut self) {
+        let mut attn = 0f32;
+        let mut moe = 0f32;
+        for (l0, l1, l2) in &self.events {
+            let mut a = 0f32;
+            unsafe {
+                let _ = (self.hip.api.hip_event_elapsed_time)(&mut a, *l0, *l1);
+            }
+            attn += a;
+            unsafe {
+                let _ = (self.hip.api.hip_event_elapsed_time)(&mut a, *l1, *l2);
+            }
+            moe += a;
+        }
+        let mut total = 0f32;
+        unsafe {
+            let _ = (self.hip.api.hip_event_elapsed_time)(
+                &mut total,
+                self.step_events.0,
+                self.step_events.1,
+            );
+        }
+        eprintln!(
+            "[prof] step {}: attn={attn:.2}ms moe={moe:.2}ms other={:.2}ms total={total:.2}ms",
+            self.step,
+            (total - attn - moe).max(0.0)
+        );
+        self.step += 1;
+    }
+}
+
+impl Drop for ProfState {
+    fn drop(&mut self) {
+        unsafe {
+            let flat = self
+                .events
+                .iter()
+                .flat_map(|(a, b, c)| [*a, *b, *c])
+                .chain([self.step_events.0, self.step_events.1]);
+            for e in flat {
+                let _ = (self.hip.api.hip_event_destroy)(e);
+            }
+        }
+    }
 }
 
 /// Max m (active rows) dispatched to the custom GEMV kernel: below this the
@@ -221,6 +303,10 @@ pub struct BatchedModel {
     /// in-kernel; all steps (prefill included) run the grouped path, since
     /// no f16/f32 expert copy exists for the hipBLAS path.
     q4_experts: Vec<Q4ExpertDev>,
+    /// Step profiler (`MACH_STEP_PROFILE=1`): per-layer event pairs bracketing
+    /// the attention and MoE phases plus a whole-step pair; `profile_report`
+    /// prints the per-step breakdown after the sampling sync.
+    prof: Option<ProfState>,
     /// Tokens per KV page (paged mode).
     tokens_per_page: usize,
     /// Pages per sequence (`max_seq / tokens_per_page`, divisibility required).
@@ -775,6 +861,7 @@ impl BatchedModel {
             paged: false,
             moe_grouped: cfg.moe_grouped,
             q4_experts: Vec::new(),
+            prof: None,
             tokens_per_page: 0,
             max_pages_per_seq: 0,
             block_tables: std::ptr::null_mut(),
@@ -785,6 +872,11 @@ impl BatchedModel {
         };
         m.alloc_buffers()?;
         upload(&mut m)?;
+        // Step profiler (MACH_STEP_PROFILE=1): per-layer attention/MoE event
+        // bracketing, reported after each decode step's sampling sync.
+        if std::env::var("MACH_STEP_PROFILE").is_ok_and(|v| v != "0") {
+            m.prof = Some(ProfState::new(cfg.n_layers, &hip)?);
+        }
         Ok(m)
     }
 
@@ -1614,6 +1706,11 @@ impl BatchedModel {
             0,
         )?;
         let next = self.sample(self.batch)?;
+        // Step profiler: the sampling sync above drained the stream, so all
+        // event records have executed — safe to read elapsed times.
+        if let Some(pf_state) = self.prof.as_mut() {
+            pf_state.report();
+        }
         for l in self.lens.iter_mut() {
             *l += 1;
         }
@@ -1702,6 +1799,15 @@ impl BatchedModel {
         } else {
             k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
         }
+        // Step profiler (MACH_STEP_PROFILE): whole-step start bracket.
+        if let Some(pf_state) = &self.prof {
+            unsafe {
+                hip::check(
+                    self.k.hip(),
+                    (self.k.hip().api.hip_event_record)(pf_state.step_events.0, self.k.stream),
+                )?;
+            }
+        }
         // Double-buffered prefill: start the first MoE layer's H2D prefetch so
         // it overlaps the first layers' compute.
         if let Some(pf) = &self.prefetch {
@@ -1709,7 +1815,17 @@ impl BatchedModel {
         }
         for (li, lw) in self.layers_dev.iter().enumerate() {
             let l16 = if f16 { Some(self.layers_f16[li]) } else { None };
-            // Issue the next MoE layer's prefetch before this layer computes.
+            // Step profiler: bracket this layer's attention phase.
+            if let Some(pf_state) = &self.prof
+                && let Some((l0, _, _)) = pf_state.events.get(li)
+            {
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_event_record)(*l0, self.k.stream),
+                    )?;
+                }
+            }
             if let Some(pf) = &self.prefetch {
                 pf.layer_begin(li)?;
             }
@@ -2152,6 +2268,17 @@ impl BatchedModel {
                 )?;
                 k.launch_add(self.x, self.proj, b * d)?;
             }
+            // Step profiler: attention phase done.
+            if let Some(pf_state) = &self.prof
+                && let Some((_, l1, _)) = pf_state.events.get(li)
+            {
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_event_record)(*l1, self.k.stream),
+                    )?;
+                }
+            }
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
             // Per-layer MoE dispatch: mixed checkpoints (Qwen3-MoE style) have
             // dense layers with empty MoE tensors alongside routed-expert
@@ -2492,10 +2619,30 @@ impl BatchedModel {
                 )?;
                 k.launch_add(self.x, self.proj, b * d)?;
             }
+            // Step profiler: MLP/MoE phase done (dense MLP or routed experts).
+            if let Some(pf_state) = &self.prof
+                && let Some((_, _, l2)) = pf_state.events.get(li)
+            {
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_event_record)(*l2, self.k.stream),
+                    )?;
+                }
+            }
             // The layer's compute is fully queued: let the prefetch engine know
             // (its ping-pong slot is now free for the layer after next).
             if let Some(pf) = &self.prefetch {
                 pf.layer_end(li, self.k.stream)?;
+            }
+        }
+        // Step profiler: whole-step end bracket.
+        if let Some(pf_state) = &self.prof {
+            unsafe {
+                hip::check(
+                    self.k.hip(),
+                    (self.k.hip().api.hip_event_record)(pf_state.step_events.1, self.k.stream),
+                )?;
             }
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
