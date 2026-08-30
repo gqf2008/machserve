@@ -9,13 +9,18 @@
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
 //! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
 //! host weights: int4 or E4M3, dequantized to f16 on the device),
+//! MACH_Q4_DEVICE=1 (with MACH_Q4: keep the MoE expert pool in raw Q4 on the
+//! device, dequantized in-kernel — the memory path for 30B-class checkpoints
+//! whose f16 experts would not fit in VRAM),
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
 //! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
 //! engage paged KV — plain, Q4 and FP8 non-MLA). Limitations: paged KV serves
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
 //! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
-//! GEMV device path — A/B switch and ops lever, parsed by mach-model).
+//! GEMV device path — A/B switch and ops lever). NOTE: Q4-on-device models
+//! (MACH_Q4_DEVICE=1) have no f16/f32 expert copy, so they ALWAYS run the
+//! grouped path and this knob is a no-op for them.
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
@@ -88,6 +93,12 @@ fn config_from_json(path: &std::path::Path) -> Config {
     if let Some(qk) = v["qk_norm"].as_bool() {
         cfg.qk_norm = qk;
     }
+    // MACH_MOE_GROUPED=0 (default on): batched-MoE decode falls back to the
+    // hipBLAS host loop. Parsed HERE, in the server's env-knob area, not in
+    // the library (the library reads no MoE env; the field lives on Config).
+    cfg.moe_grouped = std::env::var("MACH_MOE_GROUPED")
+        .map(|x| x != "0")
+        .unwrap_or(true);
     cfg
 }
 
@@ -342,6 +353,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage-Q4 mode: weights stay packed int4 on the host (dequantized to
     // f16 per tensor on the device), cutting host RAM ~4x vs f32.
     let q4 = std::env::var("MACH_Q4").is_ok_and(|v| v != "0");
+    // Q4-on-device: the MoE expert pool stays raw Q4 on the device (in-kernel
+    // dequant) instead of the dequantized f16 pool — the memory path for
+    // 30B-class checkpoints whose f16 experts would not fit in VRAM.
+    let q4_device = std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v != "0");
     // Storage-FP8 mode: weights stay E4M3 on the host (dequantized to f16
     // per tensor on the device), cutting host RAM ~2x vs f16 / ~4x vs f32.
     let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
@@ -387,6 +402,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
+    }
+    if q4_device && !q4 {
+        eprintln!(
+            "warning: MACH_Q4_DEVICE=1 requires MACH_Q4=1 (it selects the Q4 expert-pool layout); ignoring"
+        );
     }
 
     if fp8 {
@@ -562,7 +582,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(tpp) => ServerEngine::with_paged(capacity, prefill_rows, tpp),
             None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
         };
-        let handle = eng.clone().spawn_q4(hip, cfg, wq4)?;
+        let handle = if q4_device {
+            eng.clone().spawn_q4_device(hip, cfg, wq4)?
+        } else {
+            eng.clone().spawn_q4(hip, cfg, wq4)?
+        };
         (eng, handle)
     } else if fp8 {
         let wfp8: WeightsFp8 =

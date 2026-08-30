@@ -58,6 +58,7 @@ fn qwen2_1_5b_cfg() -> Config {
         qk_nope_head_dim: 0,
         qk_rope_head_dim: 0,
         v_head_dim: 0,
+        moe_grouped: true,
     }
 }
 

@@ -299,6 +299,26 @@ impl ContinuousModel {
         ))
     }
 
+    /// Q4-on-device variant of [`Self::with_prefill_rows_q4`]: the expert
+    /// pool stays raw Q4 on device (in-kernel dequant), the memory path for
+    /// 30B-class checkpoints whose dequantized f16 pool would not fit in VRAM.
+    pub fn with_prefill_rows_q4_device(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+    ) -> Result<Self, Error> {
+        let model =
+            BatchedModel::with_rows_q4_device(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
+    }
+
     /// Builds a continuous-batching engine from storage-FP8 weights: each GEMM
     /// tensor is dequantized to f16 during upload, so host RAM stays ~= the
     /// packed FP8 weights (experts stay fully GPU-resident).
@@ -406,6 +426,33 @@ impl ContinuousModel {
         tokens_per_page: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_paged_kv_rows_q4(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        ))
+    }
+
+    /// Paged Q4-on-device variant: the expert pool stays raw Q4 on device
+    /// (in-kernel dequant). Q4 mode runs the grouped path for every step, so
+    /// paged KV works over the grouped MoE kernels like the decode path.
+    pub fn with_paged_prefill_rows_q4_device(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_q4_device(
             hip,
             cfg,
             w,

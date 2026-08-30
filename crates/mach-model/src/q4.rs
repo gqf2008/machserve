@@ -124,6 +124,16 @@ impl Q4Tensor {
         Self { q, scales, n }
     }
 
+    /// Raw packed int4 bytes (2 elements per byte, low nibble first).
+    pub fn q_bytes(&self) -> &[u8] {
+        &self.q
+    }
+
+    /// Per-group f32 scales (`groups = n.div_ceil(Q4_GROUP)`), flat-aligned.
+    pub fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+
     /// Dequantizes back to f32.
     #[allow(clippy::needless_range_loop)]
     pub fn dequantize(&self) -> Vec<f32> {

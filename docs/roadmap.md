@@ -1041,3 +1041,21 @@
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
     --test-threads 1)全量套件;fp64 参考 5/5(含双放置不变性);离线
     门禁 48 内核+计数断言;
+
+- **Q4 MoE 存储路径(#85,2026-08-30,7900 XTX)**:
+  - P1 Q4-on-device 专家池 grouped GEMV:MOE_GROUPED_GATE_UP_Q4 /
+    MOE_GROUPED_DOWN_Q4 读原始打包 int4 + 每 group f32 scale(Q4_GROUP=32),
+    内核内反量化(精确 f32 scale 乘)——无 f16/f32 设备专家拷贝,30B 类
+    检查点 Q4 池 ~16GB 可行(f16 ~50GB 超 24GB VRAM);with_rows_q4_device
+    构建,Q4 模式整步走 grouped 路径;离线门禁 48→50;loader MoE 拼接改
+    concat_many(O(n²)→O(n));对拍:tiny MoE Q4-on-device vs 反量化 f16
+    参考 5e-2 容差;
+  - P2 **Qwen3-30B-A3B 真机验证兑现 README 待验证项**:加载 201.6s
+    (BF16→Q4,专家池 13.8GB)→构建 25.5s→16 步解码全有限 logits、两遍
+    greedy 逐位稳定(run-to-run 确定性);190 ms/step——瓶颈为 attention
+    投影 m=1 f16 GEMM(已知问题),非 MoE 路径;
+  - P3 MACH_MOE_GROUPED 解析统一:Config.moe_grouped 字段(默认 true),
+    库内零 MACH_* env 读取,server config_from_json 旋钮区解析;
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
+    --test-threads 1)全量套件(batched 22/22 含新 Q4 对拍);离线门禁
+    50 内核+计数断言;

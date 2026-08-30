@@ -765,22 +765,22 @@ pub fn load_safetensors_q4(
         };
         if is_moe {
             let ne_i = ne;
-            for e in 0..ne_i {
-                let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
-                // Concatenate per-expert tensors into one Q4 tensor each.
-                lw.moe_wg = concat_q4(
-                    &lw.moe_wg,
-                    &big.remove(&ep("gate_proj.weight")).expect("exp gate"),
-                );
-                lw.moe_wu = concat_q4(
-                    &lw.moe_wu,
-                    &big.remove(&ep("up_proj.weight")).expect("exp up"),
-                );
-                lw.moe_wd = concat_q4(
-                    &lw.moe_wd,
-                    &big.remove(&ep("down_proj.weight")).expect("exp down"),
-                );
-            }
+            // Single-pass per-tensor concat: the sequential fold re-clones the
+            // growing prefix per expert (O(n²) byte traffic — minutes on
+            // 256-expert checkpoints); concat_many appends in one O(total)
+            // pass (byte-identical for the group-aligned expert tensors).
+            let mut concat = |name: &str| -> Q4Tensor {
+                let parts: Vec<Q4Tensor> = (0..ne_i)
+                    .map(|e| {
+                        big.remove(&format!("model.layers.{i}.mlp.experts.{e}.{name}"))
+                            .expect("exp tensor")
+                    })
+                    .collect();
+                Q4Tensor::concat_many(&parts)
+            };
+            lw.moe_wg = concat("gate_proj.weight");
+            lw.moe_wu = concat("up_proj.weight");
+            lw.moe_wd = concat("down_proj.weight");
         }
         layers.push(lw);
     }
@@ -1051,24 +1051,20 @@ pub fn load_safetensors_fp8(
         };
         if is_moe {
             let ne_i = ne;
-            for e in 0..ne_i {
-                let ep = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
-                // Concatenate per-expert tensors into one FP8 tensor each
-                // (exact byte+scale append: every expert is quantized with its
-                // own per-expert scale and block = expert size).
-                lw.moe_wg = concat_fp8(
-                    &lw.moe_wg,
-                    &big.remove(&ep("gate_proj.weight")).expect("exp gate"),
-                );
-                lw.moe_wu = concat_fp8(
-                    &lw.moe_wu,
-                    &big.remove(&ep("up_proj.weight")).expect("exp up"),
-                );
-                lw.moe_wd = concat_fp8(
-                    &lw.moe_wd,
-                    &big.remove(&ep("down_proj.weight")).expect("exp down"),
-                );
-            }
+            // Single-pass per-tensor concat (the sequential fold re-clones the
+            // growing prefix per expert — O(n²) byte traffic).
+            let mut concat = |name: &str| -> Fp8Tensor {
+                let parts: Vec<Fp8Tensor> = (0..ne_i)
+                    .map(|e| {
+                        big.remove(&format!("model.layers.{i}.mlp.experts.{e}.{name}"))
+                            .expect("exp tensor")
+                    })
+                    .collect();
+                Fp8Tensor::concat_many(&parts)
+            };
+            lw.moe_wg = concat("gate_proj.weight");
+            lw.moe_wu = concat("up_proj.weight");
+            lw.moe_wd = concat("down_proj.weight");
         }
         layers.push(lw);
     }
@@ -1175,18 +1171,6 @@ fn expected_small_size(
 /// `Q4Tensor::concat`: group-aligned tensors append packed int4 bytes + scales
 /// directly (O(1) per expert, fixing the old O(ne^2) dequant+requant that made
 /// Q4 loading of MoE checkpoints ~30x slower than f32).
-fn concat_q4(a: &Q4Tensor, b: &Q4Tensor) -> Q4Tensor {
-    a.concat(b)
-}
-
-/// Concatenates two FP8 tensors (per-expert MoE tensors). Delegates to
-/// `Fp8Tensor::concat`: every expert is quantized with its own per-expert
-/// scale and `block = expert size`, so the packed bytes + scales append
-/// directly (exact, O(1) per expert).
-fn concat_fp8(a: &Fp8Tensor, b: &Fp8Tensor) -> Fp8Tensor {
-    a.concat(b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

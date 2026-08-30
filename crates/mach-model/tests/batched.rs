@@ -1105,6 +1105,71 @@ mod paged_quantized_cpu_parity {
         assert_paged_matches_cpu(&mut contig, cfg, &wd, &prompt, 5e-2);
     }
 
+    /// Q4-on-device expert pool (in-kernel dequant) must match the
+    /// dequantized-f16 reference within the Q4-path tolerance (the reference
+    /// rounds the dequantized weights to f16; the in-kernel path keeps the
+    /// exact f32 scales). Exercises the `with_rows_q4_device` mode end-to-end
+    /// on a MoE config: greedy decode steps (the `assert_paged_matches_cpu`
+    /// loop) plus an explicit prefill step — Q4 mode runs the grouped path
+    /// for EVERY step (no f16/f32 expert copy exists for the hipBLAS path),
+    /// so the prefill branch of the grouped condition needs its own pin.
+    #[test]
+    fn batched_q4_device_moe_matches_dequantized_reference() {
+        let Some(hip) = hip_ctx() else { return };
+        let mut cfg = Config::tiny();
+        cfg.dtype = ModelDType::F16;
+        cfg.intermediate_size = 64;
+        cfg.num_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        let w = Weights::random(&cfg, 103).unwrap();
+        let wq = WeightsQ4::from_weights(&w, &cfg);
+        let wd = dequantize_q4(&wq);
+        let mut eng = BatchedModel::with_rows_q4_device(hip.clone(), cfg, &wq, 1, 4).unwrap();
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
+        assert_paged_matches_cpu(&mut eng, cfg, &wd, &prompt, 5e-2);
+        // Explicit prefill step (decode_only=false): Q4 mode routes it
+        // through the grouped kernels too.
+        eng.reset_state().unwrap();
+        let mut params = vec![SamplingParams::greedy(1); 1];
+        let lens = vec![0u32];
+        let slots = vec![0u32];
+        eng.decode_step_explicit(
+            &[7],
+            &lens,
+            &slots,
+            &mut params,
+            &[Vec::new()],
+            &[Vec::new()],
+            false,
+        )
+        .unwrap();
+        let got = eng.read_logits().unwrap();
+        let mut ref_eng = BatchedModel::with_rows(hip.clone(), cfg, &wd, 1, 4).unwrap();
+        ref_eng.reset_state().unwrap();
+        let mut rp = vec![SamplingParams::greedy(1); 1];
+        ref_eng
+            .decode_step_explicit(
+                &[7],
+                &lens,
+                &slots,
+                &mut rp,
+                &[Vec::new()],
+                &[Vec::new()],
+                false,
+            )
+            .unwrap();
+        let want = ref_eng.read_logits().unwrap();
+        let max = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max <= 5e-2,
+            "Q4-on-device prefill must match the dequantized reference (max diff {max})"
+        );
+    }
+
     /// Control: the plain F16 engine on the unquantized f32 weights — if
     /// this fails the same way, the divergence is the harness/reference
     /// setup, not the Q4 upload path.

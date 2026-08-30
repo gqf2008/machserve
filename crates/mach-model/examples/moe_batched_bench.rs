@@ -38,6 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.num_experts = 64;
     cfg.num_experts_per_tok = 8;
     cfg.moe_intermediate_size = 256; // routed-layer width (Qwen-MoE style)
+    // A/B switch: MACH_MOE_GROUPED=0 keeps the hipBLAS host loop.
+    cfg.moe_grouped = std::env::var("MACH_MOE_GROUPED")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let batch = 32usize;
     let steps = 64usize;
 
@@ -61,14 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let per_step = dt.as_secs_f64() * 1e3 / steps as f64;
     println!(
         "config: d={} layers={} experts={} topk={} batch={} dtype=F16 grouped={}",
-        cfg.d_model,
-        cfg.n_layers,
-        cfg.num_experts,
-        cfg.num_experts_per_tok,
-        batch,
-        std::env::var("MACH_MOE_GROUPED")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        cfg.d_model, cfg.n_layers, cfg.num_experts, cfg.num_experts_per_tok, batch, cfg.moe_grouped
     );
     println!(
         "decode: {per_step:.3} ms/step, {:.0} tok/s (steps {steps})",
