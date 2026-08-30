@@ -59,6 +59,10 @@ pub struct Config {
     /// loop for A/B). The server parses `MACH_MOE_GROUPED` into this field —
     /// the library itself reads no MoE env.
     pub moe_grouped: bool,
+    /// Step profiler diagnostic: per-layer attention/MoE HIP event
+    /// bracketing, reported after each decode step. The server parses
+    /// `MACH_STEP_PROFILE` into this field — the library reads no env.
+    pub step_profile: bool,
 }
 
 impl Config {
@@ -97,6 +101,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            step_profile: false,
             moe_grouped: true,
         }
     }
@@ -132,6 +137,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            step_profile: false,
             moe_grouped: true,
         }
     }
@@ -167,6 +173,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            step_profile: false,
             moe_grouped: true,
         }
     }
@@ -195,6 +202,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            step_profile: false,
             moe_grouped: true,
         }
     }
@@ -235,6 +243,7 @@ impl Config {
             qk_nope_head_dim,
             qk_rope_head_dim,
             v_head_dim,
+            step_profile: false,
             moe_grouped: true,
         }
     }

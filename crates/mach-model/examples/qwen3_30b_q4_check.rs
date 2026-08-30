@@ -60,7 +60,9 @@ fn main() {
     let model_dir = root.join("qwen3-30b-a3b");
     let cfg_path = model_dir.join("config.json");
     assert!(cfg_path.exists(), "missing {cfg_path:?}");
-    let cfg = config_from_json(&cfg_path);
+    let mut cfg = config_from_json(&cfg_path);
+    // The diagnostic example always profiles.
+    cfg.step_profile = true;
     println!(
         "config: d={} layers={} experts={} topk={} moe_inter={} vocab={}",
         cfg.d_model,

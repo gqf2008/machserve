@@ -88,10 +88,10 @@ struct Q4ExpertDev {
     wd_s: *mut f32,
 }
 
-/// Step profiler state (`MACH_STEP_PROFILE=1`): per-layer event pairs
-/// bracketing [layer start, attention done, MoE done] plus the whole-step
-/// pair. `profile_report` prints the per-step phase breakdown after the
-/// sampling sync.
+/// Step profiler state (`Config.step_profile`, parsed from the server's
+/// `MACH_STEP_PROFILE`): per-layer event pairs bracketing [layer start,
+/// attention done, MoE done] plus the whole-step pair. `report` prints the
+/// per-step phase breakdown after the sampling sync.
 struct ProfState {
     hip: std::sync::Arc<Hip>,
     /// `[layer] -> (layer_start, attn_done, moe_done)`.
@@ -303,9 +303,9 @@ pub struct BatchedModel {
     /// in-kernel; all steps (prefill included) run the grouped path, since
     /// no f16/f32 expert copy exists for the hipBLAS path.
     q4_experts: Vec<Q4ExpertDev>,
-    /// Step profiler (`MACH_STEP_PROFILE=1`): per-layer event pairs bracketing
-    /// the attention and MoE phases plus a whole-step pair; `profile_report`
-    /// prints the per-step breakdown after the sampling sync.
+    /// Step profiler (`Config.step_profile`): per-layer event pairs bracketing
+    /// the attention and MoE phases plus a whole-step pair; `report` prints
+    /// the per-step breakdown after the sampling sync.
     prof: Option<ProfState>,
     /// Tokens per KV page (paged mode).
     tokens_per_page: usize,
@@ -872,10 +872,19 @@ impl BatchedModel {
         };
         m.alloc_buffers()?;
         upload(&mut m)?;
-        // Step profiler (MACH_STEP_PROFILE=1): per-layer attention/MoE event
-        // bracketing, reported after each decode step's sampling sync.
-        if std::env::var("MACH_STEP_PROFILE").is_ok_and(|v| v != "0") {
-            m.prof = Some(ProfState::new(cfg.n_layers, &hip)?);
+        // Step profiler (Config.step_profile, from the server's
+        // MACH_STEP_PROFILE): per-layer attention/MoE event bracketing,
+        // reported after each decode step's sampling sync. A diagnostic —
+        // if event creation fails we warn and continue without it rather
+        // than failing the model load.
+        if cfg.step_profile {
+            m.prof = match ProfState::new(cfg.n_layers, &hip) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("warning: MACH_STEP_PROFILE unavailable: {e}; continuing without");
+                    None
+                }
+            };
         }
         Ok(m)
     }
@@ -2637,14 +2646,9 @@ impl BatchedModel {
             }
         }
         // Step profiler: whole-step end bracket.
-        if let Some(pf_state) = &self.prof {
-            unsafe {
-                hip::check(
-                    self.k.hip(),
-                    (self.k.hip().api.hip_event_record)(pf_state.step_events.1, self.k.stream),
-                )?;
-            }
-        }
+        // Step profiler: whole-step end bracket — placed AFTER the output head
+        // so the reported total covers the full step (final norm + lm_head in
+        // the `other` bucket).
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
         if f16 {
             if b <= GEMV_MAX_M && d <= GEMV_MAX_D {
@@ -2677,6 +2681,14 @@ impl BatchedModel {
                 c.vocab_size as i32,
                 d,
             )?;
+        }
+        if let Some(pf_state) = &self.prof {
+            unsafe {
+                hip::check(
+                    self.k.hip(),
+                    (self.k.hip().api.hip_event_record)(pf_state.step_events.1, self.k.stream),
+                )?;
+            }
         }
         Ok(())
     }

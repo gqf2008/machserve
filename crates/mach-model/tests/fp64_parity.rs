@@ -306,6 +306,7 @@ fn moe_real_three_way_fp64_parity() {
         qk_rope_head_dim: 0,
         v_head_dim: 0,
         moe_grouped: true,
+        step_profile: false,
     };
     let w: Weights = load_safetensors(&path, &cfg, true).expect("load qwen3-moe-tiny");
     let tokens = [1u32, 100, 200, 300];

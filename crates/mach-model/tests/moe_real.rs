@@ -77,6 +77,7 @@ fn qwen3_moe_tiny_cfg() -> Config {
         qk_rope_head_dim: 0,
         v_head_dim: 0,
         moe_grouped: true,
+        step_profile: false,
     }
 }
 
