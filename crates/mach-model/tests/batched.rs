@@ -1105,6 +1105,27 @@ mod paged_quantized_cpu_parity {
         assert_paged_matches_cpu(&mut contig, cfg, &wd, &prompt, 5e-2);
     }
 
+    /// Q4-on-device expert pool (in-kernel dequant) must match the
+    /// dequantized-f16 reference within the Q4-path tolerance (the reference
+    /// rounds the dequantized weights to f16; the in-kernel path keeps the
+    /// exact f32 scales). Exercises the `with_rows_q4_device` mode end-to-end
+    /// on a MoE config — decode and prefill steps both run the grouped path.
+    #[test]
+    fn batched_q4_device_moe_matches_dequantized_reference() {
+        let Some(hip) = hip_ctx() else { return };
+        let mut cfg = Config::tiny();
+        cfg.dtype = ModelDType::F16;
+        cfg.intermediate_size = 64;
+        cfg.num_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        let w = Weights::random(&cfg, 103).unwrap();
+        let wq = WeightsQ4::from_weights(&w, &cfg);
+        let wd = dequantize_q4(&wq);
+        let mut eng = BatchedModel::with_rows_q4_device(hip, cfg, &wq, 1, 4).unwrap();
+        let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
+        assert_paged_matches_cpu(&mut eng, cfg, &wd, &prompt, 5e-2);
+    }
+
     /// Control: the plain F16 engine on the unquantized f32 weights — if
     /// this fails the same way, the divergence is the harness/reference
     /// setup, not the Q4 upload path.

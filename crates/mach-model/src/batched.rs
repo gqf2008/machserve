@@ -74,6 +74,20 @@ struct LayerDevF16 {
     mla_o: *mut u16,
 }
 
+/// Storage-Q4 expert weights on device (Q4-on-device mode): the raw packed
+/// int4 bytes + per-group f32 scales per tensor, read with in-kernel dequant
+/// by the Q4 grouped GEMV kernels. No f16/f32 device copy of the expert pool
+/// — a 30B-class checkpoint's ~16GB of Q4 experts fits in VRAM where the
+/// dequantized f16 pool (~50GB) would not.
+struct Q4ExpertDev {
+    wg_q: *mut u8,
+    wg_s: *mut f32,
+    wu_q: *mut u8,
+    wu_s: *mut f32,
+    wd_q: *mut u8,
+    wd_s: *mut f32,
+}
+
 /// Multi-sequence transformer on the GPU.
 pub struct BatchedModel {
     cfg: Config,
@@ -192,6 +206,11 @@ pub struct BatchedModel {
     /// implementations), and decode on a prefill-buffered model still waits
     /// on the per-layer prefetch stream.
     moe_grouped: bool,
+    /// Q4-on-device expert weights per layer (non-empty only in the
+    /// `with_rows_q4_device` mode): the grouped GEMV kernels dequantize
+    /// in-kernel; all steps (prefill included) run the grouped path, since
+    /// no f16/f32 expert copy exists for the hipBLAS path.
+    q4_experts: Vec<Q4ExpertDev>,
     /// Tokens per KV page (paged mode).
     tokens_per_page: usize,
     /// Pages per sequence (`max_seq / tokens_per_page`, divisibility required).
@@ -437,6 +456,31 @@ impl BatchedModel {
         Self::with_rows_q4(hip, cfg, w, batch, batch)
     }
 
+    /// Builds a batched model from storage-Q4 weights (F16) with the EXPERT
+    /// POOL KEPT IN Q4 ON DEVICE: the raw packed int4 bytes + per-group f32
+    /// scales are uploaded as-is and dequantized in-kernel by the Q4 grouped
+    /// GEMV kernels. This is the memory path for 30B-class checkpoints — the
+    /// dequantized f16 expert pool (~50GB) would not fit in VRAM, the Q4 pool
+    /// (~16GB) does. Non-expert tensors (attention/MLP/router) dequantize to
+    /// f16 on upload as usual. All steps run the grouped path (no f16/f32
+    /// expert copy exists for the hipBLAS path).
+    pub fn with_rows_q4_device(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model(
+                "from_q4 requires dtype F16 (dequantize to f16 on device)".into(),
+            ));
+        }
+        Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
+            m.upload_weights_q4(w, true)
+        })
+    }
+
     /// Q4 variant of [`with_rows`]: `slots` KV slots and `rows` row capacity
     /// (prefill can pack more prompt positions per step).
     pub fn with_rows_q4(
@@ -589,7 +633,7 @@ impl BatchedModel {
             ));
         }
         Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
-            m.upload_weights_q4(w)
+            m.upload_weights_q4(w, false)
         })
     }
 
@@ -703,6 +747,7 @@ impl BatchedModel {
             moe_grouped: std::env::var("MACH_MOE_GROUPED")
                 .map(|v| v != "0")
                 .unwrap_or(true),
+            q4_experts: Vec::new(),
             tokens_per_page: 0,
             max_pages_per_seq: 0,
             block_tables: std::ptr::null_mut(),
@@ -1200,7 +1245,13 @@ impl BatchedModel {
     /// buffer is freed after each upload. The router keeps its exact f32 copy
     /// in `LayerDev` (Q4 does not quantize it) plus the usual f16 copy for the
     /// fp16 GEMM path.
-    fn upload_weights_q4(&mut self, w: &WeightsQ4) -> Result<(), Error> {
+    /// Uploads storage-Q4 weights as f16 (dense/MoE/MLA F16 path): norms and
+    /// biases stay f32; GEMM matrices are dequantized per tensor and uploaded.
+    /// With `q4_on_device`, the MoE EXPERT tensors stay raw Q4 (packed int4
+    /// bytes + per-group f32 scales) in `self.q4_experts`, dequantized
+    /// in-kernel by the Q4 grouped GEMV kernels — the memory path for
+    /// 30B-class checkpoints (Q4 pool ~16GB vs the dequantized f16 ~50GB).
+    fn upload_weights_q4(&mut self, w: &WeightsQ4, q4_on_device: bool) -> Result<(), Error> {
         self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
         self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
         self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
@@ -1249,9 +1300,21 @@ impl BatchedModel {
                 wu: self.alloc_f16(lw.wu.len())?,
                 wd: self.alloc_f16(lw.wd.len())?,
                 moe_router: self.alloc_f16(lw.moe_router.len())?,
-                moe_wg: self.alloc_f16(lw.moe_wg.len())?,
-                moe_wu: self.alloc_f16(lw.moe_wu.len())?,
-                moe_wd: self.alloc_f16(lw.moe_wd.len())?,
+                moe_wg: if q4_on_device {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.moe_wg.len())?
+                },
+                moe_wu: if q4_on_device {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.moe_wu.len())?
+                },
+                moe_wd: if q4_on_device {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.moe_wd.len())?
+                },
                 mla_q_a: self.alloc_f16(lw.mla_q_a.len())?,
                 mla_q_b: self.alloc_f16(lw.mla_q_b.len())?,
                 mla_q_rope: self.alloc_f16(lw.mla_q_rope.len())?,
@@ -1267,9 +1330,23 @@ impl BatchedModel {
             self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
             self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
             self.upload_f16(l16.moe_router, &lw.moe_router)?;
-            self.upload_f16_bits(l16.moe_wg, &lw.moe_wg.dequantize_f16())?;
-            self.upload_f16_bits(l16.moe_wu, &lw.moe_wu.dequantize_f16())?;
-            self.upload_f16_bits(l16.moe_wd, &lw.moe_wd.dequantize_f16())?;
+            if q4_on_device {
+                // Expert pool stays raw Q4: upload the packed bytes + per-group
+                // scales as-is (in-kernel dequant reads them directly).
+                let q4 = Q4ExpertDev {
+                    wg_q: self.upload_bytes(lw.moe_wg.q_bytes())?,
+                    wg_s: self.upload_f32s(lw.moe_wg.scales())?,
+                    wu_q: self.upload_bytes(lw.moe_wu.q_bytes())?,
+                    wu_s: self.upload_f32s(lw.moe_wu.scales())?,
+                    wd_q: self.upload_bytes(lw.moe_wd.q_bytes())?,
+                    wd_s: self.upload_f32s(lw.moe_wd.scales())?,
+                };
+                self.q4_experts.push(q4);
+            } else {
+                self.upload_f16_bits(l16.moe_wg, &lw.moe_wg.dequantize_f16())?;
+                self.upload_f16_bits(l16.moe_wu, &lw.moe_wu.dequantize_f16())?;
+                self.upload_f16_bits(l16.moe_wd, &lw.moe_wd.dequantize_f16())?;
+            }
             self.upload_f16_bits(l16.mla_q_a, &lw.mla_q_a.dequantize_f16())?;
             self.upload_f16_bits(l16.mla_q_b, &lw.mla_q_b.dequantize_f16())?;
             self.upload_f16_bits(l16.mla_q_rope, &lw.mla_q_rope.dequantize_f16())?;
@@ -1279,6 +1356,26 @@ impl BatchedModel {
             self.layers_f16.push(l16);
         }
         Ok(())
+    }
+
+    /// Uploads raw bytes to a fresh device allocation.
+    fn upload_bytes(&mut self, src: &[u8]) -> Result<*mut u8, Error> {
+        let p = self.dalloc(src.len())?;
+        hip::memcpy(
+            self.k.hip(),
+            p as *mut core::ffi::c_void,
+            src.as_ptr() as *const core::ffi::c_void,
+            src.len(),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )?;
+        Ok(p as *mut u8)
+    }
+
+    /// Uploads f32s to a fresh device allocation.
+    fn upload_f32s(&mut self, src: &[f32]) -> Result<*mut f32, Error> {
+        let p = self.dalloc(src.len() * 4)?;
+        self.upload(p as *mut f32, src)?;
+        Ok(p as *mut f32)
     }
 
     /// Uploads storage-FP8 weights as f16 (dense/MoE/MLA F16 path): norms and
@@ -2057,7 +2154,10 @@ impl BatchedModel {
                     // (they serialized every MoE layer of every decode step on
                     // the host). Larger chunked-prefill steps keep the hipBLAS
                     // path, where m>1 rows per expert make weight reuse pay.
-                    let grouped = self.moe_grouped && decode_only;
+                    // Q4-on-device mode has no f16/f32 expert copy, so it runs
+                    // the grouped path for EVERY step (prefill included).
+                    let grouped = (self.moe_grouped && decode_only)
+                        || !self.q4_experts.is_empty();
                     // Buffered prefill: run the grouped GEMMs from the
                     // weights prefetched on the separate stream. Placement is a
                     // numeric no-op, so output matches the full-resident path.
@@ -2096,49 +2196,85 @@ impl BatchedModel {
                             // computes row positions inline. 4 launches per
                             // MoE layer.
                             let rows_total = b * topk;
-                            // Full-layer expert weights for this layer.
-                            let (wg16, wu16, wd16) = if f16 {
-                                let l = self.layers_f16[li];
-                                (l.moe_wg, l.moe_wu, l.moe_wd)
+                            if let Some(q) = self.q4_experts.get(li) {
+                                // Q4-on-device: in-kernel dequant from the raw
+                                // packed int4 + per-group scales (the only
+                                // expert copy on device).
+                                k.launch_moe_grouped_gate_up_q4(
+                                    self.xn2,
+                                    self.exp_ids,
+                                    q.wg_q,
+                                    q.wg_s,
+                                    q.wu_q,
+                                    q.wu_s,
+                                    self.gate_all,
+                                    self.up_all,
+                                    rows_total,
+                                    einter,
+                                    d,
+                                    topk,
+                                )?;
+                                k.launch_silu_mul(
+                                    self.up_all,
+                                    self.gate_all,
+                                    self.eh_all,
+                                    rows_total * einter,
+                                )?;
+                                k.launch_moe_grouped_down_q4(
+                                    self.eh_all,
+                                    self.exp_ids,
+                                    q.wd_q,
+                                    q.wd_s,
+                                    self.down_all,
+                                    rows_total,
+                                    d,
+                                    einter,
+                                )?;
                             } else {
-                                (
-                                    std::ptr::null_mut(),
-                                    std::ptr::null_mut(),
-                                    std::ptr::null_mut(),
-                                )
-                            };
-                            k.launch_moe_grouped_gate_up(
-                                self.xn2,
-                                self.exp_ids,
-                                wg_base,
-                                wu_base,
-                                wg16,
-                                wu16,
-                                self.gate_all,
-                                self.up_all,
-                                rows_total,
-                                einter,
-                                d,
-                                topk,
-                                f16,
-                            )?;
-                            k.launch_silu_mul(
-                                self.up_all,
-                                self.gate_all,
-                                self.eh_all,
-                                rows_total * einter,
-                            )?;
-                            k.launch_moe_grouped_down(
-                                self.eh_all,
-                                self.exp_ids,
-                                wd_base,
-                                wd16,
-                                self.down_all,
-                                rows_total,
-                                d,
-                                einter,
-                                f16,
-                            )?;
+                                // Full-layer expert weights for this layer.
+                                let (wg16, wu16, wd16) = if f16 {
+                                    let l = self.layers_f16[li];
+                                    (l.moe_wg, l.moe_wu, l.moe_wd)
+                                } else {
+                                    (
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                k.launch_moe_grouped_gate_up(
+                                    self.xn2,
+                                    self.exp_ids,
+                                    wg_base,
+                                    wu_base,
+                                    wg16,
+                                    wu16,
+                                    self.gate_all,
+                                    self.up_all,
+                                    rows_total,
+                                    einter,
+                                    d,
+                                    topk,
+                                    f16,
+                                )?;
+                                k.launch_silu_mul(
+                                    self.up_all,
+                                    self.gate_all,
+                                    self.eh_all,
+                                    rows_total * einter,
+                                )?;
+                                k.launch_moe_grouped_down(
+                                    self.eh_all,
+                                    self.exp_ids,
+                                    wd_base,
+                                    wd16,
+                                    self.down_all,
+                                    rows_total,
+                                    d,
+                                    einter,
+                                    f16,
+                                )?;
+                            }
                             k.launch_moe_scatter_all(
                                 self.h_acc,
                                 self.exp_w,

@@ -1786,6 +1786,83 @@ extern "C" __global__ void moe_grouped_down_f16(
 }
 "#;
 
+/// Storage-Q4 variant of [`MOE_GROUPED_GATE_UP`]: weights are the raw packed
+/// int4 bytes + per-group f32 scales (`Q4_GROUP = 32`, the `Q4Tensor` layout),
+/// dequantized in-kernel — no f16/f32 device copy of the expert pool, so a
+/// 30B-class checkpoint's ~16GB of Q4 experts fits in VRAM where the
+/// dequantized f16 pool (~50GB) would not. The dequant is exact (f32 scale
+/// multiply), so this path matches the host `dequantize()` + f16-upload
+/// reference up to the reference's f16 rounding.
+const MOE_GROUPED_GATE_UP_Q4: &str = r#"
+#define Q4_GROUP 32
+__device__ inline float q4_val(const unsigned char* q, const float* s, long long idx) {
+    int g = (int)(idx / Q4_GROUP);
+    unsigned char byte = q[idx / 2];
+    int nib = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+    int v = nib < 8 ? nib : nib - 16;
+    return s[g] * (float)v;
+}
+extern "C" __global__ void moe_grouped_gate_up_q4(
+    const float* __restrict__ x,
+    const int* __restrict__ ids,
+    const unsigned char* __restrict__ wg_q,
+    const float* __restrict__ wg_s,
+    const unsigned char* __restrict__ wu_q,
+    const float* __restrict__ wu_s,
+    float* __restrict__ gate_all,
+    float* __restrict__ up_all,
+    int einter, int d, int topk) {
+    int r = blockIdx.x;
+    int t = r / topk;
+    int e = ids[r];
+    const float* xr = x + (long long)t * d;
+    for (int o = blockIdx.y * blockDim.x + threadIdx.x; o < einter;
+         o += gridDim.y * blockDim.x) {
+        long long base = ((long long)e * einter + o) * d;
+        float ag = 0.f, au = 0.f;
+        for (int k = 0; k < d; k++) {
+            float xv = xr[k];
+            ag += xv * q4_val(wg_q, wg_s, base + k);
+            au += xv * q4_val(wu_q, wu_s, base + k);
+        }
+        gate_all[(long long)r * einter + o] = ag;
+        up_all[(long long)r * einter + o] = au;
+    }
+}
+"#;
+
+/// Storage-Q4 variant of [`MOE_GROUPED_DOWN`] (see
+/// [`MOE_GROUPED_GATE_UP_Q4`] for the layout/dequant contract).
+const MOE_GROUPED_DOWN_Q4: &str = r#"
+#define Q4_GROUP 32
+__device__ inline float q4_val(const unsigned char* q, const float* s, long long idx) {
+    int g = (int)(idx / Q4_GROUP);
+    unsigned char byte = q[idx / 2];
+    int nib = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+    int v = nib < 8 ? nib : nib - 16;
+    return s[g] * (float)v;
+}
+extern "C" __global__ void moe_grouped_down_q4(
+    const float* __restrict__ eh,
+    const int* __restrict__ ids,
+    const unsigned char* __restrict__ wd_q,
+    const float* __restrict__ wd_s,
+    float* __restrict__ down_all,
+    int rows, int d, int einter) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)rows * d;
+    if (idx >= total) return;
+    int r = (int)(idx / d);
+    int o = (int)(idx % d);
+    int e = ids[r];
+    const float* eh_r = eh + (long long)r * einter;
+    long long base = ((long long)e * d + o) * einter;
+    float acc = 0.f;
+    for (int k = 0; k < einter; k++) acc += eh_r[k] * q4_val(wd_q, wd_s, base + k);
+    down_all[idx] = acc;
+}
+"#;
+
 /// Whole-grouped-range scatter for the decode path, in DETERMINISTIC token
 /// order: one thread per `(token, out-dim)` accumulates the token's `topk`
 /// expert contributions in fixed `k` order. Under the token-major layout the
@@ -1894,6 +1971,8 @@ pub struct HipKernels {
     moe_grouped_gate_up_f16: HipKernelModule,
     moe_grouped_down: HipKernelModule,
     moe_grouped_down_f16: HipKernelModule,
+    moe_grouped_gate_up_q4: HipKernelModule,
+    moe_grouped_down_q4: HipKernelModule,
     moe_scatter_all: HipKernelModule,
 }
 
@@ -2047,6 +2126,16 @@ impl HipKernels {
                 &arch,
                 MOE_GROUPED_DOWN_F16,
                 "moe_grouped_down_f16",
+            )?,
+            moe_grouped_gate_up_q4: compile_cached(
+                &arch,
+                MOE_GROUPED_GATE_UP_Q4,
+                "moe_grouped_gate_up_q4",
+            )?,
+            moe_grouped_down_q4: compile_cached(
+                &arch,
+                MOE_GROUPED_DOWN_Q4,
+                "moe_grouped_down_q4",
             )?,
             moe_scatter_all: compile_cached(&arch, MOE_SCATTER_ALL, "moe_scatter_all")?,
         };
@@ -3738,6 +3827,95 @@ impl HipKernels {
         Ok(kern.launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    /// Storage-Q4 grouped gate+up GEMV (one launch for all routed rows):
+    /// weights dequantized in-kernel from the raw packed int4 bytes +
+    /// per-group f32 scales — no f16/f32 device copy of the expert pool
+    /// (the 30B-class Q4-on-device path; see [`MOE_GROUPED_GATE_UP_Q4`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_grouped_gate_up_q4(
+        &self,
+        x: *const f32,
+        ids: *const i32,
+        wg_q: *const u8,
+        wg_s: *const f32,
+        wu_q: *const u8,
+        wu_s: *const f32,
+        gate_all: *mut f32,
+        up_all: *mut f32,
+        rows: i32,
+        einter: i32,
+        d: i32,
+        topk: i32,
+    ) -> Result<(), Error> {
+        let xp = x;
+        let idp = ids;
+        let wgqp = wg_q;
+        let wgsp = wg_s;
+        let wuqp = wu_q;
+        let wusp = wu_s;
+        let gap = gate_all;
+        let uap = up_all;
+        let ytiles = (einter as u32).div_ceil(256).max(1);
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &idp as *const *const i32 as *mut core::ffi::c_void,
+            &wgqp as *const *const u8 as *mut core::ffi::c_void,
+            &wgsp as *const *const f32 as *mut core::ffi::c_void,
+            &wuqp as *const *const u8 as *mut core::ffi::c_void,
+            &wusp as *const *const f32 as *mut core::ffi::c_void,
+            &gap as *const *mut f32 as *mut core::ffi::c_void,
+            &uap as *const *mut f32 as *mut core::ffi::c_void,
+            &einter as *const i32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+            &topk as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.moe_grouped_gate_up_q4.launch(
+            [rows as u32, ytiles, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
+    /// Storage-Q4 grouped down-projection GEMV (see
+    /// [`MOE_GROUPED_DOWN_Q4`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_grouped_down_q4(
+        &self,
+        eh: *const f32,
+        ids: *const i32,
+        wd_q: *const u8,
+        wd_s: *const f32,
+        down_all: *mut f32,
+        rows: i32,
+        d: i32,
+        einter: i32,
+    ) -> Result<(), Error> {
+        let ehp = eh;
+        let idp = ids;
+        let wdqp = wd_q;
+        let wdsp = wd_s;
+        let dap = down_all;
+        let total = rows * d;
+        let blocks = (total as u32).div_ceil(256).max(1);
+        let mut p = vec![
+            &ehp as *const *const f32 as *mut core::ffi::c_void,
+            &idp as *const *const i32 as *mut core::ffi::c_void,
+            &wdqp as *const *const u8 as *mut core::ffi::c_void,
+            &wdsp as *const *const f32 as *mut core::ffi::c_void,
+            &dap as *const *mut f32 as *mut core::ffi::c_void,
+            &rows as *const i32 as *mut core::ffi::c_void,
+            &d as *const i32 as *mut core::ffi::c_void,
+            &einter as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.moe_grouped_down_q4.launch(
+            [blocks, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
     /// Whole-token-range scatter for the decode path, in deterministic
     /// token order (fixed `k` accumulation — no atomics, no host-side
     /// counts; run-to-run reproducible). Reads the router weights `w`
@@ -3897,6 +4075,8 @@ mod offline_tests {
         MOE_GROUPED_GATE_UP_F16,
         MOE_GROUPED_DOWN,
         MOE_GROUPED_DOWN_F16,
+        MOE_GROUPED_GATE_UP_Q4,
+        MOE_GROUPED_DOWN_Q4,
         MOE_SCATTER_ALL,
         KV_STORE_PAGED,
         ATTN_DECODE_PAGED,
@@ -3916,7 +4096,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            48,
+            50,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
