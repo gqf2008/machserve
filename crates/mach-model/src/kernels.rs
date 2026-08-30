@@ -1062,6 +1062,42 @@ extern "C" __global__ void cast_f32_f16(const float* x, unsigned short* y, int n
 }
 "#;
 
+/// fp16 GEMV for small-m decode GEMMs: `out[b, n] = x[b, d] @ w[n, d]^T` with
+/// f16 weights and f32 accumulation, ONE WARP PER (row, output) — 32 lanes
+/// cover d/32 of the weight row each, then a butterfly reduction (fixed
+/// order, deterministic). Replaces the rocBLAS m=1/small-m hipBLAS calls,
+/// whose m=1 kernels run the 30B-class decode 60x over the memory bound.
+/// CONTRACT (mirrors the MoE grouped kernels): activations f32 (staged to
+/// shared), weights f16, results f32 DIRECTLY — no f16 output rounding, so
+/// this path is the higher-precision variant of the hipBLAS f16 GEMM (which
+/// rounds `yh` to f16 before the f32 cast). Grid covers `batch` in y.
+/// Shared memory: one x row (d × 4B, ≤ 48 KB guard at launch).
+const GEMV_F16: &str = r#"
+__device__ inline float gemv_f16_val(unsigned short h) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = h;
+    return (float)c.h;
+}
+extern "C" __global__ void gemv_f16(
+    const float* __restrict__ x,
+    const unsigned short* __restrict__ w,
+    float* __restrict__ out,
+    int n, int d) {
+    extern __shared__ float sx[];
+    const int b = blockIdx.y;
+    for (int k = threadIdx.x; k < d; k += blockDim.x) sx[k] = x[(long long)b * d + k];
+    __syncthreads();
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int lane = threadIdx.x & 31;
+    if (warp >= n) return;
+    const unsigned short* wj = w + (long long)warp * d;
+    float acc = 0.f;
+    for (int k = lane; k < d; k += 32) acc += sx[k] * gemv_f16_val(wj[k]);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+    if (lane == 0) out[(long long)b * n + warp] = acc;
+}
+"#;
+
 /// fp16 -> f32 cast (device conversion matches `crate::fp16::f16_to_f32`).
 const CAST_F16_F32: &str = r#"
 __device__ inline float f16_to_f32(unsigned short h) {
@@ -1653,10 +1689,12 @@ extern "C" __global__ void moe_scatter_add(
 /// independent 1-row GEMV, so no per-expert counts are needed on the host —
 /// the whole gate+up projection runs as ONE launch (the host hipBLAS loop it
 /// replaces needed the counts read back plus a full stream sync and fired
-/// `3*ne` small GEMMs per layer). One block per routed row; threads tile the
-/// `einter` outputs and stream the expert's weight rows once (x is L1/L2
-/// resident). Reads the TOKEN-MAJOR input `x` directly: row `r` belongs to
-/// token `r / topk`, and its expert is `ids[r]` (the router's `[batch, topk]`
+/// `3*ne` small GEMMs per layer). BLOCK PER (routed row, output): 128 lanes
+/// stride the d reduction then a shared-memory tree reduce — small-batch
+/// decode (b=1) needs ~rows×einter×threads of parallelism to hide memory
+/// latency, which the previous block-per-row layout (rows×3 blocks) starved.
+/// Reads the TOKEN-MAJOR input `x` directly: row `r` belongs to token
+/// `r / topk`, and its expert is `ids[r]` (the router's `[batch, topk]`
 /// assignment) — the token-major layout is the identity, so no gather launch
 /// precedes this kernel.
 const MOE_GROUPED_GATE_UP: &str = r#"
@@ -1668,24 +1706,33 @@ extern "C" __global__ void moe_grouped_gate_up(
     float* __restrict__ gate_all,
     float* __restrict__ up_all,
     int einter, int d, int topk) {
+    __shared__ float s_ag[128];
+    __shared__ float s_au[128];
     int r = blockIdx.x;
+    int o = blockIdx.y;
     int t = r / topk;
     int e = ids[r];
     const float* xr = x + (long long)t * d;
-    const float* wg_e = wg + (long long)e * einter * d;
-    const float* wu_e = wu + (long long)e * einter * d;
-    for (int o = blockIdx.y * blockDim.x + threadIdx.x; o < einter;
-         o += gridDim.y * blockDim.x) {
-        const float* wgr = wg_e + (long long)o * d;
-        const float* wur = wu_e + (long long)o * d;
-        float ag = 0.f, au = 0.f;
-        for (int k = 0; k < d; k++) {
-            float xv = xr[k];
-            ag += xv * wgr[k];
-            au += xv * wur[k];
+    long long wbase = (long long)e * einter * d + (long long)o * d;
+    float ag = 0.f, au = 0.f;
+    for (int k = threadIdx.x; k < d; k += blockDim.x) {
+        float xv = xr[k];
+        ag += xv * wg[wbase + k];
+        au += xv * wu[wbase + k];
+    }
+    s_ag[threadIdx.x] = ag;
+    s_au[threadIdx.x] = au;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) {
+            s_ag[threadIdx.x] += s_ag[threadIdx.x + off];
+            s_au[threadIdx.x] += s_au[threadIdx.x + off];
         }
-        gate_all[(long long)r * einter + o] = ag;
-        up_all[(long long)r * einter + o] = au;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        gate_all[(long long)r * einter + o] = s_ag[0];
+        up_all[(long long)r * einter + o] = s_au[0];
     }
 }
 "#;
@@ -1711,31 +1758,41 @@ extern "C" __global__ void moe_grouped_gate_up_f16(
     float* __restrict__ gate_all,
     float* __restrict__ up_all,
     int einter, int d, int topk) {
+    __shared__ float s_ag[128];
+    __shared__ float s_au[128];
     int r = blockIdx.x;
+    int o = blockIdx.y;
     int t = r / topk;
     int e = ids[r];
     const float* xr = x + (long long)t * d;
-    const unsigned short* wg_e = wg + (long long)e * einter * d;
-    const unsigned short* wu_e = wu + (long long)e * einter * d;
-    for (int o = blockIdx.y * blockDim.x + threadIdx.x; o < einter;
-         o += gridDim.y * blockDim.x) {
-        const unsigned short* wgr = wg_e + (long long)o * d;
-        const unsigned short* wur = wu_e + (long long)o * d;
-        float ag = 0.f, au = 0.f;
-        for (int k = 0; k < d; k++) {
-            float xv = xr[k];
-            ag += xv * f16_bits_to_f32(wgr[k]);
-            au += xv * f16_bits_to_f32(wur[k]);
+    long long wbase = (long long)e * einter * d + (long long)o * d;
+    float ag = 0.f, au = 0.f;
+    for (int k = threadIdx.x; k < d; k += blockDim.x) {
+        float xv = xr[k];
+        ag += xv * f16_bits_to_f32(wg[wbase + k]);
+        au += xv * f16_bits_to_f32(wu[wbase + k]);
+    }
+    s_ag[threadIdx.x] = ag;
+    s_au[threadIdx.x] = au;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) {
+            s_ag[threadIdx.x] += s_ag[threadIdx.x + off];
+            s_au[threadIdx.x] += s_au[threadIdx.x + off];
         }
-        gate_all[(long long)r * einter + o] = ag;
-        up_all[(long long)r * einter + o] = au;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        gate_all[(long long)r * einter + o] = s_ag[0];
+        up_all[(long long)r * einter + o] = s_au[0];
     }
 }
 "#;
 
-/// Decode-path grouped down-projection GEMV: one thread per `(row, out)`,
-/// K-loop streams the expert's contiguous `wd` row (coalesced along k).
-/// Expert from `ids[r]` (token-major layout — see [`MOE_GROUPED_GATE_UP`]).
+/// Decode-path grouped down-projection GEMV: BLOCK PER (row, out) — 128
+/// lanes stride the einter reduction then a shared tree reduce (small-batch
+/// parallelism; see [`MOE_GROUPED_GATE_UP`]). Expert from `ids[r]`
+/// (token-major layout).
 const MOE_GROUPED_DOWN: &str = r#"
 extern "C" __global__ void moe_grouped_down(
     const float* __restrict__ eh,
@@ -1743,17 +1800,23 @@ extern "C" __global__ void moe_grouped_down(
     const float* __restrict__ wd,
     float* __restrict__ down_all,
     int rows, int d, int einter) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)rows * d;
-    if (idx >= total) return;
-    int r = (int)(idx / d);
-    int o = (int)(idx % d);
+    __shared__ float s_acc[128];
+    int r = blockIdx.x;
+    int o = blockIdx.y;
     int e = ids[r];
+    long long wbase = ((long long)e * d + o) * einter;
     const float* eh_r = eh + (long long)r * einter;
-    const float* wd_r = wd + ((long long)e * d + o) * einter;
     float acc = 0.f;
-    for (int k = 0; k < einter; k++) acc += eh_r[k] * wd_r[k];
-    down_all[idx] = acc;
+    for (int k = threadIdx.x; k < einter; k += blockDim.x) {
+        acc += eh_r[k] * wd[wbase + k];
+    }
+    s_acc[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) s_acc[threadIdx.x] += s_acc[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) down_all[(long long)r * d + o] = s_acc[0];
 }
 "#;
 
@@ -1771,18 +1834,23 @@ extern "C" __global__ void moe_grouped_down_f16(
     const unsigned short* __restrict__ wd,
     float* __restrict__ down_all,
     int rows, int d, int einter) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)rows * d;
-    if (idx >= total) return;
-    int r = (int)(idx / d);
-    int o = (int)(idx % d);
+    __shared__ float s_acc[128];
+    int r = blockIdx.x;
+    int o = blockIdx.y;
     int e = ids[r];
+    long long wbase = ((long long)e * d + o) * einter;
     const float* eh_r = eh + (long long)r * einter;
-    const unsigned short* wd_r =
-        wd + ((long long)e * d + o) * einter;
     float acc = 0.f;
-    for (int k = 0; k < einter; k++) acc += eh_r[k] * f16_bits_to_f32(wd_r[k]);
-    down_all[idx] = acc;
+    for (int k = threadIdx.x; k < einter; k += blockDim.x) {
+        acc += eh_r[k] * f16_bits_to_f32(wd[wbase + k]);
+    }
+    s_acc[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) s_acc[threadIdx.x] += s_acc[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) down_all[(long long)r * d + o] = s_acc[0];
 }
 "#;
 
@@ -1812,21 +1880,37 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
     float* __restrict__ gate_all,
     float* __restrict__ up_all,
     int einter, int d, int topk) {
+    // Block per (routed row, output): 128 lanes stride the d reduction, then
+    // a shared-memory tree reduce. Small-batch decode (b=1 -> rows*192
+    // blocks here) needs ~800K threads to hide memory latency; the previous
+    // block-per-row layout ran 24 blocks total and starved at ~5 GB/s.
+    __shared__ float s_ag[128];
+    __shared__ float s_au[128];
     int r = blockIdx.x;
+    int o = blockIdx.y;
     int t = r / topk;
     int e = ids[r];
+    long long wbase = ((long long)e * einter + o) * d;
     const float* xr = x + (long long)t * d;
-    for (int o = blockIdx.y * blockDim.x + threadIdx.x; o < einter;
-         o += gridDim.y * blockDim.x) {
-        long long base = ((long long)e * einter + o) * d;
-        float ag = 0.f, au = 0.f;
-        for (int k = 0; k < d; k++) {
-            float xv = xr[k];
-            ag += xv * q4_val(wg_q, wg_s, base + k);
-            au += xv * q4_val(wu_q, wu_s, base + k);
+    float ag = 0.f, au = 0.f;
+    for (int k = threadIdx.x; k < d; k += blockDim.x) {
+        float xv = xr[k];
+        ag += xv * q4_val(wg_q, wg_s, wbase + k);
+        au += xv * q4_val(wu_q, wu_s, wbase + k);
+    }
+    s_ag[threadIdx.x] = ag;
+    s_au[threadIdx.x] = au;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) {
+            s_ag[threadIdx.x] += s_ag[threadIdx.x + off];
+            s_au[threadIdx.x] += s_au[threadIdx.x + off];
         }
-        gate_all[(long long)r * einter + o] = ag;
-        up_all[(long long)r * einter + o] = au;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        gate_all[(long long)r * einter + o] = s_ag[0];
+        up_all[(long long)r * einter + o] = s_au[0];
     }
 }
 "#;
@@ -1849,17 +1933,25 @@ extern "C" __global__ void moe_grouped_down_q4(
     const float* __restrict__ wd_s,
     float* __restrict__ down_all,
     int rows, int d, int einter) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)rows * d;
-    if (idx >= total) return;
-    int r = (int)(idx / d);
-    int o = (int)(idx % d);
+    // Block per (routed row, output dim): 128 lanes stride the einter
+    // reduction (see the gate_up_q4 note on small-batch parallelism).
+    __shared__ float s_acc[128];
+    int r = blockIdx.x;
+    int o = blockIdx.y;
     int e = ids[r];
+    long long wbase = ((long long)e * d + o) * einter;
     const float* eh_r = eh + (long long)r * einter;
-    long long base = ((long long)e * d + o) * einter;
     float acc = 0.f;
-    for (int k = 0; k < einter; k++) acc += eh_r[k] * q4_val(wd_q, wd_s, base + k);
-    down_all[idx] = acc;
+    for (int k = threadIdx.x; k < einter; k += blockDim.x) {
+        acc += eh_r[k] * q4_val(wd_q, wd_s, wbase + k);
+    }
+    s_acc[threadIdx.x] = acc;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) s_acc[threadIdx.x] += s_acc[threadIdx.x + off];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) down_all[(long long)r * d + o] = s_acc[0];
 }
 "#;
 
@@ -1955,6 +2047,7 @@ pub struct HipKernels {
     argmax_batched: HipKernelModule,
     cast_f32_f16: HipKernelModule,
     cast_f16_f32: HipKernelModule,
+    gemv_f16: HipKernelModule,
     embed_f16: HipKernelModule,
     kv_store_f16: HipKernelModule,
     attn_f16_gqa: HipKernelModule,
@@ -2099,6 +2192,7 @@ impl HipKernels {
             argmax_batched: compile_cached(&arch, ARGMAX_BATCHED, "argmax_batched")?,
             cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
             cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
+            gemv_f16: compile_cached(&arch, GEMV_F16, "gemv_f16")?,
             embed_f16: compile_cached(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
             kv_store_f16: compile_cached(&arch, KV_F16, "kv_store_batched_f16")?,
             attn_f16_gqa: compile_cached(
@@ -2943,6 +3037,48 @@ impl HipKernels {
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    /// fp16 GEMV for small-m decode GEMMs: `out[b, n] = x[b, d] @ w[n, d]^T`,
+    /// f16 weights streamed once, f32 accumulation, f32 output DIRECTLY (no
+    /// f16 `yh` round-trip — see the [`GEMV_F16`] contract). One warp per
+    /// (row, output); shared memory stages the row's activations.
+    /// Shared memory = `d * 4` bytes — the caller guards `d <= 12_288`
+    /// (48 KB shared limit); larger `d` must use the hipBLAS path.
+    pub fn launch_gemv_f16(
+        &self,
+        out: *mut f32,
+        x: *const f32,
+        w16: *const u16,
+        n: i32,
+        d: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        assert!(
+            (d as usize) * 4 <= 48 * 1024,
+            "gemv_f16: d={d} exceeds the 48 KB shared-memory staging limit"
+        );
+        let op = out;
+        let xp = x;
+        let wp = w16;
+        let ni = n;
+        let di = d;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &wp as *const *const u16 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &ni as *const i32 as *mut core::ffi::c_void,
+            &di as *const i32 as *mut core::ffi::c_void,
+        ];
+        let warps_per_block = 256 / 32;
+        let blocks = (n as u32).div_ceil(warps_per_block);
+        Ok(self.gemv_f16.launch_shmem(
+            [blocks, batch as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            (d as u32) * 4,
+        )?)
+    }
+
     /// Embedding gather from an fp16 table into f32 activations (2D grid:
     /// `blockIdx.y` = sequence, `blockIdx.x` covers columns).
     pub fn launch_embed_f16(
@@ -3730,7 +3866,6 @@ impl HipKernels {
         let idp = ids;
         let gap = gate_all;
         let uap = up_all;
-        let ytiles = (einter as u32).div_ceil(256).max(1);
         // The f32 and f16 kernels have identical parameter LISTS but the
         // weight pointers differ in type — build the matching vector per
         // variant.
@@ -3767,7 +3902,12 @@ impl HipKernels {
             ];
             kern = &self.moe_grouped_gate_up;
         }
-        Ok(kern.launch([rows as u32, ytiles, 1], [256, 1, 1], &mut p, self.stream)?)
+        Ok(kern.launch(
+            [rows as u32, einter as u32, 1],
+            [128, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
     }
 
     /// Decode-path grouped MoE down-projection GEMV (one launch for all
@@ -3789,8 +3929,6 @@ impl HipKernels {
         let ehp = eh;
         let idp = ids;
         let dap = down_all;
-        let total = rows * d;
-        let blocks = (total as u32).div_ceil(256).max(1);
         // The f32 and f16 kernels take different parameter lists (one
         // weight pointer each).
         let kern;
@@ -3820,7 +3958,7 @@ impl HipKernels {
             ];
             kern = &self.moe_grouped_down;
         }
-        Ok(kern.launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+        Ok(kern.launch([rows as u32, d as u32, 1], [128, 1, 1], &mut p, self.stream)?)
     }
 
     /// Storage-Q4 grouped gate+up GEMV (one launch for all routed rows):
@@ -3851,7 +3989,6 @@ impl HipKernels {
         let wusp = wu_s;
         let gap = gate_all;
         let uap = up_all;
-        let ytiles = (einter as u32).div_ceil(256).max(1);
         let mut p = vec![
             &xp as *const *const f32 as *mut core::ffi::c_void,
             &idp as *const *const i32 as *mut core::ffi::c_void,
@@ -3866,8 +4003,8 @@ impl HipKernels {
             &topk as *const i32 as *mut core::ffi::c_void,
         ];
         Ok(self.moe_grouped_gate_up_q4.launch(
-            [rows as u32, ytiles, 1],
-            [256, 1, 1],
+            [rows as u32, einter as u32, 1],
+            [128, 1, 1],
             &mut p,
             self.stream,
         )?)
@@ -3892,8 +4029,6 @@ impl HipKernels {
         let wdqp = wd_q;
         let wdsp = wd_s;
         let dap = down_all;
-        let total = rows * d;
-        let blocks = (total as u32).div_ceil(256).max(1);
         let mut p = vec![
             &ehp as *const *const f32 as *mut core::ffi::c_void,
             &idp as *const *const i32 as *mut core::ffi::c_void,
@@ -3904,9 +4039,12 @@ impl HipKernels {
             &d as *const i32 as *mut core::ffi::c_void,
             &einter as *const i32 as *mut core::ffi::c_void,
         ];
-        Ok(self
-            .moe_grouped_down_q4
-            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+        Ok(self.moe_grouped_down_q4.launch(
+            [rows as u32, d as u32, 1],
+            [128, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
     }
 
     /// Whole-token-range scatter for the decode path, in deterministic
@@ -4052,6 +4190,7 @@ mod offline_tests {
         ARGMAX_BATCHED,
         CAST_F32_F16,
         CAST_F16_F32,
+        GEMV_F16,
         KV_F16,
         ATTN_DECODE_BATCHED_F16_GQA,
         ATTN_PREFILL_F16,
@@ -4089,7 +4228,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            50,
+            51,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
@@ -4737,6 +4876,124 @@ mod gpu_tests {
             dwu,
             dwd,
         ] {
+            hip::free(&h, p).unwrap();
+        }
+    }
+
+    /// GEMV_F16 vs the rocBLAS m=1 path (gemm_f16) on a 2048×2048 decode
+    /// shape: the GEMV keeps f32 results directly (no f16 `yh` rounding), so
+    /// the tolerance covers the reference's f16 output rounding. Also prints
+    /// both timings — the whole point of the kernel is that rocBLAS m=1 runs
+    /// ~60x over the memory bound on the 30B-class decode.
+    #[test]
+    fn gemv_f16_matches_and_beats_rocblas_m1() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let n = 2048usize;
+        let d = 2048usize;
+        let mut rng = lcg(31);
+        let x: Vec<f32> = (0..d).map(|_| rng()).collect();
+        let w: Vec<f32> = (0..n * d).map(|_| rng()).collect();
+        let to_f16 =
+            |v: &[f32]| -> Vec<u16> { v.iter().map(|&x| crate::fp16::f32_to_f16(x)).collect() };
+        let w16 = to_f16(&w);
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let hbytes = |n: usize| n * std::mem::size_of::<u16>();
+
+        let dx = hip::malloc(&h, bytes(d)).unwrap();
+        let dw16 = hip::malloc(&h, hbytes(w16.len())).unwrap();
+        let dout_g = hip::malloc(&h, bytes(n)).unwrap();
+        let xh = hip::malloc(&h, hbytes(d)).unwrap();
+        let yh = hip::malloc(&h, hbytes(n)).unwrap();
+        let dout_r = hip::malloc(&h, bytes(n)).unwrap();
+        let up = |dst: *mut std::ffi::c_void, src: &[u8]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+        };
+        unsafe {
+            up(
+                dx,
+                std::slice::from_raw_parts(x.as_ptr() as *const u8, bytes(d)),
+            );
+            up(
+                dw16,
+                std::slice::from_raw_parts(w16.as_ptr() as *const u8, hbytes(w16.len())),
+            );
+        }
+
+        // Custom GEMV (timed): f32 out directly.
+        let t_g = std::time::Instant::now();
+        k.launch_gemv_f16(
+            dout_g as *mut f32,
+            dx as *const f32,
+            dw16 as *const u16,
+            n as i32,
+            d as i32,
+            1,
+        )
+        .unwrap();
+        k.sync().unwrap();
+        let t_gemm = t_g.elapsed();
+
+        // rocBLAS m=1 reference (timed): cast + gemm_ex + cast.
+        let t_r = std::time::Instant::now();
+        k.gemm_f16(
+            dout_r as *mut f32,
+            dx as *const f32,
+            dw16 as *const u16,
+            n as i32,
+            d as i32,
+            xh as *mut u16,
+            yh as *mut u16,
+        )
+        .unwrap();
+        k.sync().unwrap();
+        let t_roc = t_r.elapsed();
+
+        let mut got_g = vec![0f32; n];
+        let mut got_r = vec![0f32; n];
+        let fetch = |dst: *mut std::ffi::c_void, out: &mut Vec<f32>| {
+            hip::memcpy(
+                &h,
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                dst,
+                bytes(out.len()),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+        };
+        fetch(dout_g, &mut got_g);
+        fetch(dout_r, &mut got_r);
+        let scale = w.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = got_g
+            .iter()
+            .zip(&got_r)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= 5e-2 * (1.0 + scale),
+            "gemv_f16 vs rocBLAS m=1: max diff {diff} (scale {scale})"
+        );
+        println!(
+            "gemv_f16 {:?} vs rocblas m=1 {:?} (ratio {:.1}x)",
+            t_gemm,
+            t_roc,
+            t_roc.as_secs_f64() / t_gemm.as_secs_f64().max(1e-9)
+        );
+        for p in [dx, dw16, dout_g, dout_r, xh, yh] {
             hip::free(&h, p).unwrap();
         }
     }

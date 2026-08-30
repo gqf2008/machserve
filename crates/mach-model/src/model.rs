@@ -1030,6 +1030,9 @@ impl GpuModel {
         let f16 = c.dtype == ModelDType::F16;
 
         // Selects fp16 (cast activations + fp16 weights, fp32 output) or f32.
+        // The single-sequence decode is always m=1: the custom GEMV kernel
+        // replaces the rocBLAS m=1 path (60x over the memory bound there —
+        // see the GEMV_F16 contract).
         let gemm = |out: *mut f32,
                     x: *const f32,
                     w32: *mut f32,
@@ -1038,7 +1041,7 @@ impl GpuModel {
                     kk: i32|
          -> Result<(), Error> {
             if f16 {
-                k.gemm_f16(out, x, w16, n, kk, self.xh, self.yh)
+                k.launch_gemv_f16(out, x, w16, n, kk, 1)
             } else {
                 k.gemm(out, x, w32, n, kk)
             }
@@ -1328,14 +1331,13 @@ impl GpuModel {
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, 1, d, c.rms_eps)?;
         if f16 {
-            k.gemm_f16(
+            k.launch_gemv_f16(
                 self.logits,
                 self.xn,
                 self.lm_head_f16,
                 c.vocab_size as i32,
                 d,
-                self.xh,
-                self.yh,
+                1,
             )?;
         } else {
             k.gemm(
