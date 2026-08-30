@@ -21,7 +21,7 @@ use crate::sampling::HipSampler;
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
 use mach_engine::graph::{GraphCapture, GraphHandle};
 use mach_engine::hip::HipGraphCapture;
-use mach_kernel_sys::hip::{self, Hip};
+use mach_kernel_sys::hip::{self, Hip, HipEvent, HipStream};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -169,6 +169,24 @@ pub struct GpuModel {
     reprobe_every: usize,
     /// Decode-step counter for the re-probe cadence.
     step_counter: usize,
+    /// Dedicated copy stream (owned) for the offload paths' async D2H/H2D:
+    /// the host-side MoE work overlaps the GPU-resident part instead of
+    /// draining the compute stream every layer.
+    xfer_stream: HipStream,
+    /// Recorded on the compute stream after the layer's attention + router:
+    /// the xfer stream's D2H reads wait on it (the GPU-resident GEMMs do not).
+    router_done: HipEvent,
+    /// Recorded on the compute stream after the GPU-resident accumulate: the
+    /// residual H2D upload waits on it before overwriting `x`.
+    gpu_part_done: HipEvent,
+    /// Pinned host read-back staging for the offload paths (ids/weights/xn2/
+    /// xh): hipMemcpyAsync on non-pinned buffers would fall back to
+    /// synchronous copies, blocking the host per copy. Allocated in the
+    /// offload constructors; null in full-resident builds.
+    offload_ids: *mut i32,
+    offload_w: *mut f32,
+    offload_xn2: *mut f32,
+    offload_xh: *mut f32,
 }
 
 impl GpuModel {
@@ -243,6 +261,26 @@ impl GpuModel {
             adaptive: None,
             reprobe_every: 0,
             step_counter: 0,
+            // Copy stream + events for the offload paths' async transfers.
+            xfer_stream: {
+                let mut s = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut s))? };
+                s
+            },
+            router_done: {
+                let mut e = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_event_create)(&mut e))? };
+                e
+            },
+            gpu_part_done: {
+                let mut e = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_event_create)(&mut e))? };
+                e
+            },
+            offload_ids: std::ptr::null_mut(),
+            offload_w: std::ptr::null_mut(),
+            offload_xn2: std::ptr::null_mut(),
+            offload_xh: std::ptr::null_mut(),
         };
         m.alloc_buffers()?;
         m.upload_weights(w)?;
@@ -327,6 +365,25 @@ impl GpuModel {
             adaptive: None,
             reprobe_every: 0,
             step_counter: 0,
+            xfer_stream: {
+                let mut s = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut s))? };
+                s
+            },
+            router_done: {
+                let mut e = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_event_create)(&mut e))? };
+                e
+            },
+            gpu_part_done: {
+                let mut e = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_event_create)(&mut e))? };
+                e
+            },
+            offload_ids: std::ptr::null_mut(),
+            offload_w: std::ptr::null_mut(),
+            offload_xn2: std::ptr::null_mut(),
+            offload_xh: std::ptr::null_mut(),
         };
         m.alloc_buffers()?;
         m.upload_weights_q4(w)?;
@@ -411,6 +468,25 @@ impl GpuModel {
             adaptive: None,
             reprobe_every: 0,
             step_counter: 0,
+            xfer_stream: {
+                let mut s = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut s))? };
+                s
+            },
+            router_done: {
+                let mut e = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_event_create)(&mut e))? };
+                e
+            },
+            gpu_part_done: {
+                let mut e = std::ptr::null_mut();
+                unsafe { hip::check(&hip, (hip.api.hip_event_create)(&mut e))? };
+                e
+            },
+            offload_ids: std::ptr::null_mut(),
+            offload_w: std::ptr::null_mut(),
+            offload_xn2: std::ptr::null_mut(),
+            offload_xh: std::ptr::null_mut(),
         };
         m.alloc_buffers()?;
         m.upload_weights_fp8(w)?;
@@ -1326,7 +1402,28 @@ impl GpuModel {
         let mut m = Self::new(hip, cfg, w)?;
         m.gpu_budget = gpu_budget;
         m.host_w = Some(Arc::new(w.clone()));
+        m.alloc_offload_pins()?;
         Ok(m)
+    }
+
+    /// Pinned host staging for the offload paths' async D2H/H2D read-backs
+    /// (ids/weights/xn2/xh): hipMemcpyAsync on ordinary heap would fall back
+    /// to synchronous copies and block the host per copy. Called by the
+    /// offload constructors; full-resident builds keep the fields null.
+    fn alloc_offload_pins(&mut self) -> Result<(), Error> {
+        let topk = self.cfg.num_experts_per_tok.min(self.cfg.num_experts);
+        let d = self.cfg.d_model;
+        let hip = self.k.hip();
+        let mut pin = |bytes: usize| -> Result<*mut core::ffi::c_void, Error> {
+            let b = hip::host_malloc(hip, bytes)?;
+            self.host_pins.push(b);
+            Ok(b)
+        };
+        self.offload_ids = pin(topk * 4)? as *mut i32;
+        self.offload_w = pin(topk * 4)? as *mut f32;
+        self.offload_xn2 = pin(d * 4)? as *mut f32;
+        self.offload_xh = pin(d * 4)? as *mut f32;
+        Ok(())
     }
 
     /// Builds a GPU model with expert_slots GPU-resident expert slots per MoE layer;
@@ -1340,6 +1437,7 @@ impl GpuModel {
     ) -> Result<Self, Error> {
         let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
         m.host_w = Some(Arc::new(w.clone()));
+        m.alloc_offload_pins()?;
         Ok(m)
     }
 
@@ -1357,27 +1455,21 @@ impl GpuModel {
     ) -> Result<(), Error> {
         let k = self.k.clone();
         let gpu_n = self.gpu_budget.min(topk as usize) as i32;
-        self.k.sync()?;
-
-        // Read the top-k ids + weights back to host (small).
-        let mut ids = vec![0i32; topk as usize];
-        let mut weights = vec![0.0f32; topk as usize];
-        hip::memcpy(
-            self.k.hip(),
-            ids.as_mut_ptr() as *mut core::ffi::c_void,
-            self.exp_ids as *const core::ffi::c_void,
-            (topk as usize) * 4,
-            hip::HIP_MEMCPY_DEVICE_TO_HOST,
-        )?;
-        hip::memcpy(
-            self.k.hip(),
-            weights.as_mut_ptr() as *mut core::ffi::c_void,
-            self.exp_w as *const core::ffi::c_void,
-            (topk as usize) * 4,
-            hip::HIP_MEMCPY_DEVICE_TO_HOST,
-        )?;
+        // Everything enqueued so far (the layer's attention + router) is done
+        // after this event fires: the copy stream's D2H reads wait on it
+        // instead of a full stream sync, so the GPU-resident GEMMs below run
+        // concurrently with the host-side transfers and CPU experts.
+        let hip = self.k.hip();
+        unsafe {
+            hip::check(
+                hip,
+                (hip.api.hip_event_record)(self.router_done, self.k.stream),
+            )?;
+        }
 
         // GPU-resident part: first gpu_n routed experts, existing gather+GEMM.
+        // `gpu_n` depends only on the budget, not on the router ids, so this
+        // is enqueued before the ids are read back.
         if gpu_n > 0 {
             k.launch_moe_gather_weights(
                 lw.moe_wg,
@@ -1405,26 +1497,66 @@ impl GpuModel {
                 )?;
             }
             k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, gpu_n)?;
+            // The residual upload and the post-accumulate `x` read wait on
+            // this before touching `x`.
+            unsafe {
+                hip::check(
+                    hip,
+                    (hip.api.hip_event_record)(self.gpu_part_done, self.k.stream),
+                )?;
+            }
         }
 
-        self.k.sync()?;
         // CPU fallback: routed experts beyond gpu_n.
         let n_cpu = topk - gpu_n;
         if n_cpu > 0 {
+            // Read the top-k ids + weights and the attention output back to
+            // host on the copy stream — it waits only for the router, so the
+            // GPU-resident GEMMs above keep running underneath. Targets are
+            // the model's pinned staging (async copies need pinned host
+            // memory, else hipMemcpyAsync falls back to synchronous).
+            let s = self.xfer_stream;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_wait_event)(s, self.router_done, 0))?;
+            }
+            hip::memcpy_async(
+                hip,
+                self.offload_ids as *mut core::ffi::c_void,
+                self.exp_ids as *const core::ffi::c_void,
+                (topk as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                s,
+            )?;
+            hip::memcpy_async(
+                hip,
+                self.offload_w as *mut core::ffi::c_void,
+                self.exp_w as *const core::ffi::c_void,
+                (topk as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                s,
+            )?;
+            hip::memcpy_async(
+                hip,
+                self.offload_xn2 as *mut core::ffi::c_void,
+                self.xn2 as *const core::ffi::c_void,
+                (d as usize) * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                s,
+            )?;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
+
             let host_w = self
                 .host_w
                 .as_ref()
                 .ok_or_else(|| Error::Model("offload CPU path requires host weights".into()))?;
             let lw_h = &host_w.layers[li];
 
-            let mut xn2 = vec![0.0f32; d as usize];
-            hip::memcpy(
-                self.k.hip(),
-                xn2.as_mut_ptr() as *mut core::ffi::c_void,
-                self.xn2 as *const core::ffi::c_void,
-                (d as usize) * 4,
-                hip::HIP_MEMCPY_DEVICE_TO_HOST,
-            )?;
+            // Pinned staging read back above: id/weight/xn2 slices.
+            let ids = unsafe { std::slice::from_raw_parts(self.offload_ids, topk as usize) };
+            let weights = unsafe { std::slice::from_raw_parts(self.offload_w, topk as usize) };
+            let xn2 = unsafe { std::slice::from_raw_parts(self.offload_xn2, d as usize) };
 
             let mut residual = vec![0.0f32; d as usize];
             for i in (gpu_n as usize)..(topk as usize) {
@@ -1434,24 +1566,48 @@ impl GpuModel {
                 let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
                 let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
                 let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
-                let down = moe_offload::expert_mlp(&xn2, wg, wu, wd, inter_us, d_us);
+                let down = moe_offload::expert_mlp(xn2, wg, wu, wd, inter_us, d_us);
                 for kk in 0..d_us {
                     residual[kk] += w * down[kk];
                 }
             }
 
-            let mut xh = vec![0.0f32; d as usize];
-            hip::memcpy(
-                self.k.hip(),
-                xh.as_mut_ptr() as *mut core::ffi::c_void,
+            // Read the POST-accumulate `x` (the GPU part's contribution is
+            // already folded in) and upload the residual back: both wait for
+            // `gpu_part_done`, by which time the accumulate above has long
+            // finished under the CPU work.
+            let xh = unsafe { std::slice::from_raw_parts_mut(self.offload_xh, d as usize) };
+            unsafe {
+                hip::check(
+                    hip,
+                    (hip.api.hip_stream_wait_event)(s, self.gpu_part_done, 0),
+                )?;
+            }
+            hip::memcpy_async(
+                hip,
+                self.offload_xh as *mut core::ffi::c_void,
                 self.x as *const core::ffi::c_void,
                 (d as usize) * 4,
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                s,
             )?;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
             for kk in 0..d as usize {
                 xh[kk] += residual[kk];
             }
-            self.upload(self.x, &xh)?;
+            hip::memcpy_async(
+                hip,
+                self.x as *mut core::ffi::c_void,
+                self.offload_xh as *const core::ffi::c_void,
+                (d as usize) * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                s,
+            )?;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
         }
         Ok(())
     }
@@ -1472,6 +1628,7 @@ impl GpuModel {
             a.cpu_expert_sec,
             0.9,
         ));
+        m.alloc_offload_pins()?;
         Ok(m)
     }
 
@@ -1566,25 +1723,44 @@ impl GpuModel {
         inter: i32,
     ) -> Result<(), Error> {
         let k = self.k.clone();
-        self.k.sync()?;
-
-        // Read the top-k ids + weights back to host (small).
-        let mut ids = vec![0i32; topk as usize];
-        let mut weights = vec![0.0f32; topk as usize];
-        hip::memcpy(
-            self.k.hip(),
-            ids.as_mut_ptr() as *mut core::ffi::c_void,
+        // The placement below needs the router ids on the host, but the reads
+        // only wait for the router (copy stream), never draining the compute
+        // stream — the GPU-resident GEMMs below overlap the CPU fallback.
+        let hip = self.k.hip();
+        unsafe {
+            hip::check(
+                hip,
+                (hip.api.hip_event_record)(self.router_done, self.k.stream),
+            )?;
+        }
+        let s = self.xfer_stream;
+        unsafe {
+            hip::check(hip, (hip.api.hip_stream_wait_event)(s, self.router_done, 0))?;
+        }
+        // Read the top-k ids + weights back to host into the pinned staging
+        // (async copies need pinned host memory, else hipMemcpyAsync falls
+        // back to synchronous).
+        hip::memcpy_async(
+            hip,
+            self.offload_ids as *mut core::ffi::c_void,
             self.exp_ids as *const core::ffi::c_void,
             (topk as usize) * 4,
             hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            s,
         )?;
-        hip::memcpy(
-            self.k.hip(),
-            weights.as_mut_ptr() as *mut core::ffi::c_void,
+        hip::memcpy_async(
+            hip,
+            self.offload_w as *mut core::ffi::c_void,
             self.exp_w as *const core::ffi::c_void,
             (topk as usize) * 4,
             hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            s,
         )?;
+        unsafe {
+            hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+        }
+        let ids = unsafe { std::slice::from_raw_parts(self.offload_ids, topk as usize) };
+        let weights = unsafe { std::slice::from_raw_parts(self.offload_w, topk as usize) };
 
         let host_w = self
             .host_w
@@ -1602,8 +1778,8 @@ impl GpuModel {
         let expert_bytes = 3 * inter as usize * d as usize * 4;
         let (to_upload, slot_list, gpu_w, cpu) = self.moe_slot_place(
             li,
-            &ids,
-            &weights,
+            ids,
+            weights,
             self.adaptive.as_ref().map(|p| p.profile()),
             expert_bytes,
         );
@@ -1625,14 +1801,14 @@ impl GpuModel {
         let gpu_count = slot_list.len() as i32;
         if gpu_count > 0 {
             hip::memcpy(
-                self.k.hip(),
+                hip,
                 self.slot_ids_dev as *mut core::ffi::c_void,
                 slot_list.as_ptr() as *const core::ffi::c_void,
                 (gpu_count as usize) * 4,
                 hip::HIP_MEMCPY_HOST_TO_DEVICE,
             )?;
             hip::memcpy(
-                self.k.hip(),
+                hip,
                 self.slot_w_dev as *mut core::ffi::c_void,
                 gpu_w.as_ptr() as *const core::ffi::c_void,
                 (gpu_count as usize) * 4,
@@ -1664,42 +1840,76 @@ impl GpuModel {
                 )?;
             }
             k.launch_moe_accumulate(self.x, self.down_all, self.slot_w_dev, d, gpu_count)?;
+            unsafe {
+                hip::check(
+                    hip,
+                    (hip.api.hip_event_record)(self.gpu_part_done, self.k.stream),
+                )?;
+            }
         }
 
-        // CPU fallback: routed experts that did not fit into a slot.
+        // CPU fallback: routed experts that did not fit into a slot. The reads
+        // and CPU work overlap the GPU-resident part above (they wait only for
+        // the router / the accumulate, not the full stream).
         if !cpu.is_empty() {
-            self.k.sync()?;
             let (inter_us, d_us) = (inter as usize, d as usize);
-            let mut xn2 = vec![0.0f32; d_us];
-            hip::memcpy(
-                self.k.hip(),
-                xn2.as_mut_ptr() as *mut core::ffi::c_void,
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_wait_event)(s, self.router_done, 0))?;
+            }
+            hip::memcpy_async(
+                hip,
+                self.offload_xn2 as *mut core::ffi::c_void,
                 self.xn2 as *const core::ffi::c_void,
                 d_us * 4,
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                s,
             )?;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
+            let xn2 = unsafe { std::slice::from_raw_parts(self.offload_xn2, d_us) };
             let mut residual = vec![0.0f32; d_us];
             for (e, w) in &cpu {
                 let wg = &lw_h.moe_wg[e * inter_us * d_us..(e + 1) * inter_us * d_us];
                 let wu = &lw_h.moe_wu[e * inter_us * d_us..(e + 1) * inter_us * d_us];
                 let wd = &lw_h.moe_wd[e * d_us * inter_us..(e + 1) * d_us * inter_us];
-                let down = moe_offload::expert_mlp(&xn2, wg, wu, wd, inter_us, d_us);
+                let down = moe_offload::expert_mlp(xn2, wg, wu, wd, inter_us, d_us);
                 for kk in 0..d_us {
                     residual[kk] += w * down[kk];
                 }
             }
-            let mut xh = vec![0.0f32; d_us];
-            hip::memcpy(
-                self.k.hip(),
-                xh.as_mut_ptr() as *mut core::ffi::c_void,
+            let xh = unsafe { std::slice::from_raw_parts_mut(self.offload_xh, d_us) };
+            unsafe {
+                hip::check(
+                    hip,
+                    (hip.api.hip_stream_wait_event)(s, self.gpu_part_done, 0),
+                )?;
+            }
+            hip::memcpy_async(
+                hip,
+                self.offload_xh as *mut core::ffi::c_void,
                 self.x as *const core::ffi::c_void,
                 d_us * 4,
                 hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                s,
             )?;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
             for kk in 0..d_us {
                 xh[kk] += residual[kk];
             }
-            self.upload(self.x, &xh)?;
+            hip::memcpy_async(
+                hip,
+                self.x as *mut core::ffi::c_void,
+                self.offload_xh as *const core::ffi::c_void,
+                d_us * 4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                s,
+            )?;
+            unsafe {
+                hip::check(hip, (hip.api.hip_stream_synchronize)(s))?;
+            }
         }
         Ok(())
     }
@@ -1832,6 +2042,13 @@ impl GpuModel {
 impl Drop for GpuModel {
     fn drop(&mut self) {
         let hip = self.k.hip();
+        // Drain any in-flight async transfers before freeing the buffers.
+        unsafe {
+            let _ = (hip.api.hip_stream_synchronize)(self.xfer_stream);
+            let _ = (hip.api.hip_event_destroy)(self.router_done);
+            let _ = (hip.api.hip_event_destroy)(self.gpu_part_done);
+            let _ = (hip.api.hip_stream_destroy)(self.xfer_stream);
+        }
         for &p in &self.allocs {
             let _ = hip::free(hip, p);
         }

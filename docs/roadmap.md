@@ -1008,3 +1008,36 @@
     gather,count/prefix 仅 prefill 路径使用);MACH_MOE_GROUPED 在
     mach-model 内解析(其余 MACH_* 旋钮在 server main.rs,属已知差异,
     已在 main.rs 环境文档注明)。
+
+- **批量 MoE 残余收尾(#83,2026-08-30,7900 XTX)**:
+  - P1 token-major 恒等布局收敛:gate_up/down 直读 x+ids(`t = r/topk`
+    取 token 行、`ids[r]` 取专家),scatter_all 内联 `j = t*topk+k` 并直读
+    w;删除 MOE_GATHER_ROWS_TOKENMAJOR(离线门禁 49→48)与
+    exp_of_row_dev/row_pos_dev 分配;grouped 路径每 MoE 层 5→4 发射;
+    A/B(moe_batched_bench,同方法论):0.124 → **0.110 ms/step(258K→290K
+    tok/s)**;
+  - P2 prefill_buffered 跨步 ping-pong 竞态修复:奇数 MoE 层数时新一步
+    prefetch(0) 覆盖上一步末层仍在读的槽位(步内等待链只到
+    compute_ev[n-2]);begin() 增加对 compute_ev[last] 的事件等待(覆盖
+    所有层数,首次调用按 HIP 语义视为已完成);移除构造时预记录;
+    回归测试为**确定性事件序断言**(watch 流等待 prefetch_ev[0]:无修复
+    121.9us 即过、有修复等至探针结束),并附 32 步奇数层跨步解码对拍;
+    调试发现:此平台已启动内核不可见并发 H2D 拷贝写入(陈旧 L1/L2),
+    内容对拍无法区分竞态,必须用事件序;
+  - P3 sampler 参数上传重叠:实现上传流 + 事件链(A/B 实测中性:平台
+    host 发射受限,12 次小拷贝的 GPU 时间已被后续发射的 host 时间隐藏),
+    已撤销,记录为已证伪方向;
+  - P4 单序列 offload/slots 每层同步事件化(#70 条目 2 兑现):
+    forward_moe_offload/forward_moe_slots 的两次全流 sync 改为 xfer
+    拷贝流 + 事件(router_done/gpu_part_done):ids/weights/xn2 D2H 只等
+    router,CPU 专家计算与 GPU-resident GEMM 重叠;x D2H 与残差 H2D 等
+    accumulate;offload 路径 gpu_n 只依赖 budget,GPU 部分提前入队;
+    读回缓冲 pinned 化(hipMemcpyAsync 对非 pinned 内存回退同步拷贝,
+    审查 R2 发现后修复);
+    A/B(合成 d=512/2 层/16 专家/topk4):slots=8 均衡分割 2.487 →
+    **2.119 ms/step(-14.8%,含 pinned 化)**;pinned 化前的中间测量
+    2.271(-8.7%),重度 CPU 回退场景当时 +4%(同步开销,已随 pinned
+    化消除),slots 大时中性;真机 30B 未测(加载成本,待验证);
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
+    --test-threads 1)全量套件;fp64 参考 5/5(含双放置不变性);离线
+    门禁 48 内核+计数断言;

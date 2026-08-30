@@ -92,7 +92,10 @@ mod hip_impl {
     ///   event of the current layer before the grouped expert GEMMs read it;
     /// - [`Self::layer_begin`] makes the prefetch stream wait for the previous
     ///   MoE layer's compute event before overwriting the ping-pong slot that
-    ///   compute last read.
+    ///   compute last read;
+    /// - [`Self::begin`] makes the prefetch stream wait for the PREVIOUS
+    ///   forward's last MoE layer compute event before the first prefetch
+    ///   overwrites a slot that compute may still read (cross-step reuse).
     pub struct PrefetchEngine {
         hip: Arc<Hip>,
         stream: HipStream,
@@ -174,6 +177,11 @@ mod hip_impl {
             let n_moe = moe_layers.len();
             let prefetch_ev = create_events(&hip, n_moe)?;
             let compute_ev = create_events(&hip, n_moe)?;
+            // NOTE: compute events are NOT pre-recorded here. The FIRST
+            // `begin()` waits on `compute_ev[last]`, which no forward has
+            // recorded yet — per HIP, waiting on a never-recorded event acts
+            // as already-completed, so the first call returns immediately
+            // without blocking.
 
             Ok(Self {
                 hip,
@@ -196,17 +204,29 @@ mod hip_impl {
             self.moe_layers.binary_search(&li).ok()
         }
 
-        /// Issues the prefetch of the first MoE layer (no dependencies). Called
-        /// once per forward, before the layer loop.
+        /// Issues the prefetch of the first MoE layer. Called once per
+        /// forward, before the layer loop.
         ///
-        /// KNOWN LIMITATION (pre-existing): at a forward boundary the new
-        /// prefetch(0) may overwrite the ping-pong slot the previous
-        /// forward's LAST MoE layer still reads — the only cross-step waits
-        /// chain to `compute_ev[n-2]`, not the last layer's read. Fires for
-        /// odd MoE layer counts when the copy overtakes the read (wider
-        /// with the faster grouped-GEMV decode path). Fix would require a
-        /// step-boundary event wait; tracked as a follow-up.
+        /// CROSS-STEP SLOT SAFETY: `prefetch(0)` writes ping-pong slot 0,
+        /// which the previous forward's LAST MoE layer read whenever the MoE
+        /// layer count is odd (slot `(n-1) % 2 == 0`). The per-layer waits
+        /// inside a forward only chain to `compute_ev[n-2]` (`prefetch(k+1)`
+        /// waits on `compute_ev[k-1]`), so without this wait the new copy can
+        /// overtake the previous forward's last read — the window widens with
+        /// the fast grouped-GEMV decode path. Waiting on the last layer's
+        /// event covers every count (a superset of the even-count need). On
+        /// the first call `compute_ev[last]` has never been recorded, which
+        /// per HIP acts as already-completed, so it returns immediately (no
+        /// pre-recording is needed or done).
         pub fn begin(&self) -> Result<(), Error> {
+            let last = self.moe_layers.len() - 1;
+            let ev = self.compute_ev[last];
+            unsafe {
+                hip::check(
+                    &self.hip,
+                    (self.hip.api.hip_stream_wait_event)(self.stream, ev, 0),
+                )?;
+            }
             self.prefetch(0)
         }
 
