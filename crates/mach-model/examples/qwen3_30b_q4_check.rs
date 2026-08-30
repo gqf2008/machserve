@@ -5,12 +5,16 @@
 //!
 //! Verifies: load (Q4 quantize, ~16GB host), build (Q4-on-device, ~24GB
 //! VRAM), decode steps — logits finite, greedy token stability, timing.
-#![cfg(feature = "hip")]
+#[cfg(feature = "hip")]
 use mach_model::batched::BatchedModel;
+#[cfg(feature = "hip")]
 use mach_model::loader::load_safetensors_q4;
+#[cfg(feature = "hip")]
 use mach_model::{Config, WeightsQ4};
+#[cfg(feature = "hip")]
 use std::path::PathBuf;
 
+#[cfg(feature = "hip")]
 fn config_from_json(path: &std::path::Path) -> Config {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
@@ -50,6 +54,7 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg
 }
 
+#[cfg(feature = "hip")]
 fn main() {
     let root = PathBuf::from(std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into()));
     let model_dir = root.join("qwen3-30b-a3b");
@@ -135,4 +140,9 @@ fn main() {
         n_steps
     );
     println!("OK: Q4-on-device 30B decode verified (finite logits, stable greedy)");
+}
+
+#[cfg(not(feature = "hip"))]
+fn main() {
+    eprintln!("qwen3_30b_q4_check requires the `hip` feature");
 }

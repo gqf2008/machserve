@@ -2132,11 +2132,7 @@ impl HipKernels {
                 MOE_GROUPED_GATE_UP_Q4,
                 "moe_grouped_gate_up_q4",
             )?,
-            moe_grouped_down_q4: compile_cached(
-                &arch,
-                MOE_GROUPED_DOWN_Q4,
-                "moe_grouped_down_q4",
-            )?,
+            moe_grouped_down_q4: compile_cached(&arch, MOE_GROUPED_DOWN_Q4, "moe_grouped_down_q4")?,
             moe_scatter_all: compile_cached(&arch, MOE_SCATTER_ALL, "moe_scatter_all")?,
         };
         if std::env::var_os("MACH_COMPILE_PROGRESS").is_some() {
@@ -3908,12 +3904,9 @@ impl HipKernels {
             &d as *const i32 as *mut core::ffi::c_void,
             &einter as *const i32 as *mut core::ffi::c_void,
         ];
-        Ok(self.moe_grouped_down_q4.launch(
-            [blocks, 1, 1],
-            [256, 1, 1],
-            &mut p,
-            self.stream,
-        )?)
+        Ok(self
+            .moe_grouped_down_q4
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
     /// Whole-token-range scatter for the decode path, in deterministic
