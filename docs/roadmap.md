@@ -1078,3 +1078,16 @@
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
     --test-threads 1)全量套件(lib 184+9 含新 GEMV 对拍);离线门禁
     51 内核+计数断言;
+
+- **30B 分相剖析器(#89 P1,2026-08-30,7900 XTX)**:
+  - MACH_STEP_PROFILE=1 诊断开关:batched.rs 每层三事件对
+    (layer_start/attn_done/moe_done)+ 整步事件对,decode_step 采样同步后
+    打印分相(hip_event_elapsed_time 新增 FFI);
+  - 30B Qwen3-30B-A3B 实测(16 步稳定):**attn=8.3ms moe=7.0ms
+    other≈0(总 ~15.4ms GPU;host 墙钟 17.4ms 含发射)**——两条 GEMV
+    路径各 ~6x 超内存下界:GEMV_F16 每 warp 64B/事务(半行宽)、
+    Q4 grouped 逐元素反量化 scale 查找;二者均衡,单点优化上限 ~2x,
+    合并优化(Q4 向量化解包 + f16 全行宽载入)目标 ~6ms;
+  - 后续:rocprof 细粒度剖析 + Q4 向量化(f32 结果向量化、双 int4 解包);
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
+    server 17+2;
