@@ -1346,7 +1346,11 @@ impl BatchedModel {
             self.upload_f16(l16.moe_router, &lw.moe_router)?;
             if q4_on_device {
                 // Expert pool stays raw Q4: upload the packed bytes + per-group
-                // scales as-is (in-kernel dequant reads them directly).
+                // scales as-is (in-kernel dequant reads them directly). Mixed
+                // checkpoints (dense + MoE layers) push a zero-length entry
+                // for the dense layers — never read (the layer dispatch
+                // skips layers without a router), but index-aligned with
+                // layers_dev/layers_f16.
                 let q4 = Q4ExpertDev {
                     wg_q: self.upload_bytes(lw.moe_wg.q_bytes())?,
                     wg_s: self.upload_f32s(lw.moe_wg.scales())?,

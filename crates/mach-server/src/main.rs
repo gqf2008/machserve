@@ -18,7 +18,9 @@
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
 //! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
-//! GEMV device path — A/B switch and ops lever).
+//! GEMV device path — A/B switch and ops lever). NOTE: Q4-on-device models
+//! (MACH_Q4_DEVICE=1) have no f16/f32 expert copy, so they ALWAYS run the
+//! grouped path and this knob is a no-op for them.
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
@@ -400,6 +402,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
+    }
+    if q4_device && !q4 {
+        eprintln!(
+            "warning: MACH_Q4_DEVICE=1 requires MACH_Q4=1 (it selects the Q4 expert-pool layout); ignoring"
+        );
     }
 
     if fp8 {
