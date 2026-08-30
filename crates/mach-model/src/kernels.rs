@@ -1772,8 +1772,8 @@ extern "C" __global__ void moe_grouped_gate_up_f16(
     int t = r / topk;
     int e = ids[r];
     const float* xr = x + (long long)t * d;
-    // Full-wavefront u32 loads: 2 consecutive f16 per lane (128B per warp
-    // per step vs the previous 64B half-wavefront).
+    // Two consecutive f16 per lane (4B/lane): full 128B wavefront via
+    // coalescing across the 128 lanes.
     const unsigned short* wg_e = wg + (long long)e * einter * d;
     const unsigned short* wu_e = wu + (long long)e * einter * d;
     const int d2 = d / 2;
