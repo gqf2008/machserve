@@ -93,6 +93,10 @@ struct Q4ExpertDev {
 /// 30B decode); above it, weight reuse across rows makes hipBLAS tensor-core
 /// GEMMs win (a 512-row prefill re-reads the weights m× through the GEMV).
 const GEMV_MAX_M: i32 = 8;
+/// Max reduction width the GEMV kernel can stage in its 48 KB shared row
+/// buffer (`d * 4` bytes): dispatch sites must fall back to hipBLAS above
+/// this (e.g. f16 MLA o_proj with DeepSeek-V2-level kk = 128 heads × 192).
+pub(crate) const GEMV_MAX_D: i32 = 12_288;
 
 /// Multi-sequence transformer on the GPU.
 pub struct BatchedModel {
@@ -1683,7 +1687,7 @@ impl BatchedModel {
                     kk: i32|
          -> Result<(), Error> {
             if f16 {
-                if b <= GEMV_MAX_M {
+                if b <= GEMV_MAX_M && kk <= GEMV_MAX_D {
                     k.launch_gemv_f16(out, x, w16, n, kk, b)
                 } else {
                     k.gemm_batched_f16(out, x, w16, b, n, kk, self.xh, self.yh)
@@ -2496,7 +2500,7 @@ impl BatchedModel {
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
         if f16 {
-            if b <= GEMV_MAX_M {
+            if b <= GEMV_MAX_M && d <= GEMV_MAX_D {
                 k.launch_gemv_f16(
                     self.logits,
                     self.xn,

@@ -3041,8 +3041,10 @@ impl HipKernels {
     /// f16 weights streamed once, f32 accumulation, f32 output DIRECTLY (no
     /// f16 `yh` round-trip — see the [`GEMV_F16`] contract). One warp per
     /// (row, output); shared memory stages the row's activations.
-    /// Shared memory = `d * 4` bytes — the caller guards `d <= 12_288`
-    /// (48 KB shared limit); larger `d` must use the hipBLAS path.
+    /// Shared memory = `d * 4` bytes — the LAUNCHER asserts `d <= 12_288`
+    /// (48 KB shared limit); dispatch sites must fall back to the hipBLAS
+    /// path for larger `d` (see the GEMV_MAX_D guards in batched.rs /
+    /// model.rs — e.g. f16 MLA o_proj at DeepSeek-level kk).
     pub fn launch_gemv_f16(
         &self,
         out: *mut f32,

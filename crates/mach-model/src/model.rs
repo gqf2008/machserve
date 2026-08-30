@@ -1032,7 +1032,9 @@ impl GpuModel {
         // Selects fp16 (cast activations + fp16 weights, fp32 output) or f32.
         // The single-sequence decode is always m=1: the custom GEMV kernel
         // replaces the rocBLAS m=1 path (60x over the memory bound there —
-        // see the GEMV_F16 contract).
+        // see the GEMV_F16 contract). GEMV_MAX_D guards the 48 KB shared
+        // staging (f16 MLA o_proj at DeepSeek-level kk exceeds it and falls
+        // back to the hipBLAS path).
         let gemm = |out: *mut f32,
                     x: *const f32,
                     w32: *mut f32,
@@ -1041,7 +1043,11 @@ impl GpuModel {
                     kk: i32|
          -> Result<(), Error> {
             if f16 {
-                k.launch_gemv_f16(out, x, w16, n, kk, 1)
+                if kk <= crate::batched::GEMV_MAX_D {
+                    k.launch_gemv_f16(out, x, w16, n, kk, 1)
+                } else {
+                    k.gemm_f16(out, x, w16, n, kk, self.xh, self.yh)
+                }
             } else {
                 k.gemm(out, x, w32, n, kk)
             }
@@ -1331,14 +1337,26 @@ impl GpuModel {
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, 1, d, c.rms_eps)?;
         if f16 {
-            k.launch_gemv_f16(
-                self.logits,
-                self.xn,
-                self.lm_head_f16,
-                c.vocab_size as i32,
-                d,
-                1,
-            )?;
+            if d <= crate::batched::GEMV_MAX_D {
+                k.launch_gemv_f16(
+                    self.logits,
+                    self.xn,
+                    self.lm_head_f16,
+                    c.vocab_size as i32,
+                    d,
+                    1,
+                )?;
+            } else {
+                k.gemm_f16(
+                    self.logits,
+                    self.xn,
+                    self.lm_head_f16,
+                    c.vocab_size as i32,
+                    d,
+                    self.xh,
+                    self.yh,
+                )?;
+            }
         } else {
             k.gemm(
                 self.logits,
