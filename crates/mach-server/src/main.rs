@@ -21,6 +21,8 @@
 //! GEMV device path — A/B switch and ops lever). NOTE: Q4-on-device models
 //! (MACH_Q4_DEVICE=1) have no f16/f32 expert copy, so they ALWAYS run the
 //! grouped path and this knob is a no-op for them.
+//! MACH_STEP_PROFILE=1 (diagnostic): per-layer attention/MoE HIP event
+//! bracketing printed after each decode step.
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]
@@ -99,6 +101,9 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg.moe_grouped = std::env::var("MACH_MOE_GROUPED")
         .map(|x| x != "0")
         .unwrap_or(true);
+    // MACH_STEP_PROFILE=1 (diagnostic): per-layer attention/MoE HIP event
+    // bracketing, reported after each decode step.
+    cfg.step_profile = std::env::var("MACH_STEP_PROFILE").is_ok_and(|v| v != "0");
     cfg
 }
 
@@ -616,6 +621,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through
         // a draft + target engine (greedy-only; other params rejected).
         let mut dcfg = config_from_json(&root.join(&draft_config));
+        // Two [prof] streams (draft + target) would interleave without any
+        // role tag — disable the profiler on the draft.
+        dcfg.step_profile = false;
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
             "f16" => dcfg.dtype = ModelDType::F16,

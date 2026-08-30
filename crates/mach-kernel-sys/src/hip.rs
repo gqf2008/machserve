@@ -75,6 +75,7 @@ pub struct HipApi {
     pub hip_event_destroy: unsafe extern "C" fn(HipEvent) -> c_int,
     pub hip_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> c_int,
     pub hip_event_synchronize: unsafe extern "C" fn(HipEvent) -> c_int,
+    pub hip_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> c_int,
     pub hip_stream_begin_capture: unsafe extern "C" fn(HipStream, c_int) -> c_int,
     pub hip_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> c_int,
     pub hip_graph_instantiate:
@@ -245,6 +246,7 @@ fn load() -> Result<Arc<Hip>, HipError> {
         hip_event_destroy: sym(&hip_lib, "hipEventDestroy")?,
         hip_event_record: sym(&hip_lib, "hipEventRecord")?,
         hip_event_synchronize: sym(&hip_lib, "hipEventSynchronize")?,
+        hip_event_elapsed_time: sym(&hip_lib, "hipEventElapsedTime")?,
         hip_stream_begin_capture: sym(&hip_lib, "hipStreamBeginCapture")?,
         hip_stream_end_capture: sym(&hip_lib, "hipStreamEndCapture")?,
         hip_graph_instantiate: sym(&hip_lib, "hipGraphInstantiate")?,
