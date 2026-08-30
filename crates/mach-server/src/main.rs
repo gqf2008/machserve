@@ -621,6 +621,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through
         // a draft + target engine (greedy-only; other params rejected).
         let mut dcfg = config_from_json(&root.join(&draft_config));
+        // Two [prof] streams (draft + target) would interleave without any
+        // role tag — disable the profiler on the draft.
+        dcfg.step_profile = false;
         match dtype.as_str() {
             "f32" => dcfg.dtype = ModelDType::F32,
             "f16" => dcfg.dtype = ModelDType::F16,

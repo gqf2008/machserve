@@ -104,6 +104,10 @@ struct ProfState {
 
 impl ProfState {
     fn new(n_layers: usize, hip: &std::sync::Arc<Hip>) -> Result<Self, crate::Error> {
+        // NOTE: if event creation fails midway, the already-created handles
+        // leak (Self is never constructed, so Drop does not run). Accepted:
+        // this only happens on a dying HIP context, where the process exits
+        // anyway; no guard is added for the catastrophic path.
         let mk = || -> Result<HipEvent, crate::Error> {
             let mut e = std::ptr::null_mut();
             unsafe { hip::check(hip, (hip.api.hip_event_create)(&mut e))? };
