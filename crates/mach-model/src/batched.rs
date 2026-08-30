@@ -88,6 +88,16 @@ struct Q4ExpertDev {
     wd_s: *mut f32,
 }
 
+/// Max m (active rows) dispatched to the custom GEMV kernel: below this the
+/// rocBLAS m-small kernels waste 60x over the memory bound (measured on the
+/// 30B decode); above it, weight reuse across rows makes hipBLAS tensor-core
+/// GEMMs win (a 512-row prefill re-reads the weights m× through the GEMV).
+const GEMV_MAX_M: i32 = 8;
+/// Max reduction width the GEMV kernel can stage in its 48 KB shared row
+/// buffer (`d * 4` bytes): dispatch sites must fall back to hipBLAS above
+/// this (e.g. f16 MLA o_proj with DeepSeek-V2-level kk = 128 heads × 192).
+pub(crate) const GEMV_MAX_D: i32 = 12_288;
+
 /// Multi-sequence transformer on the GPU.
 pub struct BatchedModel {
     cfg: Config,
@@ -1666,6 +1676,9 @@ impl BatchedModel {
         let f16 = c.dtype == ModelDType::F16;
 
         // Selects fp16 (cast activations + fp16 weights, fp32 output) or f32.
+        // Small m (decode rows) takes the custom GEMV kernel — rocBLAS m=1
+        // runs the 30B-class decode 60x over the memory bound; large m keeps
+        // hipBLAS (weight reuse across rows pays on tensor cores).
         let gemm = |out: *mut f32,
                     x: *const f32,
                     w32: *mut f32,
@@ -1674,7 +1687,11 @@ impl BatchedModel {
                     kk: i32|
          -> Result<(), Error> {
             if f16 {
-                k.gemm_batched_f16(out, x, w16, b, n, kk, self.xh, self.yh)
+                if b <= GEMV_MAX_M && kk <= GEMV_MAX_D {
+                    k.launch_gemv_f16(out, x, w16, n, kk, b)
+                } else {
+                    k.gemm_batched_f16(out, x, w16, b, n, kk, self.xh, self.yh)
+                }
             } else {
                 k.gemm_batched(out, x, w32, b, n, kk)
             }
@@ -2483,16 +2500,27 @@ impl BatchedModel {
         }
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
         if f16 {
-            k.gemm_batched_f16(
-                self.logits,
-                self.xn,
-                self.lm_head_f16,
-                b,
-                c.vocab_size as i32,
-                d,
-                self.xh,
-                self.yh,
-            )?;
+            if b <= GEMV_MAX_M && d <= GEMV_MAX_D {
+                k.launch_gemv_f16(
+                    self.logits,
+                    self.xn,
+                    self.lm_head_f16,
+                    c.vocab_size as i32,
+                    d,
+                    b,
+                )?;
+            } else {
+                k.gemm_batched_f16(
+                    self.logits,
+                    self.xn,
+                    self.lm_head_f16,
+                    b,
+                    c.vocab_size as i32,
+                    d,
+                    self.xh,
+                    self.yh,
+                )?;
+            }
         } else {
             k.gemm_batched(
                 self.logits,

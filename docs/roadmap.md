@@ -1059,3 +1059,22 @@
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
     --test-threads 1)全量套件(batched 22/22 含新 Q4 对拍);离线门禁
     50 内核+计数断言;
+
+- **m=1 GEMV 内核 + grouped 小批量并行重构(#87,2026-08-30,7900 XTX)**:
+  - 归因修正:30B Q4-on-device 解码 190 ms/step 并非 attention m=1 GEMM
+    单因素——head-to-head 实测 rocBLAS m=1 2048×2048 f16 GEMM 18.8ms vs
+    自定义 GEMV 246us(76x);而 **grouped MoE 内核小批量饥饿才是主因**
+    (batch=1 时 8 路由行×3 y-tile = 24 blocks×256 线程读 18.9MB,
+    实测 ~5GB/s,延迟无法隐藏);
+  - GEMV_F16 新内核:每 warp 处理一个(行,输出),32 lane 分摊 d +
+    蝴蝶归约(固定序,确定性),共享内存缓存 x 行(d×4B,≤48KB guard),
+    f32 直接输出免 f16 中转+两次 cast;GEMV_MAX_M=8 以下走 GEMV;
+  - 6 个 grouped 内核(f32/f16/Q4 × gate_up/down)重构为
+    block-per-(row, output) + 128 lane k-stride + 共享树归约
+    (batch=1 时 786K~1.5M 线程 vs 原 6144);离线门禁 50→51;
+  - A/B:**30B 真机 190 → 17.4 ms/step(10.9x,greedy 逐位一致)**;
+    batch=32 合成 0.110 → 0.098 ms/step(无回归,更快);head-to-head
+    76x;剩余 17ms 与 ~6ms 内存下界的差距为后续 Q4 反量化内核优化空间;
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
+    --test-threads 1)全量套件(lib 184+9 含新 GEMV 对拍);离线门禁
+    51 内核+计数断言;
