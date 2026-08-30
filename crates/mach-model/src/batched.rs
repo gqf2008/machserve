@@ -744,9 +744,7 @@ impl BatchedModel {
             host_w: None,
             prefetch: None,
             paged: false,
-            moe_grouped: std::env::var("MACH_MOE_GROUPED")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            moe_grouped: cfg.moe_grouped,
             q4_experts: Vec::new(),
             tokens_per_page: 0,
             max_pages_per_seq: 0,
@@ -1374,8 +1372,8 @@ impl BatchedModel {
     /// Uploads f32s to a fresh device allocation.
     fn upload_f32s(&mut self, src: &[f32]) -> Result<*mut f32, Error> {
         let p = self.dalloc(src.len() * 4)?;
-        self.upload(p as *mut f32, src)?;
-        Ok(p as *mut f32)
+        self.upload(p, src)?;
+        Ok(p)
     }
 
     /// Uploads storage-FP8 weights as f16 (dense/MoE/MLA F16 path): norms and
@@ -2156,8 +2154,7 @@ impl BatchedModel {
                     // path, where m>1 rows per expert make weight reuse pay.
                     // Q4-on-device mode has no f16/f32 expert copy, so it runs
                     // the grouped path for EVERY step (prefill included).
-                    let grouped = (self.moe_grouped && decode_only)
-                        || !self.q4_experts.is_empty();
+                    let grouped = (self.moe_grouped && decode_only) || !self.q4_experts.is_empty();
                     // Buffered prefill: run the grouped GEMMs from the
                     // weights prefetched on the separate stream. Placement is a
                     // numeric no-op, so output matches the full-resident path.

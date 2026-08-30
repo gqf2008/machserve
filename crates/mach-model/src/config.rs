@@ -54,6 +54,11 @@ pub struct Config {
     pub qk_rope_head_dim: usize,
     /// MLA: value head dim.
     pub v_head_dim: usize,
+    /// Batched-MoE decode uses the device-side grouped GEMV kernels when true
+    /// (the only batched MoE implementation; `false` keeps the hipBLAS host
+    /// loop for A/B). The server parses `MACH_MOE_GROUPED` into this field —
+    /// the library itself reads no MoE env.
+    pub moe_grouped: bool,
 }
 
 impl Config {
@@ -92,6 +97,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            moe_grouped: true,
         }
     }
 
@@ -126,6 +132,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            moe_grouped: true,
         }
     }
 
@@ -160,6 +167,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            moe_grouped: true,
         }
     }
 
@@ -187,6 +195,7 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            moe_grouped: true,
         }
     }
 
@@ -226,6 +235,7 @@ impl Config {
             qk_nope_head_dim,
             qk_rope_head_dim,
             v_head_dim,
+            moe_grouped: true,
         }
     }
 }

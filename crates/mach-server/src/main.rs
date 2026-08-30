@@ -88,6 +88,12 @@ fn config_from_json(path: &std::path::Path) -> Config {
     if let Some(qk) = v["qk_norm"].as_bool() {
         cfg.qk_norm = qk;
     }
+    // MACH_MOE_GROUPED=0 (default on): batched-MoE decode falls back to the
+    // hipBLAS host loop. Parsed HERE, in the server's env-knob area, not in
+    // the library (the library reads no MoE env; the field lives on Config).
+    cfg.moe_grouped = std::env::var("MACH_MOE_GROUPED")
+        .map(|x| x != "0")
+        .unwrap_or(true);
     cfg
 }
 
