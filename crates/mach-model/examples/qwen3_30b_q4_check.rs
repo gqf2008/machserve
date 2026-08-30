@@ -1,4 +1,4 @@
-//! TEMP→real: Qwen3-30B-A3B Q4-on-device 真机验证 (issue #85 P2).
+//! Qwen3-30B-A3B Q4-on-device 真机验证 (issue #85 P2).
 //!
 //!   MACH_MODELS=<dir with model-*.safetensors + config.json> \
 //!     cargo run -p mach-model --release --features hip --example qwen3_30b_q4_check
@@ -73,18 +73,16 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let w: WeightsQ4 = load_safetensors_q4(&model_dir, &cfg, true).expect("load q4");
-    println!(
-        "load: {:.1}s (host Q4 ~{} MiB)",
-        t0.elapsed().as_secs_f64(),
-        0
-    );
     let q4_mib = w
         .layers
         .iter()
         .map(|l| l.moe_wg.q_bytes().len() + l.moe_wu.q_bytes().len() + l.moe_wd.q_bytes().len())
         .sum::<usize>()
         / (1024 * 1024);
-    println!("expert Q4 bytes: ~{q4_mib} MiB (3 tensors)");
+    println!(
+        "load: {:.1}s (host Q4; expert pool ~{q4_mib} MiB across 3 tensors)",
+        t0.elapsed().as_secs_f64()
+    );
 
     let hip = mach_kernel_sys::hip::hip().expect("HIP runtime");
     assert!(
@@ -97,9 +95,9 @@ fn main() {
     println!("build: {:.1}s", t1.elapsed().as_secs_f64());
     drop(w);
 
-    // Warmup, then two full passes over the same sequence: logits finite on
-    // every step, greedy tokens run-to-run stable (deterministic Q4 path),
-    // and per-step timing.
+    // Two full passes over the same sequence (the first pass doubles as
+    // warmup): logits finite on every step, greedy tokens run-to-run stable
+    // (deterministic Q4 path), and per-step timing.
     let n_steps = 16usize;
     let run = |model: &mut BatchedModel| -> (Vec<u32>, std::time::Duration) {
         model.reset_state().unwrap();

@@ -306,6 +306,25 @@ impl BatchedModel {
         Ok(m)
     }
 
+    /// Paged Q4-on-device variant: the expert pool stays raw Q4 on device
+    /// (in-kernel dequant) — the memory path for 30B-class checkpoints under
+    /// paged KV with cross-request prefix reuse.
+    pub fn with_paged_kv_rows_q4_device(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
+            m.upload_weights_q4(w, true)
+        })?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
     /// [`Self::with_paged_kv_rows`] for storage-FP8 weights: E4M3 tensors are
     /// dequantized to f16 on upload; the f16 paged kernels serve the device.
     pub fn with_paged_kv_rows_fp8(
@@ -1239,13 +1258,10 @@ impl BatchedModel {
     }
 
     /// Uploads storage-Q4 weights as f16 (dense/MoE/MLA F16 path): norms and
-    /// biases stay f32; GEMM matrices are dequantized per tensor and the f16
-    /// buffer is freed after each upload. The router keeps its exact f32 copy
-    /// in `LayerDev` (Q4 does not quantize it) plus the usual f16 copy for the
-    /// fp16 GEMM path.
-    /// Uploads storage-Q4 weights as f16 (dense/MoE/MLA F16 path): norms and
     /// biases stay f32; GEMM matrices are dequantized per tensor and uploaded.
-    /// With `q4_on_device`, the MoE EXPERT tensors stay raw Q4 (packed int4
+    /// The router keeps its exact f32 copy in `LayerDev` (Q4 does not quantize
+    /// it) plus the usual f16 copy for the fp16 GEMM path. With
+    /// `q4_on_device`, the MoE EXPERT tensors stay raw Q4 (packed int4
     /// bytes + per-group f32 scales) in `self.q4_experts`, dequantized
     /// in-kernel by the Q4 grouped GEMV kernels — the memory path for
     /// 30B-class checkpoints (Q4 pool ~16GB vs the dequantized f16 ~50GB).
