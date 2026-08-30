@@ -2649,7 +2649,6 @@ impl BatchedModel {
                 pf.layer_end(li, self.k.stream)?;
             }
         }
-        // Step profiler: whole-step end bracket.
         // Step profiler: whole-step end bracket — placed AFTER the output head
         // so the reported total covers the full step (final norm + lm_head in
         // the `other` bucket).
