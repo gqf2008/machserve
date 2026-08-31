@@ -1105,3 +1105,21 @@
     **14.4 ms/step(-17%)**;batch=32 合成 0.098→0.100(噪声内);
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
   - 后续:剩余 ~2.4x 差距需 rocprof 细粒度剖析(occupancy/调度);
+
+- **逐内核形状基准 + QKV 融合发射(#93,2026-08-31,7900 XTX)**:
+  - P1 形状基准(gemv_shape_bench,30B 形状,batch=1,每迭代含 sync
+    为延迟主导带宽):q GEMV 16.8MB 132μs(127GB/s)、**k/v GEMV
+    2.1MB 108μs(19.5GB/s,64 blocks occupancy 饥饿)**、o 8.4MB
+    116μs(72GB/s)、gate_up_q4 12MB 138μs(91GB/s)、down_q4 6MB
+    150μs(42GB/s)——数据定位 QKV 融合为首选优化;
+  - P2 QKV 融合发射:GEMV_F16_QKV 内核单次 launch 覆盖 q+k+v 三投影
+    (按输出行选择 wq/wk/wv 权重与 q/k_buf/v_buf 输出缓冲),k/v 行获得
+    q 行的 640 blocks 并行度;离线门禁 51→52;batched.rs 标准注意力
+    路径小 m(f16 && b<=8)走融合,大 m 与 f32 保持 hipBLAS;修复:
+    融合分支最初误置 else-if 链上跳过 rope/kv_store/attn——对拍抓出
+    (2.29 diff)后重构进 else 块内;
+  - A/B(30B 分相):**attn 6.5→5.55ms、总 14.4 → 13.31 ms/step
+    (-8%)**;greedy 序列不变;
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22、
+    lib 185+9(含 gemv_f16_qkv_matches_cpu_reference 对拍);离线门禁
+    52 内核+计数断言;

@@ -1,6 +1,9 @@
 //! Per-kernel shape benchmark for the 30B decode path: times gemv_f16 at the
 //! four attention projection shapes and the Q4 grouped pair at the routed
-//! MoE shape, reporting effective bandwidth per kernel.
+//! MoE shape, reporting effective bandwidth per kernel. NOTE: each iteration
+//! includes a device sync, so the numbers are LATENCY-DOMINATED bandwidth
+//! floors (launch + drain included) — good for relative hotspot ranking, not
+//! steady-state throughput.
 //!
 //!   cargo run -p mach-model --release --features hip --example gemv_shape_bench
 #[cfg(feature = "hip")]

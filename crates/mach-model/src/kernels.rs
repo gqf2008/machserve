@@ -5166,9 +5166,9 @@ mod gpu_tests {
     }
 
     /// QKV-fused GEMV parity: the fused launch must produce the same q / k /
-    /// v rows as three separate GEMV launches on the same weights.
+    /// v rows as the CPU f32-dot reference on the same weights.
     #[test]
-    fn gemv_f16_qkv_matches_three_separate_gemvs() {
+    fn gemv_f16_qkv_matches_cpu_reference() {
         let Ok(h) = hip::hip() else {
             eprintln!("skipping: ROCm runtime not available");
             return;
