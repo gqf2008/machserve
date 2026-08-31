@@ -1123,3 +1123,22 @@
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22、
     lib 185+9(含 gemv_f16_qkv_matches_cpu_reference 对拍);离线门禁
     52 内核+计数断言;
+
+- **30B 真实模型服务链端到端(#95,2026-08-31,7900 XTX)**:
+  - **根因修复:Qwen3 共享 QK-norm**——HF checkpoint 的 q_norm/k_norm
+    为共享 [head_dim] 向量,QK-norm 内核按 per-head [n_heads,head_dim]
+    索引;f32 loader 已做共享->per-head 广播,**Q4/FP8 loader 缺失**,
+    真实权重下 head>=1 读越界垃圾 -> 全部真实 Qwen3 推理退化
+    (合成权重测试用 per-head 布局恰好掩盖)。loader 补
+    broadcast_qk_norm 后 8B Q4 与 30B Q4-on-device 均生成连贯推理文本;
+  - server:config_from_json 的 qk_norm 默认改由 model_type 前缀 qwen3
+    推导(HF 无 use_qk_norm 键,此前被静默关闭,显式键仍覆盖);
+    estimate_vram 修正 Q4 口径(服务端从 BF16 文件加载,设备 f16 =
+    文件同大小,原 x4 高估 4 倍挡掉合法加载)并新增 q4_device 0.3x 档;
+  - **30B Q4-on-device 服务链端到端**:mach-server(MACH_Q4=1
+    MACH_Q4_DEVICE=1 MACH_CAPACITY=4)+ 真实 tokenizer + chat 模板 +
+    HTTP;真实对话输出完整 Qwen3 思考链,答案正确(Paris);
+  - 真实负载性能:单流 **68 tok/s**(3.74s / 256 tok,含采样与 HTTP
+    开销);engine 侧 13.3 ms/step(attn 5.55/moe 5.5/other 0.75);
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
+    server 13+17;qwen3_q4_real 新增真实文本生成测试;

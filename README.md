@@ -13,11 +13,12 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | **decode 吞吐(B=512)** | **35251 tok/s ≈ llama.cpp Vulkan(643 tok/s)的 55x** |
 | decode 吞吐(B=64,短 ctx) | 12887 tok/s(4.97 ms/step) |
 | **长 context decode(2048)** | **13.40 ms/step(4778 tok/s/seq,GQA 复用 2.6x)** |
+| **Qwen3-30B-A3B 单流(真机,2026-08-31)** | **68 tok/s(Q4-on-device,13.3ms/step;24GB 消费级 GPU)** |
 | **长 prompt TTFT** | 512-token 57ms / 2048-token 289ms(分块 prefill;`MACH_PREFILL_ROWS=512` 默认,长 prompt -25~40%) |
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |
 | **OpenAI API** | completions / chat / SSE / 采样全参数 / top_logprobs / stop / n / usage |
-| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、Qwen3 QK-norm、MLA(合成对拍)、**Qwen3-8B(存储级 Q4 实测)** |
+| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、**Qwen3 全系(QK-norm,真实 chat 实测)**、MLA(合成对拍)、**Qwen3-8B Q4 / Qwen3-30B-A3B Q4-on-device(真机 chat 实测)** |
 
 > 测量口径:Qwen2.5-0.5B fp16、capacity 64,`lctx_bench`(不 reset、真长 context)。
 > 详细历史见 [docs/roadmap.md](docs/roadmap.md)。
