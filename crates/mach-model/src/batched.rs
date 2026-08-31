@@ -2026,30 +2026,41 @@ impl BatchedModel {
                 )?;
                 k.launch_add(self.x, self.proj, b * d)?;
             } else {
-                gemm(
-                    self.q,
-                    self.xn,
-                    lw.wq,
-                    l16.map_or(std::ptr::null_mut(), |l| l.wq),
-                    nq,
-                    d,
-                )?;
-                gemm(
-                    self.k_buf,
-                    self.xn,
-                    lw.wk,
-                    l16.map_or(std::ptr::null_mut(), |l| l.wk),
-                    nkv,
-                    d,
-                )?;
-                gemm(
-                    self.v_buf,
-                    self.xn,
-                    lw.wv,
-                    l16.map_or(std::ptr::null_mut(), |l| l.wv),
-                    nkv,
-                    d,
-                )?;
+                // QKV projections: small-m f16 takes the fused GEMV (one
+                // launch for q + k + v — the k/v halves alone run at only
+                // 64 blocks / 20 GB/s; the fused launch gives them the q
+                // rows' parallelism). Large-m and f32 keep hipBLAS.
+                if f16 && b <= GEMV_MAX_M {
+                    let l = l16.expect("f16 layer");
+                    k.launch_gemv_f16_qkv(
+                        self.xn, l.wq, l.wk, l.wv, self.q, self.k_buf, self.v_buf, nq, nkv, d, b,
+                    )?;
+                } else {
+                    gemm(
+                        self.q,
+                        self.xn,
+                        lw.wq,
+                        l16.map_or(std::ptr::null_mut(), |l| l.wq),
+                        nq,
+                        d,
+                    )?;
+                    gemm(
+                        self.k_buf,
+                        self.xn,
+                        lw.wk,
+                        l16.map_or(std::ptr::null_mut(), |l| l.wk),
+                        nkv,
+                        d,
+                    )?;
+                    gemm(
+                        self.v_buf,
+                        self.xn,
+                        lw.wv,
+                        l16.map_or(std::ptr::null_mut(), |l| l.wv),
+                        nkv,
+                        d,
+                    )?;
+                }
                 // Qwen2 checkpoints ship q/k/v biases.
                 if !lw.bq.is_null() {
                     k.launch_add_bias(self.q, lw.bq, b, nq)?;
