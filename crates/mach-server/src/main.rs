@@ -326,7 +326,6 @@ fn run_doctor() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
-        let q4 = std::env::var("MACH_Q4").is_ok_and(|v| v != "0");
         let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
         let q4_device = std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v != "0");
         let need = estimate_vram(&cfg, cap, fb, None, fp8, q4_device);
