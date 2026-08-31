@@ -1057,8 +1057,8 @@
   - P3 MACH_MOE_GROUPED 解析统一:Config.moe_grouped 字段(默认 true),
     库内零 MACH_* env 读取,server config_from_json 旋钮区解析;
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU(7900 XTX,
-    --test-threads 1)全量套件(batched 22/22 含新 Q4 对拍);离线门禁
-    50 内核+计数断言;
+    --test-threads 1)全量套件(lib 184+9 含新 GEMV 对拍);离线门禁
+    51 内核+计数断言;
 
 - **m=1 GEMV 内核 + grouped 小批量并行重构(#87,2026-08-30,7900 XTX)**:
   - 归因修正:30B Q4-on-device 解码 190 ms/step 并非 attention m=1 GEMM
@@ -1092,3 +1092,16 @@
   - 后续:rocprof 细粒度剖析 + Q4 向量化(f32 结果向量化、双 int4 解包);
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
     server 17+2;
+
+- **GEMV_F16 全行宽载入 + Q4 字节对反量化(#91,2026-08-31,7900 XTX)**:
+  - GEMV_F16:每 lane 一次处理 2 个连续 f16(4B 载入,128B 全行宽,
+    替换 #87 的 64B 半行宽);
+  - Q4 grouped gate_up/down:每 lane 每 iteration 处理 1 字节 = 2 元素
+    (双 nibble 解包;32 元素 group = 16 整字节,字节永不跨组,scale 每
+    字节一次),iterations 减半;
+  - 修复:down_f16 首版 u32 索引把 o 双计(base 已含 (e*d+o)*einter)——
+    对拍抓出后以标量对载入修正;
+  - A/B(30B,分相):attn 8.1→6.5ms、moe 7.1→5.4ms、总 17.4 →
+    **14.4 ms/step(-17%)**;batch=32 合成 0.098→0.100(噪声内);
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
+  - 后续:剩余 ~2.4x 差距需 rocprof 细粒度剖析(occupancy/调度);

@@ -1091,8 +1091,15 @@ extern "C" __global__ void gemv_f16(
     const int lane = threadIdx.x & 31;
     if (warp >= n) return;
     const unsigned short* wj = w + (long long)warp * d;
+    // Full-wavefront loads: each lane reads one u32 = 2 consecutive f16
+    // (64B -> 128B per warp per step; d is even for every supported model).
     float acc = 0.f;
-    for (int k = lane; k < d; k += 32) acc += sx[k] * gemv_f16_val(wj[k]);
+    const int d2 = d / 2;
+    for (int k2 = lane; k2 < d2; k2 += 32) {
+        unsigned int pair = *(const unsigned int*)(wj + 2 * k2);
+        acc += sx[2 * k2] * gemv_f16_val((unsigned short)(pair & 0xFFFFu))
+             + sx[2 * k2 + 1] * gemv_f16_val((unsigned short)(pair >> 16));
+    }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
     if (lane == 0) out[(long long)b * n + warp] = acc;
 }
@@ -1765,12 +1772,20 @@ extern "C" __global__ void moe_grouped_gate_up_f16(
     int t = r / topk;
     int e = ids[r];
     const float* xr = x + (long long)t * d;
-    long long wbase = (long long)e * einter * d + (long long)o * d;
+    // Two consecutive f16 per lane (4B/lane): full 128B wavefront via
+    // coalescing across the 128 lanes.
+    const unsigned short* wg_e = wg + (long long)e * einter * d;
+    const unsigned short* wu_e = wu + (long long)e * einter * d;
+    const int d2 = d / 2;
     float ag = 0.f, au = 0.f;
-    for (int k = threadIdx.x; k < d; k += blockDim.x) {
-        float xv = xr[k];
-        ag += xv * f16_bits_to_f32(wg[wbase + k]);
-        au += xv * f16_bits_to_f32(wu[wbase + k]);
+    for (int k2 = threadIdx.x; k2 < d2; k2 += blockDim.x) {
+        unsigned short w0 = wg_e[(long long)o * d + 2 * k2];
+        unsigned short w1 = wg_e[(long long)o * d + 2 * k2 + 1];
+        unsigned short u0 = wu_e[(long long)o * d + 2 * k2];
+        unsigned short u1 = wu_e[(long long)o * d + 2 * k2 + 1];
+        float x0 = xr[2 * k2], x1 = xr[2 * k2 + 1];
+        ag += x0 * f16_bits_to_f32(w0) + x1 * f16_bits_to_f32(w1);
+        au += x0 * f16_bits_to_f32(u0) + x1 * f16_bits_to_f32(u1);
     }
     s_ag[threadIdx.x] = ag;
     s_au[threadIdx.x] = au;
@@ -1838,11 +1853,14 @@ extern "C" __global__ void moe_grouped_down_f16(
     int r = blockIdx.x;
     int o = blockIdx.y;
     int e = ids[r];
-    long long wbase = ((long long)e * d + o) * einter;
+    // Two consecutive f16 per lane per step: 128 lanes x 4B = full 128B
+    // wavefront (the scalar one-per-lane version read only 64B).
     const float* eh_r = eh + (long long)r * einter;
+    const unsigned short* wd_r = wd + ((long long)e * d + o) * einter;
     float acc = 0.f;
-    for (int k = threadIdx.x; k < einter; k += blockDim.x) {
-        acc += eh_r[k] * f16_bits_to_f32(wd[wbase + k]);
+    for (int k = 2 * threadIdx.x; k + 1 < einter; k += 2 * blockDim.x) {
+        acc += eh_r[k] * f16_bits_to_f32(wd_r[k])
+             + eh_r[k + 1] * f16_bits_to_f32(wd_r[k + 1]);
     }
     s_acc[threadIdx.x] = acc;
     __syncthreads();
@@ -1862,14 +1880,6 @@ extern "C" __global__ void moe_grouped_down_f16(
 /// multiply), so this path matches the host `dequantize()` + f16-upload
 /// reference up to the reference's f16 rounding.
 const MOE_GROUPED_GATE_UP_Q4: &str = r#"
-#define Q4_GROUP 32
-__device__ inline float q4_val(const unsigned char* q, const float* s, long long idx) {
-    int g = (int)(idx / Q4_GROUP);
-    unsigned char byte = q[idx / 2];
-    int nib = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
-    int v = nib < 8 ? nib : nib - 16;
-    return s[g] * (float)v;
-}
 extern "C" __global__ void moe_grouped_gate_up_q4(
     const float* __restrict__ x,
     const int* __restrict__ ids,
@@ -1880,10 +1890,11 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
     float* __restrict__ gate_all,
     float* __restrict__ up_all,
     int einter, int d, int topk) {
-    // Block per (routed row, output): 128 lanes stride the d reduction, then
-    // a shared-memory tree reduce. Small-batch decode (b=1 -> rows*192
-    // blocks here) needs ~800K threads to hide memory latency; the previous
-    // block-per-row layout ran 24 blocks total and starved at ~5 GB/s.
+    // Block per (routed row, output): 128 lanes, each processing one Q4
+    // BYTE = 2 elements (both nibbles share the group scale — a 32-element
+    // group is 16 whole bytes, so a byte never straddles a boundary).
+    // Small-batch decode needs ~rows*einter*lanes of parallelism to hide
+    // memory latency.
     __shared__ float s_ag[128];
     __shared__ float s_au[128];
     int r = blockIdx.x;
@@ -1892,11 +1903,23 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
     int e = ids[r];
     long long wbase = ((long long)e * einter + o) * d;
     const float* xr = x + (long long)t * d;
+    const float2* xr2 = (const float2*)xr;
+    const long long b0 = wbase / 2;  // first Q4 byte of this row (wbase even)
+    const int nb = d / 2;            // bytes in this row
     float ag = 0.f, au = 0.f;
-    for (int k = threadIdx.x; k < d; k += blockDim.x) {
-        float xv = xr[k];
-        ag += xv * q4_val(wg_q, wg_s, wbase + k);
-        au += xv * q4_val(wu_q, wu_s, wbase + k);
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        int l0 = wg_q[b0 + b] & 0x0F;
+        int h0 = wg_q[b0 + b] >> 4;
+        int l1 = wu_q[b0 + b] & 0x0F;
+        int h1 = wu_q[b0 + b] >> 4;
+        int g = (int)(((wbase >> 1) + b) >> 4);
+        float swg = wg_s[g];
+        float swu = wu_s[g];
+        float2 x2 = xr2[b];
+        ag += x2.x * swg * (float)(l0 < 8 ? l0 : l0 - 16)
+            + x2.y * swg * (float)(h0 < 8 ? h0 : h0 - 16);
+        au += x2.x * swu * (float)(l1 < 8 ? l1 : l1 - 16)
+            + x2.y * swu * (float)(h1 < 8 ? h1 : h1 - 16);
     }
     s_ag[threadIdx.x] = ag;
     s_au[threadIdx.x] = au;
@@ -1918,14 +1941,6 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
 /// Storage-Q4 variant of [`MOE_GROUPED_DOWN`] (see
 /// [`MOE_GROUPED_GATE_UP_Q4`] for the layout/dequant contract).
 const MOE_GROUPED_DOWN_Q4: &str = r#"
-#define Q4_GROUP 32
-__device__ inline float q4_val(const unsigned char* q, const float* s, long long idx) {
-    int g = (int)(idx / Q4_GROUP);
-    unsigned char byte = q[idx / 2];
-    int nib = (idx & 1) ? (byte >> 4) : (byte & 0x0F);
-    int v = nib < 8 ? nib : nib - 16;
-    return s[g] * (float)v;
-}
 extern "C" __global__ void moe_grouped_down_q4(
     const float* __restrict__ eh,
     const int* __restrict__ ids,
@@ -1933,17 +1948,26 @@ extern "C" __global__ void moe_grouped_down_q4(
     const float* __restrict__ wd_s,
     float* __restrict__ down_all,
     int rows, int d, int einter) {
-    // Block per (routed row, output dim): 128 lanes stride the einter
-    // reduction (see the gate_up_q4 note on small-batch parallelism).
+    // Block per (routed row, output dim): 128 lanes, each processing one Q4
+    // BYTE = 2 elements (both nibbles share the group scale — see the
+    // gate_up_q4 note on small-batch parallelism and byte alignment).
     __shared__ float s_acc[128];
     int r = blockIdx.x;
     int o = blockIdx.y;
     int e = ids[r];
     long long wbase = ((long long)e * d + o) * einter;
-    const float* eh_r = eh + (long long)r * einter;
+    const float2* eh2 = (const float2*)(eh + (long long)r * einter);
+    const long long b0 = wbase / 2;
+    const int nb = einter / 2;
     float acc = 0.f;
-    for (int k = threadIdx.x; k < einter; k += blockDim.x) {
-        acc += eh_r[k] * q4_val(wd_q, wd_s, wbase + k);
+    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+        int l0 = wd_q[b0 + b] & 0x0F;
+        int h0 = wd_q[b0 + b] >> 4;
+        int g = (int)(((wbase >> 1) + b) >> 4);
+        float s = wd_s[g];
+        float2 x2 = eh2[b];
+        acc += x2.x * s * (float)(l0 < 8 ? l0 : l0 - 16)
+             + x2.y * s * (float)(h0 < 8 ? h0 : h0 - 16);
     }
     s_acc[threadIdx.x] = acc;
     __syncthreads();
@@ -3058,6 +3082,10 @@ impl HipKernels {
             (d as usize) * 4 <= 48 * 1024,
             "gemv_f16: d={d} exceeds the 48 KB shared-memory staging limit"
         );
+        assert!(
+            d % 2 == 0,
+            "gemv_f16 requires even d (u32 pair loads), got d={d}"
+        );
         let op = out;
         let xp = x;
         let wp = w16;
@@ -3864,6 +3892,13 @@ impl HipKernels {
         topk: i32,
         f16: bool,
     ) -> Result<(), Error> {
+        if f16 {
+            // The f16 kernel processes 2 consecutive f16 (4B) per lane.
+            assert!(
+                d % 2 == 0 && einter % 2 == 0,
+                "grouped gate_up f16 requires even d/einter (pair loads), got d={d} einter={einter}"
+            );
+        }
         let xp = x;
         let idp = ids;
         let gap = gate_all;
@@ -3928,6 +3963,13 @@ impl HipKernels {
         einter: i32,
         f16: bool,
     ) -> Result<(), Error> {
+        if f16 {
+            // The f16 kernel processes 2 consecutive elements per lane.
+            assert!(
+                einter % 2 == 0,
+                "grouped down f16 requires even einter (pair loads), got einter={einter}"
+            );
+        }
         let ehp = eh;
         let idp = ids;
         let dap = down_all;
@@ -3983,6 +4025,10 @@ impl HipKernels {
         d: i32,
         topk: i32,
     ) -> Result<(), Error> {
+        assert!(
+            d % 2 == 0 && einter % 2 == 0,
+            "gate_up_q4 requires even d/einter (byte-pair Q4 unpacking), got d={d} einter={einter}"
+        );
         let xp = x;
         let idp = ids;
         let wgqp = wg_q;
@@ -4026,6 +4072,10 @@ impl HipKernels {
         d: i32,
         einter: i32,
     ) -> Result<(), Error> {
+        assert!(
+            d % 2 == 0 && einter % 2 == 0,
+            "down_q4 requires even d/einter (byte-pair Q4 unpacking), got d={d} einter={einter}"
+        );
         let ehp = eh;
         let idp = ids;
         let wdqp = wd_q;
