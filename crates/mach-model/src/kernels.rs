@@ -1105,6 +1105,58 @@ extern "C" __global__ void gemv_f16(
 }
 "#;
 
+/// QKV-fused variant of [`GEMV_F16`]: ONE launch covers the q / k / v
+/// projections (separate weight tensors, selected by output range) and
+/// writes each output row to its own buffer — replacing three separate
+/// launches whose k/v halves starve at 64 blocks (20 GB/s).
+/// Same warp-per-(row, output) full-wavefront contract as [`GEMV_F16`];
+/// f32 output directly (no f16 `yh` round-trip).
+const GEMV_F16_QKV: &str = r#"
+__device__ inline float gemv_qkv_val(unsigned short h) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = h;
+    return (float)c.h;
+}
+extern "C" __global__ void gemv_f16_qkv(
+    const float* __restrict__ x,
+    const unsigned short* __restrict__ wq,
+    const unsigned short* __restrict__ wk,
+    const unsigned short* __restrict__ wv,
+    float* __restrict__ q,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    int nq, int nkv, int d) {
+    extern __shared__ float sx[];
+    const int b = blockIdx.y;
+    for (int k = threadIdx.x; k < d; k += blockDim.x) sx[k] = x[(long long)b * d + k];
+    __syncthreads();
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const int lane = threadIdx.x & 31;
+    if (warp >= nq + 2 * nkv) return;
+    const unsigned short* wj = (warp < nq)
+        ? wq + (long long)warp * d
+        : (warp < nq + nkv)
+            ? wk + (long long)(warp - nq) * d
+            : wv + (long long)(warp - nq - nkv) * d;
+    float acc = 0.f;
+    const int d2 = d / 2;
+    for (int k2 = lane; k2 < d2; k2 += 32) {
+        unsigned int pair = *(const unsigned int*)(wj + 2 * k2);
+        acc += sx[2 * k2] * gemv_qkv_val((unsigned short)(pair & 0xFFFFu))
+             + sx[2 * k2 + 1] * gemv_qkv_val((unsigned short)(pair >> 16));
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+    if (lane != 0) return;
+    if (warp < nq) {
+        q[(long long)b * nq + warp] = acc;
+    } else if (warp < nq + nkv) {
+        k_out[(long long)b * nkv + (warp - nq)] = acc;
+    } else {
+        v_out[(long long)b * nkv + (warp - nq - nkv)] = acc;
+    }
+}
+"#;
+
 /// fp16 -> f32 cast (device conversion matches `crate::fp16::f16_to_f32`).
 const CAST_F16_F32: &str = r#"
 __device__ inline float f16_to_f32(unsigned short h) {
@@ -2072,6 +2124,7 @@ pub struct HipKernels {
     cast_f32_f16: HipKernelModule,
     cast_f16_f32: HipKernelModule,
     gemv_f16: HipKernelModule,
+    gemv_f16_qkv: HipKernelModule,
     embed_f16: HipKernelModule,
     kv_store_f16: HipKernelModule,
     attn_f16_gqa: HipKernelModule,
@@ -2217,6 +2270,7 @@ impl HipKernels {
             cast_f32_f16: compile_cached(&arch, CAST_F32_F16, "cast_f32_f16")?,
             cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
             gemv_f16: compile_cached(&arch, GEMV_F16, "gemv_f16")?,
+            gemv_f16_qkv: compile_cached(&arch, GEMV_F16_QKV, "gemv_f16_qkv")?,
             embed_f16: compile_cached(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
             kv_store_f16: compile_cached(&arch, KV_F16, "kv_store_batched_f16")?,
             attn_f16_gqa: compile_cached(
@@ -3101,6 +3155,66 @@ impl HipKernels {
         let warps_per_block = 256 / 32;
         let blocks = (n as u32).div_ceil(warps_per_block);
         Ok(self.gemv_f16.launch_shmem(
+            [blocks, batch as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            (d as u32) * 4,
+        )?)
+    }
+
+    /// QKV-fused GEMV (see the [`GEMV_F16_QKV`] contract): one launch for the
+    /// q / k / v projections (separate weight tensors, selected by output
+    /// range) writing q / k / v rows to their own buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gemv_f16_qkv(
+        &self,
+        x: *const f32,
+        wq: *const u16,
+        wk: *const u16,
+        wv: *const u16,
+        q: *mut f32,
+        k_out: *mut f32,
+        v_out: *mut f32,
+        nq: i32,
+        nkv: i32,
+        d: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        assert!(
+            (d as usize) * 4 <= 48 * 1024,
+            "gemv_f16_qkv: d={d} exceeds the 48 KB shared-memory staging limit"
+        );
+        assert!(
+            d % 2 == 0,
+            "gemv_f16_qkv requires even d (u32 pair loads), got d={d}"
+        );
+        let xp = x;
+        let wqp = wq;
+        let wkp = wk;
+        let wvp = wv;
+        let qp = q;
+        let kp = k_out;
+        let vp = v_out;
+        let nqi = nq;
+        let nvki = nkv;
+        let di = d;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &wqp as *const *const u16 as *mut core::ffi::c_void,
+            &wkp as *const *const u16 as *mut core::ffi::c_void,
+            &wvp as *const *const u16 as *mut core::ffi::c_void,
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &kp as *const *mut f32 as *mut core::ffi::c_void,
+            &vp as *const *mut f32 as *mut core::ffi::c_void,
+            &nqi as *const i32 as *mut core::ffi::c_void,
+            &nvki as *const i32 as *mut core::ffi::c_void,
+            &di as *const i32 as *mut core::ffi::c_void,
+        ];
+        let rows = nq + 2 * nkv;
+        let warps_per_block = 256 / 32;
+        let blocks = (rows as u32).div_ceil(warps_per_block);
+        Ok(self.gemv_f16_qkv.launch_shmem(
             [blocks, batch as u32, 1],
             [256, 1, 1],
             &mut p,
@@ -4243,6 +4357,7 @@ mod offline_tests {
         CAST_F32_F16,
         CAST_F16_F32,
         GEMV_F16,
+        GEMV_F16_QKV,
         KV_F16,
         ATTN_DECODE_BATCHED_F16_GQA,
         ATTN_PREFILL_F16,
@@ -4280,7 +4395,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            51,
+            52,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
@@ -5046,6 +5161,144 @@ mod gpu_tests {
             t_roc.as_secs_f64() / t_gemm.as_secs_f64().max(1e-9)
         );
         for p in [dx, dw16, dout_g, dout_r, xh, yh] {
+            hip::free(&h, p).unwrap();
+        }
+    }
+
+    /// QKV-fused GEMV parity: the fused launch must produce the same q / k /
+    /// v rows as the CPU f32-dot reference on the same weights.
+    #[test]
+    fn gemv_f16_qkv_matches_cpu_reference() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let nq = 128usize;
+        let nkv = 64usize;
+        let d = 128usize;
+        let batch = 3usize;
+        let mut rng = lcg(47);
+        let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
+        let wq: Vec<f32> = (0..nq * d).map(|_| rng()).collect();
+        let wk: Vec<f32> = (0..nkv * d).map(|_| rng()).collect();
+        let wv: Vec<f32> = (0..nkv * d).map(|_| rng()).collect();
+        let to_f16 =
+            |v: &[f32]| -> Vec<u16> { v.iter().map(|&x| crate::fp16::f32_to_f16(x)).collect() };
+        let wq16 = to_f16(&wq);
+        let wk16 = to_f16(&wk);
+        let wv16 = to_f16(&wv);
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let hbytes = |n: usize| n * std::mem::size_of::<u16>();
+
+        let dx = hip::malloc(&h, bytes(batch * d)).unwrap();
+        let dwq = hip::malloc(&h, hbytes(wq16.len())).unwrap();
+        let dwk = hip::malloc(&h, hbytes(wk16.len())).unwrap();
+        let dwv = hip::malloc(&h, hbytes(wv16.len())).unwrap();
+        let dq = hip::malloc(&h, bytes(batch * nq)).unwrap();
+        let dk = hip::malloc(&h, bytes(batch * nkv)).unwrap();
+        let dv = hip::malloc(&h, bytes(batch * nkv)).unwrap();
+        unsafe {
+            let up = |dst: *mut std::ffi::c_void, src: &[u8]| {
+                hip::memcpy(
+                    &h,
+                    dst,
+                    src.as_ptr() as *const std::ffi::c_void,
+                    src.len(),
+                    hip::HIP_MEMCPY_HOST_TO_DEVICE,
+                )
+                .unwrap();
+            };
+            up(
+                dx,
+                std::slice::from_raw_parts(x.as_ptr() as *const u8, bytes(batch * d)),
+            );
+            up(
+                dwq,
+                std::slice::from_raw_parts(wq16.as_ptr() as *const u8, hbytes(wq16.len())),
+            );
+            up(
+                dwk,
+                std::slice::from_raw_parts(wk16.as_ptr() as *const u8, hbytes(wk16.len())),
+            );
+            up(
+                dwv,
+                std::slice::from_raw_parts(wv16.as_ptr() as *const u8, hbytes(wv16.len())),
+            );
+        }
+
+        let kg = std::sync::Arc::new(k);
+        let xptr = dx as *const f32;
+        let wqptr = dwq as *const u16;
+        let wkptr = dwk as *const u16;
+        let wvptr = dwv as *const u16;
+        let qptr = dq as *mut f32;
+        let kptr = dk as *mut f32;
+        let vptr = dv as *mut f32;
+        let nq_i = nq as i32;
+        let nkv_i = nkv as i32;
+        let d_i = d as i32;
+        let batch_i = batch as i32;
+        kg.launch_gemv_f16_qkv(
+            xptr, wqptr, wkptr, wvptr, qptr, kptr, vptr, nq_i, nkv_i, d_i, batch_i,
+        )
+        .unwrap();
+        kg.sync().unwrap();
+
+        let mut gq = vec![0f32; batch * nq];
+        let mut gk = vec![0f32; batch * nkv];
+        let mut gv = vec![0f32; batch * nkv];
+        let fetch = |dst: *mut std::ffi::c_void, out: &mut Vec<f32>| {
+            hip::memcpy(
+                &h,
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                dst,
+                bytes(out.len()),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+        };
+        fetch(dq, &mut gq);
+        fetch(dk, &mut gk);
+        fetch(dv, &mut gv);
+
+        // CPU reference: per (row, output) f32 dot over the f16 weights.
+        let mut ok = true;
+        for b in 0..batch {
+            for j in 0..nq {
+                let want: f32 = (0..d)
+                    .map(|kk| x[b * d + kk] * crate::fp16::f16_to_f32(wq16[j * d + kk]))
+                    .sum();
+                if (gq[b * nq + j] - want).abs() > 5e-2 * (1.0 + want.abs()) {
+                    ok = false;
+                    eprintln!(
+                        "MISMATCH q b={b} j={j}: got={:e} want={:e}",
+                        gq[b * nq + j],
+                        want
+                    );
+                }
+            }
+            for j in 0..nkv {
+                let want: f32 = (0..d)
+                    .map(|kk| x[b * d + kk] * crate::fp16::f16_to_f32(wk16[j * d + kk]))
+                    .sum();
+                if (gk[b * nkv + j] - want).abs() > 5e-2 * (1.0 + want.abs()) {
+                    ok = false;
+                }
+                let wantv: f32 = (0..d)
+                    .map(|kk| x[b * d + kk] * crate::fp16::f16_to_f32(wv16[j * d + kk]))
+                    .sum();
+                if (gv[b * nkv + j] - wantv).abs() > 5e-2 * (1.0 + wantv.abs()) {
+                    ok = false;
+                }
+            }
+        }
+        assert!(ok, "gemv_f16_qkv must match the CPU reference");
+        for p in [dx, dwq, dwk, dwv, dq, dk, dv] {
             hip::free(&h, p).unwrap();
         }
     }
