@@ -18,7 +18,7 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |
 | **OpenAI API** | completions / chat / SSE / 采样全参数 / top_logprobs / stop / n / usage |
-| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、**Qwen3 全系(QK-norm,真实 chat 实测)**、MLA(合成对拍)、**Qwen3-8B Q4 / Qwen3-30B-A3B Q4-on-device(真机 chat 实测)** |
+| 模型兼容 | Qwen2.5-0.5B / **1.5B**(F32+F16,head_dim 128)、**Qwen3(QK-norm;8B / 30B-A3B 真实 chat 实测)**、MLA(合成对拍)、**Qwen3-8B Q4 / Qwen3-30B-A3B Q4-on-device(真机 chat 实测)** |
 
 > 测量口径:Qwen2.5-0.5B fp16、capacity 64,`lctx_bench`(不 reset、真长 context)。
 > 详细历史见 [docs/roadmap.md](docs/roadmap.md)。

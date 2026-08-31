@@ -918,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn q4_scales_weight_term_by_four() {
+    fn q4_and_q4_device_weight_terms() {
         let cfg = dense_cfg();
         let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false);
         // MACH_Q4 loads standard BF16/F16 files and quantizes at load: the
