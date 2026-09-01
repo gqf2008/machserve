@@ -1078,11 +1078,30 @@ __device__ inline float gemv_f16_val(unsigned short h) {
     c.u = h;
     return (float)c.h;
 }
+// Optional in-kernel profiling (RGP cannot trace hiprtc module launches on
+// Windows — ROCm/rocm-systems#395). When prof != nullptr, thread 0 of each
+// block records, at slot (blockIdx.y * gridDim.x + blockIdx.x) * 5:
+//   [0..2] clock64() stamps: entry / main-loop done / end (cheap s_getreg;
+//          per-SIMD cycles — durations valid per block, NOT cross-block);
+//   [3..4] globaltimer ns stamps: entry / end — only for every 16th block
+//          (prof_rt costs ~162 ns via sendmsg, so it is sampled);
+//          10 ns/tick on gfx1100. prof == nullptr is the production path
+//          (one null check per block).
+// gfx1100 (RDNA3) has no s_memrealtime/s_memtime; the globaltimer read is
+// sendmsg(MSG_RTN_GET_REALTIME), exposed as __builtin_readsteadycounter().
+__device__ inline unsigned long long prof_rt() {
+    return __builtin_readsteadycounter();
+}
 extern "C" __global__ void gemv_f16(
     const float* __restrict__ x,
     const unsigned short* __restrict__ w,
     float* __restrict__ out,
-    int n, int d) {
+    int n, int d,
+    unsigned long long* __restrict__ prof) {
+    const int blid = blockIdx.y * gridDim.x + blockIdx.x;
+    unsigned long long* ps = prof ? prof + (long long)blid * 5 : nullptr;
+    const bool pr = ps != nullptr && threadIdx.x == 0;
+    if (pr) { ps[0] = clock64(); if ((blid & 15) == 0) ps[3] = prof_rt(); }
     extern __shared__ float sx[];
     const int b = blockIdx.y;
     for (int k = threadIdx.x; k < d; k += blockDim.x) sx[k] = x[(long long)b * d + k];
@@ -1091,17 +1110,34 @@ extern "C" __global__ void gemv_f16(
     const int lane = threadIdx.x & 31;
     if (warp >= n) return;
     const unsigned short* wj = w + (long long)warp * d;
-    // Full-wavefront loads: each lane reads one u32 = 2 consecutive f16
-    // (64B -> 128B per warp per step; d is even for every supported model).
+    // Full-wavefront loads: each lane reads one uint2 = 4 consecutive f16
+    // (256B per warp per step — doubles bytes-in-flight vs the u32 pair
+    // version; the in-kernel profiler showed the kernel latency-bound at
+    // ~3 blocks/CU residency, #102). d is even for every supported model;
+    // a d%4==2 tail pair is folded in by lane 0.
     float acc = 0.f;
-    const int d2 = d / 2;
-    for (int k2 = lane; k2 < d2; k2 += 32) {
-        unsigned int pair = *(const unsigned int*)(wj + 2 * k2);
-        acc += sx[2 * k2] * gemv_f16_val((unsigned short)(pair & 0xFFFFu))
-             + sx[2 * k2 + 1] * gemv_f16_val((unsigned short)(pair >> 16));
+    if ((d & 3) == 0) {
+        const int d4 = d / 4;
+        for (int k4 = lane; k4 < d4; k4 += 32) {
+            uint2 quad = *(const uint2*)(wj + 4 * k4);
+            acc += sx[4 * k4] * gemv_f16_val((unsigned short)(quad.x & 0xFFFFu))
+                 + sx[4 * k4 + 1] * gemv_f16_val((unsigned short)(quad.x >> 16))
+                 + sx[4 * k4 + 2] * gemv_f16_val((unsigned short)(quad.y & 0xFFFFu))
+                 + sx[4 * k4 + 3] * gemv_f16_val((unsigned short)(quad.y >> 16));
+        }
+    } else {
+        // d%4==2 rows are only 4-mod-8 aligned on odd warps; keep u32 pairs.
+        const int d2 = d / 2;
+        for (int k2 = lane; k2 < d2; k2 += 32) {
+            unsigned int pair = *(const unsigned int*)(wj + 2 * k2);
+            acc += sx[2 * k2] * gemv_f16_val((unsigned short)(pair & 0xFFFFu))
+                 + sx[2 * k2 + 1] * gemv_f16_val((unsigned short)(pair >> 16));
+        }
     }
+    if (pr) ps[1] = clock64();
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
     if (lane == 0) out[(long long)b * n + warp] = acc;
+    if (pr) { ps[2] = clock64(); if ((blid & 15) == 0) ps[4] = prof_rt(); }
 }
 "#;
 
@@ -1117,6 +1153,10 @@ __device__ inline float gemv_qkv_val(unsigned short h) {
     c.u = h;
     return (float)c.h;
 }
+// Same optional in-kernel profiling contract as GEMV_F16.
+__device__ inline unsigned long long prof_rt() {
+    return __builtin_readsteadycounter();
+}
 extern "C" __global__ void gemv_f16_qkv(
     const float* __restrict__ x,
     const unsigned short* __restrict__ wq,
@@ -1125,7 +1165,12 @@ extern "C" __global__ void gemv_f16_qkv(
     float* __restrict__ q,
     float* __restrict__ k_out,
     float* __restrict__ v_out,
-    int nq, int nkv, int d) {
+    int nq, int nkv, int d,
+    unsigned long long* __restrict__ prof) {
+    const int blid = blockIdx.y * gridDim.x + blockIdx.x;
+    unsigned long long* ps = prof ? prof + (long long)blid * 5 : nullptr;
+    const bool pr = ps != nullptr && threadIdx.x == 0;
+    if (pr) { ps[0] = clock64(); if ((blid & 15) == 0) ps[3] = prof_rt(); }
     extern __shared__ float sx[];
     const int b = blockIdx.y;
     for (int k = threadIdx.x; k < d; k += blockDim.x) sx[k] = x[(long long)b * d + k];
@@ -1138,13 +1183,27 @@ extern "C" __global__ void gemv_f16_qkv(
         : (warp < nq + nkv)
             ? wk + (long long)(warp - nq) * d
             : wv + (long long)(warp - nq - nkv) * d;
+    // Same uint2 (4 x f16) full-wavefront load scheme as GEMV_F16.
     float acc = 0.f;
-    const int d2 = d / 2;
-    for (int k2 = lane; k2 < d2; k2 += 32) {
-        unsigned int pair = *(const unsigned int*)(wj + 2 * k2);
-        acc += sx[2 * k2] * gemv_qkv_val((unsigned short)(pair & 0xFFFFu))
-             + sx[2 * k2 + 1] * gemv_qkv_val((unsigned short)(pair >> 16));
+    if ((d & 3) == 0) {
+        const int d4 = d / 4;
+        for (int k4 = lane; k4 < d4; k4 += 32) {
+            uint2 quad = *(const uint2*)(wj + 4 * k4);
+            acc += sx[4 * k4] * gemv_qkv_val((unsigned short)(quad.x & 0xFFFFu))
+                 + sx[4 * k4 + 1] * gemv_qkv_val((unsigned short)(quad.x >> 16))
+                 + sx[4 * k4 + 2] * gemv_qkv_val((unsigned short)(quad.y & 0xFFFFu))
+                 + sx[4 * k4 + 3] * gemv_qkv_val((unsigned short)(quad.y >> 16));
+        }
+    } else {
+        // d%4==2: keep u32 pairs (row base only 4-mod-8 aligned on odd warps).
+        const int d2 = d / 2;
+        for (int k2 = lane; k2 < d2; k2 += 32) {
+            unsigned int pair = *(const unsigned int*)(wj + 2 * k2);
+            acc += sx[2 * k2] * gemv_qkv_val((unsigned short)(pair & 0xFFFFu))
+                 + sx[2 * k2 + 1] * gemv_qkv_val((unsigned short)(pair >> 16));
+        }
     }
+    if (pr) ps[1] = clock64();
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
     if (lane != 0) return;
     if (warp < nq) {
@@ -1154,6 +1213,7 @@ extern "C" __global__ void gemv_f16_qkv(
     } else {
         v_out[(long long)b * nkv + (warp - nq - nkv)] = acc;
     }
+    if (pr) { ps[2] = clock64(); if ((blid & 15) == 0) ps[4] = prof_rt(); }
 }
 "#;
 
@@ -1932,6 +1992,10 @@ extern "C" __global__ void moe_grouped_down_f16(
 /// multiply), so this path matches the host `dequantize()` + f16-upload
 /// reference up to the reference's f16 rounding.
 const MOE_GROUPED_GATE_UP_Q4: &str = r#"
+// Same optional in-kernel profiling contract as GEMV_F16.
+__device__ inline unsigned long long prof_rt() {
+    return __builtin_readsteadycounter();
+}
 extern "C" __global__ void moe_grouped_gate_up_q4(
     const float* __restrict__ x,
     const int* __restrict__ ids,
@@ -1941,14 +2005,20 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
     const float* __restrict__ wu_s,
     float* __restrict__ gate_all,
     float* __restrict__ up_all,
-    int einter, int d, int topk) {
+    int einter, int d, int topk,
+    unsigned long long* __restrict__ prof) {
+    const int blid = blockIdx.y * gridDim.x + blockIdx.x;
+    unsigned long long* ps = prof ? prof + (long long)blid * 5 : nullptr;
+    const bool pr = ps != nullptr && threadIdx.x == 0;
+    if (pr) { ps[0] = clock64(); if ((blid & 15) == 0) ps[3] = prof_rt(); }
     // Block per (routed row, output): 128 lanes, each processing one Q4
     // BYTE = 2 elements (both nibbles share the group scale — a 32-element
     // group is 16 whole bytes, so a byte never straddles a boundary).
     // Small-batch decode needs ~rows*einter*lanes of parallelism to hide
     // memory latency.
-    __shared__ float s_ag[128];
-    __shared__ float s_au[128];
+    // Cross-warp combine scratch (blockDim.x = 128 fixed by the launcher).
+    __shared__ float s_ag[4];
+    __shared__ float s_au[4];
     int r = blockIdx.x;
     int o = blockIdx.y;
     int t = r / topk;
@@ -1963,19 +2033,19 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
     // group scale per tensor (wbase 32-aligned → 4 aligned elements never
     // straddle); halves the iteration count vs 1-byte lanes.
     for (int b2 = threadIdx.x; b2 < nb / 2; b2 += blockDim.x) {
-        unsigned short pw = wg_q[b0 + 2 * b2];
-        unsigned short pw1 = wg_q[b0 + 2 * b2 + 1];
-        unsigned short pu = wu_q[b0 + 2 * b2];
-        unsigned short pu1 = wu_q[b0 + 2 * b2 + 1];
+        // One u16 load per tensor (b0 even: wbase is a multiple of 32):
+        // low byte = nibbles 0/1, high byte = nibbles 2/3.
+        unsigned short pw01 = *(const unsigned short*)(wg_q + b0 + 2 * b2);
+        unsigned short pu01 = *(const unsigned short*)(wu_q + b0 + 2 * b2);
         int g = (int)(((wbase >> 1) + 2 * b2) >> 4);
         float swg = wg_s[g];
         float swu = wu_s[g];
         float2 x0 = xr2[2 * b2];
         float2 x1 = xr2[2 * b2 + 1];
-        int lw0 = pw & 0x0F; int hw0 = pw >> 4;
-        int lw1 = pw1 & 0x0F; int hw1 = pw1 >> 4;
-        int lu0 = pu & 0x0F; int hu0 = pu >> 4;
-        int lu1 = pu1 & 0x0F; int hu1 = pu1 >> 4;
+        int lw0 = pw01 & 0x0F; int hw0 = (pw01 >> 4) & 0x0F;
+        int lw1 = (pw01 >> 8) & 0x0F; int hw1 = pw01 >> 12;
+        int lu0 = pu01 & 0x0F; int hu0 = (pu01 >> 4) & 0x0F;
+        int lu1 = (pu01 >> 8) & 0x0F; int hu1 = pu01 >> 12;
         ag += x0.x * swg * (float)(lw0 < 8 ? lw0 : lw0 - 16)
             + x0.y * swg * (float)(hw0 < 8 ? hw0 : hw0 - 16)
             + x1.x * swg * (float)(lw1 < 8 ? lw1 : lw1 - 16)
@@ -1985,6 +2055,7 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
             + x1.x * swu * (float)(lu1 < 8 ? lu1 : lu1 - 16)
             + x1.y * swu * (float)(hu1 < 8 ? hu1 : hu1 - 16);
     }
+    if (pr) ps[1] = clock64();
     // Odd tail (nb odd): last byte handled by lane 0.
     if (threadIdx.x == 0 && (nb & 1)) {
         int b = nb - 1;
@@ -2001,19 +2072,23 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
         au += x2.x * swu * (float)(l1 < 8 ? l1 : l1 - 16)
             + x2.y * swu * (float)(h1 < 8 ? h1 : h1 - 16);
     }
-    s_ag[threadIdx.x] = ag;
-    s_au[threadIdx.x] = au;
-    __syncthreads();
-    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
-        if (threadIdx.x < off) {
-            s_ag[threadIdx.x] += s_ag[threadIdx.x + off];
-            s_au[threadIdx.x] += s_au[threadIdx.x + off];
-        }
-        __syncthreads();
+    // Warp-shuffle reduce + one shared round across the 4 warps (replaces the
+    // 7-__syncthreads() full tree — the in-kernel profiler showed ~26% of
+    // block time in reduce here, #102). Lanes reconverge after the
+    // grid-stride loop before the shuffles.
+    for (int off = 16; off > 0; off >>= 1) {
+        ag += __shfl_down(ag, off);
+        au += __shfl_down(au, off);
     }
+    if ((threadIdx.x & 31) == 0) {
+        s_ag[threadIdx.x >> 5] = ag;
+        s_au[threadIdx.x >> 5] = au;
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
-        gate_all[(long long)r * einter + o] = s_ag[0];
-        up_all[(long long)r * einter + o] = s_au[0];
+        gate_all[(long long)r * einter + o] = (s_ag[0] + s_ag[1]) + (s_ag[2] + s_ag[3]);
+        up_all[(long long)r * einter + o] = (s_au[0] + s_au[1]) + (s_au[2] + s_au[3]);
+        if (pr) { ps[2] = clock64(); if ((blid & 15) == 0) ps[4] = prof_rt(); }
     }
 }
 "#;
@@ -2021,17 +2096,27 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
 /// Storage-Q4 variant of [`MOE_GROUPED_DOWN`] (see
 /// [`MOE_GROUPED_GATE_UP_Q4`] for the layout/dequant contract).
 const MOE_GROUPED_DOWN_Q4: &str = r#"
+// Same optional in-kernel profiling contract as GEMV_F16.
+__device__ inline unsigned long long prof_rt() {
+    return __builtin_readsteadycounter();
+}
 extern "C" __global__ void moe_grouped_down_q4(
     const float* __restrict__ eh,
     const int* __restrict__ ids,
     const unsigned char* __restrict__ wd_q,
     const float* __restrict__ wd_s,
     float* __restrict__ down_all,
-    int rows, int d, int einter) {
+    int rows, int d, int einter,
+    unsigned long long* __restrict__ prof) {
+    const int blid = blockIdx.y * gridDim.x + blockIdx.x;
+    unsigned long long* ps = prof ? prof + (long long)blid * 5 : nullptr;
+    const bool pr = ps != nullptr && threadIdx.x == 0;
+    if (pr) { ps[0] = clock64(); if ((blid & 15) == 0) ps[3] = prof_rt(); }
     // Block per (routed row, output dim): 128 lanes, each processing one Q4
     // BYTE = 2 elements (both nibbles share the group scale — see the
     // gate_up_q4 note on small-batch parallelism and byte alignment).
-    __shared__ float s_acc[128];
+    // Cross-warp combine scratch (blockDim.x = 128 fixed by the launcher).
+    __shared__ float s_acc[4];
     int r = blockIdx.x;
     int o = blockIdx.y;
     int e = ids[r];
@@ -2044,21 +2129,22 @@ extern "C" __global__ void moe_grouped_down_q4(
     // one group scale (wbase is a multiple of 32, so 4 aligned elements
     // never straddle); halves the iteration count vs 1-byte lanes.
     for (int b2 = threadIdx.x; b2 < nb / 2; b2 += blockDim.x) {
-        unsigned short p0 = wd_q[b0 + 2 * b2];
-        unsigned short p1 = wd_q[b0 + 2 * b2 + 1];
+        // One u16 load (b0 even): low byte = nibbles 0/1, high = 2/3.
+        unsigned short p01 = *(const unsigned short*)(wd_q + b0 + 2 * b2);
         int g = (int)(((wbase >> 1) + 2 * b2) >> 4);
         float s = wd_s[g];
         float2 x0 = eh2[2 * b2];
         float2 x1 = eh2[2 * b2 + 1];
-        int l0 = p0 & 0x0F;
-        int h0 = p0 >> 4;
-        int l1 = p1 & 0x0F;
-        int h1 = p1 >> 4;
+        int l0 = p01 & 0x0F;
+        int h0 = (p01 >> 4) & 0x0F;
+        int l1 = (p01 >> 8) & 0x0F;
+        int h1 = p01 >> 12;
         acc += x0.x * s * (float)(l0 < 8 ? l0 : l0 - 16)
              + x0.y * s * (float)(h0 < 8 ? h0 : h0 - 16)
              + x1.x * s * (float)(l1 < 8 ? l1 : l1 - 16)
              + x1.y * s * (float)(h1 < 8 ? h1 : h1 - 16);
     }
+    if (pr) ps[1] = clock64();
     // Odd tail (nb odd): last byte handled by lane 0.
     if (threadIdx.x == 0 && (nb & 1)) {
         int b = nb - 1;
@@ -2070,13 +2156,16 @@ extern "C" __global__ void moe_grouped_down_q4(
         acc += x2.x * s * (float)(l0 < 8 ? l0 : l0 - 16)
              + x2.y * s * (float)(h0 < 8 ? h0 : h0 - 16);
     }
-    s_acc[threadIdx.x] = acc;
+    // Warp-shuffle reduce + one shared round across the 4 warps (see the
+    // gate_up_q4 note; profiler showed ~50% of block time in the old tree
+    // reduce here, #102).
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+    if ((threadIdx.x & 31) == 0) s_acc[threadIdx.x >> 5] = acc;
     __syncthreads();
-    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
-        if (threadIdx.x < off) s_acc[threadIdx.x] += s_acc[threadIdx.x + off];
-        __syncthreads();
+    if (threadIdx.x == 0) {
+        down_all[(long long)r * d + o] = (s_acc[0] + s_acc[1]) + (s_acc[2] + s_acc[3]);
+        if (pr) { ps[2] = clock64(); if ((blid & 15) == 0) ps[4] = prof_rt(); }
     }
-    if (threadIdx.x == 0) down_all[(long long)r * d + o] = s_acc[0];
 }
 "#;
 
@@ -3172,6 +3261,7 @@ impl HipKernels {
     /// (48 KB shared limit); dispatch sites must fall back to the hipBLAS
     /// path for larger `d` (see the GEMV_MAX_D guards in batched.rs /
     /// model.rs — e.g. f16 MLA o_proj at DeepSeek-level kk).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_gemv_f16(
         &self,
         out: *mut f32,
@@ -3180,6 +3270,7 @@ impl HipKernels {
         n: i32,
         d: i32,
         batch: i32,
+        prof: *mut u64,
     ) -> Result<(), Error> {
         assert!(
             (d as usize) * 4 <= 48 * 1024,
@@ -3194,12 +3285,14 @@ impl HipKernels {
         let wp = w16;
         let ni = n;
         let di = d;
+        let pp = prof;
         let mut p = vec![
             &xp as *const *const f32 as *mut core::ffi::c_void,
             &wp as *const *const u16 as *mut core::ffi::c_void,
             &op as *const *mut f32 as *mut core::ffi::c_void,
             &ni as *const i32 as *mut core::ffi::c_void,
             &di as *const i32 as *mut core::ffi::c_void,
+            &pp as *const *mut u64 as *mut core::ffi::c_void,
         ];
         let warps_per_block = 256 / 32;
         let blocks = (n as u32).div_ceil(warps_per_block);
@@ -3229,6 +3322,7 @@ impl HipKernels {
         nkv: i32,
         d: i32,
         batch: i32,
+        prof: *mut u64,
     ) -> Result<(), Error> {
         assert!(
             (d as usize) * 4 <= 48 * 1024,
@@ -3248,6 +3342,7 @@ impl HipKernels {
         let nqi = nq;
         let nvki = nkv;
         let di = d;
+        let pp = prof;
         let mut p = vec![
             &xp as *const *const f32 as *mut core::ffi::c_void,
             &wqp as *const *const u16 as *mut core::ffi::c_void,
@@ -3259,6 +3354,7 @@ impl HipKernels {
             &nqi as *const i32 as *mut core::ffi::c_void,
             &nvki as *const i32 as *mut core::ffi::c_void,
             &di as *const i32 as *mut core::ffi::c_void,
+            &pp as *const *mut u64 as *mut core::ffi::c_void,
         ];
         let rows = nq + 2 * nkv;
         let warps_per_block = 256 / 32;
@@ -4187,6 +4283,7 @@ impl HipKernels {
         einter: i32,
         d: i32,
         topk: i32,
+        prof: *mut u64,
     ) -> Result<(), Error> {
         assert!(
             d % 4 == 0 && einter % 4 == 0,
@@ -4200,6 +4297,7 @@ impl HipKernels {
         let wusp = wu_s;
         let gap = gate_all;
         let uap = up_all;
+        let pp = prof;
         let mut p = vec![
             &xp as *const *const f32 as *mut core::ffi::c_void,
             &idp as *const *const i32 as *mut core::ffi::c_void,
@@ -4212,6 +4310,7 @@ impl HipKernels {
             &einter as *const i32 as *mut core::ffi::c_void,
             &d as *const i32 as *mut core::ffi::c_void,
             &topk as *const i32 as *mut core::ffi::c_void,
+            &pp as *const *mut u64 as *mut core::ffi::c_void,
         ];
         Ok(self.moe_grouped_gate_up_q4.launch(
             [rows as u32, einter as u32, 1],
@@ -4234,6 +4333,7 @@ impl HipKernels {
         rows: i32,
         d: i32,
         einter: i32,
+        prof: *mut u64,
     ) -> Result<(), Error> {
         assert!(
             d % 4 == 0 && einter % 4 == 0,
@@ -4244,6 +4344,7 @@ impl HipKernels {
         let wdqp = wd_q;
         let wdsp = wd_s;
         let dap = down_all;
+        let pp = prof;
         let mut p = vec![
             &ehp as *const *const f32 as *mut core::ffi::c_void,
             &idp as *const *const i32 as *mut core::ffi::c_void,
@@ -4253,6 +4354,7 @@ impl HipKernels {
             &rows as *const i32 as *mut core::ffi::c_void,
             &d as *const i32 as *mut core::ffi::c_void,
             &einter as *const i32 as *mut core::ffi::c_void,
+            &pp as *const *mut u64 as *mut core::ffi::c_void,
         ];
         Ok(self.moe_grouped_down_q4.launch(
             [rows as u32, d as u32, 1],
@@ -5159,6 +5261,7 @@ mod gpu_tests {
             n as i32,
             d as i32,
             1,
+            std::ptr::null_mut(),
         )
         .unwrap();
         k.sync().unwrap();
@@ -5293,7 +5396,18 @@ mod gpu_tests {
         let d_i = d as i32;
         let batch_i = batch as i32;
         kg.launch_gemv_f16_qkv(
-            xptr, wqptr, wkptr, wvptr, qptr, kptr, vptr, nq_i, nkv_i, d_i, batch_i,
+            xptr,
+            wqptr,
+            wkptr,
+            wvptr,
+            qptr,
+            kptr,
+            vptr,
+            nq_i,
+            nkv_i,
+            d_i,
+            batch_i,
+            std::ptr::null_mut(),
         )
         .unwrap();
         kg.sync().unwrap();

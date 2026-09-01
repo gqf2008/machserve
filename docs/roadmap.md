@@ -1163,3 +1163,40 @@
     **12.72 ms/step**;greedy 序列不变;
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
     离线门禁 52 内核+计数断言;
+
+- **内核内 clock64/globaltimer 插桩剖析 + 三项微优化(#102,2026-09-02,7900 XTX)**:
+  - **背景**:RGP 实测对 hiprtc hipModuleLaunchKernel 路径 trace 即进程
+    segfault(AMD 已知 ROCm/rocm-systems#395;runtime API 正常)——外部
+    计数器工具不可用,转内核内插桩。工具链发现:RDS 须以
+    RadeonDeveloperServiceCLI 提权运行;RDP 驱动层枚举 [0]=核显
+    [1]=7900 XTX,与 HIP 层相反;readsteadycounter 单读 ~162ns(sendmsg
+    序列化)只能采样,gfx1100 无 s_memrealtime/s_memtime,全局时钟须用
+    `__builtin_readsteadycounter()`(sendmsg MSG_RTN_GET_REALTIME,
+    实测 100MHz/10ns tick);clock64() = HW_REG_SHADER_CYCLES(32 位
+    每 SIMD 周期计数,~4 cycle/读,块内 delta 有效)。
+  - **插桩契约**(GEMV_F16 / GEMV_F16_QKV / MOE_GROUPED_GATE_UP_Q4 /
+    MOE_GROUPED_DOWN_Q4):可空 prof 出参,每 block thread0 记
+    [clock64 entry/loop_done/end] + 每 16 块采样 [globaltimer entry/end];
+    prof=null 为生产路径(每 block 一次空判),不增内核(离线门禁仍 52)。
+    新增 gemv_prof_bench example:稳态流中插桩一次(中途驻留防降频),
+    按采样块校准 cycles→ns,报告 span/busy/块级并行度/loop 占比/块时长
+    分位/尾波。
+  - **首批数据**(30B 形状,batch=1):GEMV loop 占 97-98%、驻留 ~3
+    块/CU(par 269-307,近 96 CU × 3 上限)、访存延迟主导(在途字节不足);
+    gate_up_q4 loop 74%(reduce 26%);down_q4 loop 仅 50%(7 级
+    syncthreads 树归约吃掉一半块时长)。
+  - **优化 1**:Q4 双内核 warp-shfl 归约 + 一轮共享合并(替换 7 级
+    syncthreads 树)——down_q4 loop 50→74%、span 58→44μs,in-stream
+    201→236 GB/s;gate_up loop 74→89%。
+  - **优化 2**:GEMV_F16/QKV uint2 载入(每 lane 4×f16=256B/warp/步,
+    在途字节翻倍;d%4==2 行基址仅 4-mod-8 对齐,保 u32 对回退)——
+    q 445→488 GB/s、k/v 152→213、o 330→425、qkv 515→565(in-stream)。
+  - **优化 3**:Q4 双内核字节对改为单次 u16 载入(每张量每 lane 少 1 条
+    load)——A/B 在噪声内,按"更少指令"保留。
+  - **30B 真机 A/B**:attn 5.55→5.1ms、moe 4.6→4.37ms、总 12.34(当日
+    master 基线)→ **10.2ms;decode 11.33 ms/step(88 tok/s,16 步)**;
+    greedy 序列与 master 逐 token 一致(220 220 16 271 ... 198)。
+  - 累计:190 → 11.33 ms/step = 16.8x。
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量;离线门禁 52
+    内核+计数断言;gemv_shape_bench 新增 MACH_BENCH_HOLD_SECS 驻留旋钮
+    (RGP 复测用)。

@@ -1798,7 +1798,7 @@ impl BatchedModel {
          -> Result<(), Error> {
             if f16 {
                 if b <= GEMV_MAX_M && kk <= GEMV_MAX_D {
-                    k.launch_gemv_f16(out, x, w16, n, kk, b)
+                    k.launch_gemv_f16(out, x, w16, n, kk, b, std::ptr::null_mut())
                 } else {
                     k.gemm_batched_f16(out, x, w16, b, n, kk, self.xh, self.yh)
                 }
@@ -2033,7 +2033,18 @@ impl BatchedModel {
                 if f16 && b <= GEMV_MAX_M {
                     let l = l16.expect("f16 layer");
                     k.launch_gemv_f16_qkv(
-                        self.xn, l.wq, l.wk, l.wv, self.q, self.k_buf, self.v_buf, nq, nkv, d, b,
+                        self.xn,
+                        l.wq,
+                        l.wk,
+                        l.wv,
+                        self.q,
+                        self.k_buf,
+                        self.v_buf,
+                        nq,
+                        nkv,
+                        d,
+                        b,
+                        std::ptr::null_mut(),
                     )?;
                 } else {
                     gemm(
@@ -2398,6 +2409,7 @@ impl BatchedModel {
                                     einter,
                                     d,
                                     topk,
+                                    std::ptr::null_mut(),
                                 )?;
                                 k.launch_silu_mul(
                                     self.up_all,
@@ -2414,6 +2426,7 @@ impl BatchedModel {
                                     rows_total,
                                     d,
                                     einter,
+                                    std::ptr::null_mut(),
                                 )?;
                             } else {
                                 // Full-layer expert weights for this layer.
@@ -2673,6 +2686,7 @@ impl BatchedModel {
                     c.vocab_size as i32,
                     d,
                     b,
+                    std::ptr::null_mut(),
                 )?;
             } else {
                 k.gemm_batched_f16(
