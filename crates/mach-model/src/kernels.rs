@@ -2012,9 +2012,9 @@ extern "C" __global__ void moe_grouped_down_q4(
     const long long b0 = wbase / 2;
     const int nb = einter / 2;
     float acc = 0.f;
-    // 2 bytes (4 elements) per lane per iteration: all 4 elements share one
-    // group scale (wbase is a multiple of 32, so 4 aligned elements never
-    // straddle); the u16 load halves the iteration count vs 1-byte lanes.
+    // 2 consecutive bytes (4 elements) per lane per iteration: all 4 share
+    // one group scale (wbase is a multiple of 32, so 4 aligned elements
+    // never straddle); halves the iteration count vs 1-byte lanes.
     for (int b2 = threadIdx.x; b2 < nb / 2; b2 += blockDim.x) {
         unsigned short p0 = wd_q[b0 + 2 * b2];
         unsigned short p1 = wd_q[b0 + 2 * b2 + 1];
