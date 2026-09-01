@@ -1959,15 +1959,43 @@ extern "C" __global__ void moe_grouped_gate_up_q4(
     const long long b0 = wbase / 2;  // first Q4 byte of this row (wbase even)
     const int nb = d / 2;            // bytes in this row
     float ag = 0.f, au = 0.f;
-    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
-        int l0 = wg_q[b0 + b] & 0x0F;
-        int h0 = wg_q[b0 + b] >> 4;
-        int l1 = wu_q[b0 + b] & 0x0F;
-        int h1 = wu_q[b0 + b] >> 4;
+    // 2 consecutive bytes per tensor per lane (4+4 elements): all share one
+    // group scale per tensor (wbase 32-aligned → 4 aligned elements never
+    // straddle); halves the iteration count vs 1-byte lanes.
+    for (int b2 = threadIdx.x; b2 < nb / 2; b2 += blockDim.x) {
+        unsigned short pw = wg_q[b0 + 2 * b2];
+        unsigned short pw1 = wg_q[b0 + 2 * b2 + 1];
+        unsigned short pu = wu_q[b0 + 2 * b2];
+        unsigned short pu1 = wu_q[b0 + 2 * b2 + 1];
+        int g = (int)(((wbase >> 1) + 2 * b2) >> 4);
+        float swg = wg_s[g];
+        float swu = wu_s[g];
+        float2 x0 = xr2[2 * b2];
+        float2 x1 = xr2[2 * b2 + 1];
+        int lw0 = pw & 0x0F; int hw0 = pw >> 4;
+        int lw1 = pw1 & 0x0F; int hw1 = pw1 >> 4;
+        int lu0 = pu & 0x0F; int hu0 = pu >> 4;
+        int lu1 = pu1 & 0x0F; int hu1 = pu1 >> 4;
+        ag += x0.x * swg * (float)(lw0 < 8 ? lw0 : lw0 - 16)
+            + x0.y * swg * (float)(hw0 < 8 ? hw0 : hw0 - 16)
+            + x1.x * swg * (float)(lw1 < 8 ? lw1 : lw1 - 16)
+            + x1.y * swg * (float)(hw1 < 8 ? hw1 : hw1 - 16);
+        au += x0.x * swu * (float)(lu0 < 8 ? lu0 : lu0 - 16)
+            + x0.y * swu * (float)(hu0 < 8 ? hu0 : hu0 - 16)
+            + x1.x * swu * (float)(lu1 < 8 ? lu1 : lu1 - 16)
+            + x1.y * swu * (float)(hu1 < 8 ? hu1 : hu1 - 16);
+    }
+    // Odd tail (nb odd): last byte handled by lane 0.
+    if (threadIdx.x == 0 && (nb & 1)) {
+        int b = nb - 1;
         int g = (int)(((wbase >> 1) + b) >> 4);
         float swg = wg_s[g];
         float swu = wu_s[g];
         float2 x2 = xr2[b];
+        int l0 = wg_q[b0 + b] & 0x0F;
+        int h0 = wg_q[b0 + b] >> 4;
+        int l1 = wu_q[b0 + b] & 0x0F;
+        int h1 = wu_q[b0 + b] >> 4;
         ag += x2.x * swg * (float)(l0 < 8 ? l0 : l0 - 16)
             + x2.y * swg * (float)(h0 < 8 ? h0 : h0 - 16);
         au += x2.x * swu * (float)(l1 < 8 ? l1 : l1 - 16)
@@ -4161,8 +4189,8 @@ impl HipKernels {
         topk: i32,
     ) -> Result<(), Error> {
         assert!(
-            d % 2 == 0 && einter % 2 == 0,
-            "gate_up_q4 requires even d/einter (byte-pair Q4 unpacking), got d={d} einter={einter}"
+            d % 4 == 0 && einter % 4 == 0,
+            "gate_up_q4 requires d/einter divisible by 4 (paired Q4 unpacking + group alignment), got d={d} einter={einter}"
         );
         let xp = x;
         let idp = ids;
@@ -4208,8 +4236,8 @@ impl HipKernels {
         einter: i32,
     ) -> Result<(), Error> {
         assert!(
-            d % 2 == 0 && einter % 2 == 0,
-            "down_q4 requires even d/einter (byte-pair Q4 unpacking), got d={d} einter={einter}"
+            d % 4 == 0 && einter % 4 == 0,
+            "down_q4 requires d/einter divisible by 4 (paired Q4 unpacking + group alignment), got d={d} einter={einter}"
         );
         let ehp = eh;
         let idp = ids;
