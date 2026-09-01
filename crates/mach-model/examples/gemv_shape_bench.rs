@@ -1,9 +1,10 @@
 //! Per-kernel shape benchmark for the 30B decode path: times gemv_f16 at the
 //! four attention projection shapes and the Q4 grouped pair at the routed
-//! MoE shape, reporting effective bandwidth per kernel. NOTE: each iteration
-//! includes a device sync, so the numbers are LATENCY-DOMINATED bandwidth
-//! floors (launch + drain included) — good for relative hotspot ranking, not
-//! steady-state throughput.
+//! MoE shape. Reports BOTH modes per kernel:
+//! - "sync":   launch + device sync per iteration — latency floor (one
+//!   kernel in flight, launch overhead included);
+//! - "stream": N back-to-back launches with one final sync — the in-stream
+//!   throughput the engine actually sees.
 //!
 //!   cargo run -p mach-model --release --features hip --example gemv_shape_bench
 #[cfg(feature = "hip")]
@@ -41,21 +42,34 @@ fn run() {
 
     let iters = 200usize;
 
-    let time = |label: &str, bytes: usize, f: &mut dyn FnMut()| {
+    let time = |label: &str, bytes: usize, f_stream: &mut dyn FnMut()| {
+        // Warmup (launches + final sync).
         for _ in 0..10 {
-            f();
+            f_stream();
         }
         k.sync().unwrap();
+
+        // Sync mode: launch + device sync per iteration (latency floor).
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            f();
+            f_stream();
+            k.sync().unwrap();
+        }
+        let sync_us = t0.elapsed().as_secs_f64() / iters as f64 * 1e6;
+
+        // Stream mode: back-to-back launches, one final sync (in-stream).
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            f_stream();
         }
         k.sync().unwrap();
-        let el = t0.elapsed().as_secs_f64() / iters as f64;
-        let bw = bytes as f64 / el / 1e9;
-        let us = el * 1e6;
-        let mib = bytes as f64 / (1024.0 * 1024.0);
-        println!("{label:24} {us:8.1} us  ({bw:7.1} GB/s, {mib:.1} MiB)");
+        let stream_us = t1.elapsed().as_secs_f64() / iters as f64 * 1e6;
+        let stream_bw = bytes as f64 / (stream_us / 1e6) / 1e9;
+
+        println!(
+            "{label:26} sync {sync_us:8.1} us | stream {stream_us:9.1} us ({stream_bw:7.1} GB/s, {:6.2} MiB)",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
     };
 
     // ---- attention GEMV shapes ----
@@ -72,7 +86,6 @@ fn run() {
         let mut f = Box::new(move || {
             kg.launch_gemv_f16(out, x, w, n as i32, d as i32, batch as i32)
                 .unwrap();
-            kg.sync().unwrap();
         });
         time(name, n * d * 2 + batch * d * 4, &mut f);
         hip::free(&h, x as *mut core::ffi::c_void).unwrap();
@@ -125,7 +138,6 @@ fn run() {
             topk as i32,
         )
         .unwrap();
-        kg.sync().unwrap();
     });
     // down_q4 reads 1 Q4 tensor (topk rows x d*einter/2 each) + scales.
     let kg = k.clone();
@@ -141,7 +153,6 @@ fn run() {
             einter as i32,
         )
         .unwrap();
-        kg.sync().unwrap();
     });
 
     time(
