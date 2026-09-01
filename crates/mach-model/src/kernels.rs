@@ -4189,8 +4189,8 @@ impl HipKernels {
         topk: i32,
     ) -> Result<(), Error> {
         assert!(
-            d % 2 == 0 && einter % 2 == 0,
-            "gate_up_q4 requires even d/einter (byte-pair Q4 unpacking), got d={d} einter={einter}"
+            d % 4 == 0 && einter % 4 == 0,
+            "gate_up_q4 requires d/einter divisible by 4 (paired Q4 unpacking + group alignment), got d={d} einter={einter}"
         );
         let xp = x;
         let idp = ids;
@@ -4236,8 +4236,8 @@ impl HipKernels {
         einter: i32,
     ) -> Result<(), Error> {
         assert!(
-            d % 2 == 0 && einter % 2 == 0,
-            "down_q4 requires even d/einter (byte-pair Q4 unpacking), got d={d} einter={einter}"
+            d % 4 == 0 && einter % 4 == 0,
+            "down_q4 requires d/einter divisible by 4 (paired Q4 unpacking + group alignment), got d={d} einter={einter}"
         );
         let ehp = eh;
         let idp = ids;
