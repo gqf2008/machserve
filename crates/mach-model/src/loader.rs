@@ -334,6 +334,26 @@ fn load_qk_norm(
     Err(Error::Model(format!("{name}: unexpected QK-norm size {n}")))
 }
 
+/// Qwen3 ships q_norm/k_norm as one SHARED `[head_dim]` vector, while the
+/// QK-norm kernel indexes per head (`[n_heads, head_dim]`). The f32 loader
+/// broadcasts via `load_qk_norm`; the Q4/FP8 loaders call this after the
+/// layer is built so both storage paths match the kernel contract.
+fn broadcast_qk_norm(q_norm: &mut Vec<f32>, k_norm: &mut Vec<f32>, cfg: &Config) {
+    let hd = cfg.head_dim;
+    if q_norm.len() == hd && cfg.n_heads > 1 {
+        let shared = q_norm.clone();
+        for _ in 1..cfg.n_heads {
+            q_norm.extend_from_slice(&shared);
+        }
+    }
+    if k_norm.len() == hd && cfg.n_kv_heads > 1 {
+        let shared = k_norm.clone();
+        for _ in 1..cfg.n_kv_heads {
+            k_norm.extend_from_slice(&shared);
+        }
+    }
+}
+
 /// Builds [`Weights`] from a merged tensor map (single file or shards).
 fn build_weights(
     tensors: &HashMap<String, RawTensor>,
@@ -782,6 +802,7 @@ pub fn load_safetensors_q4(
             lw.moe_wu = concat("up_proj.weight");
             lw.moe_wd = concat("down_proj.weight");
         }
+        broadcast_qk_norm(&mut lw.q_norm, &mut lw.k_norm, cfg);
         layers.push(lw);
     }
 
@@ -1066,6 +1087,7 @@ pub fn load_safetensors_fp8(
             lw.moe_wu = concat("up_proj.weight");
             lw.moe_wd = concat("down_proj.weight");
         }
+        broadcast_qk_norm(&mut lw.q_norm, &mut lw.k_norm, cfg);
         layers.push(lw);
     }
 

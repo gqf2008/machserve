@@ -64,3 +64,58 @@ fn qwen3_8b_q4_decodes_finite_and_deterministic() {
     assert_eq!(max, 0.0, "decode must be deterministic");
     eprintln!("qwen3_8b_q4 OK: {} logits", a.len());
 }
+
+/// Real-prompt chat generation through the single-sequence GpuModel
+/// (Config::qwen3, no fusion — the known-good path). Prints the generated
+/// text so coherence can be judged by eye; NOT asserted automatically.
+#[test]
+fn qwen3_8b_q4_chat_generation_print() {
+    let Some(dir) = model_dir() else {
+        eprintln!("skipping qwen3_8b_q4 chat: set MACH_TEST_MODEL to the model dir");
+        return;
+    };
+    let Some(hip) = hip_ctx() else { return };
+
+    let mut cfg = Config::qwen3(4096, 36, 32, 8, 151936, 2048);
+    cfg.dtype = ModelDType::F16;
+    let w: WeightsQ4 = load_safetensors_q4(&dir, &cfg, false).expect("load Qwen3-8B Q4");
+    let mut m = GpuModel::from_q4(hip, cfg, &w).expect("build model from q4");
+
+    let tok = mach_model::tokenizer::Tokenizer::from_path(&dir.join("tokenizer.json"))
+        .expect("load tokenizer");
+    let im_start = tok.special_token_id("<|im_start|>").expect("im_start");
+    let im_end = tok.special_token_id("<|im_end|>").expect("im_end");
+    let user = tok.encode("user\nWhat is the capital of France? Answer briefly.");
+    let assistant = tok.encode("assistant\n");
+
+    let mut ids: Vec<u32> = vec![im_start];
+    ids.extend(user);
+    ids.push(im_end);
+    ids.extend(assistant);
+    let prompt_len = ids.len();
+
+    // First forward consumes the whole prompt; subsequent calls feed the
+    // last generated token only (the model keeps its KV state).
+    let logits = m.forward(&ids).expect("prefill");
+    let mut next = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i as u32)
+        .unwrap();
+    for _ in 1..40 {
+        if next == im_end {
+            break;
+        }
+        ids.push(next);
+        let logits = m.forward(&ids[ids.len() - 1..]).expect("decode");
+        next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+    }
+    let gen_text_ids = &ids[prompt_len..];
+    eprintln!("GENERATED: {}", tok.decode(gen_text_ids));
+}
