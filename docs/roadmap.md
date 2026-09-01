@@ -1142,3 +1142,16 @@
     开销);engine 侧 13.3 ms/step(attn 5.55/moe 5.5/other 0.75);
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
     server 13+17;qwen3_q4_real 新增真实文本生成测试;
+
+- **双口径内核基准 + down_q4 u16-lane 优化(#97,2026-09-01,7900 XTX)**:
+  - gemv_shape_bench 增加双口径:sync(launch+sync,延迟下界)与
+    stream(背靠背 launch,单次尾 sync,in-stream 吞吐);
+  - in-stream 实测(30B 形状,batch=1):q 423GB/s、k/v 152-154GB/s、
+    o 330GB/s、gate_up_q4 232GB/s、down_q4 170GB/s——**引擎已在内核
+    稳态吞吐运行**(sync 口径含 launch+排空,不代表引擎实际);
+  - down_q4 优化:每 lane 2 字节(4 元素,u16 载入)替代 1 字节;
+    wbase 32 对齐保证 4 元素不跨组(单 scale 查找);迭代减半;
+    A/B:in-stream 37→31.2μs(170→202GB/s,-16%);30B 真机 moe
+    5.5→5.2ms、总 **13.31 → 12.99 ms/step**;greedy 序列不变;
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
+    离线门禁 52 内核+计数断言;

@@ -2012,7 +2012,28 @@ extern "C" __global__ void moe_grouped_down_q4(
     const long long b0 = wbase / 2;
     const int nb = einter / 2;
     float acc = 0.f;
-    for (int b = threadIdx.x; b < nb; b += blockDim.x) {
+    // 2 consecutive bytes (4 elements) per lane per iteration: all 4 share
+    // one group scale (wbase is a multiple of 32, so 4 aligned elements
+    // never straddle); halves the iteration count vs 1-byte lanes.
+    for (int b2 = threadIdx.x; b2 < nb / 2; b2 += blockDim.x) {
+        unsigned short p0 = wd_q[b0 + 2 * b2];
+        unsigned short p1 = wd_q[b0 + 2 * b2 + 1];
+        int g = (int)(((wbase >> 1) + 2 * b2) >> 4);
+        float s = wd_s[g];
+        float2 x0 = eh2[2 * b2];
+        float2 x1 = eh2[2 * b2 + 1];
+        int l0 = p0 & 0x0F;
+        int h0 = p0 >> 4;
+        int l1 = p1 & 0x0F;
+        int h1 = p1 >> 4;
+        acc += x0.x * s * (float)(l0 < 8 ? l0 : l0 - 16)
+             + x0.y * s * (float)(h0 < 8 ? h0 : h0 - 16)
+             + x1.x * s * (float)(l1 < 8 ? l1 : l1 - 16)
+             + x1.y * s * (float)(h1 < 8 ? h1 : h1 - 16);
+    }
+    // Odd tail (nb odd): last byte handled by lane 0.
+    if (threadIdx.x == 0 && (nb & 1)) {
+        int b = nb - 1;
         int l0 = wd_q[b0 + b] & 0x0F;
         int h0 = wd_q[b0 + b] >> 4;
         int g = (int)(((wbase >> 1) + b) >> 4);
