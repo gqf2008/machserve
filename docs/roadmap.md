@@ -1155,3 +1155,11 @@
     5.5→5.2ms、总 **13.31 → 12.99 ms/step**;greedy 序列不变;
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
     离线门禁 52 内核+计数断言;
+
+- **gate_up_q4 u16-lane 优化(#99,2026-09-01,7900 XTX)**:
+  - #97 down_q4 同款:每 lane 2 字节 × 2 张量(wg+wu)= 8 元素/迭代,
+    迭代减半;wbase 32 对齐保证不跨组(单 scale 查找);
+  - A/B(30B 分相):**moe 5.5→4.81ms(-13%)**,总 12.99 →
+    **12.72 ms/step**;greedy 序列不变;
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量 batched 22/22;
+    离线门禁 52 内核+计数断言;
