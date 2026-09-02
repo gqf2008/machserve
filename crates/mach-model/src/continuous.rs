@@ -863,6 +863,11 @@ impl ContinuousModel {
         self.active == 0
     }
 
+    /// Forwards decode-graph capture control (#103) to the inner model.
+    pub fn set_decode_graph_enabled(&mut self, on: bool) {
+        self.model.set_decode_graph_enabled(on);
+    }
+
     /// Whether the sequence with `id` has finished (or is unknown).
     #[must_use]
     pub fn is_done(&self, id: SeqId) -> bool {

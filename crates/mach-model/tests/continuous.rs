@@ -1264,3 +1264,74 @@ fn paged_engine_retired_cap_recovers_and_reuses() {
         "reuse before and after the cap drain"
     );
 }
+
+/// #103 regression: sequential requests through the continuous engine with
+/// decode graphs enabled must produce token-for-token the same greedy output
+/// as the eager engine — across request churn (prefill eager + decode graph
+/// interleaved, slot reuse, per-n graph replay). Mirrors the mach-server
+/// single-stream loop where long generations on MACH_GRAPH=1 degenerated
+/// after several requests (2026-09-02).
+#[test]
+fn decode_graph_engine_repeated_requests_match_eager() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    cfg.num_experts = 4;
+    cfg.num_experts_per_tok = 2;
+    cfg.max_seq_len = 1024; // room for the long generations below
+    let w = Weights::random(&cfg, 211).unwrap();
+    // 6 sequential requests x 96 steps (request churn) then 2 requests x 600
+    // steps (long single-stream decode, the 30B server failure shape).
+    let run = |eng: &mut ContinuousModel| {
+        let mut outs = Vec::new();
+        for (r, &steps) in [96usize, 96, 96, 96, 96, 96, 600, 600].iter().enumerate() {
+            let prompt: Vec<u32> = (0..12u32)
+                .map(|i| (i * 13 + r as u32 * 7 + 1) % 900 + 1)
+                .collect();
+            let id = eng
+                .add(
+                    &prompt,
+                    steps,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    SamplingParams::greedy(0),
+                )
+                .unwrap();
+            while !eng.is_done(id) {
+                eng.step().unwrap();
+            }
+            outs.push(eng.generated(id));
+        }
+        outs
+    };
+    // F16 grouped-MoE engine. prefill_rows=512 mirrors the server: the whole
+    // 12-token prompt prefills in one n=12 chunk through the hipBLAS path.
+    {
+        let mut eager = ContinuousModel::with_prefill_rows(hip.clone(), cfg, &w, 2, 512).unwrap();
+        let mut graphed = ContinuousModel::with_prefill_rows(hip.clone(), cfg, &w, 2, 512).unwrap();
+        graphed.set_decode_graph_enabled(true);
+        let e = run(&mut eager);
+        let g = run(&mut graphed);
+        for (r, (e, g)) in e.iter().zip(&g).enumerate() {
+            assert_eq!(e, g, "f16 request {r}: graph engine diverged from eager");
+        }
+    }
+    // Q4-on-device engine (the 30B server path: in-kernel dequant experts).
+    {
+        let wq = mach_model::WeightsQ4::from_weights(&w, &cfg);
+        let mut eager =
+            ContinuousModel::with_prefill_rows_q4_device(hip.clone(), cfg, &wq, 2, 512).unwrap();
+        let mut graphed =
+            ContinuousModel::with_prefill_rows_q4_device(hip.clone(), cfg, &wq, 2, 512).unwrap();
+        graphed.set_decode_graph_enabled(true);
+        let e = run(&mut eager);
+        let g = run(&mut graphed);
+        for (r, (e, g)) in e.iter().zip(&g).enumerate() {
+            assert_eq!(
+                e, g,
+                "q4-device request {r}: graph engine diverged from eager"
+            );
+        }
+    }
+}

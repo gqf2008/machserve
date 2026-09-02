@@ -1200,3 +1200,38 @@
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量;离线门禁 52
     内核+计数断言;gemv_shape_bench 新增 MACH_BENCH_HOLD_SECS 驻留旋钮
     (RGP 复测用)。
+
+- **服务链 HIP graph 捕获接入(#103,2026-09-02,7900 XTX)——实验开关落地**:
+  - **摸底**:30B 单步 ~725 次 hiprtc 模块 launch(48 MoE 层 × 15)+ ~5
+    输入上传 + 采样(12 参数上传 + kernel + sync + 2 D2H);#102 步时
+    11.33ms vs 内核 prof 总和 ~10.2ms → host launch 间隙 ~1.1ms(~10%)。
+  - **实现**(mach-engine/hip.rs + batched.rs,全部走 k.stream 单流):
+    per-n decode graph 桶(`decode_graphs: HashMap<i32, _>`)+ 贪心
+    `decode_step` 专用图(argmax 入图);捕获门控 `graph_capture_ok`
+    (f16、n≤8、decode_only、无 prof/prefetch、grouped MoE、专家槽
+    足量);host 每步只写 pinned 暂存(tokens/pos/slots/run_mask/表
+    偏移 + 采样参数),graph 内 memcpy 节点重放时重读;采样 sync+D2H
+    readback 留在图外(图边界)。`hipGraphUpload` 实例化后显式上传。
+  - **正确性**:合成 GPU 测试(F16+Q4-device)graph 与 eager 逐位
+    一致;30B 贪心路径 12000 次 replay(6000×2 pass)run-to-run 稳定;
+    churn 复现 example(qwen3_30b_graph_churn)eager 模式 8 请求
+    逐 token 一致。
+  - **裸 decode harness 收益**:11.02 → 10.27 ms/step(91→97 tok/s,
+    +7%),greedy 序列不变。
+  - **30B 真机腐化(驱动级,未解)**:服务链 MACH_GRAPH=1 下重复请求
+    数百至数千次 replay 后输出静默腐化(先"满速算错"后整体 no-op,
+    ~0.9ms/步,logits 冻结交替旧值;hipGraphLaunch/sync 均返回成功、
+    无 fault)。腐化与图内容无关(full/kernels-only/零 memcpy/
+    uploads-only 全中)、与 hipBLAS prefill 无关(GEMV prefill 同坏)、
+    hipGraphUpload 与周期重捕获均无效(重捕获还暴露 instantiate 数轮
+    capture/destroy 后假性 OOM);纯单流重放 12k 次稳定。判为 ROCm
+    6.2/Windows 驱动缺陷(与 rocm-systems#395 同类),用户态无解,
+    待 ROCm 升级用 churn example 复测。
+  - **服务链端到端零收益(前提被否定)**:kernels-only 图稳定运行时
+    服务端 512-token 请求 7.55s(eager)== 7.55s(graph)——瓶颈在
+    GPU 步之外的 host 簿记(~2.5ms/步),graph 只省 GPU 内 launch
+    开销;graph 收益只存在于裸 decode harness。
+  - **落地**:MACH_GRAPH=1 实验开关(默认关);churn example 留作
+    ROCm 升级复测工具;hip_graph_upload 入 API 表。
+  - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量
+    --test-threads 1;离线门禁 52 内核+计数断言。

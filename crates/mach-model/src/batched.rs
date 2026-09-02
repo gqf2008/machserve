@@ -12,6 +12,7 @@ use crate::kernels::HipKernels;
 use crate::moe_offload;
 use crate::sampling::{BatchedSampler, SampleOutput, SamplingParams};
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
+use mach_engine::graph::GraphCapture;
 use mach_kernel_sys::hip::{self, Hip, HipEvent};
 use std::sync::Arc;
 
@@ -333,6 +334,26 @@ pub struct BatchedModel {
     /// Device per-row table offsets: `[rows]` ints, `offset[row] = slots[row] *
     /// max_pages_per_seq`, refreshed per step.
     table_offsets: *mut i32,
+    /// #103: lazily captured HIP graphs for pure-decode steps, keyed by the
+    /// active row count `n` (`1..=GEMV_MAX_M`). Capture folds the whole decode
+    /// step (~700 module launches + the input-upload memcpys on this
+    /// host-launch-bound platform) into one `hipGraphLaunch`; replay re-reads
+    /// the pinned staging buffers, so only the sampler readback (sync + D2H)
+    /// stays outside the graph.
+    decode_graphs: std::collections::HashMap<i32, Box<dyn mach_engine::graph::GraphHandle>>,
+    /// The greedy [`Self::decode_step`] graph (its row count is always
+    /// `self.batch`, so a single graph suffices — kept separate from
+    /// `decode_graphs`, whose captures embed the full sampler instead of the
+    /// argmax readback kernel).
+    greedy_graph: Option<Box<dyn mach_engine::graph::GraphHandle>>,
+    /// MACH_GRAPH=1 gate for service-chain decode-graph capture (also
+    /// switchable via [`Self::set_decode_graph_enabled`]). Experimental: on
+    /// ROCm 6.2 / Windows the 30B service chain degenerates after ~1-4k graph
+    /// replays (hipGraphLaunch/sync report success while the GPU work silently
+    /// vanishes — see the churn repro `qwen3_30b_graph_churn`); pure single-
+    /// stream replay survived 12k steps, so the knob stays opt-in until the
+    /// driver-side behavior is re-verified on a newer ROCm.
+    graph_enabled: bool,
 }
 
 impl BatchedModel {
@@ -873,6 +894,9 @@ impl BatchedModel {
             offsets_host: std::ptr::null_mut(),
             offsets_dirty: false,
             table_offsets: std::ptr::null_mut(),
+            decode_graphs: std::collections::HashMap::new(),
+            greedy_graph: None,
+            graph_enabled: std::env::var("MACH_GRAPH").is_ok_and(|v| v == "1"),
         };
         m.alloc_buffers()?;
         upload(&mut m)?;
@@ -1666,6 +1690,44 @@ impl BatchedModel {
                 return Err(Error::Model(format!("seq {i} exceeds max_seq_len")));
             }
         }
+        let b = self.batch;
+        if self.graph_capture_ok(b, true) {
+            // Greedy graph path (#103): stage every pinned mirror, then one
+            // replay covers uploads + run_kernels + argmax; only the D2H
+            // readback stays outside.
+            unsafe {
+                for (i, (&t, &l)) in tokens.iter().zip(&self.lens).enumerate() {
+                    *self.tokens_host.add(i) = t as i32;
+                    *self.pos_host.add(i) = l as i32;
+                    *self.slots_host.add(i) = i as i32; // row == slot for decode
+                    *self.run_mask_host.add(i) = 0;
+                    self.last_row_by_slot[i] = i;
+                }
+            }
+            if self.paged {
+                // The graph always re-uploads the offsets: keep the staging at
+                // the identity mapping this entry point guarantees.
+                let identity: Vec<u32> = (0..b as u32).collect();
+                self.stage_table_offsets(&identity);
+            }
+            if self.greedy_graph.is_none() {
+                self.capture_greedy_decode_graph()?;
+            }
+            // SAFETY: every captured buffer is owned by `self` and alive; the
+            // pinned staging mirrors were refreshed above on this thread.
+            unsafe { self.greedy_graph.as_deref().unwrap().replay()? }
+            let next = self.sample_readback(b)?;
+            // Only now is the device offsets buffer known to hold the identity
+            // mapping (the graph's recorded memcpy uploaded it): clearing the
+            // dirty flag earlier would let a failed capture/replay leave a
+            // stale non-identity table in place while the eager fallback
+            // skips its refresh.
+            self.offsets_dirty = false;
+            for l in self.lens.iter_mut() {
+                *l += 1;
+            }
+            return Ok(next);
+        }
         unsafe {
             for (i, (&t, &l)) in tokens.iter().zip(&self.lens).enumerate() {
                 *self.tokens_host.add(i) = t as i32;
@@ -1736,23 +1798,41 @@ impl BatchedModel {
     /// slot` no longer holds — every row addresses its sequence's pages via
     /// this offset. No-op outside paged mode.
     fn refresh_table_offsets(&mut self, slots: &[u32]) -> Result<(), Error> {
+        self.stage_table_offsets(slots);
+        self.upload_table_offsets(slots.len())
+    }
+
+    /// Host half of [`Self::refresh_table_offsets`]: refills the pinned
+    /// offsets staging only. Split from the upload so decode-graph capture can
+    /// record the memcpy (the graph then re-reads this staging on replay)
+    /// while the per-step host write stays outside the graph. No-op outside
+    /// paged mode.
+    fn stage_table_offsets(&mut self, slots: &[u32]) {
         if !self.paged {
-            return Ok(());
+            return;
         }
         debug_assert!(slots.len() <= self.rows, "active rows exceed capacity");
         unsafe {
             for (r, &s) in slots.iter().enumerate() {
                 *self.offsets_host.add(r) = (s as usize * self.max_pages_per_seq) as i32;
             }
-            hip::memcpy_async(
-                self.k.hip(),
-                self.table_offsets as *mut core::ffi::c_void,
-                self.offsets_host as *const core::ffi::c_void,
-                slots.len() * 4,
-                hip::HIP_MEMCPY_HOST_TO_DEVICE,
-                self.k.stream,
-            )?;
         }
+    }
+
+    /// Device half of [`Self::refresh_table_offsets`]: stream-ordered H2D of
+    /// the pinned offsets staging. No-op outside paged mode.
+    fn upload_table_offsets(&self, n: usize) -> Result<(), Error> {
+        if !self.paged {
+            return Ok(());
+        }
+        hip::memcpy_async(
+            self.k.hip(),
+            self.table_offsets as *mut core::ffi::c_void,
+            self.offsets_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
         Ok(())
     }
 
@@ -1765,6 +1845,212 @@ impl BatchedModel {
             self.offsets_dirty = false;
         }
         Ok(())
+    }
+
+    /// Device half of the decode-step input staging: tokens/pos/slots/run_mask
+    /// (+ paged table offsets) H2D from the pinned mirrors. When captured into
+    /// a decode graph these become memcpy nodes that re-copy the current
+    /// staging contents on every replay, so the host only rewrites the pinned
+    /// buffers between steps.
+    fn upload_decode_inputs(&self, n: usize) -> Result<(), Error> {
+        hip::memcpy_async(
+            self.k.hip(),
+            self.tokens_dev as *mut core::ffi::c_void,
+            self.tokens_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        hip::memcpy_async(
+            self.k.hip(),
+            self.pos_dev as *mut core::ffi::c_void,
+            self.pos_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        hip::memcpy_async(
+            self.k.hip(),
+            self.slots_dev as *mut core::ffi::c_void,
+            self.slots_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        hip::memcpy_async(
+            self.k.hip(),
+            self.run_mask_dev as *mut core::ffi::c_void,
+            self.run_mask_host as *const core::ffi::c_void,
+            n * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        self.upload_table_offsets(n)
+    }
+
+    /// #103: a step is graph-capturable only when it is a pure decode step on
+    /// the custom-GEMV path with a fully device-driven MoE and no outside
+    /// stream/sync involvement:
+    /// - `decode_only` (prefill/mixed steps keep the hipBLAS/host-loop paths,
+    ///   which sync and read counts back to the host);
+    /// - `n <= GEMV_MAX_M` so every projection's grid is fixed at capture
+    ///   time, and every projection's reduction width `<= GEMV_MAX_D` so
+    ///   every projection takes the custom GEMV kernels — the hipBLAS
+    ///   `GemmEx` fallback may lazily allocate workspace, which aborts
+    ///   capture. The widths are the input side of each projection: dense
+    ///   models use d / nq / inter, MLA adds q_lora_rank / kv_lora_rank;
+    /// - f16 (f32 routes even small GEMMs through hipBLAS);
+    /// - no step profiler (event records would be baked into the graph) and no
+    ///   prefetch engine (its cross-stream H2D pipeline cannot be captured);
+    /// - MoE models must take the device-driven grouped path with all experts
+    ///   resident (no CPU-expert host loop).
+    fn graph_capture_ok(&self, n: usize, decode_only: bool) -> bool {
+        if !(self.graph_enabled && decode_only)
+            || self.prof.is_some()
+            || self.prefetch.is_some()
+            || self.cfg.dtype != ModelDType::F16
+            || n == 0
+            || n > GEMV_MAX_M as usize
+        {
+            return false;
+        }
+        let c = &self.cfg;
+        let max_kk = if c.kv_lora_rank > 0 {
+            // MLA: q_a(d) / kv_a(d) / q_b(q_lora_rank) / kv_b(kv_lora_rank)
+            // / o(n_heads * v_head_dim).
+            c.d_model
+                .max(c.q_lora_rank)
+                .max(c.kv_lora_rank)
+                .max(c.n_heads * c.v_head_dim)
+        } else {
+            // Dense/MoE: q/k/v + router + lm_head(d), o(nq), dense-MLP
+            // down(inter); MoE experts ride the device-driven grouped kernels
+            // (required below), not the gemm closure.
+            c.d_model
+                .max(c.n_heads * c.head_dim)
+                .max(c.intermediate_size)
+        };
+        if max_kk > GEMV_MAX_D as usize {
+            return false;
+        }
+        if c.num_experts > 0 {
+            let grouped = self.moe_grouped || !self.q4_experts.is_empty();
+            if !grouped || self.expert_slots < c.num_experts {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Enables/disables decode-graph capture (MACH_GRAPH=1 sets the initial
+    /// value at construction; tests use this setter instead of the process-wide
+    /// env). Existing captured graphs stay cached.
+    pub fn set_decode_graph_enabled(&mut self, on: bool) {
+        self.graph_enabled = on;
+    }
+
+    /// Number of captured decode graphs (one per active-row-count bucket seen
+    /// so far). Diagnostics/tests for the #103 graph path.
+    #[must_use]
+    pub fn decode_graph_count(&self) -> usize {
+        self.decode_graphs.len()
+    }
+
+    /// Captures the greedy [`Self::decode_step`] sequence (input uploads +
+    /// `run_kernels` + argmax) into a single HIP graph. Same capture-then-
+    /// immediately-replay contract as [`Self::capture_decode_graph`].
+    fn capture_greedy_decode_graph(&mut self) -> Result<(), Error> {
+        let cap =
+            mach_engine::hip::HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)
+                .inspect_err(|_| self.graph_enabled = false)?;
+        // Any capture failure permanently disables the graph path: a caller
+        // must fall back to eager rather than re-failing every step.
+        if let Err(e) = cap.prepare() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
+        self.k.sync()?;
+        if let Err(e) = cap.begin() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
+        let record = (|| {
+            self.upload_decode_inputs(self.batch)?;
+            self.run_kernels(
+                self.batch as i32,
+                self.slots_dev,
+                self.run_mask_dev,
+                true,
+                0,
+            )?;
+            self.sample_device(self.batch)
+        })();
+        // `end` must run even when recording failed, to leave capture mode.
+        match (record, cap.end()) {
+            (Ok(()), Ok(g)) => {
+                self.greedy_graph = Some(g);
+                eprintln!("greedy decode graph captured (batch={})", self.batch);
+                Ok(())
+            }
+            (Err(e), _) => {
+                self.graph_enabled = false;
+                Err(e)
+            }
+            (Ok(()), Err(e)) => {
+                self.graph_enabled = false;
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Captures one pure-decode step (input uploads + `run_kernels` + sampler
+    /// upload/kernel) into a HIP graph keyed by the active row count `n`.
+    /// Stream capture records without executing, so the first replay right
+    /// after capture performs exactly the step that was just recorded — no
+    /// separate warmup is needed (all kernels were compiled at
+    /// [`HipKernels::new`] and all device buffers were allocated at
+    /// construction, so the capture window allocates and compiles nothing).
+    fn capture_decode_graph(&mut self, n: i32) -> Result<(), Error> {
+        let cap =
+            mach_engine::hip::HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)
+                .inspect_err(|_| self.graph_enabled = false)?;
+        // Any capture failure permanently disables the graph path: a caller
+        // must fall back to eager rather than re-failing every step.
+        if let Err(e) = cap.prepare() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
+        self.k.sync()?;
+        if let Err(e) = cap.begin() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
+        let record = (|| {
+            self.upload_decode_inputs(n as usize)?;
+            self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0)?;
+            self.sampler.sample_batched_upload(n as usize)?;
+            self.sampler
+                .sample_batched_kernel(self.logits, n, self.cfg.vocab_size)
+        })();
+        // `end` must run even when recording failed, to leave capture mode.
+        match (record, cap.end()) {
+            (Ok(()), Ok(g)) => {
+                self.decode_graphs.insert(n, g);
+                eprintln!(
+                    "decode graph captured: n={n} ({} total)",
+                    self.decode_graphs.len()
+                );
+                Ok(())
+            }
+            (Err(e), _) => {
+                self.graph_enabled = false; // don't retry a failing shape
+                Err(e)
+            }
+            (Ok(()), Err(e)) => {
+                self.graph_enabled = false;
+                Err(e.into())
+            }
+        }
     }
 
     fn run_kernels(
@@ -2723,13 +3009,24 @@ impl BatchedModel {
 
     /// Batched greedy sampling: argmax per row, read back only `batch` tokens.
     fn sample(&self, n: usize) -> Result<Vec<u32>, Error> {
-        let b = n as i32;
+        self.sample_device(n)?;
+        self.sample_readback(n)
+    }
+
+    /// Device half of [`Self::sample`]: the argmax kernel only (graph-
+    /// capturable, #103).
+    fn sample_device(&self, n: usize) -> Result<(), Error> {
         self.k.launch_argmax_batched(
             self.logits,
             self.out_tok_dev,
             self.cfg.vocab_size as i32,
-            b,
-        )?;
+            n as i32,
+        )
+    }
+
+    /// Host half of [`Self::sample`]: sync + D2H of the sampled tokens. This
+    /// is the graph boundary — it cannot be captured.
+    fn sample_readback(&self, n: usize) -> Result<Vec<u32>, Error> {
         unsafe {
             hip::check(
                 self.k.hip(),
@@ -2781,6 +3078,9 @@ impl BatchedModel {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
+        // The sampler stages/reads per row; a mismatch would silently sample
+        // stale staging rows in the graph path (its grid uses `n`).
+        assert_eq!(n, params.len(), "tokens and params must be equal length");
         assert!(n <= self.rows, "active count exceeds row capacity");
         // Positions and slots must stay inside the device buffers: an out-of-
         // range length would make the KV store write past the cache (silent
@@ -2801,9 +3101,11 @@ impl BatchedModel {
         // Prefill-attention runs are currently disabled: the naive shared-KV
         // kernel is occupancy-bound and slower than decode attention on this
         // GPU (see roadmap). All rows use decode attention (run_mask = 0).
-        let runs: Vec<i32> = Vec::new();
         let run_mask = vec![0i32; n];
         let num_runs = 0;
+        // Host staging: refresh every pinned input mirror. Replayable graphs
+        // re-read these buffers on every launch, so this write is the ONLY
+        // per-step input work in the graph path.
         unsafe {
             for i in 0..n {
                 *self.tokens_host.add(i) = tokens[i] as i32;
@@ -2811,66 +3113,39 @@ impl BatchedModel {
                 *self.slots_host.add(i) = slots[i] as i32;
                 *self.run_mask_host.add(i) = run_mask[i];
             }
-            for (k, &v) in runs.iter().enumerate() {
-                *self.runs_host.add(k) = v;
-            }
-            hip::memcpy_async(
-                self.k.hip(),
-                self.tokens_dev as *mut core::ffi::c_void,
-                self.tokens_host as *const core::ffi::c_void,
-                n * 4,
-                hip::HIP_MEMCPY_HOST_TO_DEVICE,
-                self.k.stream,
-            )?;
-            hip::memcpy_async(
-                self.k.hip(),
-                self.pos_dev as *mut core::ffi::c_void,
-                self.pos_host as *const core::ffi::c_void,
-                n * 4,
-                hip::HIP_MEMCPY_HOST_TO_DEVICE,
-                self.k.stream,
-            )?;
-            hip::memcpy_async(
-                self.k.hip(),
-                self.slots_dev as *mut core::ffi::c_void,
-                self.slots_host as *const core::ffi::c_void,
-                n * 4,
-                hip::HIP_MEMCPY_HOST_TO_DEVICE,
-                self.k.stream,
-            )?;
-            hip::memcpy_async(
-                self.k.hip(),
-                self.run_mask_dev as *mut core::ffi::c_void,
-                self.run_mask_host as *const core::ffi::c_void,
-                n * 4,
-                hip::HIP_MEMCPY_HOST_TO_DEVICE,
-                self.k.stream,
-            )?;
-            if num_runs > 0 {
-                hip::memcpy_async(
-                    self.k.hip(),
-                    self.runs_dev as *mut core::ffi::c_void,
-                    self.runs_host as *const core::ffi::c_void,
-                    num_runs * 4 * 4,
-                    hip::HIP_MEMCPY_HOST_TO_DEVICE,
-                    self.k.stream,
-                )?;
-            }
         }
         for (r, &s) in slots.iter().enumerate() {
             self.last_row_by_slot[s as usize] = r;
         }
-        self.refresh_table_offsets(slots)?;
+        self.stage_table_offsets(slots);
         self.offsets_dirty = true;
+        // Sampler parameter staging is host-only; the upload + kernel either
+        // run eagerly below or are recorded inside the decode graph.
+        self.sampler.sample_batched_stage(params, counts, bias)?;
+        let vocab = self.cfg.vocab_size;
+        if self.graph_capture_ok(n, decode_only) {
+            let key = n as i32;
+            if !self.decode_graphs.contains_key(&key) {
+                self.capture_decode_graph(key)?;
+            }
+            // SAFETY: every buffer the graph touches is owned by `self` and
+            // alive; the pinned staging mirrors (inputs + sampler params) were
+            // refreshed above on this thread, and no other stream uses them.
+            unsafe { self.decode_graphs[&key].replay()? }
+            return self
+                .sampler
+                .sample_batched_readback(self.logits, params, vocab);
+        }
+        self.upload_decode_inputs(n)?;
         self.run_kernels(
             n as i32,
             self.slots_dev,
             self.run_mask_dev,
             decode_only,
-            num_runs as i32,
+            num_runs,
         )?;
         self.sampler
-            .sample_batched(self.logits, params, counts, bias, self.cfg.vocab_size)
+            .sample_batched_after_stage(self.logits, params, vocab)
     }
 
     /// Saves a lightweight token-boundary anchor for `slot`: the per-layer KV
