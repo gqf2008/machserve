@@ -1044,7 +1044,7 @@ impl GpuModel {
          -> Result<(), Error> {
             if f16 {
                 if kk <= crate::batched::GEMV_MAX_D {
-                    k.launch_gemv_f16(out, x, w16, n, kk, 1)
+                    k.launch_gemv_f16(out, x, w16, n, kk, 1, std::ptr::null_mut())
                 } else {
                     k.gemm_f16(out, x, w16, n, kk, self.xh, self.yh)
                 }
@@ -1345,6 +1345,7 @@ impl GpuModel {
                     c.vocab_size as i32,
                     d,
                     1,
+                    std::ptr::null_mut(),
                 )?;
             } else {
                 k.gemm_f16(

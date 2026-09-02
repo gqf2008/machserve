@@ -17,6 +17,14 @@ fn main() {
     run();
     #[cfg(not(feature = "hip"))]
     eprintln!("gemv_shape_bench requires the `hip` feature");
+
+    // RGP/RDP 捕获需要进程在 trace 结束后仍驻留(ROCm/rocm-systems#395):
+    // MACH_BENCH_HOLD_SECS=N 时进程退出前驻留 N 秒。
+    if let Ok(secs) = std::env::var("MACH_BENCH_HOLD_SECS")
+        && let Ok(secs) = secs.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
 }
 
 #[cfg(feature = "hip")]
@@ -84,8 +92,16 @@ fn run() {
         let out = hip::malloc(&h, batch * n * 4).unwrap() as *mut f32;
         let kg = k.clone();
         let mut f = Box::new(move || {
-            kg.launch_gemv_f16(out, x, w, n as i32, d as i32, batch as i32)
-                .unwrap();
+            kg.launch_gemv_f16(
+                out,
+                x,
+                w,
+                n as i32,
+                d as i32,
+                batch as i32,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
         });
         time(name, n * d * 2 + batch * d * 4, &mut f);
         hip::free(&h, x as *mut core::ffi::c_void).unwrap();
@@ -136,6 +152,7 @@ fn run() {
             einter as i32,
             d as i32,
             topk as i32,
+            std::ptr::null_mut(),
         )
         .unwrap();
     });
@@ -151,6 +168,7 @@ fn run() {
             rows as i32,
             d as i32,
             einter as i32,
+            std::ptr::null_mut(),
         )
         .unwrap();
     });
