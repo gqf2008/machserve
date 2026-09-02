@@ -23,6 +23,12 @@
 //! grouped path and this knob is a no-op for them.
 //! MACH_STEP_PROFILE=1 (diagnostic): per-layer attention/MoE HIP event
 //! bracketing printed after each decode step.
+//! MACH_GRAPH=1 (experimental, #103): capture the decode step as a HIP graph
+//! and replay it (per active-row-count bucket). Raw decode wins ~7% at short
+//! context; the service chain shows no end-to-end gain (host bookkeeping
+//! dominates), and on ROCm 6.2 / Windows long-lived replays degenerate after
+//! ~1-4k launches (silent GPU-side no-op — see docs/roadmap.md and the
+//! qwen3_30b_graph_churn example). Off by default.
 #[cfg(feature = "hip")]
 use mach_kernel_sys::hip;
 #[cfg(feature = "hip")]

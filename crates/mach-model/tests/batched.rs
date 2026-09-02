@@ -358,6 +358,85 @@ fn moe_grouped_fallback_matches_grouped_f16() {
     }
 }
 
+/// #103: a captured decode graph replays bit-identically to the eager path —
+/// same greedy tokens and identical logits at every step (same kernels, same
+/// buffers; the graph only folds the launches).
+#[test]
+fn decode_graph_matches_eager_f16() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 171).unwrap();
+    let mut eager = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut graphed = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    graphed.set_decode_graph_enabled(true);
+    let prompt: Vec<u32> = (0..16u32).map(|i| (i * 17 + 3) % 1024 + 1).collect();
+    for (i, &t) in prompt.iter().enumerate() {
+        let mut pe = [SamplingParams::greedy(0)];
+        let mut pg = [SamplingParams::greedy(0)];
+        let e = eager
+            .decode_step_explicit(
+                &[t],
+                &[i as u32],
+                &[0],
+                &mut pe,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                true,
+            )
+            .unwrap();
+        let g = graphed
+            .decode_step_explicit(
+                &[t],
+                &[i as u32],
+                &[0],
+                &mut pg,
+                &vec![Vec::new(); 1],
+                &vec![Vec::new(); 1],
+                true,
+            )
+            .unwrap();
+        assert_eq!(e.0, g.0, "step {i}: graph vs eager sampled tokens");
+        let el = eager.read_logits().unwrap();
+        let gl = graphed.read_logits().unwrap();
+        assert_eq!(el, gl, "step {i}: graph replay must be bitwise identical");
+        assert_eq!(graphed.decode_graph_count(), 1, "one graph for n=1");
+    }
+}
+
+/// #103: changing the active row count switches per-n graph buckets — each n
+/// captures once and replays thereafter, outputs matching the eager twin.
+#[test]
+fn decode_graph_buckets_follow_active_rows() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 173).unwrap();
+    let mut eager = BatchedModel::new(hip.clone(), cfg, &w, 2).unwrap();
+    let mut graphed = BatchedModel::new(hip.clone(), cfg, &w, 2).unwrap();
+    graphed.set_decode_graph_enabled(true);
+    // n = 1, 2, 2, 1: captures the n=1 and n=2 buckets, then replays both.
+    for (i, &n) in [1usize, 2, 2, 1].iter().enumerate() {
+        let toks: Vec<u32> = (0..n as u32)
+            .map(|r| (i as u32 * 31 + r * 7 + 1) % 1024 + 1)
+            .collect();
+        let lens: Vec<u32> = vec![i as u32; n];
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let counts = vec![Vec::new(); n];
+        let bias = vec![Vec::new(); n];
+        let mut pe = vec![SamplingParams::greedy(0); n];
+        let mut pg = vec![SamplingParams::greedy(0); n];
+        let e = eager
+            .decode_step_explicit(&toks, &lens, &slots, &mut pe, &counts, &bias, true)
+            .unwrap();
+        let g = graphed
+            .decode_step_explicit(&toks, &lens, &slots, &mut pg, &counts, &bias, true)
+            .unwrap();
+        assert_eq!(e.0, g.0, "step {i} (n={n}): graph vs eager tokens");
+    }
+    assert_eq!(graphed.decode_graph_count(), 2, "n=1 and n=2 buckets");
+}
+
 #[test]
 fn batched_moe_small_config_matches_single_seq() {
     let Some(hip) = hip_ctx() else { return };

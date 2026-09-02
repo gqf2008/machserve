@@ -81,6 +81,7 @@ pub struct HipApi {
     pub hip_graph_instantiate:
         unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut c_void, *mut c_char, usize) -> c_int,
     pub hip_graph_launch: unsafe extern "C" fn(HipGraphExec, HipStream) -> c_int,
+    pub hip_graph_upload: unsafe extern "C" fn(HipGraphExec, HipStream) -> c_int,
     pub hip_graph_exec_destroy: unsafe extern "C" fn(HipGraphExec) -> c_int,
     pub hip_graph_destroy: unsafe extern "C" fn(HipGraph) -> c_int,
     pub hip_module_load_data: unsafe extern "C" fn(*mut HipModule, *const c_void) -> c_int,
@@ -251,6 +252,7 @@ fn load() -> Result<Arc<Hip>, HipError> {
         hip_stream_end_capture: sym(&hip_lib, "hipStreamEndCapture")?,
         hip_graph_instantiate: sym(&hip_lib, "hipGraphInstantiate")?,
         hip_graph_launch: sym(&hip_lib, "hipGraphLaunch")?,
+        hip_graph_upload: sym(&hip_lib, "hipGraphUpload")?,
         hip_graph_exec_destroy: sym(&hip_lib, "hipGraphExecDestroy")?,
         hip_graph_destroy: sym(&hip_lib, "hipGraphDestroy")?,
         hip_module_load_data: sym(&hip_lib, "hipModuleLoadData")?,

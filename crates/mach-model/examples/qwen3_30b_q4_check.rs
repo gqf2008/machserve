@@ -61,8 +61,10 @@ fn main() {
     let cfg_path = model_dir.join("config.json");
     assert!(cfg_path.exists(), "missing {cfg_path:?}");
     let mut cfg = config_from_json(&cfg_path);
-    // The diagnostic example always profiles.
-    cfg.step_profile = true;
+    // The diagnostic example profiles by default; MACH_GRAPH=1 (#103 decode
+    // graphs) turns it off — event records and graph capture are mutually
+    // exclusive by design.
+    cfg.step_profile = !std::env::var("MACH_GRAPH").is_ok_and(|v| v == "1");
     println!(
         "config: d={} layers={} experts={} topk={} moe_inter={} vocab={}",
         cfg.d_model,
@@ -99,8 +101,12 @@ fn main() {
 
     // Two full passes over the same sequence (the first pass doubles as
     // warmup): logits finite on every step, greedy tokens run-to-run stable
-    // (deterministic Q4 path), and per-step timing.
-    let n_steps = 16usize;
+    // (deterministic Q4 path), and per-step timing. MACH_CHECK_STEPS overrides
+    // the default 16 (long runs exercise graph replay stability, #103).
+    let n_steps = std::env::var("MACH_CHECK_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16usize);
     let run = |model: &mut BatchedModel| -> (Vec<u32>, std::time::Duration) {
         model.reset_state().unwrap();
         let mut got = Vec::with_capacity(n_steps);
@@ -125,7 +131,7 @@ fn main() {
         (got, t.elapsed())
     };
     let (a, el) = run(&mut model);
-    let (b, _) = run(&mut model);
+    let (b, el2) = run(&mut model);
     assert_eq!(
         a, b,
         "greedy tokens must be run-to-run stable (deterministic)"
@@ -133,11 +139,18 @@ fn main() {
     for (i, &g) in a.iter().enumerate() {
         println!("step {i}: greedy token {g}");
     }
+    // The first pass includes the one-time graph capture when MACH_GRAPH=1;
+    // the second is pure replay steady-state.
     println!(
-        "decode: {:.2} ms/step ({:.0} tok/s, {} steps)",
+        "decode: {:.2} ms/step pass1 ({:.0} tok/s, {} steps)",
         el.as_secs_f64() * 1000.0 / n_steps as f64,
         n_steps as f64 / el.as_secs_f64(),
         n_steps
+    );
+    println!(
+        "decode: {:.2} ms/step pass2 ({:.0} tok/s, steady-state)",
+        el2.as_secs_f64() * 1000.0 / n_steps as f64,
+        n_steps as f64 / el2.as_secs_f64(),
     );
     println!("OK: Q4-on-device 30B decode verified (finite logits, stable greedy)");
 }

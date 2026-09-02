@@ -772,6 +772,20 @@ impl BatchedSampler {
         bias: &[Vec<(u32, f32)>],
         vocab: usize,
     ) -> Result<SampleOutput, Error> {
+        self.sample_batched_stage(params, counts, bias)?;
+        self.sample_batched_after_stage(logits, params, vocab)
+    }
+
+    /// Host half of [`Self::sample_batched`]: validates the per-row inputs and
+    /// refills the pinned parameter staging (no device traffic). Split out so
+    /// decode-graph replay (#103) can redo just this host write per step while
+    /// the upload + kernel are folded into the graph.
+    pub(crate) fn sample_batched_stage(
+        &self,
+        params: &[SamplingParams],
+        counts: &[Vec<(u32, u32)>],
+        bias: &[Vec<(u32, f32)>],
+    ) -> Result<(), Error> {
         let n = params.len();
         assert!(n <= self.capacity, "sampler capacity exceeded");
         assert_eq!(counts.len(), n, "counts must be per-row");
@@ -802,11 +816,30 @@ impl BatchedSampler {
                 }
             }
         }
-        // Per-field `n`-row uploads from the packed staging block. The
-        // fields sit at fixed offsets, so this is 12 small memcpys — a
-        // whole-block copy would transfer `capacity` rows per step
-        // (~34MB at prefill-rows capacity) and dominate n≪capacity
-        // decode steps, which is exactly the hot case this sampler serves.
+        Ok(())
+    }
+
+    /// Eager device half following [`Self::sample_batched_stage`]: parameter
+    /// upload + sampling kernel + readback. Used by the non-graph decode path.
+    pub(crate) fn sample_batched_after_stage(
+        &self,
+        logits: *const f32,
+        params: &mut [SamplingParams],
+        vocab: usize,
+    ) -> Result<SampleOutput, Error> {
+        let n = params.len();
+        self.sample_batched_upload(n)?;
+        self.sample_batched_kernel(logits, n as i32, vocab)?;
+        self.sample_batched_readback(logits, params, vocab)
+    }
+
+    /// Per-field `n`-row uploads from the packed staging block. The fields sit
+    /// at fixed offsets, so this is 12 small memcpys — a whole-block copy
+    /// would transfer `capacity` rows per step (~34MB at prefill-rows
+    /// capacity) and dominate n≪capacity decode steps, which is exactly the
+    /// hot case this sampler serves. Graph-capturable (memcpy nodes re-copy
+    /// the current staging contents at replay).
+    pub(crate) fn sample_batched_upload(&self, n: usize) -> Result<(), Error> {
         hip::memcpy_async(
             &self.hip,
             self.temp_dev as *mut core::ffi::c_void,
@@ -903,7 +936,17 @@ impl BatchedSampler {
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.stream,
         )?;
+        Ok(())
+    }
 
+    /// The sampling kernel itself (penalties/bias in place on `logits`, then
+    /// per-row top-k/top-p/temperature draw). Graph-capturable.
+    pub(crate) fn sample_batched_kernel(
+        &self,
+        logits: *const f32,
+        n: i32,
+        vocab: usize,
+    ) -> Result<(), Error> {
         let lp = logits as *mut f32; // kernel applies penalties in place
         let tp = self.temp_dev;
         let kp = self.topk_dev;
@@ -920,7 +963,7 @@ impl BatchedSampler {
         let bvp = self.bias_vals_dev;
         let bcp = self.bias_count_dev;
         let vocab_i = vocab as i32;
-        let n_i = n as i32;
+        let n_i = n;
         let max_pen = MAX_PEN as i32;
         let max_bias = MAX_BIAS as i32;
         let mut args: Vec<*mut core::ffi::c_void> = vec![
@@ -946,7 +989,21 @@ impl BatchedSampler {
         ];
         self.kernel
             .launch([n as u32, 1, 1], [256, 1, 1], &mut args, self.stream)?;
+        Ok(())
+    }
 
+    /// Host-side readback half: sync, D2H the sampled tokens + logprobs,
+    /// advance the authoritative seeds, then the optional per-row
+    /// `top_logprobs` pass. This is the graph boundary (#103): the sync and
+    /// D2H cannot be captured, so the graph ends right after the sampling
+    /// kernel and every caller (graph or eager) funnels through here.
+    pub(crate) fn sample_batched_readback(
+        &self,
+        logits: *const f32,
+        params: &mut [SamplingParams],
+        vocab: usize,
+    ) -> Result<SampleOutput, Error> {
+        let n = params.len();
         unsafe {
             hip::check(
                 &self.hip,

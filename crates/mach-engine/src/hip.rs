@@ -406,6 +406,22 @@ impl GraphCapture for HipGraphCapture {
                 hip::error_string(&self.hip, r)
             )));
         }
+        // Upload the exec to the device up front rather than lazily inside
+        // the first `hipGraphLaunch`: the device image is deterministic
+        // before any replay and the first launch does not pay upload cost.
+        // (Measured on ROCm 6.2 / Windows this does NOT prevent the large-
+        // graph replay degeneration seen in issue #103 — kept because the
+        // explicit upload is the correct, deterministic pattern.)
+        let r = unsafe { (self.hip.api.hip_graph_upload)(exec, self.stream.0) };
+        if r != hip::HIP_SUCCESS {
+            unsafe {
+                let _ = (self.hip.api.hip_graph_exec_destroy)(exec);
+            }
+            return Err(GraphError::Driver(format!(
+                "hipGraphUpload: {r} {}",
+                hip::error_string(&self.hip, r)
+            )));
+        }
         Ok(Box::new(HipGraph {
             hip: std::sync::Arc::clone(&self.hip),
             exec: HipHandle(exec),
