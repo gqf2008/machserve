@@ -1710,7 +1710,6 @@ impl BatchedModel {
                 let identity: Vec<u32> = (0..b as u32).collect();
                 self.stage_table_offsets(&identity);
             }
-            self.offsets_dirty = false;
             if self.greedy_graph.is_none() {
                 self.capture_greedy_decode_graph()?;
             }
@@ -1718,6 +1717,12 @@ impl BatchedModel {
             // pinned staging mirrors were refreshed above on this thread.
             unsafe { self.greedy_graph.as_deref().unwrap().replay()? }
             let next = self.sample_readback(b)?;
+            // Only now is the device offsets buffer known to hold the identity
+            // mapping (the graph's recorded memcpy uploaded it): clearing the
+            // dirty flag earlier would let a failed capture/replay leave a
+            // stale non-identity table in place while the eager fallback
+            // skips its refresh.
+            self.offsets_dirty = false;
             for l in self.lens.iter_mut() {
                 *l += 1;
             }
@@ -1888,9 +1893,12 @@ impl BatchedModel {
     /// stream/sync involvement:
     /// - `decode_only` (prefill/mixed steps keep the hipBLAS/host-loop paths,
     ///   which sync and read counts back to the host);
-    /// - `n <= GEMV_MAX_M` so every projection takes the custom GEMV kernels
-    ///   (the hipBLAS `GemmEx` path may allocate workspace and is not captured
-    ///   in v1) — this also fixes every grid at capture time;
+    /// - `n <= GEMV_MAX_M` so every projection's grid is fixed at capture
+    ///   time, and every projection's reduction width `<= GEMV_MAX_D` so
+    ///   every projection takes the custom GEMV kernels — the hipBLAS
+    ///   `GemmEx` fallback may lazily allocate workspace, which aborts
+    ///   capture. The widths are the input side of each projection: dense
+    ///   models use d / nq / inter, MLA adds q_lora_rank / kv_lora_rank;
     /// - f16 (f32 routes even small GEMMs through hipBLAS);
     /// - no step profiler (event records would be baked into the graph) and no
     ///   prefetch engine (its cross-stream H2D pipeline cannot be captured);
@@ -1906,9 +1914,28 @@ impl BatchedModel {
         {
             return false;
         }
-        if self.cfg.num_experts > 0 {
+        let c = &self.cfg;
+        let max_kk = if c.kv_lora_rank > 0 {
+            // MLA: q_a(d) / kv_a(d) / q_b(q_lora_rank) / kv_b(kv_lora_rank)
+            // / o(n_heads * v_head_dim).
+            c.d_model
+                .max(c.q_lora_rank)
+                .max(c.kv_lora_rank)
+                .max(c.n_heads * c.v_head_dim)
+        } else {
+            // Dense/MoE: q/k/v + router + lm_head(d), o(nq), dense-MLP
+            // down(inter); MoE experts ride the device-driven grouped kernels
+            // (required below), not the gemm closure.
+            c.d_model
+                .max(c.n_heads * c.head_dim)
+                .max(c.intermediate_size)
+        };
+        if max_kk > GEMV_MAX_D as usize {
+            return false;
+        }
+        if c.num_experts > 0 {
             let grouped = self.moe_grouped || !self.q4_experts.is_empty();
-            if !grouped || self.expert_slots < self.cfg.num_experts {
+            if !grouped || self.expert_slots < c.num_experts {
                 return false;
             }
         }
@@ -1933,13 +1960,20 @@ impl BatchedModel {
     /// `run_kernels` + argmax) into a single HIP graph. Same capture-then-
     /// immediately-replay contract as [`Self::capture_decode_graph`].
     fn capture_greedy_decode_graph(&mut self) -> Result<(), Error> {
-        let cap = mach_engine::hip::HipGraphCapture::with_stream(
-            Arc::clone(self.k.hip()),
-            self.k.stream,
-        )?;
-        cap.prepare()?;
+        let cap =
+            mach_engine::hip::HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)
+                .inspect_err(|_| self.graph_enabled = false)?;
+        // Any capture failure permanently disables the graph path: a caller
+        // must fall back to eager rather than re-failing every step.
+        if let Err(e) = cap.prepare() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
         self.k.sync()?;
-        cap.begin()?;
+        if let Err(e) = cap.begin() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
         let record = (|| {
             self.upload_decode_inputs(self.batch)?;
             self.run_kernels(
@@ -1977,13 +2011,20 @@ impl BatchedModel {
     /// [`HipKernels::new`] and all device buffers were allocated at
     /// construction, so the capture window allocates and compiles nothing).
     fn capture_decode_graph(&mut self, n: i32) -> Result<(), Error> {
-        let cap = mach_engine::hip::HipGraphCapture::with_stream(
-            Arc::clone(self.k.hip()),
-            self.k.stream,
-        )?;
-        cap.prepare()?;
+        let cap =
+            mach_engine::hip::HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)
+                .inspect_err(|_| self.graph_enabled = false)?;
+        // Any capture failure permanently disables the graph path: a caller
+        // must fall back to eager rather than re-failing every step.
+        if let Err(e) = cap.prepare() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
         self.k.sync()?;
-        cap.begin()?;
+        if let Err(e) = cap.begin() {
+            self.graph_enabled = false;
+            return Err(e.into());
+        }
         let record = (|| {
             self.upload_decode_inputs(n as usize)?;
             self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0)?;
@@ -3037,6 +3078,9 @@ impl BatchedModel {
         let n = tokens.len();
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
+        // The sampler stages/reads per row; a mismatch would silently sample
+        // stale staging rows in the graph path (its grid uses `n`).
+        assert_eq!(n, params.len(), "tokens and params must be equal length");
         assert!(n <= self.rows, "active count exceeds row capacity");
         // Positions and slots must stay inside the device buffers: an out-of-
         // range length would make the KV store write past the cache (silent
