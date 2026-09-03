@@ -83,6 +83,26 @@ fn config_from_json(path: &std::path::Path) -> Config {
     cfg.intermediate_size = inter;
     cfg.rms_eps = eps;
     cfg.rope_theta = theta;
+    // RoPE pairing convention is a property of the checkpoint's own modeling
+    // code, not of any hyper-parameter, so it has to be keyed off the model
+    // family. DeepSeek-V2 rotates ADJACENT coordinates (its
+    // `apply_rotary_pos_emb` permutes `view(d//2, 2).transpose(4, 3)` before
+    // `rotate_half`; current transformers rotates `view_as_complex` pairs),
+    // while Llama/Qwen2/Qwen3 apply `rotate_half` straight to split halves.
+    // Getting this wrong leaves `pos == 0` bit-identical and corrupts every
+    // later position, so it is invisible to a first-token-only comparison.
+    // DeepSeek-V3/R1 share the V2 lineage and the same convention.
+    let family = v["model_type"]
+        .as_str()
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            v["architectures"]
+                .get(0)
+                .and_then(|a| a.as_str())
+                .map(str::to_ascii_lowercase)
+        })
+        .unwrap_or_default();
+    cfg.rope_interleave = family.starts_with("deepseek");
     // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace q/k/v/o.
     cfg.q_lora_rank = v["q_lora_rank"].as_u64().unwrap_or(0) as usize;
     cfg.kv_lora_rank = v["kv_lora_rank"].as_u64().unwrap_or(0) as usize;

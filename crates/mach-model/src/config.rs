@@ -82,6 +82,22 @@ pub struct Config {
     /// YaRN: `mscale_all_dim`; > 0 applies the `mscale^2` attention-logit
     /// correction (`0.1 * mscale_all_dim * ln(factor) + 1`, squared).
     pub rope_yarn_mscale_all_dim: f32,
+    /// RoPE pairing convention: which two coordinates rotate together.
+    ///
+    /// `false` (GPT-NeoX / HF `rotate_half`): coordinate `d` pairs with
+    /// `d + head_dim/2`. This is what Llama, Qwen2 and Qwen3 do — their
+    /// `apply_rotary_pos_emb` is a bare `q * cos + rotate_half(q) * sin`.
+    ///
+    /// `true` (interleaved): coordinate `2d` pairs with `2d + 1`. DeepSeek-V2
+    /// needs this — its `apply_rotary_pos_emb` first permutes
+    /// `view(d//2, 2).transpose(4, 3)` from interleaved to split-halves
+    /// before applying `rotate_half`, and transformers' current builtin
+    /// rotates `view_as_complex(x.reshape(-1, 2))`, i.e. adjacent pairs.
+    ///
+    /// The two produce identical output at `pos == 0` (cos=1, sin=0 makes
+    /// RoPE the identity), so a diff taken at position 0 cannot tell them
+    /// apart. Compare at `pos > 0`.
+    pub rope_interleave: bool,
     /// Step profiler diagnostic: per-layer attention/MoE HIP event
     /// bracketing, reported after each decode step. The server parses
     /// `MACH_STEP_PROFILE` into this field — the library reads no env.
@@ -189,6 +205,7 @@ impl Config {
             rope_yarn_beta_slow: 0.0,
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -234,6 +251,7 @@ impl Config {
             rope_yarn_beta_slow: 0.0,
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -279,6 +297,7 @@ impl Config {
             rope_yarn_beta_slow: 0.0,
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -317,6 +336,7 @@ impl Config {
             rope_yarn_beta_slow: 0.0,
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -367,6 +387,7 @@ impl Config {
             rope_yarn_beta_slow: 0.0,
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }

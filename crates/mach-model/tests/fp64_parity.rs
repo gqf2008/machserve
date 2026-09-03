@@ -314,6 +314,7 @@ fn moe_real_three_way_fp64_parity() {
         rope_yarn_beta_slow: 0.0,
         rope_yarn_mscale: 1.0,
         rope_yarn_mscale_all_dim: 0.0,
+        rope_interleave: false,
         moe_grouped: true,
         step_profile: false,
     };

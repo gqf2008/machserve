@@ -558,12 +558,23 @@ pub(crate) fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: us
             let ang = pos as f32 * freq;
             let c = ang.cos() * attn_factor;
             let sn = ang.sin() * attn_factor;
-            // GPT-NeoX rotary: pairs (d, d + half), matching HF rotate_half.
-            let idx = h * head_dim + d;
+            // `d` is the PAIR index and the frequency index; which two
+            // coordinates it joins depends on the checkpoint's convention:
+            //   interleave=false -> GPT-NeoX/HF rotate_half: (d, d + half)
+            //   interleave=true  -> DeepSeek-V2: (2d, 2d + 1)
+            // Identical at pos 0 (RoPE is the identity there), so a pos-0-only
+            // comparison cannot tell them apart.
+            let (d0, d1) = if cfg.rope_interleave {
+                (2 * d, 2 * d + 1)
+            } else {
+                (d, d + half)
+            };
+            let idx = h * head_dim + d0;
+            let jdx = h * head_dim + d1;
             let a = x[idx];
-            let b = x[idx + half];
+            let b = x[jdx];
             x[idx] = a * c - b * sn;
-            x[idx + half] = a * sn + b * c;
+            x[jdx] = a * sn + b * c;
         }
     }
 }
@@ -792,6 +803,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// DeepSeek-V2 rotates ADJACENT coordinates, not split halves: its
+    /// `apply_rotary_pos_emb` permutes `view(d//2, 2).transpose(4, 3)` before
+    /// `rotate_half`, and transformers' current builtin rotates
+    /// `view_as_complex(x.reshape(-1, 2))`. Both pair `2d` with `2d+1`.
+    #[test]
+    fn apply_rope_interleave_pairs_adjacent_coordinates() {
+        let mut cfg = yarn_cfg(64);
+        cfg.rope_interleave = true;
+        let pos = 7usize;
+        let (hf, _) = hf_yarn_cos_sin(cfg, pos);
+        let heads = 2usize;
+        let half = 32usize;
+        let mut x: Vec<f32> = (0..heads * 64)
+            .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+            .collect();
+        let orig = x.clone();
+        apply_rope(&mut x, heads, 64, pos, cfg);
+        for h in 0..heads {
+            for d in 0..half {
+                let (a, b) = (orig[h * 64 + 2 * d], orig[h * 64 + 2 * d + 1]);
+                let (c, s) = (hf.cos[d], hf.sin[d]);
+                let (want_a, want_b) = (a * c - b * s, b * c + a * s);
+                let (got_a, got_b) = (x[h * 64 + 2 * d], x[h * 64 + 2 * d + 1]);
+                let tol = 1e-3 + 1e-3 * want_a.abs().max(want_b.abs());
+                assert!(
+                    (got_a - want_a).abs() <= tol && (got_b - want_b).abs() <= tol,
+                    "h={h} d={d}: got ({got_a}, {got_b}) want ({want_a}, {want_b})"
+                );
+            }
+        }
+    }
+
+    /// The two conventions must be INDISTINGUISHABLE at `pos == 0` — there
+    /// cos=1 and sin=0 make RoPE the identity, so a first-token-only diff
+    /// silently passes while every later position is rotated wrongly. This is
+    /// the trap that let the DeepSeek pairing bug through: pin it, and assert
+    /// the opposite direction too, that pos > 0 really does separate them.
+    #[test]
+    fn rope_conventions_agree_at_pos_zero_and_differ_after() {
+        let mut interleave = yarn_cfg(64);
+        interleave.rope_interleave = true;
+        let halves = yarn_cfg(64);
+        let x0: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.41).sin() * 2.0).collect();
+
+        let a0 = {
+            let mut v = x0.clone();
+            apply_rope(&mut v, 1, 64, 0, interleave);
+            v
+        };
+        let b0 = {
+            let mut v = x0.clone();
+            apply_rope(&mut v, 1, 64, 0, halves);
+            v
+        };
+        let d0: f32 = a0
+            .iter()
+            .zip(&b0)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(d0 < 1e-6, "pos 0 must agree, got max diff {d0:.3e}");
+
+        let a1 = {
+            let mut v = x0.clone();
+            apply_rope(&mut v, 1, 64, 5, interleave);
+            v
+        };
+        let b1 = {
+            let mut v = x0.clone();
+            apply_rope(&mut v, 1, 64, 5, halves);
+            v
+        };
+        let d1: f32 = a1
+            .iter()
+            .zip(&b1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            d1 > 1e-2,
+            "pos 5 must differ (pairing is only observable at pos > 0), got {d1:.3e}"
+        );
     }
 
     /// The cos/sin factor is `mscale(factor) / mscale_all_dim(factor)`, so it

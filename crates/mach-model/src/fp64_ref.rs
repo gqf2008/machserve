@@ -192,11 +192,20 @@ fn apply_rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, cfg: C
             let (sn, c) = ang.sin_cos();
             let c = c * attn_factor;
             let sn = sn * attn_factor;
-            let idx = h * head_dim + d;
+            // Pairing convention, matching the f32 reference and the device
+            // kernel: `d` is the pair/frequency index, and it joins either
+            // (d, d + half) or the adjacent pair (2d, 2d + 1).
+            let (d0, d1) = if cfg.rope_interleave {
+                (2 * d, 2 * d + 1)
+            } else {
+                (d, d + half)
+            };
+            let idx = h * head_dim + d0;
+            let jdx = h * head_dim + d1;
             let a = x[idx];
-            let b = x[idx + half];
+            let b = x[jdx];
             x[idx] = a * c - b * sn;
-            x[idx + half] = a * sn + b * c;
+            x[jdx] = a * sn + b * c;
         }
     }
 }

@@ -26,6 +26,12 @@ pub struct RopeParams {
     pub orig_len: i32,
     /// YaRN cos/sin `attention_factor`.
     pub attn_factor: f32,
+    /// RoPE pairing convention: 1 = interleaved (coordinate `2d` pairs with
+    /// `2d + 1`, DeepSeek-V2 / transformers' `view_as_complex` path),
+    /// 0 = split-halves (coordinate `d` pairs with `d + head_dim/2`,
+    /// GPT-NeoX / HF `rotate_half`, used by Llama and Qwen3).
+    /// The two agree exactly at `pos == 0`, where RoPE is the identity.
+    pub interleave: i32,
 }
 
 impl From<Config> for RopeParams {
@@ -38,6 +44,7 @@ impl From<Config> for RopeParams {
             beta_slow: c.rope_yarn_beta_slow,
             orig_len: c.rope_yarn_orig_len as i32,
             attn_factor: c.yarn_attention_factor(),
+            interleave: i32::from(c.rope_interleave),
         }
     }
 }
@@ -196,13 +203,17 @@ __device__ __forceinline__ float yarn_freq(int d, int head_dim, float theta,
 extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
                                 int n_heads, int n_kv_heads, int head_dim, float theta,
                                 int yarn, float factor, float beta_fast, float beta_slow,
-                                float orig_len, float attn_factor) {
+                                float orig_len, float attn_factor, int interleave) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int pos = *pos_buf;
     int half = head_dim / 2;
     int total_q = n_heads * head_dim;
     int total_k = n_kv_heads * head_dim;
-    // GPT-NeoX rotary: pairs (d, d + half), matching HF rotate_half.
+    // Pairing convention. `d` is the PAIR index (0..half-1) and also the
+    // frequency index; which two coordinates it joins differs:
+    //   interleave=0 -> GPT-NeoX / HF rotate_half: (d, d + half)
+    //   interleave=1 -> DeepSeek-V2 / view_as_complex: (2*d, 2*d + 1)
+    // Both are the identity at pos 0, so only pos > 0 distinguishes them.
     if (i < total_q) {
         int h = i / head_dim;
         int d = i % head_dim;
@@ -212,9 +223,11 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = q + h * head_dim;
-            float a = p[d], b = p[d + half];
-            p[d] = a * c - b * sn;
-            p[d + half] = a * sn + b * c;
+            int d0 = interleave ? 2 * d : d;
+            int d1 = interleave ? 2 * d + 1 : d + half;
+            float a = p[d0], b = p[d1];
+            p[d0] = a * c - b * sn;
+            p[d1] = a * sn + b * c;
         }
     }
     if (i < total_k) {
@@ -226,9 +239,11 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = k + h * head_dim;
-            float a = p[d], b = p[d + half];
-            p[d] = a * c - b * sn;
-            p[d + half] = a * sn + b * c;
+            int d0 = interleave ? 2 * d : d;
+            int d1 = interleave ? 2 * d + 1 : d + half;
+            float a = p[d0], b = p[d1];
+            p[d0] = a * c - b * sn;
+            p[d1] = a * sn + b * c;
         }
     }
 }
@@ -428,7 +443,7 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
                                         int head_dim, float theta,
                                         int yarn, float factor, float beta_fast,
                                         float beta_slow, float orig_len,
-                                        float attn_factor) {
+                                        float attn_factor, int interleave) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = head_dim / 2;
     int total_q = batch * n_heads * head_dim;
@@ -445,9 +460,11 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = q + (long long)s * n_heads * head_dim + h * head_dim;
-            float a = p[d], b = p[d + half];
-            p[d] = a * c - b * sn;
-            p[d + half] = a * sn + b * c;
+            int d0 = interleave ? 2 * d : d;
+            int d1 = interleave ? 2 * d + 1 : d + half;
+            float a = p[d0], b = p[d1];
+            p[d0] = a * c - b * sn;
+            p[d1] = a * sn + b * c;
         }
     }
     if (idx < total_k) {
@@ -462,9 +479,11 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = k + (long long)s * n_kv_heads * head_dim + h * head_dim;
-            float a = p[d], b = p[d + half];
-            p[d] = a * c - b * sn;
-            p[d + half] = a * sn + b * c;
+            int d0 = interleave ? 2 * d : d;
+            int d1 = interleave ? 2 * d + 1 : d + half;
+            float a = p[d0], b = p[d1];
+            p[d0] = a * c - b * sn;
+            p[d1] = a * sn + b * c;
         }
     }
 }
@@ -3104,6 +3123,7 @@ impl HipKernels {
             &rp.beta_slow as *const f32 as *mut core::ffi::c_void,
             &rp.orig_len as *const i32 as *mut core::ffi::c_void,
             &rp.attn_factor as *const f32 as *mut core::ffi::c_void,
+            &rp.interleave as *const i32 as *mut core::ffi::c_void,
         ];
         let total = (n_heads.max(n_kv_heads) * head_dim) as u32;
         let blocks = total.div_ceil(256);
@@ -3230,6 +3250,7 @@ impl HipKernels {
             &rp.beta_slow as *const f32 as *mut core::ffi::c_void,
             &rp.orig_len as *const i32 as *mut core::ffi::c_void,
             &rp.attn_factor as *const f32 as *mut core::ffi::c_void,
+            &rp.interleave as *const i32 as *mut core::ffi::c_void,
         ];
         let total = (batch * n_heads.max(n_kv_heads) * head_dim) as u32;
         let blocks = total.div_ceil(256);

@@ -121,6 +121,9 @@ fn main() {
                 beta_slow: 0.0,
                 orig_len: 0,
                 attn_factor: 1.0,
+                // MACH_ROPE_INTERLEAVE=1 exercises the DeepSeek-V2 adjacent-pair
+                // convention; default 0 is the Qwen3/Llama split-halves one.
+                interleave: i32::from(std::env::var("MACH_ROPE_INTERLEAVE").as_deref() == Ok("1")),
             },
         )
         .unwrap();
