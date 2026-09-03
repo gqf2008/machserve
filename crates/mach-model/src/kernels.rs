@@ -5387,6 +5387,30 @@ mod gpu_tests {
             .collect()
     }
 
+    /// Pin the WRITE side of the quantize seam: every spec-dequantized value
+    /// must lie within half a quantization step of the original weight
+    /// (round-to-nearest with `scale = max|w|/7` bounds `|w_hat - w| <= s/2`
+    /// up to f32 division rounding; `+1e-6` covers that and the reconstruct
+    /// multiply — `s <= 0.5/7` here, so the margin is far below any real
+    /// convention error). Without this, a nibble-order or group-formula bug
+    /// in `Q4Tensor::quantize` would pass every kernel comparison above —
+    /// kernel and spec reader decode the same wrong bytes with the same
+    /// convention — and would equally pass the Q4_DEVICE on/off A/B (both
+    /// paths decode the same bytes). Convention-level, so pinned once in the
+    /// small-pool test.
+    fn pin_quantize_writer(name: &str, w: &[f32], q: &crate::q4::Q4Tensor) {
+        let hat = spec_dequant(q);
+        let sc = q.scales();
+        for (i, (got, want)) in hat.iter().zip(w).enumerate() {
+            let bound = sc[i / crate::q4::Q4_GROUP] * 0.5 + 1e-6;
+            assert!(
+                (got - want).abs() <= bound,
+                "{name}: quantize writer drifted at [{i}] (got {got}, want {want}, bound {bound}) \
+                 — round-to-nearest must stay within half a step"
+            );
+        }
+    }
+
     /// Storage-Q4 grouped GEMV kernels (`moe_grouped_gate_up_q4` /
     /// `moe_grouped_down_q4`) vs the spec-dequantized CPU reference. #85
     /// shipped them with no direct coverage — every test reached them only
@@ -5422,6 +5446,11 @@ mod gpu_tests {
             crate::q4::Q4Tensor::quantize(&wu),
             crate::q4::Q4Tensor::quantize(&wd),
         );
+        // The kernel comparisons below decode the packed bytes, so they pin
+        // the reader side; this pins the WRITER side (see helper doc).
+        pin_quantize_writer("wg", &wg, &qwg);
+        pin_quantize_writer("wu", &wu, &qwu);
+        pin_quantize_writer("wd", &wd, &qwd);
         // Reference weights = what the packed bytes actually encode (not the
         // pre-quantization values): the kernels can only be as good as their
         // Q4 input, so quantization error itself must not count as a diff.
@@ -5478,7 +5507,7 @@ mod gpu_tests {
             &[0, 1, 2, 3, 4, 5],       // contiguous (the only pattern any bench ever fed)
             &[15, 15, 15, 15, 15, 15], // every row the SAME (highest) expert
             &[15, 0, 15, 7, 15, 3],    // repeats across the pool range
-            &[15, 0, 15, 7, 15, 3, 2, 2, 2, 9, 9, 0], // batch=2 token-major, expert 15 in BOTH tokens
+            &[15, 0, 15, 7, 15, 3, 2, 2, 2, 9, 9, 0], // batch=2 token-major, expert 0 in BOTH tokens
         ];
         for (ci, &ids) in cases.iter().enumerate() {
             let rows = ids.len();
