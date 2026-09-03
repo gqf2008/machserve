@@ -20,6 +20,16 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 unicode-normalization = "0.1.25"
+# Transitive pin (`unicode-normalization` -> `tinyvec`), not a direct use.
+# tinyvec 1.13.0 (published 2026-09-03) does not compile on any toolchain:
+# its `use alloc::vec::{self, Vec}` shadows the `vec!` macro, so
+# `TinyVec::Heap(vec![..])` resolves `vec` to the module and fails with
+# "cannot find macro `vec` in this scope". Cargo.lock is not committed in
+# this repo, so CI resolves fresh versions on every run and picked the
+# broken release up minutes after it shipped. Bounded on BOTH sides: a bare
+# `<1.13` also admits the ancient 0.4.x line. Drop this pin once upstream
+# publishes a fixed release.
+tinyvec = ">=1.12, <1.13"
 
 [lints]
 workspace = true
