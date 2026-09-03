@@ -223,6 +223,14 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = q + h * head_dim;
+            // Pairing convention, NOT output placement: the rotated values are
+            // written back to the SAME two slots they were read from, in both
+            // modes. HF's DeepSeek code instead permutes into split-halves
+            // first and lets `rotate_half` write across halves, so a literal
+            // port would appear to "move" results. Do not add that permutation
+            // here -- it is elided, not missing; downstream consumers read the
+            // buffer in the same convention it was written in. See
+            // `Config::rope_interleave`.
             int d0 = interleave ? 2 * d : d;
             int d1 = interleave ? 2 * d + 1 : d + half;
             float a = p[d0], b = p[d1];

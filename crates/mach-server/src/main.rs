@@ -46,6 +46,20 @@ use mach_server::{AppState, ChatFormat, ServerEngine, router};
 #[cfg(feature = "hip")]
 use std::path::PathBuf;
 
+/// Collapse a model-family name to a lowercase alphanumeric key so the two
+/// places it can come from agree: `model_type` is snake_case (`deepseek_v2`)
+/// while the `architectures[0]` fallback is a PascalCase class name
+/// (`DeepseekV2ForCausalLM`). Both must yield `deepseekv2`, or a checkpoint
+/// that omits `model_type` silently misses the `rope_interleave` allowlist.
+#[cfg(feature = "hip")]
+fn normalize_model_family(raw: Option<&str>) -> String {
+    raw.unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 #[cfg(feature = "hip")]
 fn config_from_json(path: &std::path::Path) -> Config {
     let v: serde_json::Value =
@@ -92,17 +106,21 @@ fn config_from_json(path: &std::path::Path) -> Config {
     // Getting this wrong leaves `pos == 0` bit-identical and corrupts every
     // later position, so it is invisible to a first-token-only comparison.
     // DeepSeek-V3/R1 share the V2 lineage and the same convention.
-    let family = v["model_type"]
-        .as_str()
-        .map(str::to_ascii_lowercase)
-        .or_else(|| {
-            v["architectures"]
-                .get(0)
-                .and_then(|a| a.as_str())
-                .map(str::to_ascii_lowercase)
-        })
-        .unwrap_or_default();
-    cfg.rope_interleave = family.starts_with("deepseek");
+    let family = normalize_model_family(
+        v["model_type"]
+            .as_str()
+            .or_else(|| v["architectures"].get(0).and_then(|a| a.as_str())),
+    );
+    // Allowlist, NOT a `starts_with("deepseek")` prefix test: the bare
+    // `model_type: "deepseek"` is DeepSeek-**V1** / DeepSeekMoE, whose
+    // modeling code is a Llama copy (`rotate_half` on split halves, no
+    // permute). Those checkpoints are dense-shaped, so they load without
+    // complaint and then get silently corrupted at every `pos > 0` — the very
+    // bug this flag exists to prevent, with no error path to catch it.
+    // Only the MLA lineage (V2/V3/R1/VL2) rotates adjacent coordinates.
+    cfg.rope_interleave = ["deepseekv2", "deepseekv3", "deepseekvlv2"]
+        .iter()
+        .any(|p| family.starts_with(p));
     // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace q/k/v/o.
     cfg.q_lora_rank = v["q_lora_rank"].as_u64().unwrap_or(0) as usize;
     cfg.kv_lora_rank = v["kv_lora_rank"].as_u64().unwrap_or(0) as usize;
@@ -967,6 +985,56 @@ mod tests {
         );
         assert_eq!(cfg.n_kv_heads, 128, "MLA n_kv_heads == n_heads");
         assert_eq!(cfg.num_experts, 0);
+    }
+
+    /// The allowlist in `config_from_json` is the ONLY thing that decides which
+    /// real checkpoints get the interleaved convention, and getting it wrong is
+    /// invisible at `pos == 0`. Pin it in both directions: the MLA lineage must
+    /// be interleaved, and everything else — especially the bare
+    /// `model_type: "deepseek"` (V1 / DeepSeekMoE, a Llama copy that uses plain
+    /// `rotate_half`) — must keep the split-halves default.
+    #[test]
+    fn rope_interleave_is_allowlisted_per_family() {
+        let parse = |model_type: &str| {
+            parse_json(&format!(
+                r#"{{"model_type":"{model_type}","hidden_size":2048,"num_hidden_layers":2,"num_attention_heads":16,"vocab_size":102400,"max_position_embeddings":4096}}"#
+            ))
+        };
+        for t in ["deepseek_v2", "deepseek_v3", "deepseek_vl_v2"] {
+            assert!(
+                parse(t).rope_interleave,
+                "MLA lineage {t} must use adjacent-pair RoPE"
+            );
+        }
+        // `deepseek` (V1/DeepSeekMoE) is a Llama copy and must NOT be flipped:
+        // a prefix test silently corrupts it at every pos > 0.
+        for t in [
+            "deepseek",
+            "llama",
+            "qwen2",
+            "qwen3",
+            "qwen3_moe",
+            "deepseek_v1",
+        ] {
+            assert!(
+                !parse(t).rope_interleave,
+                "{t} must keep the split-halves default"
+            );
+        }
+    }
+
+    /// `architectures[0]` is the fallback when `model_type` is absent; it must
+    /// classify the same way so a checkpoint with only `architectures` is not
+    /// silently misrouted.
+    #[test]
+    fn rope_interleave_falls_back_to_architectures() {
+        let cfg = parse_json(
+            r#"{"architectures":["DeepseekV2ForCausalLM"],"hidden_size":2048,"num_hidden_layers":2,"num_attention_heads":16,"vocab_size":102400,"max_position_embeddings":4096}"#,
+        );
+        assert!(
+            cfg.rope_interleave,
+            "DeepseekV2ForCausalLM must be interleaved via the architectures fallback"
+        );
     }
 
     #[test]

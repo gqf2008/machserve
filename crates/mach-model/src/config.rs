@@ -89,10 +89,12 @@ pub struct Config {
     /// `apply_rotary_pos_emb` is a bare `q * cos + rotate_half(q) * sin`.
     ///
     /// `true` (interleaved): coordinate `2d` pairs with `2d + 1`. DeepSeek-V2
-    /// needs this — its `apply_rotary_pos_emb` first permutes
+    /// and its successors need this — their `apply_rotary_pos_emb` permutes
     /// `view(d//2, 2).transpose(4, 3)` from interleaved to split-halves
-    /// before applying `rotate_half`, and transformers' current builtin
-    /// rotates `view_as_complex(x.reshape(-1, 2))`, i.e. adjacent pairs.
+    /// before applying `rotate_half`, i.e. the pair that ends up rotating
+    /// together came from adjacent coordinates. transformers' dedicated
+    /// `apply_rotary_pos_emb_interleave` (selected per-checkpoint, not the
+    /// default path) does the same.
     ///
     /// The two produce identical output at `pos == 0` (cos=1, sin=0 makes
     /// RoPE the identity), so a diff taken at position 0 cannot tell them
@@ -387,7 +389,13 @@ impl Config {
             rope_yarn_beta_slow: 0.0,
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
-            rope_interleave: false,
+            // MLA is DeepSeek's attention, and every DeepSeek checkpoint uses
+            // the interleaved convention — defaulting to `false` here would
+            // make this constructor disagree with the real checkpoints it is
+            // shaped for, and would leave the interleaved branch with no
+            // model-level coverage (parity tests compare both sides under the
+            // same flag, so either default passes; only this one is truthful).
+            rope_interleave: true,
             step_profile: false,
             moe_grouped: true,
         }
