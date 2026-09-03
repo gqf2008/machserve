@@ -82,16 +82,27 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
                 lw.mla_q_a_norm.clone(),
                 vec![cfg.q_lora_rank],
             ));
-            t.push((
-                p("self_attn.q_b_proj.weight"),
-                lw.mla_q_b.clone(),
-                vec![heads * nope, cfg.q_lora_rank],
-            ));
-            t.push((
-                p("self_attn.q_rope_proj.weight"),
-                lw.mla_q_rope.clone(),
-                vec![heads * rope, d],
-            ));
+            // Real checkpoints ship ONE fused q projection
+            // `[heads*(nope+rope), kk]` split per head after the projection
+            // (`q_b_proj` with a low-rank q, `q_proj` without one,
+            // DeepSeek-V2-Lite). Rebuild it from the runtime's split halves so
+            // the loader's split is exercised on every MLA load test.
+            let kk = if cfg.q_lora_rank > 0 {
+                cfg.q_lora_rank
+            } else {
+                d
+            };
+            let mut fused = Vec::with_capacity(heads * (nope + rope) * kk);
+            for h in 0..heads {
+                fused.extend_from_slice(&lw.mla_q_b[h * nope * kk..(h + 1) * nope * kk]);
+                fused.extend_from_slice(&lw.mla_q_rope[h * rope * kk..(h + 1) * rope * kk]);
+            }
+            let q_name = if cfg.q_lora_rank > 0 {
+                "self_attn.q_b_proj.weight"
+            } else {
+                "self_attn.q_proj.weight"
+            };
+            t.push((p(q_name), fused, vec![heads * (nope + rope), kk]));
             t.push((
                 p("self_attn.kv_a_proj_with_mqa.weight"),
                 lw.mla_kv_a.clone(),
@@ -154,6 +165,24 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
                 t.push((ep("gate_proj.weight"), wg.to_vec(), vec![inter, d]));
                 t.push((ep("up_proj.weight"), wu.to_vec(), vec![inter, d]));
                 t.push((ep("down_proj.weight"), wd.to_vec(), vec![d, inter]));
+            }
+            // Shared experts (DeepSeek-V2): one dense MLP of width
+            // `n_shared_experts * expert_size`, stored alongside the routed
+            // experts in the same `mlp.` namespace.
+            let shinter = cfg.shared_size();
+            if shinter > 0 {
+                let sp = |s: &str| format!("model.layers.{i}.mlp.shared_experts.{s}");
+                t.push((
+                    sp("gate_proj.weight"),
+                    lw.shared_wg.clone(),
+                    vec![shinter, d],
+                ));
+                t.push((sp("up_proj.weight"), lw.shared_wu.clone(), vec![shinter, d]));
+                t.push((
+                    sp("down_proj.weight"),
+                    lw.shared_wd.clone(),
+                    vec![d, shinter],
+                ));
             }
         }
     }
@@ -975,6 +1004,9 @@ fn q4_batched_matches_dequantized_f16() {
                     moe_wg: to_f32(&l.moe_wg),
                     moe_wu: to_f32(&l.moe_wu),
                     moe_wd: to_f32(&l.moe_wd),
+                    shared_wg: to_f32(&l.shared_wg),
+                    shared_wu: to_f32(&l.shared_wu),
+                    shared_wd: to_f32(&l.shared_wd),
                 })
                 .collect(),
         };
@@ -1206,6 +1238,9 @@ fn fp8_batched_matches_dequantized_f16() {
                     moe_wg: to_f32(&l.moe_wg),
                     moe_wu: to_f32(&l.moe_wu),
                     moe_wd: to_f32(&l.moe_wd),
+                    shared_wg: to_f32(&l.shared_wg),
+                    shared_wu: to_f32(&l.shared_wu),
+                    shared_wd: to_f32(&l.shared_wd),
                 })
                 .collect(),
         };

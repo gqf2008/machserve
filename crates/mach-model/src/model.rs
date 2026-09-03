@@ -15,6 +15,7 @@ use crate::adaptive::{AdaptiveProfile, BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
+use crate::kernels::RopeParams;
 use crate::moe_backend::LruExpertCache;
 use crate::moe_offload;
 use crate::sampling::HipSampler;
@@ -59,6 +60,12 @@ struct LayerDev {
     moe_wg: *mut f32,
     moe_wu: *mut f32,
     moe_wd: *mut f32,
+    /// Shared experts (DeepSeek-V2): one dense SwiGLU MLP of width
+    /// `n_shared_experts * expert_size`, added to the routed experts' sum. Null
+    /// (and `shared_size() == 0`) for checkpoints without shared experts.
+    shared_wg: *mut f32,
+    shared_wu: *mut f32,
+    shared_wd: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -524,7 +531,10 @@ impl GpuModel {
         self.v_buf = self.dalloc(nkv * 4)?;
         self.attn = self.dalloc(nq * 4)?;
         self.proj = self.dalloc(d * 4)?;
-        let inter = c.intermediate_size;
+        // The shared experts (DeepSeek-V2) are one dense MLP of width
+        // `n_shared_experts * expert_size`, which can exceed the dense
+        // `intermediate_size`; gate/up/h must cover both.
+        let inter = c.intermediate_size.max(c.shared_size());
         self.gate = self.dalloc(inter * 4)?;
         self.up = self.dalloc(inter * 4)?;
         self.h = self.dalloc(inter * 4)?;
@@ -687,6 +697,11 @@ impl GpuModel {
                 moe_wg: std::ptr::null_mut(),
                 moe_wu: std::ptr::null_mut(),
                 moe_wd: std::ptr::null_mut(),
+                // The single-sequence path has no MLA/shared-expert fp16 copy;
+                // shared experts stay null here (F16 upload path only).
+                shared_wg: std::ptr::null_mut(),
+                shared_wu: std::ptr::null_mut(),
+                shared_wd: std::ptr::null_mut(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -750,6 +765,11 @@ impl GpuModel {
                 moe_wg: std::ptr::null_mut(),
                 moe_wu: std::ptr::null_mut(),
                 moe_wd: std::ptr::null_mut(),
+                // The single-sequence path has no MLA/shared-expert fp16 copy;
+                // shared experts stay null here (F16 upload path only).
+                shared_wg: std::ptr::null_mut(),
+                shared_wu: std::ptr::null_mut(),
+                shared_wd: std::ptr::null_mut(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -946,6 +966,11 @@ impl GpuModel {
                     self.upload(p, &lw.moe_wd)?;
                     p
                 },
+                // Shared experts are one small dense MLP: always fully resident
+                // (never part of the expert slot cache).
+                shared_wg: self.upload_mat32(&lw.shared_wg, f16)?,
+                shared_wu: self.upload_mat32(&lw.shared_wu, f16)?,
+                shared_wd: self.upload_mat32(&lw.shared_wd, f16)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1026,7 +1051,7 @@ impl GpuModel {
         let c = self.cfg;
         let d = c.d_model as i32;
         let k = &self.k;
-        let scale = 1.0 / (c.head_dim as f32).sqrt();
+        let scale = c.attn_scale(c.head_dim);
         let f16 = c.dtype == ModelDType::F16;
 
         // Selects fp16 (cast activations + fp16 weights, fp32 output) or f32.
@@ -1070,25 +1095,31 @@ impl GpuModel {
                 let rope = c.qk_rope_head_dim as i32;
                 let v_hd = c.v_head_dim as i32;
                 let kvlr = c.kv_lora_rank as i32;
+                // DeepSeek-V2-Lite ships `q_lora_rank: null`: the fused q
+                // projection reads the layer input directly (contraction width
+                // `d`), not a normalized low-rank q.
+                let low_rank_q = c.q_lora_rank > 0;
                 // q_lora = q_a(xn); rms; q_nope = q_b(q_lora)
-                k.gemm(self.mla_q_lora, self.xn, lw.mla_q_a, qlr, d)?;
-                k.launch_rms_norm(
-                    self.mla_q_lora,
-                    lw.mla_q_a_norm,
-                    self.mla_q_lora_n,
-                    1,
-                    qlr,
-                    c.rms_eps,
-                )?;
-                k.gemm(
-                    self.q_nope,
-                    self.mla_q_lora_n,
-                    lw.mla_q_b,
-                    heads * nope,
-                    qlr,
-                )?;
+                if low_rank_q {
+                    k.gemm(self.mla_q_lora, self.xn, lw.mla_q_a, qlr, d)?;
+                    k.launch_rms_norm(
+                        self.mla_q_lora,
+                        lw.mla_q_a_norm,
+                        self.mla_q_lora_n,
+                        1,
+                        qlr,
+                        c.rms_eps,
+                    )?;
+                }
+                let q_src = if low_rank_q {
+                    self.mla_q_lora_n
+                } else {
+                    self.xn
+                };
+                let q_kk = if low_rank_q { qlr } else { d };
+                k.gemm(self.q_nope, q_src, lw.mla_q_b, heads * nope, q_kk)?;
                 // q_rope = q_rope_proj(xn) + RoPE (k_buf is scratch on this path).
-                k.gemm(self.q_rope, self.xn, lw.mla_q_rope, heads * rope, d)?;
+                k.gemm(self.q_rope, q_src, lw.mla_q_rope, heads * rope, q_kk)?;
                 k.launch_rope(
                     self.q_rope,
                     self.k_buf,
@@ -1096,7 +1127,7 @@ impl GpuModel {
                     heads,
                     heads,
                     rope,
-                    c.rope_theta,
+                    RopeParams::from(c),
                 )?;
                 // compressed_kv = kv_a(xn); latent rms; k_rope (shared) + RoPE.
                 k.gemm(self.mla_kv_a, self.xn, lw.mla_kv_a, kvlr + rope, d)?;
@@ -1116,7 +1147,7 @@ impl GpuModel {
                     1,
                     1,
                     rope,
-                    c.rope_theta,
+                    RopeParams::from(c),
                 )?;
                 // kv = kv_b_proj(latent): [heads*(nope + v_hd)].
                 k.gemm(
@@ -1140,7 +1171,7 @@ impl GpuModel {
                     rope,
                     v_hd,
                 )?;
-                let scale = 1.0 / ((nope + rope) as f32).sqrt();
+                let scale = c.attn_scale((nope + rope) as usize);
                 k.launch_mla_attn_decode(
                     self.q,
                     kc,
@@ -1211,7 +1242,7 @@ impl GpuModel {
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
-                    c.rope_theta,
+                    RopeParams::from(c),
                 )?;
 
                 let (kc, vc) = self.kv_cache[li];
@@ -1264,7 +1295,15 @@ impl GpuModel {
                 if topk > 0 {
                     // Router logits [ne] = xn2 @ moe_router^T.
                     k.gemm(self.router, self.xn2, lw.moe_router, ne, d)?;
-                    k.launch_moe_router(self.router, self.exp_ids, self.exp_w, ne, topk)?;
+                    k.launch_moe_router(
+                        self.router,
+                        self.exp_ids,
+                        self.exp_w,
+                        ne,
+                        topk,
+                        c.moe_norm_topk,
+                        c.moe_routed_scale,
+                    )?;
                     if self.expert_slots < ne as usize {
                         self.forward_moe_slots(lw, li, ne, topk, d, einter)?;
                     } else if self.gpu_budget < topk as usize {
@@ -1303,6 +1342,18 @@ impl GpuModel {
                         }
                         k.launch_moe_accumulate(self.x, self.down_all, self.exp_w, d, topk)?;
                     }
+                }
+                // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
+                // `n_shared_experts * expert_size` on the same normalized input,
+                // ADDED on top of the routed experts' weighted sum.
+                if !lw.shared_wg.is_null() {
+                    let shinter = c.shared_size() as i32;
+                    k.gemm(self.gate, self.xn2, lw.shared_wg, shinter, d)?;
+                    k.gemm(self.up, self.xn2, lw.shared_wu, shinter, d)?;
+                    // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
+                    k.launch_silu_mul(self.up, self.gate, self.h, shinter)?;
+                    k.gemm(self.proj, self.h, lw.shared_wd, d, shinter)?;
+                    k.launch_add(self.x, self.proj, d)?;
                 }
                 // topk == 0: MoE contributes nothing (matches ref_model).
             } else {

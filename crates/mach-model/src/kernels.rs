@@ -3,9 +3,44 @@
 //! Keep them minimal and correct; performance tuning (flash attention,
 //! vectorized GEMM epilogues) is a later phase.
 
+use crate::Config;
 use crate::Error;
 use mach_engine::hip::hip_arch;
 use mach_kernel_sys::hip::{self, Hip, HipKernelModule, HipStream};
+
+/// Rotary embedding parameters, bundled so the RoPE launches keep a stable
+/// signature as YaRN grows more knobs. Derived from the model [`Config`]:
+/// plain RoPE when YaRN is off (`yarn() == false`).
+#[derive(Debug, Clone, Copy)]
+pub struct RopeParams {
+    /// Base frequency (`rope_theta`).
+    pub theta: f32,
+    /// 1 = YaRN interpolated frequencies, 0 = plain RoPE.
+    pub yarn: i32,
+    /// YaRN `factor`.
+    pub factor: f32,
+    /// YaRN `beta_fast` / `beta_slow` correction-range bounds.
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    /// YaRN `original_max_position_embeddings`.
+    pub orig_len: i32,
+    /// YaRN cos/sin `attention_factor`.
+    pub attn_factor: f32,
+}
+
+impl From<Config> for RopeParams {
+    fn from(c: Config) -> Self {
+        Self {
+            theta: c.rope_theta,
+            yarn: i32::from(c.yarn()),
+            factor: c.rope_yarn_factor,
+            beta_fast: c.rope_yarn_beta_fast,
+            beta_slow: c.rope_yarn_beta_slow,
+            orig_len: c.rope_yarn_orig_len as i32,
+            attn_factor: c.yarn_attention_factor(),
+        }
+    }
+}
 
 /// Embedding gather: `x = emb[*tok]`.
 const EMBED_GATHER: &str = r#"
@@ -130,9 +165,38 @@ extern "C" __global__ void kv_store(const float* kv, float* cache, const int* po
 "#;
 
 /// Rotary position embeddings applied in place to q and k.
+///
+/// Plain RoPE is `1 / theta^(2d/head_dim)`. YaRN (`yarn != 0`, HF
+/// `_compute_yarn_parameters`) interpolates between that ("extra") and
+/// `1 / (factor * theta^(2d/head_dim))` ("inter") with a ramp over the
+/// correction range derived from `beta_fast`/`beta_slow`, then scales cos/sin
+/// by `attn_factor` (DeepSeek-V2 `rope_scaling.type == "yarn"`). The device
+/// helper is duplicated in both RoPE kernels: they are separate hiprtc
+/// compilation units, and `concat!` cannot join named `const`s.
 const ROPE: &str = r#"
+__device__ __forceinline__ float yarn_freq(int d, int head_dim, float theta,
+                                           int yarn, float factor, float beta_fast,
+                                           float beta_slow, float orig_len) {
+    float freq_extra = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+    if (!yarn) return freq_extra;
+    float freq_inter = 1.0f / (factor * powf(theta, (2.0f * (float)d) / (float)head_dim));
+    float two_pi = 6.28318530717958647692f;
+    float low = floorf((float)head_dim * logf((float)orig_len / (beta_fast * two_pi))
+                       / (2.0f * logf(theta)));
+    float high = ceilf((float)head_dim * logf((float)orig_len / (beta_slow * two_pi))
+                       / (2.0f * logf(theta)));
+    low = fmaxf(low, 0.0f);
+    high = fminf(high, (float)head_dim - 1.0f);
+    if (high == low) high += 0.001f;
+    float ramp = ((float)d - low) / (high - low);
+    ramp = fminf(fmaxf(ramp, 0.0f), 1.0f);
+    return freq_inter * ramp + freq_extra * (1.0f - ramp);
+}
+
 extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
-                                int n_heads, int n_kv_heads, int head_dim, float theta) {
+                                int n_heads, int n_kv_heads, int head_dim, float theta,
+                                int yarn, float factor, float beta_fast, float beta_slow,
+                                float orig_len, float attn_factor) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int pos = *pos_buf;
     int half = head_dim / 2;
@@ -143,9 +207,10 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
         int h = i / head_dim;
         int d = i % head_dim;
         if (d < half) {
-            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+                                    beta_slow, orig_len);
             float ang = (float)pos * freq;
-            float c = cosf(ang), sn = sinf(ang);
+            float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = q + h * head_dim;
             float a = p[d], b = p[d + half];
             p[d] = a * c - b * sn;
@@ -156,9 +221,10 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
         int h = i / head_dim;
         int d = i % head_dim;
         if (d < half) {
-            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+                                    beta_slow, orig_len);
             float ang = (float)pos * freq;
-            float c = cosf(ang), sn = sinf(ang);
+            float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = k + h * head_dim;
             float a = p[d], b = p[d + half];
             p[d] = a * c - b * sn;
@@ -335,11 +401,34 @@ extern "C" __global__ void embed_batched(const int* tok, const float* emb, float
 }
 "#;
 
-/// Batched rotary embeddings with per-sequence positions.
+/// Batched rotary embeddings with per-sequence positions. YaRN params as in
+/// [`ROPE`] (the `yarn_freq` helper is duplicated — see that comment).
 const ROPE_BATCHED: &str = r#"
+__device__ __forceinline__ float yarn_freq(int d, int head_dim, float theta,
+                                           int yarn, float factor, float beta_fast,
+                                           float beta_slow, float orig_len) {
+    float freq_extra = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+    if (!yarn) return freq_extra;
+    float freq_inter = 1.0f / (factor * powf(theta, (2.0f * (float)d) / (float)head_dim));
+    float two_pi = 6.28318530717958647692f;
+    float low = floorf((float)head_dim * logf((float)orig_len / (beta_fast * two_pi))
+                       / (2.0f * logf(theta)));
+    float high = ceilf((float)head_dim * logf((float)orig_len / (beta_slow * two_pi))
+                       / (2.0f * logf(theta)));
+    low = fmaxf(low, 0.0f);
+    high = fminf(high, (float)head_dim - 1.0f);
+    if (high == low) high += 0.001f;
+    float ramp = ((float)d - low) / (high - low);
+    ramp = fminf(fmaxf(ramp, 0.0f), 1.0f);
+    return freq_inter * ramp + freq_extra * (1.0f - ramp);
+}
+
 extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
                                         int batch, int n_heads, int n_kv_heads,
-                                        int head_dim, float theta) {
+                                        int head_dim, float theta,
+                                        int yarn, float factor, float beta_fast,
+                                        float beta_slow, float orig_len,
+                                        float attn_factor) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half = head_dim / 2;
     int total_q = batch * n_heads * head_dim;
@@ -351,9 +440,10 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
         int d = rem % head_dim;
         if (d < half) {
             int pos = pos_buf[s];
-            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+                                    beta_slow, orig_len);
             float ang = (float)pos * freq;
-            float c = cosf(ang), sn = sinf(ang);
+            float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = q + (long long)s * n_heads * head_dim + h * head_dim;
             float a = p[d], b = p[d + half];
             p[d] = a * c - b * sn;
@@ -367,9 +457,10 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
         int d = rem % head_dim;
         if (d < half) {
             int pos = pos_buf[s];
-            float freq = 1.0f / powf(theta, (2.0f * (float)d) / (float)head_dim);
+            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+                                    beta_slow, orig_len);
             float ang = (float)pos * freq;
-            float c = cosf(ang), sn = sinf(ang);
+            float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
             float* p = k + (long long)s * n_kv_heads * head_dim + h * head_dim;
             float a = p[d], b = p[d + half];
             p[d] = a * c - b * sn;
@@ -1537,13 +1628,19 @@ extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short
 
 /// MoE routing (single token): softmax over `ne` expert logits, select the
 /// `topk` highest-probability experts (ties: lower index, matching the CPU
-/// reference), and emit per-slot normalized weights (prob / top-k sum).
+/// reference), and emit per-slot weights.
+///
+/// `norm_topk` selects the two checkpoint conventions: Qwen-MoE renormalizes
+/// the selected probabilities to sum to 1 (`w = p / sum(p)`), DeepSeek-V2 sets
+/// `norm_topk_prob=false` and instead multiplies by `routed_scaling_factor`
+/// (`w = p * rscale`). Both are then scaled by `rscale`, which is 1.0 for
+/// Qwen-MoE.
 const MOE_ROUTER: &str = r#"
 extern "C" __global__ void moe_router(
     const float* __restrict__ logits,
     int* __restrict__ out_ids,
     float* __restrict__ out_w,
-    int ne, int topk) {
+    int ne, int topk, int norm_topk, float rscale) {
     extern __shared__ float sm[];
     float* probs = sm;
     __shared__ float red[256];
@@ -1590,7 +1687,11 @@ extern "C" __global__ void moe_router(
             out_ids[k] = best;
             norm += probs[best];
         }
-        for (int k = 0; k < topk; k++) out_w[k] = probs[out_ids[k]] / norm;
+        for (int k = 0; k < topk; k++) {
+            float p = probs[out_ids[k]];
+            out_w[k] = norm_topk ? p / norm : p;
+            out_w[k] *= rscale;
+        }
     }
 }
 "#;
@@ -1640,13 +1741,13 @@ extern "C" __global__ void moe_accumulate(
 
 /// Batched MoE routing: one block per token, softmax + top-k with the same
 /// tie-breaking (lower index) as the CPU reference. Outputs `out_ids[B, topk]`
-/// and normalized `out_w[B, topk]`.
+/// and `out_w[B, topk]`, weighted per the same convention as [`MOE_ROUTER`].
 const MOE_ROUTER_BATCHED: &str = r#"
 extern "C" __global__ void moe_router_batched(
     const float* __restrict__ logits,
     int* __restrict__ out_ids,
     float* __restrict__ out_w,
-    int ne, int topk, int batch) {
+    int ne, int topk, int batch, int norm_topk, float rscale) {
     int s = blockIdx.x;
     const float* lg = logits + (long long)s * ne;
     int* ids = out_ids + (long long)s * topk;
@@ -1731,7 +1832,11 @@ extern "C" __global__ void moe_router_batched(
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        for (int k = 0; k < topk; k++) w[k] = probs[ids[k]] / norm;
+        for (int k = 0; k < topk; k++) {
+            float p = probs[ids[k]];
+            w[k] = norm_topk ? p / norm : p;
+            w[k] *= rscale;
+        }
     }
 }
 "#;
@@ -2980,7 +3085,7 @@ impl HipKernels {
         n_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
-        theta: f32,
+        rp: RopeParams,
     ) -> Result<(), Error> {
         let qp = q;
         let kp = k;
@@ -2992,7 +3097,13 @@ impl HipKernels {
             &n_heads as *const i32 as *mut core::ffi::c_void,
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,
             &head_dim as *const i32 as *mut core::ffi::c_void,
-            &theta as *const f32 as *mut core::ffi::c_void,
+            &rp.theta as *const f32 as *mut core::ffi::c_void,
+            &rp.yarn as *const i32 as *mut core::ffi::c_void,
+            &rp.factor as *const f32 as *mut core::ffi::c_void,
+            &rp.beta_fast as *const f32 as *mut core::ffi::c_void,
+            &rp.beta_slow as *const f32 as *mut core::ffi::c_void,
+            &rp.orig_len as *const i32 as *mut core::ffi::c_void,
+            &rp.attn_factor as *const f32 as *mut core::ffi::c_void,
         ];
         let total = (n_heads.max(n_kv_heads) * head_dim) as u32;
         let blocks = total.div_ceil(256);
@@ -3099,7 +3210,7 @@ impl HipKernels {
         n_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
-        theta: f32,
+        rp: RopeParams,
     ) -> Result<(), Error> {
         let qp = q;
         let kp = k;
@@ -3112,7 +3223,13 @@ impl HipKernels {
             &n_heads as *const i32 as *mut core::ffi::c_void,
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,
             &head_dim as *const i32 as *mut core::ffi::c_void,
-            &theta as *const f32 as *mut core::ffi::c_void,
+            &rp.theta as *const f32 as *mut core::ffi::c_void,
+            &rp.yarn as *const i32 as *mut core::ffi::c_void,
+            &rp.factor as *const f32 as *mut core::ffi::c_void,
+            &rp.beta_fast as *const f32 as *mut core::ffi::c_void,
+            &rp.beta_slow as *const f32 as *mut core::ffi::c_void,
+            &rp.orig_len as *const i32 as *mut core::ffi::c_void,
+            &rp.attn_factor as *const f32 as *mut core::ffi::c_void,
         ];
         let total = (batch * n_heads.max(n_kv_heads) * head_dim) as u32;
         let blocks = total.div_ceil(256);
@@ -3925,7 +4042,11 @@ impl HipKernels {
 
     /// Synchronizes the execution stream.
     /// MoE router for a single token: softmax over `ne` logits + top-k
-    /// selection; writes `out_ids[topk]` and normalized `out_w[topk]`.
+    /// selection; writes `out_ids[topk]` and `out_w[topk]`. `norm_topk` picks
+    /// the checkpoint's weighting convention (see the `moe_router` source);
+    /// `rscale` is `routed_scaling_factor`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_moe_router(
         &self,
         logits: *const f32,
@@ -3933,16 +4054,22 @@ impl HipKernels {
         out_w: *mut f32,
         ne: i32,
         topk: i32,
+        norm_topk: bool,
+        rscale: f32,
     ) -> Result<(), Error> {
         let lp = logits;
         let ip = out_ids;
         let wp = out_w;
+        let nt = i32::from(norm_topk);
+        let rs = rscale;
         let mut p = vec![
             &lp as *const *const f32 as *mut core::ffi::c_void,
             &ip as *const *mut i32 as *mut core::ffi::c_void,
             &wp as *const *mut f32 as *mut core::ffi::c_void,
             &ne as *const i32 as *mut core::ffi::c_void,
             &topk as *const i32 as *mut core::ffi::c_void,
+            &nt as *const i32 as *mut core::ffi::c_void,
+            &rs as *const f32 as *mut core::ffi::c_void,
         ];
         Ok(self.moe_router.launch_shmem(
             [1, 1, 1],
@@ -4028,7 +4155,10 @@ impl HipKernels {
     }
 
     /// Batched MoE router: one block per token, softmax + top-k selection;
-    /// writes `out_ids[B, topk]` and normalized `out_w[B, topk]`.
+    /// writes `out_ids[B, topk]` and `out_w[B, topk]`. See
+    /// [`Self::launch_moe_router`] for `norm_topk` / `rscale`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_moe_router_batched(
         &self,
         logits: *const f32,
@@ -4037,10 +4167,14 @@ impl HipKernels {
         ne: i32,
         topk: i32,
         batch: i32,
+        norm_topk: bool,
+        rscale: f32,
     ) -> Result<(), Error> {
         let lp = logits;
         let ip = out_ids;
         let wp = out_w;
+        let nt = i32::from(norm_topk);
+        let rs = rscale;
         let mut p = vec![
             &lp as *const *const f32 as *mut core::ffi::c_void,
             &ip as *const *mut i32 as *mut core::ffi::c_void,
@@ -4048,6 +4182,8 @@ impl HipKernels {
             &ne as *const i32 as *mut core::ffi::c_void,
             &topk as *const i32 as *mut core::ffi::c_void,
             &batch as *const i32 as *mut core::ffi::c_void,
+            &nt as *const i32 as *mut core::ffi::c_void,
+            &rs as *const f32 as *mut core::ffi::c_void,
         ];
         // The parallel top-k reduce uses fixed 256-thread shared arrays
         // (`bval[256]`/`bidx[256]` in the kernel) — this launch size is part
@@ -4956,6 +5092,8 @@ mod gpu_tests {
             ne as i32,
             topk as i32,
             batch as i32,
+            true,
+            1.0,
         )
         .unwrap();
         k.sync().unwrap();

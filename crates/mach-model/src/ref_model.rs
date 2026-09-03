@@ -106,8 +106,8 @@ impl RefModel {
                         cfg.rms_eps,
                     );
                 }
-                apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg.rope_theta);
-                apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg.rope_theta);
+                apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg);
+                apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg);
 
                 // Store into KV cache.
                 store_row(&mut self.kv[li].0, &k, pos, cfg);
@@ -169,9 +169,32 @@ impl RefModel {
                         eh[i] = silu(gate[i]) * up[i];
                     }
                     let down = matvec_t(&eh, wd, d);
-                    let w = probs[e] / norm;
+                    // Qwen-MoE renormalizes the top-k probabilities to sum to
+                    // 1; DeepSeek-V2 leaves the softmax scores alone and
+                    // applies `routed_scaling_factor` instead.
+                    let w = if cfg.moe_norm_topk {
+                        probs[e] / norm
+                    } else {
+                        probs[e]
+                    };
                     for i in 0..d {
-                        h[i] += w * down[i];
+                        h[i] += cfg.moe_routed_scale * w * down[i];
+                    }
+                }
+                // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
+                // `n_shared_experts * expert_size` on the same normalized
+                // input, ADDED to the routed experts' weighted sum.
+                if !lw.shared_wg.is_empty() {
+                    let shinter = cfg.shared_size();
+                    let gate = matvec_t(&xn2, &lw.shared_wg, shinter);
+                    let up = matvec_t(&xn2, &lw.shared_wu, shinter);
+                    let mut eh = vec![0.0; shinter];
+                    for i in 0..shinter {
+                        eh[i] = silu(gate[i]) * up[i];
+                    }
+                    let down = matvec_t(&eh, &lw.shared_wd, d);
+                    for i in 0..d {
+                        h[i] += down[i];
                     }
                 }
                 for i in 0..d {
@@ -414,21 +437,27 @@ fn decode_step_mla(
     let rope_hd = cfg.qk_rope_head_dim;
     let v_hd = cfg.v_head_dim;
     let hd = nope + rope_hd;
-    let scale = 1.0 / (hd as f32).sqrt();
+    let scale = cfg.attn_scale(hd);
 
-    // q_nope = q_b(rms(q_a(x))), q_rope = q_rope(x) + RoPE.
-    let q_lora = matvec_t(xn, &lw.mla_q_a, cfg.q_lora_rank);
-    let q_lora = rms_norm(&q_lora, &lw.mla_q_a_norm, cfg.rms_eps);
+    // q_nope = q_b(rms(q_a(x))), q_rope = q_rope(x) + RoPE. With
+    // `q_lora_rank == 0` (DeepSeek-V2-Lite) there is no low-rank q: both halves
+    // of the fused projection read the layer input directly.
+    let q_lora = if cfg.q_lora_rank > 0 {
+        let ql = matvec_t(xn, &lw.mla_q_a, cfg.q_lora_rank);
+        rms_norm(&ql, &lw.mla_q_a_norm, cfg.rms_eps)
+    } else {
+        xn.to_vec()
+    };
     let q_nope = matvec_t(&q_lora, &lw.mla_q_b, heads * nope);
-    let mut q_rope = matvec_t(xn, &lw.mla_q_rope, heads * rope_hd);
-    apply_rope(&mut q_rope, heads, rope_hd, pos, cfg.rope_theta);
+    let mut q_rope = matvec_t(&q_lora, &lw.mla_q_rope, heads * rope_hd);
+    apply_rope(&mut q_rope, heads, rope_hd, pos, cfg);
 
     // compressed_kv = kv_a(x); kv_lora (rms) feeds kv_b; k_rope is shared
     // across heads and rotated like a single-head rope.
     let kv_a = matvec_t(xn, &lw.mla_kv_a, cfg.kv_lora_rank + rope_hd);
     let kv_lora = rms_norm(&kv_a[..cfg.kv_lora_rank], &lw.mla_kv_a_norm, cfg.rms_eps);
     let mut k_rope = kv_a[cfg.kv_lora_rank..].to_vec();
-    apply_rope(&mut k_rope, 1, rope_hd, pos, cfg.rope_theta);
+    apply_rope(&mut k_rope, 1, rope_hd, pos, cfg);
 
     // kv_b expands the latent into per-head k_nope + v.
     let kv = matvec_t(&kv_lora, &lw.mla_kv_b, heads * (nope + v_hd));
@@ -487,14 +516,47 @@ fn decode_step_mla(
     }
 }
 
-pub(crate) fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
+/// YaRN inverse frequency for pair index `d`, mirroring the `yarn_freq` device
+/// helper in `kernels.rs` (HF `_compute_yarn_parameters`): plain RoPE when YaRN
+/// is off, else an interpolation of `freq_extra` and `freq_inter` over the
+/// `beta_fast`/`beta_slow` correction range.
+fn rope_freq(d: usize, head_dim: usize, cfg: Config) -> f32 {
+    let theta = cfg.rope_theta;
+    let freq_extra = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+    if !cfg.yarn() {
+        return freq_extra;
+    }
+    let freq_inter = 1.0 / (cfg.rope_yarn_factor * theta.powf(2.0 * d as f32 / head_dim as f32));
+    let low = (head_dim as f32
+        * (cfg.rope_yarn_orig_len as f32
+            / (cfg.rope_yarn_beta_fast * 2.0 * core::f32::consts::PI))
+            .ln()
+        / (2.0 * theta.ln()))
+    .floor();
+    let high = (head_dim as f32
+        * (cfg.rope_yarn_orig_len as f32
+            / (cfg.rope_yarn_beta_slow * 2.0 * core::f32::consts::PI))
+            .ln()
+        / (2.0 * theta.ln()))
+    .ceil();
+    let low = low.max(0.0);
+    let mut high = high.min(head_dim as f32 - 1.0);
+    if high == low {
+        high += 0.001;
+    }
+    let ramp = ((d as f32 - low) / (high - low)).clamp(0.0, 1.0);
+    freq_inter * ramp + freq_extra * (1.0 - ramp)
+}
+
+pub(crate) fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, cfg: Config) {
     let half = head_dim / 2;
+    let attn_factor = cfg.yarn_attention_factor();
     for h in 0..n_heads {
         for d in 0..half {
-            let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+            let freq = rope_freq(d, head_dim, cfg);
             let ang = pos as f32 * freq;
-            let c = ang.cos();
-            let sn = ang.sin();
+            let c = ang.cos() * attn_factor;
+            let sn = ang.sin() * attn_factor;
             // GPT-NeoX rotary: pairs (d, d + half), matching HF rotate_half.
             let idx = h * head_dim + d;
             let a = x[idx];
@@ -514,7 +576,7 @@ fn store_row(cache: &mut [f32], row: &[f32], pos: usize, cfg: Config) {
 fn attention_decode(q: &[f32], kc: &[f32], vc: &[f32], pos: usize, cfg: Config) -> Vec<f32> {
     let hd = cfg.head_dim;
     let groups = cfg.n_heads / cfg.n_kv_heads;
-    let scale = 1.0 / (hd as f32).sqrt();
+    let scale = cfg.attn_scale(hd);
     let mut out = vec![0.0; cfg.n_heads * hd];
     for h in 0..cfg.n_heads {
         let kv = h / groups;

@@ -354,6 +354,40 @@ fn broadcast_qk_norm(q_norm: &mut Vec<f32>, k_norm: &mut Vec<f32>, cfg: &Config)
     }
 }
 
+/// Splits a fused MLA q projection `[n_heads * (nope + rope), kk]` into the
+/// per-head non-RoPE and RoPE row blocks.
+///
+/// Real DeepSeek checkpoints ship ONE fused matrix per layer and split it per
+/// head *after* the projection: `q_proj [heads*(nope+rope), d]` when
+/// `q_lora_rank == 0` (DeepSeek-V2-Lite) and `q_b_proj [heads*(nope+rope),
+/// q_lora_rank]` when the low-rank q path is used (DeepSeek-V2 236B). The
+/// runtime keeps the halves separate so RoPE touches only the second half.
+fn split_mla_q(
+    fused: &[f32],
+    heads: usize,
+    nope: usize,
+    rope: usize,
+    kk: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let per_head = nope + rope;
+    assert_eq!(
+        fused.len(),
+        heads * per_head * kk,
+        "fused MLA q: expected [{}x{}], got {}",
+        heads * per_head,
+        kk,
+        fused.len()
+    );
+    let mut nope_w = Vec::with_capacity(heads * nope * kk);
+    let mut rope_w = Vec::with_capacity(heads * rope * kk);
+    for h in 0..heads {
+        let base = h * per_head * kk;
+        nope_w.extend_from_slice(&fused[base..base + nope * kk]);
+        rope_w.extend_from_slice(&fused[base + nope * kk..base + per_head * kk]);
+    }
+    (nope_w, rope_w)
+}
+
 /// Builds [`Weights`] from a merged tensor map (single file or shards).
 fn build_weights(
     tensors: &HashMap<String, RawTensor>,
@@ -416,22 +450,64 @@ fn build_weights(
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
-        // MLA (DeepSeek-V2 style): low-rank Q + compressed KV replaces the
+        // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace the
         // standard q/k/v/o projections when kv_lora_rank > 0.
         let mla = cfg.kv_lora_rank > 0;
+        // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
+        // `n_shared_experts * expert_size` on routed layers, added to the
+        // routed experts' output. Dense layers never have one.
+        let shinter = cfg.shared_size();
+        let (shared_wg, shared_wu, shared_wd) = if is_moe && shinter > 0 {
+            let sp = |proj: &str| format!("model.layers.{i}.mlp.shared_experts.{proj}");
+            (
+                get(&sp("gate_proj.weight"), shinter * d)?,
+                get(&sp("up_proj.weight"), shinter * d)?,
+                get(&sp("down_proj.weight"), d * shinter)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         let (mla_q_a, mla_q_a_norm, mla_q_b, mla_q_rope, mla_kv_a, mla_kv_a_norm, mla_kv_b, mla_o) =
             if mla {
+                // One fused q projection, split per head into the non-RoPE and
+                // RoPE halves (see [`split_mla_q`]). `q_lora_rank > 0`
+                // (DeepSeek-V2 236B) reads `q_b_proj` and contracts over the
+                // normalized q_lora; `q_lora_rank == 0` (V2-Lite, whose config
+                // ships `q_lora_rank: null`) reads `q_proj` and contracts over
+                // the layer input.
+                let kk = if cfg.q_lora_rank > 0 {
+                    cfg.q_lora_rank
+                } else {
+                    d
+                };
+                let fused_n = cfg.n_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) * kk;
+                let fused = if cfg.q_lora_rank > 0 {
+                    get(&p("self_attn.q_b_proj.weight"), fused_n)?
+                } else {
+                    get(&p("self_attn.q_proj.weight"), fused_n)?
+                };
+                let (q_nope_w, q_rope_w) = split_mla_q(
+                    &fused,
+                    cfg.n_heads,
+                    cfg.qk_nope_head_dim,
+                    cfg.qk_rope_head_dim,
+                    kk,
+                );
+                // The low-rank q path (`q_a` + `q_a_layernorm`) exists only
+                // when `q_lora_rank > 0`.
+                let (q_a, q_a_norm) = if cfg.q_lora_rank > 0 {
+                    (
+                        get(&p("self_attn.q_a_proj.weight"), cfg.q_lora_rank * d)?,
+                        get(&p("self_attn.q_a_layernorm.weight"), cfg.q_lora_rank)?,
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 (
-                    get(&p("self_attn.q_a_proj.weight"), cfg.q_lora_rank * d)?,
-                    get(&p("self_attn.q_a_layernorm.weight"), cfg.q_lora_rank)?,
-                    get(
-                        &p("self_attn.q_b_proj.weight"),
-                        cfg.n_heads * cfg.qk_nope_head_dim * cfg.q_lora_rank,
-                    )?,
-                    get(
-                        &p("self_attn.q_rope_proj.weight"),
-                        cfg.n_heads * cfg.qk_rope_head_dim * d,
-                    )?,
+                    q_a,
+                    q_a_norm,
+                    q_nope_w,
+                    q_rope_w,
                     get(
                         &p("self_attn.kv_a_proj_with_mqa.weight"),
                         (cfg.kv_lora_rank + cfg.qk_rope_head_dim) * d,
@@ -528,6 +604,9 @@ fn build_weights(
             moe_wg,
             moe_wu,
             moe_wd,
+            shared_wg,
+            shared_wu,
+            shared_wd,
         };
         layers.push(lw);
     }
@@ -668,10 +747,47 @@ pub fn load_safetensors_q4(
     }
 
     // Assemble per-layer Q4 weights.
+    // Fused MLA q projection → per-head non-RoPE / RoPE halves. The row blocks
+    // are group-aligned (`kk` is `d_model` or `q_lora_rank`), so the Q4 split
+    // slices packed bytes + scales without re-quantizing.
+    let mla_fused_q = |fused: Q4Tensor| -> (Q4Tensor, Q4Tensor) {
+        let kk = if cfg.q_lora_rank > 0 {
+            cfg.q_lora_rank
+        } else {
+            d
+        };
+        let per_head = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        let mut nope_blocks = Vec::with_capacity(cfg.n_heads);
+        let mut rope_blocks = Vec::with_capacity(cfg.n_heads);
+        for h in 0..cfg.n_heads {
+            nope_blocks.push((h * per_head, cfg.qk_nope_head_dim));
+            rope_blocks.push((h * per_head + cfg.qk_nope_head_dim, cfg.qk_rope_head_dim));
+        }
+        let nope = Q4Tensor::concat_many(&fused.split_row_blocks(kk, &nope_blocks));
+        let rope = Q4Tensor::concat_many(&fused.split_row_blocks(kk, &rope_blocks));
+        (nope, rope)
+    };
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
         let is_moe = ne > 0 && small.contains_key(&p("mlp.gate.weight"));
+        // Shared experts (DeepSeek-V2): dense SwiGLU MLP of width
+        // `n_shared_experts * expert_size`, added to the routed experts' sum.
+        let shinter = cfg.shared_size();
+        let (shared_wg, shared_wu, shared_wd) = if is_moe && shinter > 0 {
+            let sp = |proj: &str| format!("model.layers.{i}.mlp.shared_experts.{proj}");
+            (
+                big.remove(&sp("gate_proj.weight")).expect("shared gate"),
+                big.remove(&sp("up_proj.weight")).expect("shared up"),
+                big.remove(&sp("down_proj.weight")).expect("shared down"),
+            )
+        } else {
+            (
+                Q4Tensor::default(),
+                Q4Tensor::default(),
+                Q4Tensor::default(),
+            )
+        };
         let mut lw = LayerWeightsQ4 {
             wq: if mla {
                 Q4Tensor::default()
@@ -729,31 +845,23 @@ pub fn load_safetensors_q4(
             k_norm: small
                 .remove(&p("self_attn.k_norm.weight"))
                 .unwrap_or_default(),
-            mla_q_a: if mla {
+            mla_q_a: if mla && cfg.q_lora_rank > 0 {
                 big.remove(&p("self_attn.q_a_proj.weight"))
                     .expect("mla q_a")
             } else {
                 Q4Tensor::default()
             },
-            mla_q_a_norm: if mla {
+            mla_q_a_norm: if mla && cfg.q_lora_rank > 0 {
                 small
                     .remove(&p("self_attn.q_a_layernorm.weight"))
                     .expect("mla q_a_norm")
             } else {
                 Vec::new()
             },
-            mla_q_b: if mla {
-                big.remove(&p("self_attn.q_b_proj.weight"))
-                    .expect("mla q_b")
-            } else {
-                Q4Tensor::default()
-            },
-            mla_q_rope: if mla {
-                big.remove(&p("self_attn.q_rope_proj.weight"))
-                    .expect("mla q_rope")
-            } else {
-                Q4Tensor::default()
-            },
+            // Placeholders: overwritten below from the fused projection, which
+            // is loaded once and split per head into the two halves.
+            mla_q_b: Q4Tensor::default(),
+            mla_q_rope: Q4Tensor::default(),
             mla_kv_a: if mla {
                 big.remove(&p("self_attn.kv_a_proj_with_mqa.weight"))
                     .expect("mla kv_a")
@@ -782,7 +890,22 @@ pub fn load_safetensors_q4(
             moe_wg: Q4Tensor::default(),
             moe_wu: Q4Tensor::default(),
             moe_wd: Q4Tensor::default(),
+            shared_wg,
+            shared_wu,
+            shared_wd,
         };
+        if mla {
+            let fused = if cfg.q_lora_rank > 0 {
+                big.remove(&p("self_attn.q_b_proj.weight"))
+                    .expect("mla q_b")
+            } else {
+                big.remove(&p("self_attn.q_proj.weight"))
+                    .expect("mla q_proj")
+            };
+            let (nope, rope) = mla_fused_q(fused);
+            lw.mla_q_b = nope;
+            lw.mla_q_rope = rope;
+        }
         if is_moe {
             let ne_i = ne;
             // Single-pass per-tensor concat: the sequential fold re-clones the
@@ -955,10 +1078,47 @@ pub fn load_safetensors_fp8(
     }
 
     // Assemble per-layer FP8 weights.
+    // Fused MLA q projection → per-head non-RoPE / RoPE halves. FP8 keeps a
+    // per-tensor scale, so the halves are re-quantized from the sliced values
+    // (byte-identical to loading them as separate tensors).
+    let mla_fused_q = |fused: Fp8Tensor| -> (Fp8Tensor, Fp8Tensor) {
+        let kk = if cfg.q_lora_rank > 0 {
+            cfg.q_lora_rank
+        } else {
+            d
+        };
+        let per_head = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        let mut nope_blocks = Vec::with_capacity(cfg.n_heads);
+        let mut rope_blocks = Vec::with_capacity(cfg.n_heads);
+        for h in 0..cfg.n_heads {
+            nope_blocks.push((h * per_head, cfg.qk_nope_head_dim));
+            rope_blocks.push((h * per_head + cfg.qk_nope_head_dim, cfg.qk_rope_head_dim));
+        }
+        let nope = Fp8Tensor::concat_many(&fused.split_row_blocks(kk, &nope_blocks));
+        let rope = Fp8Tensor::concat_many(&fused.split_row_blocks(kk, &rope_blocks));
+        (nope, rope)
+    };
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
         let is_moe = ne > 0 && small.contains_key(&p("mlp.gate.weight"));
+        // Shared experts (DeepSeek-V2): dense SwiGLU MLP of width
+        // `n_shared_experts * expert_size`, added to the routed experts' sum.
+        let shinter = cfg.shared_size();
+        let (shared_wg, shared_wu, shared_wd) = if is_moe && shinter > 0 {
+            let sp = |proj: &str| format!("model.layers.{i}.mlp.shared_experts.{proj}");
+            (
+                big.remove(&sp("gate_proj.weight")).expect("shared gate"),
+                big.remove(&sp("up_proj.weight")).expect("shared up"),
+                big.remove(&sp("down_proj.weight")).expect("shared down"),
+            )
+        } else {
+            (
+                Fp8Tensor::default(),
+                Fp8Tensor::default(),
+                Fp8Tensor::default(),
+            )
+        };
         let mut lw = LayerWeightsFp8 {
             wq: if mla {
                 Fp8Tensor::default()
@@ -1016,31 +1176,23 @@ pub fn load_safetensors_fp8(
             k_norm: small
                 .remove(&p("self_attn.k_norm.weight"))
                 .unwrap_or_default(),
-            mla_q_a: if mla {
+            mla_q_a: if mla && cfg.q_lora_rank > 0 {
                 big.remove(&p("self_attn.q_a_proj.weight"))
                     .expect("mla q_a")
             } else {
                 Fp8Tensor::default()
             },
-            mla_q_a_norm: if mla {
+            mla_q_a_norm: if mla && cfg.q_lora_rank > 0 {
                 small
                     .remove(&p("self_attn.q_a_layernorm.weight"))
                     .expect("mla q_a_norm")
             } else {
                 Vec::new()
             },
-            mla_q_b: if mla {
-                big.remove(&p("self_attn.q_b_proj.weight"))
-                    .expect("mla q_b")
-            } else {
-                Fp8Tensor::default()
-            },
-            mla_q_rope: if mla {
-                big.remove(&p("self_attn.q_rope_proj.weight"))
-                    .expect("mla q_rope")
-            } else {
-                Fp8Tensor::default()
-            },
+            // Placeholders: overwritten below from the fused projection, which
+            // is loaded once and split per head into the two halves.
+            mla_q_b: Fp8Tensor::default(),
+            mla_q_rope: Fp8Tensor::default(),
             mla_kv_a: if mla {
                 big.remove(&p("self_attn.kv_a_proj_with_mqa.weight"))
                     .expect("mla kv_a")
@@ -1069,7 +1221,22 @@ pub fn load_safetensors_fp8(
             moe_wg: Fp8Tensor::default(),
             moe_wu: Fp8Tensor::default(),
             moe_wd: Fp8Tensor::default(),
+            shared_wg,
+            shared_wu,
+            shared_wd,
         };
+        if mla {
+            let fused = if cfg.q_lora_rank > 0 {
+                big.remove(&p("self_attn.q_b_proj.weight"))
+                    .expect("mla q_b")
+            } else {
+                big.remove(&p("self_attn.q_proj.weight"))
+                    .expect("mla q_proj")
+            };
+            let (nope, rope) = mla_fused_q(fused);
+            lw.mla_q_b = nope;
+            lw.mla_q_rope = rope;
+        }
         if is_moe {
             let ne_i = ne;
             // Single-pass per-tensor concat (the sequential fold re-clones the
@@ -1125,16 +1292,28 @@ fn expected_q4_size(
     // different shape, so it must be matched before the dense `o_proj`.
     if mla && name.contains("self_attn.o_proj.weight") {
         Some(d * cfg.n_heads * cfg.v_head_dim)
-    } else if mla && name.contains("self_attn.q_a_proj.weight") {
+    } else if mla && cfg.q_lora_rank > 0 && name.contains("self_attn.q_a_proj.weight") {
         Some(cfg.q_lora_rank * d)
-    } else if mla && name.contains("self_attn.q_b_proj.weight") {
-        Some(cfg.n_heads * cfg.qk_nope_head_dim * cfg.q_lora_rank)
-    } else if mla && name.contains("self_attn.q_rope_proj.weight") {
-        Some(cfg.n_heads * cfg.qk_rope_head_dim * d)
+    } else if mla && cfg.q_lora_rank > 0 && name.contains("self_attn.q_b_proj.weight") {
+        // Fused: the RoPE and non-RoPE rows are interleaved per head and split
+        // after loading (see [`split_mla_q`]).
+        Some(cfg.n_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) * cfg.q_lora_rank)
+    } else if mla && cfg.q_lora_rank == 0 && name.contains("self_attn.q_proj.weight") {
+        // Fused `q_proj` (DeepSeek-V2-Lite ships `q_lora_rank: null`): one
+        // `[heads*(nope+rope), d]` matrix holding both halves per head.
+        Some(cfg.n_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) * d)
     } else if mla && name.contains("self_attn.kv_a_proj_with_mqa.weight") {
         Some((cfg.kv_lora_rank + cfg.qk_rope_head_dim) * d)
     } else if mla && name.contains("self_attn.kv_b_proj.weight") {
         Some(cfg.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim) * cfg.kv_lora_rank)
+    } else if name.contains("mlp.shared_experts.")
+        && (name.ends_with("gate_proj.weight")
+            || name.ends_with("up_proj.weight")
+            || name.ends_with("down_proj.weight"))
+    {
+        // DeepSeek-V2 shared experts: one dense SwiGLU MLP of width
+        // `n_shared_experts * expert_size` (not per-expert tensors).
+        Some(cfg.shared_size() * d)
     } else if name.contains("self_attn.q_proj.weight") {
         Some(d * nq)
     } else if name.contains("self_attn.k_proj.weight") || name.contains("self_attn.v_proj.weight") {

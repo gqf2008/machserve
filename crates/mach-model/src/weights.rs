@@ -58,6 +58,13 @@ pub struct LayerWeights {
     pub moe_wu: Vec<f32>,
     /// Per-expert down `[num_experts, d_model, intermediate_size]`.
     pub moe_wd: Vec<f32>,
+    /// Shared experts (DeepSeek-V2 `n_shared_experts > 0`, MoE layers only):
+    /// one dense SwiGLU MLP of width `n_shared_experts * expert_size()` whose
+    /// output is ADDED to the routed experts' weighted sum. Empty when the
+    /// checkpoint has no shared experts.
+    pub shared_wg: Vec<f32>,
+    pub shared_wu: Vec<f32>,
+    pub shared_wd: Vec<f32>,
 }
 
 /// Q4 (storage-level int4) layer weights: GEMM tensors quantized, norms and
@@ -92,6 +99,11 @@ pub struct LayerWeightsQ4 {
     pub moe_wg: crate::q4::Q4Tensor,
     pub moe_wu: crate::q4::Q4Tensor,
     pub moe_wd: crate::q4::Q4Tensor,
+    /// Shared experts (DeepSeek-V2): gate/up `[shared_size, d_model]`, down
+    /// `[d_model, shared_size]`; empty when absent.
+    pub shared_wg: crate::q4::Q4Tensor,
+    pub shared_wu: crate::q4::Q4Tensor,
+    pub shared_wd: crate::q4::Q4Tensor,
 }
 
 /// All model weights in storage-Q4 form (host memory ~4x smaller than f32 for
@@ -136,6 +148,11 @@ pub struct LayerWeightsFp8 {
     pub moe_wg: crate::fp8::Fp8Tensor,
     pub moe_wu: crate::fp8::Fp8Tensor,
     pub moe_wd: crate::fp8::Fp8Tensor,
+    /// Shared experts (DeepSeek-V2): gate/up `[shared_size, d_model]`, down
+    /// `[d_model, shared_size]`; empty when absent.
+    pub shared_wg: crate::fp8::Fp8Tensor,
+    pub shared_wu: crate::fp8::Fp8Tensor,
+    pub shared_wd: crate::fp8::Fp8Tensor,
 }
 
 /// All model weights in storage-FP8 form (host memory ~2x smaller than f16 /
@@ -180,9 +197,30 @@ impl Weights {
             (0..n).map(|_| 1.0 + (rng.next_f32() - 0.5) * 0.1).collect()
         }
 
+        // MLA: the q projection's contraction width. With a low-rank q
+        // (`q_lora_rank > 0`, DeepSeek-V2 236B) both halves take the
+        // normalized q_lora; without one (DeepSeek-V2-Lite, `q_lora_rank` is
+        // null) they take the layer input directly, so the width is d_model.
         let mla = cfg.kv_lora_rank > 0;
+        let q_kk = if cfg.q_lora_rank > 0 {
+            cfg.q_lora_rank
+        } else {
+            d
+        };
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
+            // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
+            // `n_shared_experts * expert_size`, present on every routed layer.
+            let (shared_wg, shared_wu, shared_wd) =
+                if cfg.num_experts > 0 && cfg.n_shared_experts > 0 {
+                    (
+                        mat(&mut rng, cfg.shared_size(), d, scale),
+                        mat(&mut rng, cfg.shared_size(), d, scale),
+                        mat(&mut rng, d, cfg.shared_size(), scale),
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
             let (moe_router, moe_wg, moe_wu, moe_wd) = if cfg.num_experts > 0 {
                 (
                     mat(&mut rng, cfg.num_experts, d, scale),
@@ -233,28 +271,36 @@ impl Weights {
                 } else {
                     Vec::new()
                 },
-                mla_q_a: if mla {
+                // Low-rank q exists only when `q_lora_rank > 0`; DeepSeek-V2
+                // -Lite ships `q_lora_rank: null`, so its q path is a single
+                // full-width projection straight from the layer input.
+                mla_q_a: if mla && cfg.q_lora_rank > 0 {
                     mat(&mut rng, cfg.q_lora_rank, d, scale)
                 } else {
                     Vec::new()
                 },
-                mla_q_a_norm: if mla {
+                mla_q_a_norm: if mla && cfg.q_lora_rank > 0 {
                     vec1(&mut rng, cfg.q_lora_rank)
                 } else {
                     Vec::new()
                 },
+                // MLA q: ONE fused projection per checkpoint family, split per
+                // head into the non-RoPE and RoPE halves at load time:
+                //   q_lora_rank > 0 (DeepSeek-V2 236B): `q_b_proj`
+                //     [heads*(nope+rope), q_lora_rank], applied to the
+                //     normalized q_lora.
+                //   q_lora_rank == 0 (DeepSeek-V2-Lite): `q_proj`
+                //     [heads*(nope+rope), d_model], applied to the layer
+                //     input.
+                // Both halves share the same input and contraction width,
+                // which is what the runtime GEMMs below assume.
                 mla_q_b: if mla {
-                    mat(
-                        &mut rng,
-                        cfg.n_heads * cfg.qk_nope_head_dim,
-                        cfg.q_lora_rank,
-                        scale,
-                    )
+                    mat(&mut rng, cfg.n_heads * cfg.qk_nope_head_dim, q_kk, scale)
                 } else {
                     Vec::new()
                 },
                 mla_q_rope: if mla {
-                    mat(&mut rng, cfg.n_heads * cfg.qk_rope_head_dim, d, scale)
+                    mat(&mut rng, cfg.n_heads * cfg.qk_rope_head_dim, q_kk, scale)
                 } else {
                     Vec::new()
                 },
@@ -287,6 +333,9 @@ impl Weights {
                 moe_wg,
                 moe_wu,
                 moe_wd,
+                shared_wg,
+                shared_wu,
+                shared_wd,
             });
         }
 
@@ -325,7 +374,10 @@ impl Weights {
                 + l.moe_router.len()
                 + l.moe_wg.len()
                 + l.moe_wu.len()
-                + l.moe_wd.len();
+                + l.moe_wd.len()
+                + l.shared_wg.len()
+                + l.shared_wu.len()
+                + l.shared_wd.len();
         }
         n * 4
     }
@@ -388,6 +440,9 @@ impl WeightsQ4 {
                     moe_wg: qm(&l.moe_wg),
                     moe_wu: qm(&l.moe_wu),
                     moe_wd: qm(&l.moe_wd),
+                    shared_wg: q(&l.shared_wg),
+                    shared_wu: q(&l.shared_wu),
+                    shared_wd: q(&l.shared_wd),
                 })
                 .collect(),
         }
@@ -450,6 +505,9 @@ impl WeightsFp8 {
                     moe_wg: qm(&l.moe_wg),
                     moe_wu: qm(&l.moe_wu),
                     moe_wd: qm(&l.moe_wd),
+                    shared_wg: qm(&l.shared_wg),
+                    shared_wu: qm(&l.shared_wu),
+                    shared_wd: qm(&l.shared_wd),
                 })
                 .collect(),
         }

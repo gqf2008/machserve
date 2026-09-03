@@ -46,6 +46,11 @@ pub struct LayerWeights64 {
     pub moe_wu: Vec<f64>,
     /// Per-expert down `[num_experts, d_model, intermediate_size]`.
     pub moe_wd: Vec<f64>,
+    /// Shared experts (DeepSeek-V2): gate/up `[shared_size, d_model]`, down
+    /// `[d_model, shared_size]`; empty when the checkpoint has none.
+    pub shared_wg: Vec<f64>,
+    pub shared_wu: Vec<f64>,
+    pub shared_wd: Vec<f64>,
 }
 
 impl From<&LayerWeights> for LayerWeights64 {
@@ -66,6 +71,9 @@ impl From<&LayerWeights> for LayerWeights64 {
             moe_wg: to_f64(&w.moe_wg),
             moe_wu: to_f64(&w.moe_wu),
             moe_wd: to_f64(&w.moe_wd),
+            shared_wg: to_f64(&w.shared_wg),
+            shared_wu: to_f64(&w.shared_wu),
+            shared_wd: to_f64(&w.shared_wd),
         }
     }
 }
@@ -146,13 +154,44 @@ fn qk_norm(x: &mut [f64], w: &[f64], n_heads: usize, head_dim: usize, eps: f64) 
 }
 
 /// GPT-NeoX rotary embedding (pairs `(d, d + half)`), matching the f32 paths.
-fn apply_rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, theta: f64) {
+fn apply_rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, cfg: Config) {
     let half = head_dim / 2;
+    let theta = f64::from(cfg.rope_theta);
+    let attn_factor = f64::from(cfg.yarn_attention_factor());
     for h in 0..n_heads {
         for d in 0..half {
             let freq = 1.0 / theta.powf(2.0 * d as f64 / head_dim as f64);
+            // YaRN (HF `_compute_yarn_parameters`): interpolate the plain and
+            // factor-scaled frequencies over the beta_fast/beta_slow range.
+            let freq = if cfg.yarn() {
+                let factor = f64::from(cfg.rope_yarn_factor);
+                let freq_inter = 1.0 / (factor * theta.powf(2.0 * d as f64 / head_dim as f64));
+                let low = (head_dim as f64
+                    * (cfg.rope_yarn_orig_len as f64
+                        / (f64::from(cfg.rope_yarn_beta_fast) * 2.0 * core::f64::consts::PI))
+                        .ln()
+                    / (2.0 * theta.ln()))
+                .floor();
+                let mut high = (head_dim as f64
+                    * (cfg.rope_yarn_orig_len as f64
+                        / (f64::from(cfg.rope_yarn_beta_slow) * 2.0 * core::f64::consts::PI))
+                        .ln()
+                    / (2.0 * theta.ln()))
+                .ceil();
+                let low = low.max(0.0);
+                high = high.min(head_dim as f64 - 1.0);
+                if high == low {
+                    high += 0.001;
+                }
+                let ramp = ((d as f64 - low) / (high - low)).clamp(0.0, 1.0);
+                freq_inter * ramp + freq * (1.0 - ramp)
+            } else {
+                freq
+            };
             let ang = pos as f64 * freq;
             let (sn, c) = ang.sin_cos();
+            let c = c * attn_factor;
+            let sn = sn * attn_factor;
             let idx = h * head_dim + d;
             let a = x[idx];
             let b = x[idx + half];
@@ -166,7 +205,8 @@ fn apply_rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, theta:
 fn attention_decode(q: &[f64], kc: &[f64], vc: &[f64], pos: usize, cfg: Config) -> Vec<f64> {
     let hd = cfg.head_dim;
     let groups = cfg.n_heads / cfg.n_kv_heads;
-    let scale = 1.0 / (hd as f64).sqrt();
+    let m = cfg.yarn_mscale() as f64;
+    let scale = m * m / (hd as f64).sqrt();
     let mut out = vec![0.0; cfg.n_heads * hd];
     for h in 0..cfg.n_heads {
         let kv = h / groups;
@@ -258,7 +298,20 @@ pub fn moe_route(xn: &[f64], lw: &LayerWeights64, cfg: &Config) -> (Vec<i32>, Ve
         norm += probs[e];
     }
     let ids: Vec<i32> = chosen.iter().map(|&e| e as i32).collect();
-    let weights: Vec<f64> = chosen.iter().map(|&e| probs[e] / norm).collect();
+    // Qwen-MoE renormalizes the top-k probabilities; DeepSeek-V2 leaves the
+    // softmax scores alone and applies `routed_scaling_factor` instead.
+    let rscale = f64::from(cfg.moe_routed_scale);
+    let weights: Vec<f64> = chosen
+        .iter()
+        .map(|&e| {
+            let p = if cfg.moe_norm_topk {
+                probs[e] / norm
+            } else {
+                probs[e]
+            };
+            rscale * p
+        })
+        .collect();
     (ids, weights)
 }
 
@@ -280,6 +333,15 @@ pub fn moe_layer(xn: &[f64], lw: &LayerWeights64, cfg: &Config) -> Vec<f64> {
         let down = expert_mlp(xn, wg, wu, wd, inter, d);
         for kk in 0..d {
             residual[kk] += w * down[kk];
+        }
+    }
+    // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
+    // `n_shared_experts * expert_size`, added to the routed experts' sum.
+    if !lw.shared_wg.is_empty() {
+        let shinter = cfg.shared_size();
+        let down = expert_mlp(xn, &lw.shared_wg, &lw.shared_wu, &lw.shared_wd, shinter, d);
+        for kk in 0..d {
+            residual[kk] += down[kk];
         }
     }
     residual
@@ -384,7 +446,6 @@ impl Fp64RefModel {
             "sequence length exceeded max_seq_len"
         );
         let eps = cfg.rms_eps as f64;
-        let theta = cfg.rope_theta as f64;
 
         for (li, lw) in self.w.layers.iter().enumerate() {
             let xn = rms_norm(&x, &lw.rms_attn, eps);
@@ -395,8 +456,8 @@ impl Fp64RefModel {
                 qk_norm(&mut q, &lw.q_norm, cfg.n_heads, cfg.head_dim, eps);
                 qk_norm(&mut k, &lw.k_norm, cfg.n_kv_heads, cfg.head_dim, eps);
             }
-            apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, theta);
-            apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, theta);
+            apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg);
+            apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg);
 
             let row = cfg.n_kv_heads * cfg.head_dim;
             let off = pos * row;
