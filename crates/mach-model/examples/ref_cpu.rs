@@ -99,7 +99,13 @@ fn matvec_t(x: &[f64], w: &[f64], out_dim: usize) -> Vec<f64> {
         .collect()
 }
 
-fn rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, theta: f64) {
+/// RoPE, with the pairing convention chosen by `interleave` so this oracle
+/// agrees with `tools/ref_llama.py` (which pairs `d` with `d + half`,
+/// "matching HF rotate_half") on the Llama/Qwen configs it is used with.
+/// Hardcoding adjacent pairs here silently disagreed with that Python
+/// reference at every `pos > 0` — invisible at `pos == 0`, where cos=1 and
+/// sin=0 make RoPE the identity.
+fn rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, theta: f64, interleave: bool) {
     let half = head_dim / 2;
     for h in 0..n_heads {
         for d in 0..half {
@@ -107,10 +113,11 @@ fn rope(x: &mut [f64], n_heads: usize, head_dim: usize, pos: usize, theta: f64) 
             let ang = pos as f64 * freq;
             let c = ang.cos();
             let sn = ang.sin();
-            let idx = h * head_dim + 2 * d;
-            let (a, b) = (x[idx], x[idx + 1]);
-            x[idx] = a * c - b * sn;
-            x[idx + 1] = a * sn + b * c;
+            let i0 = h * head_dim + if interleave { 2 * d } else { d };
+            let i1 = h * head_dim + if interleave { 2 * d + 1 } else { d + half };
+            let (a, b) = (x[i0], x[i1]);
+            x[i0] = a * c - b * sn;
+            x[i1] = a * sn + b * c;
         }
     }
 }
@@ -199,6 +206,7 @@ fn forward_f64(w: &Weights, cfg: &Config, tokens: &[u32]) -> Vec<f64> {
                 cfg.head_dim,
                 pos,
                 cfg.rope_theta as f64,
+                cfg.rope_interleave,
             );
             rope(
                 &mut k,
@@ -206,6 +214,7 @@ fn forward_f64(w: &Weights, cfg: &Config, tokens: &[u32]) -> Vec<f64> {
                 cfg.head_dim,
                 pos,
                 cfg.rope_theta as f64,
+                cfg.rope_interleave,
             );
             let _ = li;
             kcaches[li][pos * nkv..(pos + 1) * nkv].copy_from_slice(&k);
@@ -296,13 +305,21 @@ fn forward_f64_layer0(w: &Weights, cfg: &Config, token: u32) -> Vec<Vec<f64>> {
         &lw.wv.iter().map(|v| *v as f64).collect::<Vec<_>>(),
         nkv,
     );
-    rope(&mut q, cfg.n_heads, cfg.head_dim, 0, cfg.rope_theta as f64);
+    rope(
+        &mut q,
+        cfg.n_heads,
+        cfg.head_dim,
+        0,
+        cfg.rope_theta as f64,
+        cfg.rope_interleave,
+    );
     rope(
         &mut k,
         cfg.n_kv_heads,
         cfg.head_dim,
         0,
         cfg.rope_theta as f64,
+        cfg.rope_interleave,
     );
     let mut kc = vec![0.0; cfg.max_seq_len * nkv];
     let mut vc = vec![0.0; cfg.max_seq_len * nkv];

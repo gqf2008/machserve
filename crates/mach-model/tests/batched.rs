@@ -1085,6 +1085,9 @@ mod paged_quantized_cpu_parity {
                     moe_wg: l.moe_wg.dequantize(),
                     moe_wu: l.moe_wu.dequantize(),
                     moe_wd: l.moe_wd.dequantize(),
+                    shared_wg: l.shared_wg.dequantize(),
+                    shared_wu: l.shared_wu.dequantize(),
+                    shared_wd: l.shared_wd.dequantize(),
                 })
                 .collect(),
         }
@@ -1125,6 +1128,9 @@ mod paged_quantized_cpu_parity {
                     moe_wg: l.moe_wg.dequantize(),
                     moe_wu: l.moe_wu.dequantize(),
                     moe_wd: l.moe_wd.dequantize(),
+                    shared_wg: l.shared_wg.dequantize(),
+                    shared_wu: l.shared_wu.dequantize(),
+                    shared_wd: l.shared_wd.dequantize(),
                 })
                 .collect(),
         }

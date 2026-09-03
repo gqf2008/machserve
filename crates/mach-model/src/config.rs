@@ -59,6 +59,47 @@ pub struct Config {
     /// loop for A/B). The server parses `MACH_MOE_GROUPED` into this field —
     /// the library itself reads no MoE env.
     pub moe_grouped: bool,
+    /// Number of shared (always-active) experts, added to the routed-expert
+    /// output — DeepSeek-V2 style (`n_shared_experts`). 0 = none.
+    pub n_shared_experts: usize,
+    /// MoE routing: renormalize the selected experts' scores to sum to 1
+    /// (Qwen-MoE: always). DeepSeek-V2 sets `norm_topk_prob=false`, which
+    /// leaves the softmax scores un-renormalized.
+    pub moe_norm_topk: bool,
+    /// MoE routing: multiplier applied to every selected expert's weight
+    /// (`routed_scaling_factor`; 1.0 for DeepSeek-V2-Lite).
+    pub moe_routed_scale: f32,
+    /// YaRN RoPE context extension (`rope_scaling.type == "yarn"`): the
+    /// position-scaling factor. 0 = plain RoPE (no YaRN).
+    pub rope_yarn_factor: f32,
+    /// YaRN: `original_max_position_embeddings` (the un-extended context).
+    pub rope_yarn_orig_len: usize,
+    /// YaRN: `beta_fast` / `beta_slow` correction-range bounds.
+    pub rope_yarn_beta_fast: f32,
+    pub rope_yarn_beta_slow: f32,
+    /// YaRN: `mscale` (numerator of the cos/sin `attention_factor`).
+    pub rope_yarn_mscale: f32,
+    /// YaRN: `mscale_all_dim`; > 0 applies the `mscale^2` attention-logit
+    /// correction (`0.1 * mscale_all_dim * ln(factor) + 1`, squared).
+    pub rope_yarn_mscale_all_dim: f32,
+    /// RoPE pairing convention: which two coordinates rotate together.
+    ///
+    /// `false` (GPT-NeoX / HF `rotate_half`): coordinate `d` pairs with
+    /// `d + head_dim/2`. This is what Llama, Qwen2 and Qwen3 do — their
+    /// `apply_rotary_pos_emb` is a bare `q * cos + rotate_half(q) * sin`.
+    ///
+    /// `true` (interleaved): coordinate `2d` pairs with `2d + 1`. DeepSeek-V2
+    /// and its successors need this — their `apply_rotary_pos_emb` permutes
+    /// `view(d//2, 2).transpose(4, 3)` from interleaved to split-halves
+    /// before applying `rotate_half`, i.e. the pair that ends up rotating
+    /// together came from adjacent coordinates. transformers' dedicated
+    /// `apply_rotary_pos_emb_interleave` (selected per-checkpoint, not the
+    /// default path) does the same.
+    ///
+    /// The two produce identical output at `pos == 0` (cos=1, sin=0 makes
+    /// RoPE the identity), so a diff taken at position 0 cannot tell them
+    /// apart. Compare at `pos > 0`.
+    pub rope_interleave: bool,
     /// Step profiler diagnostic: per-layer attention/MoE HIP event
     /// bracketing, reported after each decode step. The server parses
     /// `MACH_STEP_PROFILE` into this field — the library reads no env.
@@ -75,6 +116,62 @@ impl Config {
         } else {
             self.intermediate_size
         }
+    }
+
+    /// Shared-expert FFN width: `n_shared_experts * expert_size()`. The shared
+    /// experts are stored as one dense MLP (DeepSeek-V2 ships them as
+    /// `mlp.shared_experts.*_proj` with the experts' width each), so the
+    /// per-layer gate/up matrices are `[shared_size, d_model]`.
+    #[must_use]
+    pub fn shared_size(&self) -> usize {
+        self.n_shared_experts * self.expert_size()
+    }
+
+    /// YaRN enabled (rope_scaling.type == "yarn" with a factor > 1).
+    #[must_use]
+    pub fn yarn(&self) -> bool {
+        self.rope_yarn_factor > 1.0 && self.rope_yarn_orig_len > 0
+    }
+
+    /// YaRN `mscale` logit correction: `0.1 * mscale_all_dim * ln(factor) + 1`.
+    /// Attention logits are multiplied by `mscale^2` when this is > 1
+    /// (DeepSeek-V2 rope_scaling). Returns 1.0 when YaRN/mscale is off.
+    #[must_use]
+    pub fn yarn_mscale(&self) -> f32 {
+        if !self.yarn() || self.rope_yarn_mscale_all_dim <= 0.0 {
+            return 1.0;
+        }
+        0.1 * self.rope_yarn_mscale_all_dim * self.rope_yarn_factor.ln() + 1.0
+    }
+
+    /// Attention logit scale for head dim `hd`: `1/sqrt(hd)` with the YaRN
+    /// `mscale^2` correction folded in when it applies (DeepSeek-V2
+    /// `rope_scaling` sets `mscale_all_dim`, and its attention multiplies
+    /// `softmax_scale` by `mscale^2`). Plain RoPE / no YaRN returns the usual
+    /// `1/sqrt(hd)`.
+    #[must_use]
+    pub fn attn_scale(&self, hd: usize) -> f32 {
+        let m = self.yarn_mscale();
+        m * m / (hd as f32).sqrt()
+    }
+
+    /// YaRN cos/sin `attention_factor`: `mscale(factor) / mscale_all_dim(factor)`
+    /// with `mscale(x) = 0.1 * x * ln(factor) + 1` (HF
+    /// `_yarn_get_mscale`). DeepSeek-V2 sets both to 0.707, so this is 1.0 and
+    /// cos/sin are unscaled; the logit correction above is what actually bites.
+    /// Returns 1.0 when YaRN is off or both scales are absent.
+    #[must_use]
+    pub fn yarn_attention_factor(&self) -> f32 {
+        if !self.yarn() {
+            return 1.0;
+        }
+        // HF `yarn_get_mscale(scale, mscale)` with the config defaults
+        // (`mscale = 1` when absent, `mscale_all_dim = 0`), so a missing
+        // `mscale_all_dim` leaves the cos/sin unscaled.
+        let ln = self.rope_yarn_factor.ln();
+        let num = 0.1 * self.rope_yarn_mscale * ln + 1.0;
+        let den = 0.1 * self.rope_yarn_mscale_all_dim * ln + 1.0;
+        num / den
     }
 
     /// Minimal config for tests: fast to run, exercises GQA + capture.
@@ -101,6 +198,16 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            n_shared_experts: 0,
+            moe_norm_topk: true,
+            moe_routed_scale: 1.0,
+            rope_yarn_factor: 0.0,
+            rope_yarn_orig_len: 0,
+            rope_yarn_beta_fast: 0.0,
+            rope_yarn_beta_slow: 0.0,
+            rope_yarn_mscale: 1.0,
+            rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -137,6 +244,16 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            n_shared_experts: 0,
+            moe_norm_topk: true,
+            moe_routed_scale: 1.0,
+            rope_yarn_factor: 0.0,
+            rope_yarn_orig_len: 0,
+            rope_yarn_beta_fast: 0.0,
+            rope_yarn_beta_slow: 0.0,
+            rope_yarn_mscale: 1.0,
+            rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -173,6 +290,16 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            n_shared_experts: 0,
+            moe_norm_topk: true,
+            moe_routed_scale: 1.0,
+            rope_yarn_factor: 0.0,
+            rope_yarn_orig_len: 0,
+            rope_yarn_beta_fast: 0.0,
+            rope_yarn_beta_slow: 0.0,
+            rope_yarn_mscale: 1.0,
+            rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -202,6 +329,16 @@ impl Config {
             qk_nope_head_dim: 0,
             qk_rope_head_dim: 0,
             v_head_dim: 0,
+            n_shared_experts: 0,
+            moe_norm_topk: true,
+            moe_routed_scale: 1.0,
+            rope_yarn_factor: 0.0,
+            rope_yarn_orig_len: 0,
+            rope_yarn_beta_fast: 0.0,
+            rope_yarn_beta_slow: 0.0,
+            rope_yarn_mscale: 1.0,
+            rope_yarn_mscale_all_dim: 0.0,
+            rope_interleave: false,
             step_profile: false,
             moe_grouped: true,
         }
@@ -243,6 +380,22 @@ impl Config {
             qk_nope_head_dim,
             qk_rope_head_dim,
             v_head_dim,
+            n_shared_experts: 0,
+            moe_norm_topk: true,
+            moe_routed_scale: 1.0,
+            rope_yarn_factor: 0.0,
+            rope_yarn_orig_len: 0,
+            rope_yarn_beta_fast: 0.0,
+            rope_yarn_beta_slow: 0.0,
+            rope_yarn_mscale: 1.0,
+            rope_yarn_mscale_all_dim: 0.0,
+            // MLA is DeepSeek's attention, and every DeepSeek checkpoint uses
+            // the interleaved convention — defaulting to `false` here would
+            // make this constructor disagree with the real checkpoints it is
+            // shaped for, and would leave the interleaved branch with no
+            // model-level coverage (parity tests compare both sides under the
+            // same flag, so either default passes; only this one is truthful).
+            rope_interleave: true,
             step_profile: false,
             moe_grouped: true,
         }

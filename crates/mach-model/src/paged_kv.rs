@@ -518,11 +518,19 @@ impl PagedRef {
                 let rope_hd = cfg.qk_rope_head_dim;
                 let v_hd = cfg.v_head_dim;
                 let hd = nope + rope_hd;
-                let q_lora = crate::ref_model::matvec_t(&xn, &lw.mla_q_a, cfg.q_lora_rank);
-                let q_lora = crate::ref_model::rms_norm(&q_lora, &lw.mla_q_a_norm, cfg.rms_eps);
+                // Both halves of the fused q projection read the same source:
+                // the normalized low-rank q when `q_lora_rank > 0`, the layer
+                // input when it is 0 (DeepSeek-V2-Lite).
+                let q_lora = if cfg.q_lora_rank > 0 {
+                    let q = crate::ref_model::matvec_t(&xn, &lw.mla_q_a, cfg.q_lora_rank);
+                    crate::ref_model::rms_norm(&q, &lw.mla_q_a_norm, cfg.rms_eps)
+                } else {
+                    xn.clone()
+                };
                 let q_nope = crate::ref_model::matvec_t(&q_lora, &lw.mla_q_b, heads * nope);
-                let mut q_rope = crate::ref_model::matvec_t(&xn, &lw.mla_q_rope, heads * rope_hd);
-                crate::ref_model::apply_rope(&mut q_rope, heads, rope_hd, pos, cfg.rope_theta);
+                let mut q_rope =
+                    crate::ref_model::matvec_t(&q_lora, &lw.mla_q_rope, heads * rope_hd);
+                crate::ref_model::apply_rope(&mut q_rope, heads, rope_hd, pos, cfg);
                 let kv_a =
                     crate::ref_model::matvec_t(&xn, &lw.mla_kv_a, cfg.kv_lora_rank + rope_hd);
                 let kv_lora = crate::ref_model::rms_norm(
@@ -531,7 +539,7 @@ impl PagedRef {
                     cfg.rms_eps,
                 );
                 let mut k_rope = kv_a[cfg.kv_lora_rank..].to_vec();
-                crate::ref_model::apply_rope(&mut k_rope, 1, rope_hd, pos, cfg.rope_theta);
+                crate::ref_model::apply_rope(&mut k_rope, 1, rope_hd, pos, cfg);
                 let kv = crate::ref_model::matvec_t(&kv_lora, &lw.mla_kv_b, heads * (nope + v_hd));
                 let mut qm = vec![0.0f32; heads * hd];
                 let mut km = vec![0.0f32; heads * hd];
@@ -549,7 +557,7 @@ impl PagedRef {
                 let (page, off) = page_offsets(table, pos, tpp).expect("page mapped");
                 store_row_paged_mla(&mut self.mla_k_pools[li], &km, page, off, heads, hd, tpp);
                 store_row_paged_mla(&mut self.mla_v_pools[li], &vm, page, off, heads, v_hd, tpp);
-                let scale = 1.0 / (hd as f32).sqrt();
+                let scale = cfg.attn_scale(hd);
                 let attn = paged_attention_decode_mla(
                     &qm,
                     &self.mla_k_pools[li],
@@ -583,24 +591,12 @@ impl PagedRef {
                         cfg.rms_eps,
                     );
                 }
-                crate::ref_model::apply_rope(
-                    &mut q,
-                    cfg.n_heads,
-                    cfg.head_dim,
-                    pos,
-                    cfg.rope_theta,
-                );
-                crate::ref_model::apply_rope(
-                    &mut k,
-                    cfg.n_kv_heads,
-                    cfg.head_dim,
-                    pos,
-                    cfg.rope_theta,
-                );
+                crate::ref_model::apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg);
+                crate::ref_model::apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg);
                 let (page, off) = page_offsets(table, pos, tpp).expect("page mapped");
                 store_row_paged(&mut self.k_pools[li], &k, page, off, cfg, tpp);
                 store_row_paged(&mut self.v_pools[li], &v, page, off, cfg, tpp);
-                let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                let scale = cfg.attn_scale(cfg.head_dim);
                 let attn = paged_attention_decode(
                     &q,
                     &self.k_pools[li],

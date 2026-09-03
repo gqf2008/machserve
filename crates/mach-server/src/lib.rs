@@ -8,4 +8,4 @@ pub mod routes;
 #[cfg(feature = "hip")]
 pub use engine::ServerEngine;
 #[cfg(feature = "hip")]
-pub use routes::{AppState, router};
+pub use routes::{AppState, ChatFormat, router};

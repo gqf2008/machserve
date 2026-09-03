@@ -169,8 +169,12 @@ fn profiled(
         hip::HIP_MEMCPY_DEVICE_TO_HOST,
     )
     .unwrap();
-    let recs: Vec<Rec> = host
-        .chunks_exact(5)
+    // `as_chunks::<5>()` instead of `chunks_exact(5)`: clippy 1.98 added
+    // `chunks_exact_to_as_chunks`, which fires under `-D warnings` on a
+    // constant chunk size (`as_chunks` is stable since 1.88).
+    let (rec5, _tail) = host.as_chunks::<5>();
+    let recs: Vec<Rec> = rec5
+        .iter()
         .map(|c| Rec {
             entry_c: c[0],
             loop_c: c[1],

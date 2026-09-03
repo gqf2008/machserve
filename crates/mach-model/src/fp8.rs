@@ -290,6 +290,35 @@ impl Fp8Tensor {
         Self::quantize(&v)
     }
 
+    /// Row-block split of a `[rows, kk]` quantized matrix. `blocks` are
+    /// `(start_row, n_rows)` ranges. Unlike the same-named Q4 helper the FP8
+    /// scale is per-tensor (or per expert), so each piece is sliced out of
+    /// the dequantized values and re-quantized with its own single scale —
+    /// identical to loading the halves as separate tensors.
+    ///
+    /// Used to break a fused `q_proj`/`q_b_proj` `[heads*(nope+rope), kk]` into
+    /// the per-head non-RoPE and RoPE halves the runtime keeps separate.
+    #[must_use]
+    pub fn split_row_blocks(&self, kk: usize, blocks: &[(usize, usize)]) -> Vec<Self> {
+        if blocks.is_empty() || self.n == 0 {
+            return Vec::new();
+        }
+        let v = self.dequantize();
+        blocks
+            .iter()
+            .map(|&(r0, nr)| {
+                let i0 = r0 * kk;
+                let i1 = i0 + nr * kk;
+                assert!(
+                    i1 <= self.n,
+                    "fp8 row split: rows {r0}..{} out of range",
+                    r0 + nr
+                );
+                Self::quantize(&v[i0..i1])
+            })
+            .collect()
+    }
+
     /// Single-pass append of `parts` in order, O(total) bytes — folding
     /// [`Self::concat`] instead re-clones the growing prefix per part
     /// (O(n²) over many MoE experts). Byte/scale-identical to that fold

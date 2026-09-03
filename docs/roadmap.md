@@ -1235,3 +1235,82 @@
     ROCm 升级复测工具;hip_graph_upload 入 API 表。
   - 验证:fmt/clippy -D warnings/check×2 全绿;GPU 全量
     --test-threads 1;离线门禁 52 内核+计数断言。
+
+- **真实检查点批次:混合 dense+MoE Q4-on-device + DeepSeek MLA(#104,
+  2026-09-04,7900 XTX)——RoPE 配对约定根因已修,Q4 遗留另立 #107**:
+  - **选模**:DeepSeek-V2-Lite-Chat 一个模型同时覆盖两项 —— layer0 为
+    dense(`first_k_dense_replace=1`)+ 26 层 MoE(`n_routed_experts=64`、
+    `topk=6`、`n_shared_experts=2`)= 混合检查点;真实 MLA
+    (`kv_lora_rank=512`、`qk_nope_head_dim=128`、`qk_rope_head_dim=64`、
+    `v_head_dim=128`);15.7B 参数,必须走 Q4-on-device 才装得进 24GB。
+  - **根因:RoPE 配对约定按 checkpoint 而异(已修)**。半半配对
+    (GPT-NeoX / HF `rotate_half`,坐标 `d` 配 `d + head_dim/2`)是 Llama /
+    Qwen2 / Qwen3 的约定;DeepSeek 用**相邻对**(坐标 `2d` 配 `2d+1`),
+    其 `apply_rotary_pos_emb` 先做 `view(d//2,2).transpose(4,3)` 置换再套
+    `rotate_half`,即最终一起旋转的那一对来自**相邻坐标**(transformers 侧对应
+    按 checkpoint 选择的 `apply_rotary_pos_emb_interleave`,非默认路径)。
+    此前统一按半半配对实现,DeepSeek 每个 `pos>0` 的位置都被破坏。
+    - **数值隔离证据**:`inv_freq` 两者一致(rel 1.0e-08,错的不是频率);
+      施加 RoPE 后与 HF 的差 —— 相邻对 1.5e-07(吻合),半半配对 ~2.0
+      (量级级错误)。
+    - **为什么此前没抓到**:两者在 `pos == 0` 输出**完全相同**(cos=1、
+      sin=0 让 RoPE 退化为恒等),同理 `pos 0` 时 T=1、softmax 退化为常数,
+      softmax_scale 错也不可见。#85 的 30B 验证只查了"logits 全有限 + 两遍
+      greedy 逐位稳定"(确定性),未查连贯性,且半半配对对 Qwen3 恰好正确。
+    - **修复**:`Config::rope_interleave`(非 MLA 的 4 个构造函数默认 false);
+      两个 HIP rope 内核加 `int interleave` 参数;ref_model / fp64_ref 的
+      CPU 参考同步;`mach-server` 按 **白名单** `deepseekv2` / `deepseekv3` /
+      `deepseekvlv2` 判定(该约定属于 checkpoint 自带建模代码,不是超参,
+      无法从配置推导);`kernel_probe` 支持 `MACH_ROPE_INTERLEAVE=1`。
+      `Config::mla()` 默认改为 `true` —— MLA 即 DeepSeek 的注意力,默认 false
+      会与它要描述的真实检查点相反,且让相邻对分支在模型级零覆盖。
+    - **判定必须是白名单,不能用 `starts_with("deepseek")`**:model_type 为
+      `"deepseek"` 的是 DeepSeek-**V1** / DeepSeekMoE,其建模代码是 Llama 抄本
+      (半半配对、无 permute),且为 dense 形状 —— 加载不报错,却在每个
+      `pos > 0` 被静默写坏,且无错误路径可拦。第 2 版实现正是踩了这个坑。
+    - **两个族名来源要归一化**:`model_type` 是 snake_case(`deepseek_v2`),
+      `architectures[0]` 回退是 PascalCase 类名
+      (`DeepseekV2ForCausalLM`);只 `to_lowercase` 得到
+      `deepseekv2forcausallm`,永远匹配不上白名单 —— 缺 `model_type` 的检查点
+      会静默漏掉修复。归一化为"仅保留 ASCII 字母数字 + 小写"后两者都收敛到
+      `deepseekv2`。此缺陷由补写的
+      `rope_interleave_falls_back_to_architectures` 当场抓出。
+    - **防回归**:新增 `apply_rope_interleave_pairs_adjacent_coordinates`
+      与 `rope_conventions_agree_at_pos_zero_and_differ_after`,后者双向
+      钉住"pos 0 必须一致(<1e-6)、pos 5 必须不同(>1e-2)",使 pos-0 对拍
+      这种无效比较无法再伪装成通过。
+    - **顺带修掉两处同源缺陷**:
+      - `examples/ref_cpu.rs` 的 `rope()` **硬编码相邻对**,但它自称对拍的
+        `tools/ref_llama.py:62-66` 用的是半半配对(注释即 "matching HF
+        rotate_half"),且该文件只处理 llama/qwen 配置 —— 于是它在**任何
+        `pos > 0`** 与自己的 Python 参考静默不一致。同样因 pos 0 不可见而
+        一直没暴露。已改为按 `cfg.rope_interleave` 选约定(仓库内无已提交的
+        由它生成的 golden JSON,不影响既有数据)。
+      - 内核侧注明"配对约定 ≠ 输出重排":旋转结果写回**读出的同一对槽位**
+        (两种模式皆然),HF 的 permute 是被**消去**而非遗漏,照抄会写坏。
+  - **对齐/已核对无误**(对照 numpy 独立参考实现):`mla_assemble_kv_batched`
+    的 k_nope/v 切分顺序、MLA softmax scale(`192^-0.5 × mscale² =
+    0.114721`)、YaRN inv_freq 用 rope 维 64、shared experts 的 SwiGLU 后
+    累加、`norm_topk_prob=false` 的路由权重语义、chat 模板与 BOS
+    (prompt_tokens=12 与 numpy 的 12 个 id 吻合)、Q4 分组对齐(行长
+    2048/512/1408 均为 32 的倍数,无组跨越切分边界)。
+  - **加载与显存**(Q4-on-device):need **10.08 GiB** / free 23.84 GiB,
+    加载成功。对照:f16 需 30.56 GiB、FP8 需 59.82 GiB、Q4 不开启
+    `Q4_DEVICE` 需 30.56 GiB —— **均装不下**,即该 checkpoint 在本卡上只有
+    Q4-on-device 一条可跑路径,拿不到未量化基线。
+  - **遗留(未解决,已另立 #107)**:Q4-on-device 下输出仍不连贯
+    (`' Languages Capital Languages...'`,首 token 60750),而 numpy 参考
+    **加上模拟 Q4 之后依然连贯**(`' The capital of France is Paris.'`,
+    step 7 正常 EOS)。60750 不在 numpy top-20 内(下限 22.85),偏离约
+    7 个 logit 量级。已排除:核内 Q4 反量化 kernel(8 层截断 A/B 下
+    `MACH_Q4_DEVICE` 开/关给出**相同首 token** 11763)、f16 前向路径(截断
+    模型上取到 numpy 次选,间距仅 0.18,落在 f16 舍入内)、rope 缓冲区
+    越界(`k_buf` 实为 `b*3072` float > 所需 `b*1024`)。#85 引入的
+    `moe_grouped_gate_up_q4` / `moe_grouped_down_q4` 目前**零测试覆盖**,
+    建议优先补单元测试。
+  - **性能数据暂缺**:既有吞吐数字(25.73 tok/s @ Q4-on-device、capacity 4)
+    是在 RoPE 修复**之前**测的,且对应输出不连贯,不能作为有效数据收录;
+    待 #107 解决后重测再补。
+  - 验证:fmt/clippy -D warnings/check×2 全绿;CPU 全量(177 passed,含
+    新增 2 个 rope 测试);GPU 全量 --test-threads 1;离线门禁 52 内核
+    +计数断言。

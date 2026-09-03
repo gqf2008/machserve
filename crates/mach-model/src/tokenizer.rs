@@ -13,7 +13,26 @@ use fancy_regex::Regex;
 use std::collections::HashMap;
 use unicode_normalization::UnicodeNormalization;
 
+/// One pre-tokenizer step from a HuggingFace `tokenizer.json`.
+///
+/// Real checkpoints do not agree on pre-tokenization: Qwen2.5/Llama ship a
+/// single `Split` with the GPT-2 regex, while DeepSeek-V2 ships a chain of
+/// five `Split`s (newlines, letter runs, punctuation runs, trailing spaces,
+/// CJK runs) plus a `Digits` step that emits every digit separately. A
+/// hardcoded GPT-2 regex silently mis-tokenizes the latter (digits and CJK
+/// boundaries come out wrong), so the chain is read from the checkpoint.
+enum PreStep {
+    /// `Split` with a regex: matches are kept as their own pieces, and the
+    /// text between them is kept too (HF `Isolated` behavior).
+    Regex(Regex),
+    /// `Digits`: separates digit runs from the rest; `true` emits every digit
+    /// as its own piece (`individual_digits`).
+    Digits(bool),
+}
+
 /// The GPT-2 pre-tokenization regex (standard for Qwen2.5 / Llama BPE).
+///
+/// Used only as a fallback when `tokenizer.json` carries no `pre_tokenizer`.
 const PRE_TOKENIZE_RE: &str = r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^
 \p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[
 ]*|\s*[
@@ -50,6 +69,103 @@ impl ByteMap {
     }
 }
 
+/// True when the tokenizer declares NFC normalization anywhere in its
+/// `normalizer` (a bare `NFC` or a `Sequence` containing one).
+///
+/// Qwen2.5/Llama declare `{"type":"NFC"}`; DeepSeek-V2 declares an empty
+/// `Sequence`, i.e. NO normalization — normalizing anyway would diverge from
+/// HuggingFace on text whose bytes are not already in NFC form.
+fn normalizer_is_nfc(v: Option<&serde_json::Value>) -> bool {
+    let Some(v) = v else {
+        return false;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("NFC") => true,
+        Some("Sequence") => v
+            .get("normalizers")
+            .and_then(|n| n.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("NFC"))
+            }),
+        _ => false,
+    }
+}
+
+/// Parses a HuggingFace `pre_tokenizer` into a [`PreStep`] chain.
+///
+/// Steps we do not need to model are skipped (`ByteLevel` — this tokenizer
+/// always maps bytes itself). A missing or unparseable chain yields an empty
+/// `Vec`, which makes the caller fall back to the GPT-2 regex.
+fn parse_pre_tokenizer(v: Option<&serde_json::Value>) -> Vec<PreStep> {
+    let mut steps = Vec::new();
+    let Some(v) = v else {
+        return steps;
+    };
+    let list: Vec<&serde_json::Value> = match v.get("type").and_then(|t| t.as_str()) {
+        Some("Sequence") => v
+            .get("pretokenizers")
+            .and_then(|p| p.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default(),
+        _ => vec![v],
+    };
+    for step in list {
+        match step.get("type").and_then(|t| t.as_str()) {
+            Some("Split") => {
+                let Some(pat) = step
+                    .get("pattern")
+                    .and_then(|p| p.get("Regex"))
+                    .and_then(|r| r.as_str())
+                else {
+                    continue;
+                };
+                match Regex::new(pat) {
+                    Ok(re) => steps.push(PreStep::Regex(re)),
+                    Err(e) => eprintln!("tokenizer: unsupported pre-tokenizer regex: {e}"),
+                }
+            }
+            // `Digits`: `individual_digits` (default true) emits one piece per
+            // digit; DeepSeek-V2 relies on it (digits never merge across).
+            Some("Digits") => steps.push(PreStep::Digits(
+                step.get("individual_digits")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(true),
+            )),
+            _ => {}
+        }
+    }
+    steps
+}
+
+/// Splits `s` into digit / non-digit pieces (`Digits` pre-tokenizer): with
+/// `individual`, every digit becomes its own piece.
+fn push_digit_pieces<'a>(s: &'a str, individual: bool, out: &mut Vec<&'a str>) {
+    if s.is_empty() {
+        return;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let is_digit = bytes[i].is_ascii_digit();
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_digit() == is_digit {
+            j += 1;
+        }
+        let chunk = &s[i..j];
+        if is_digit && individual {
+            // Byte-safe: ASCII digits are single bytes, so slicing on byte
+            // offsets cannot split a multi-byte character.
+            for k in 0..chunk.len() {
+                out.push(&chunk[k..k + 1]);
+            }
+        } else {
+            out.push(chunk);
+        }
+        i = j;
+    }
+}
+
 /// A loaded byte-level BPE tokenizer.
 pub struct Tokenizer {
     vocab: HashMap<String, u32>,
@@ -58,6 +174,12 @@ pub struct Tokenizer {
     /// Added (special) tokens: (content, id), longest content first.
     added: Vec<(String, u32)>,
     byte_map: ByteMap,
+    /// Pre-tokenizer chain read from `tokenizer.json` (see [`PreStep`]).
+    pre_steps: Vec<PreStep>,
+    /// Whether the checkpoint declares NFC normalization (Qwen: yes;
+    /// DeepSeek-V2: no — its `normalizer` is an empty `Sequence`).
+    nfc: bool,
+    /// Fallback regex when the json carries no `pre_tokenizer`.
     pre_regex: Regex,
 }
 
@@ -132,6 +254,11 @@ impl Tokenizer {
             }
         }
         added.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        // Pre-tokenizer chain + normalizer come from the checkpoint: Qwen and
+        // DeepSeek disagree on both, and a hardcoded GPT-2 regex silently
+        // mis-tokenizes DeepSeek (digit runs and CJK boundaries differ).
+        let pre_steps = parse_pre_tokenizer(v.get("pre_tokenizer"));
+        let nfc = normalizer_is_nfc(v.get("normalizer"));
         let pre_regex = Regex::new(PRE_TOKENIZE_RE)
             .map_err(|e| crate::Error::Model(format!("pre-tokenize regex: {e}")))?;
         Ok(Self {
@@ -140,8 +267,50 @@ impl Tokenizer {
             bpe_ranks,
             added,
             byte_map: ByteMap::new(),
+            pre_steps,
+            nfc,
             pre_regex,
         })
+    }
+
+    /// Splits `text` into BPE pieces: the pre-tokenizer chain when the
+    /// checkpoint declares one, else the GPT-2 regex.
+    fn pre_pieces<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        if self.pre_steps.is_empty() {
+            return self
+                .pre_regex
+                .find_iter(text)
+                .map(|r| r.expect("regex match"))
+                .map(|m| &text[m.start()..m.end()])
+                .collect();
+        }
+        let mut pieces: Vec<&str> = vec![text];
+        for step in &self.pre_steps {
+            let mut next: Vec<&str> = Vec::with_capacity(pieces.len());
+            for p in pieces {
+                match step {
+                    PreStep::Regex(re) => {
+                        let mut last = 0usize;
+                        for m in re.find_iter(p).map(|r| r.expect("regex match")) {
+                            // `Isolated`: the gap before a match and the match
+                            // itself are both pieces.
+                            if m.start() > last {
+                                next.push(&p[last..m.start()]);
+                            }
+                            next.push(&p[m.start()..m.end()]);
+                            last = m.end();
+                        }
+                        if last < p.len() {
+                            next.push(&p[last..]);
+                        }
+                    }
+                    PreStep::Digits(individual) => push_digit_pieces(p, *individual, &mut next),
+                }
+            }
+            pieces = next;
+        }
+        pieces.retain(|p| !p.is_empty());
+        pieces
     }
 
     /// Vocabulary size.
@@ -163,7 +332,13 @@ impl Tokenizer {
     /// Encodes `text` to token ids (added tokens matched literally first).
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let normalized: String = text.nfc().collect();
+        // NFC only when the checkpoint declares it (Qwen does; DeepSeek-V2
+        // does not — its `normalizer` is an empty `Sequence`).
+        let normalized: String = if self.nfc {
+            text.nfc().collect()
+        } else {
+            text.to_string()
+        };
         let mut out = Vec::new();
         self.encode_specials(&normalized, &mut out);
         out
@@ -234,12 +409,7 @@ impl Tokenizer {
     }
 
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
-        for m in self
-            .pre_regex
-            .find_iter(text)
-            .map(|r| r.expect("regex match"))
-        {
-            let word = &text[m.start()..m.end()];
+        for word in self.pre_pieces(text) {
             let chars: Vec<char> = word
                 .bytes()
                 .map(|b| self.byte_map.to_char[b as usize])
@@ -357,6 +527,104 @@ mod tests {
             .map(|v| v.as_u64().unwrap() as u32)
             .collect();
         assert_eq!(tok.encode(text), want, "special-token encode mismatch");
+    }
+
+    /// DeepSeek-V2-Lite (`tokenizer_config` differs from Qwen's in the three
+    /// ways that change token ids: no NFC normalizer, a two-step `Split`
+    /// pre-tokenizer chain, and a ByteLevel decoder with
+    /// `add_prefix_space: true`). Opt-in: `.models/` is gitignored, so the
+    /// test skips when the checkpoint is absent.
+    fn deepseek_golden_path() -> Option<PathBuf> {
+        [
+            PathBuf::from("tests/data/tok_golden_deepseek.json"),
+            PathBuf::from("../../tests/data/tok_golden_deepseek.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    fn deepseek_tokenizer_path() -> Option<PathBuf> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        [
+            root.join("..")
+                .join("..")
+                .join(".models")
+                .join("deepseek-v2-lite-chat")
+                .join("tokenizer.json"),
+            root.join(".models")
+                .join("deepseek-v2-lite-chat")
+                .join("tokenizer.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    #[test]
+    fn deepseek_golden_encode_matches_hf() {
+        let Some(gp) = deepseek_golden_path() else {
+            eprintln!("skipping: tok_golden_deepseek.json missing");
+            return;
+        };
+        let Some(tj) = deepseek_tokenizer_path() else {
+            eprintln!("skipping: DeepSeek-V2-Lite tokenizer.json missing");
+            return;
+        };
+        let tok = Tokenizer::from_path(&tj).expect("load DeepSeek tokenizer");
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(gp).expect("read golden"))
+                .expect("parse golden");
+        for (key, case) in golden["enc"].as_object().expect("enc object") {
+            let text = case["text"].as_str().expect("text");
+            let want: Vec<u32> = case["ids"]
+                .as_array()
+                .expect("ids")
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let got = tok.encode(text);
+            assert_eq!(got, want, "DeepSeek encode mismatch {key}: {text:?}");
+        }
+        for case in golden["dec"].as_array().expect("dec array") {
+            let ids: Vec<u32> = case["ids"]
+                .as_array()
+                .expect("ids")
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let want = case["text"].as_str().expect("text");
+            let got = tok.decode(&ids);
+            assert_eq!(&got, want, "DeepSeek decode mismatch for ids {ids:?}");
+        }
+        // `add_special_tokens` is not modelled by `encode`, so both HF rows
+        // must agree with it — the server's chat template emits BOS itself.
+        let extra = &golden["extra"];
+        let want: Vec<u32> = extra["encode_with_special"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(tok.encode("hi"), want, "DeepSeek 'hi' encode mismatch");
+        let want_no: Vec<u32> = extra["encode_without_special"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(
+            want, want_no,
+            "DeepSeek tokenizer.json must not add BOS in `encode` \
+             (the chat template does)"
+        );
+        // The server stops generation on this id; a wrong special id would
+        // decode past the end of the answer forever. Delimiters are U+FF5C
+        // (fullwidth vertical line) and U+2581 — not ASCII `|`.
+        let eos: u32 = extra["eos_id"].as_u64().unwrap() as u32;
+        let eos_text = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+        assert_eq!(tok.special_token_id(eos_text), Some(eos), "eos id");
+        let bos: u32 = extra["bos_id"].as_u64().unwrap() as u32;
+        let bos_text = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+        assert_eq!(tok.special_token_id(bos_text), Some(bos), "bos id");
     }
 
     #[test]

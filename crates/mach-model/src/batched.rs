@@ -9,6 +9,7 @@
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
+use crate::kernels::RopeParams;
 use crate::moe_offload;
 use crate::sampling::{BatchedSampler, SampleOutput, SamplingParams};
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
@@ -49,6 +50,12 @@ struct LayerDev {
     moe_wg: *mut f32,
     moe_wu: *mut f32,
     moe_wd: *mut f32,
+    /// Shared experts (DeepSeek-V2): one dense SwiGLU MLP of width
+    /// `n_shared_experts * expert_size`, added to the routed experts' sum. Null
+    /// (and `shared_size() == 0`) for checkpoints without shared experts.
+    shared_wg: *mut f32,
+    shared_wu: *mut f32,
+    shared_wd: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -66,6 +73,10 @@ struct LayerDevF16 {
     moe_wg: *mut u16,
     moe_wu: *mut u16,
     moe_wd: *mut u16,
+    /// Shared experts fp16 (DeepSeek-V2): dense SwiGLU MLP, see `LayerDev`.
+    shared_wg: *mut u16,
+    shared_wu: *mut u16,
+    shared_wd: *mut u16,
     /// MLA fp16 (kv_lora_rank > 0): low-rank Q / compressed KV weights.
     mla_q_a: *mut u16,
     mla_q_b: *mut u16,
@@ -1058,7 +1069,10 @@ impl BatchedModel {
         let d = c.d_model;
         let nq = c.n_heads * c.head_dim;
         let nkv = c.n_kv_heads * c.head_dim;
-        let inter = c.intermediate_size;
+        // The shared experts (DeepSeek-V2) are one dense MLP of width
+        // `n_shared_experts * expert_size`, which can exceed the dense
+        // `intermediate_size`; the gate/up/h scratch must cover both.
+        let inter = c.intermediate_size.max(c.shared_size());
 
         self.tokens_dev = self.dalloc(b * 4)? as *mut i32;
         self.pos_dev = self.dalloc(b * 4)? as *mut i32;
@@ -1099,10 +1113,10 @@ impl BatchedModel {
         // path, which is then cast back to fp32 for the sampler).
         let max_n = c
             .d_model
-            .max(c.intermediate_size)
+            .max(inter)
             .max(c.n_heads * c.head_dim)
             .max(c.vocab_size);
-        let xh_bytes = b * c.d_model.max(c.intermediate_size) * 2;
+        let xh_bytes = b * c.d_model.max(inter) * 2;
         let xh = hip::malloc(self.k.hip(), xh_bytes)?;
         self.xh = xh as *mut u16;
         self.allocs.push(xh);
@@ -1334,6 +1348,29 @@ impl BatchedModel {
                     self.upload(p, &lw.moe_wd)?;
                     p
                 },
+                // Shared experts are always resident (one small dense MLP), so
+                // they follow the same f32/f16 split as the dense MLP weights.
+                shared_wg: if f16 || lw.shared_wg.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.shared_wg.len() * 4)?;
+                    self.upload(p, &lw.shared_wg)?;
+                    p
+                },
+                shared_wu: if f16 || lw.shared_wu.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.shared_wu.len() * 4)?;
+                    self.upload(p, &lw.shared_wu)?;
+                    p
+                },
+                shared_wd: if f16 || lw.shared_wd.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.shared_wd.len() * 4)?;
+                    self.upload(p, &lw.shared_wd)?;
+                    p
+                },
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1370,6 +1407,9 @@ impl BatchedModel {
                     mla_kv_a: self.alloc_f16(lw.mla_kv_a.len())?,
                     mla_kv_b: self.alloc_f16(lw.mla_kv_b.len())?,
                     mla_o: self.alloc_f16(lw.mla_o.len())?,
+                    shared_wg: self.alloc_f16(lw.shared_wg.len())?,
+                    shared_wu: self.alloc_f16(lw.shared_wu.len())?,
+                    shared_wd: self.alloc_f16(lw.shared_wd.len())?,
                 };
                 self.upload_f16(l16.wq, &lw.wq)?;
                 self.upload_f16(l16.wk, &lw.wk)?;
@@ -1390,6 +1430,9 @@ impl BatchedModel {
                 self.upload_f16(l16.mla_kv_a, &lw.mla_kv_a)?;
                 self.upload_f16(l16.mla_kv_b, &lw.mla_kv_b)?;
                 self.upload_f16(l16.mla_o, &lw.mla_o)?;
+                self.upload_f16(l16.shared_wg, &lw.shared_wg)?;
+                self.upload_f16(l16.shared_wu, &lw.shared_wu)?;
+                self.upload_f16(l16.shared_wd, &lw.shared_wd)?;
                 self.layers_f16.push(l16);
             }
         }
@@ -1440,6 +1483,11 @@ impl BatchedModel {
                 moe_wg: std::ptr::null_mut(),
                 moe_wu: std::ptr::null_mut(),
                 moe_wd: std::ptr::null_mut(),
+                // Shared experts live in the f16 copy only (the Q4/FP8 paths
+                // always run f16 GEMMs); the f32 pointers stay null.
+                shared_wg: std::ptr::null_mut(),
+                shared_wu: std::ptr::null_mut(),
+                shared_wd: std::ptr::null_mut(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1474,6 +1522,9 @@ impl BatchedModel {
                 mla_kv_a: self.alloc_f16(lw.mla_kv_a.len())?,
                 mla_kv_b: self.alloc_f16(lw.mla_kv_b.len())?,
                 mla_o: self.alloc_f16(lw.mla_o.len())?,
+                shared_wg: self.alloc_f16(lw.shared_wg.len())?,
+                shared_wu: self.alloc_f16(lw.shared_wu.len())?,
+                shared_wd: self.alloc_f16(lw.shared_wd.len())?,
             };
             self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
             self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
@@ -1510,6 +1561,11 @@ impl BatchedModel {
             self.upload_f16_bits(l16.mla_kv_a, &lw.mla_kv_a.dequantize_f16())?;
             self.upload_f16_bits(l16.mla_kv_b, &lw.mla_kv_b.dequantize_f16())?;
             self.upload_f16_bits(l16.mla_o, &lw.mla_o.dequantize_f16())?;
+            // Shared experts: the Q4/FP8 pool stays packed for the routed
+            // experts, but the shared MLP is small and always dequantized.
+            self.upload_f16_bits(l16.shared_wg, &lw.shared_wg.dequantize_f16())?;
+            self.upload_f16_bits(l16.shared_wu, &lw.shared_wu.dequantize_f16())?;
+            self.upload_f16_bits(l16.shared_wd, &lw.shared_wd.dequantize_f16())?;
             self.layers_f16.push(l16);
         }
         Ok(())
@@ -1576,6 +1632,11 @@ impl BatchedModel {
                 moe_wg: std::ptr::null_mut(),
                 moe_wu: std::ptr::null_mut(),
                 moe_wd: std::ptr::null_mut(),
+                // Shared experts live in the f16 copy only (the Q4/FP8 paths
+                // always run f16 GEMMs); the f32 pointers stay null.
+                shared_wg: std::ptr::null_mut(),
+                shared_wu: std::ptr::null_mut(),
+                shared_wd: std::ptr::null_mut(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1598,6 +1659,9 @@ impl BatchedModel {
                 mla_kv_a: self.alloc_f16(lw.mla_kv_a.len())?,
                 mla_kv_b: self.alloc_f16(lw.mla_kv_b.len())?,
                 mla_o: self.alloc_f16(lw.mla_o.len())?,
+                shared_wg: self.alloc_f16(lw.shared_wg.len())?,
+                shared_wu: self.alloc_f16(lw.shared_wu.len())?,
+                shared_wd: self.alloc_f16(lw.shared_wd.len())?,
             };
             self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
             self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
@@ -1616,6 +1680,11 @@ impl BatchedModel {
             self.upload_f16_bits(l16.mla_kv_a, &lw.mla_kv_a.dequantize_f16())?;
             self.upload_f16_bits(l16.mla_kv_b, &lw.mla_kv_b.dequantize_f16())?;
             self.upload_f16_bits(l16.mla_o, &lw.mla_o.dequantize_f16())?;
+            // Shared experts: the Q4/FP8 pool stays packed for the routed
+            // experts, but the shared MLP is small and always dequantized.
+            self.upload_f16_bits(l16.shared_wg, &lw.shared_wg.dequantize_f16())?;
+            self.upload_f16_bits(l16.shared_wu, &lw.shared_wu.dequantize_f16())?;
+            self.upload_f16_bits(l16.shared_wd, &lw.shared_wd.dequantize_f16())?;
             self.layers_f16.push(l16);
         }
         Ok(())
@@ -2067,7 +2136,7 @@ impl BatchedModel {
         let nq = (c.n_heads * c.head_dim) as i32;
         let nkv = (c.n_kv_heads * c.head_dim) as i32;
         let inter = c.intermediate_size as i32;
-        let scale = 1.0 / (c.head_dim as f32).sqrt();
+        let scale = c.attn_scale(c.head_dim);
         let k = &self.k;
         let f16 = c.dtype == ModelDType::F16;
 
@@ -2137,39 +2206,51 @@ impl BatchedModel {
                 let v_hd = c.v_head_dim as i32;
                 let kvlr = c.kv_lora_rank as i32;
                 let max_seq = c.max_seq_len as i32;
+                // DeepSeek-V2-Lite ships `q_lora_rank: null`: the fused q
+                // projection reads the layer input directly, so both halves
+                // contract over `d` instead of a normalized low-rank q.
+                let low_rank_q = c.q_lora_rank > 0;
+                let q_kk = if low_rank_q { qlr } else { d };
                 // q_lora = q_a(xn); rms; q_nope = q_b(q_lora).
-                gemm(
-                    self.mla_q_lora,
-                    self.xn,
-                    lw.mla_q_a,
-                    l16.map_or(std::ptr::null_mut(), |l| l.mla_q_a),
-                    qlr,
-                    d,
-                )?;
-                k.launch_rms_norm(
-                    self.mla_q_lora,
-                    lw.mla_q_a_norm,
-                    self.mla_q_lora_n,
-                    b,
-                    qlr,
-                    c.rms_eps,
-                )?;
+                if low_rank_q {
+                    gemm(
+                        self.mla_q_lora,
+                        self.xn,
+                        lw.mla_q_a,
+                        l16.map_or(std::ptr::null_mut(), |l| l.mla_q_a),
+                        qlr,
+                        d,
+                    )?;
+                    k.launch_rms_norm(
+                        self.mla_q_lora,
+                        lw.mla_q_a_norm,
+                        self.mla_q_lora_n,
+                        b,
+                        qlr,
+                        c.rms_eps,
+                    )?;
+                }
+                let q_src = if low_rank_q {
+                    self.mla_q_lora_n
+                } else {
+                    self.xn
+                };
                 gemm(
                     self.q_nope,
-                    self.mla_q_lora_n,
+                    q_src,
                     lw.mla_q_b,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_q_b),
                     heads * nope,
-                    qlr,
+                    q_kk,
                 )?;
                 // q_rope = q_rope_proj(xn) + RoPE (k_buf is scratch here).
                 gemm(
                     self.q_rope,
-                    self.xn,
+                    q_src,
                     lw.mla_q_rope,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_q_rope),
                     heads * rope,
-                    d,
+                    q_kk,
                 )?;
                 k.launch_rope_batched(
                     self.q_rope,
@@ -2179,7 +2260,7 @@ impl BatchedModel {
                     heads,
                     heads,
                     rope,
-                    c.rope_theta,
+                    RopeParams::from(c),
                 )?;
                 // compressed_kv = kv_a(xn); latent is followed by k_rope in
                 // kv_a, so extract it to a contiguous buffer before the RMSNorm
@@ -2210,7 +2291,7 @@ impl BatchedModel {
                     1,
                     1,
                     rope,
-                    c.rope_theta,
+                    RopeParams::from(c),
                 )?;
                 // kv = kv_b_proj(latent): [batch, heads*(nope + v_hd)].
                 gemm(
@@ -2232,7 +2313,7 @@ impl BatchedModel {
                     rope,
                 )?;
                 let (kc, vc) = self.mla_kv_cache[li];
-                let scale = 1.0 / ((nope + rope) as f32).sqrt();
+                let scale = c.attn_scale((nope + rope) as usize);
                 if self.paged {
                     // Paged MLA: one fused kernel expands kv + shared k_rope
                     // on the fly while storing through the block tables into
@@ -2390,7 +2471,7 @@ impl BatchedModel {
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
-                    c.rope_theta,
+                    RopeParams::from(c),
                 )?;
                 let (kc, vc) = self.kv_cache[li];
                 if f16 && self.paged {
@@ -2629,6 +2710,8 @@ impl BatchedModel {
                         ne,
                         topk,
                         b,
+                        c.moe_norm_topk,
+                        c.moe_routed_scale,
                     )?;
                     // Decode/small steps run the whole grouped MoE on device:
                     // the per-row GEMV kernels need no per-expert counts, so
@@ -2908,6 +2991,40 @@ impl BatchedModel {
                                     d,
                                 )?;
                             }
+                        }
+                        // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of
+                        // width `n_shared_experts * expert_size` on the same
+                        // normalized input, ADDED on top of the routed
+                        // experts' weighted sum in `h_acc`.
+                        if !lw.shared_wg.is_null() {
+                            let shinter = c.shared_size() as i32;
+                            gemm(
+                                self.gate,
+                                self.xn2,
+                                lw.shared_wg,
+                                l16.map_or(std::ptr::null_mut(), |l| l.shared_wg),
+                                shinter,
+                                d,
+                            )?;
+                            gemm(
+                                self.up,
+                                self.xn2,
+                                lw.shared_wu,
+                                l16.map_or(std::ptr::null_mut(), |l| l.shared_wu),
+                                shinter,
+                                d,
+                            )?;
+                            // SwiGLU: h = silu(gate) * up, so silu applies to `gate`.
+                            k.launch_silu_mul(self.up, self.gate, self.h, b * shinter)?;
+                            gemm(
+                                self.proj,
+                                self.h,
+                                lw.shared_wd,
+                                l16.map_or(std::ptr::null_mut(), |l| l.shared_wd),
+                                d,
+                                shinter,
+                            )?;
+                            k.launch_add(self.h_acc, self.proj, b * d)?;
                         }
                         k.launch_add(self.x, self.h_acc, b * d)?;
                     }

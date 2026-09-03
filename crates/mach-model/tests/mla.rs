@@ -20,15 +20,23 @@ fn mla_weights_have_expected_shapes() {
     let heads = cfg.n_heads;
     assert_eq!(l.mla_q_a.len(), cfg.q_lora_rank * d, "q_a [q_lora, d]");
     assert_eq!(l.mla_q_a_norm.len(), cfg.q_lora_rank, "q_a_norm");
+    // Both halves of the fused q projection contract over the same width: the
+    // normalized q_lora when `q_lora_rank > 0`, the layer input otherwise
+    // (DeepSeek-V2-Lite ships `q_lora_rank: null`).
+    let q_kk = if cfg.q_lora_rank > 0 {
+        cfg.q_lora_rank
+    } else {
+        d
+    };
     assert_eq!(
         l.mla_q_b.len(),
-        heads * cfg.qk_nope_head_dim * cfg.q_lora_rank,
-        "q_b [heads*nope, q_lora]"
+        heads * cfg.qk_nope_head_dim * q_kk,
+        "q_b [heads*nope, q_kk]"
     );
     assert_eq!(
         l.mla_q_rope.len(),
-        heads * cfg.qk_rope_head_dim * d,
-        "q_rope [heads*rope, d]"
+        heads * cfg.qk_rope_head_dim * q_kk,
+        "q_rope [heads*rope, q_kk]"
     );
     assert_eq!(
         l.mla_kv_a.len(),
@@ -51,6 +59,45 @@ fn mla_weights_have_expected_shapes() {
     let dense = Weights::random(&Config::tiny(), 42).unwrap();
     assert!(dense.layers[0].mla_q_a.is_empty());
     assert!(dense.layers[0].mla_kv_b.is_empty());
+}
+
+/// DeepSeek-V2-Lite shape: `q_lora_rank` is null, so the fused `q_proj` reads
+/// the layer input directly (`q_kk = d_model`) and there is no `q_a` / `q_a_norm`.
+#[test]
+fn mla_without_low_rank_q_has_expected_shapes() {
+    let mut cfg = mla_cfg();
+    cfg.q_lora_rank = 0;
+    let w = Weights::random(&cfg, 42).unwrap();
+    let l = &w.layers[0];
+    let d = cfg.d_model;
+    let heads = cfg.n_heads;
+    assert!(l.mla_q_a.is_empty(), "no q_a without a low-rank q");
+    assert!(
+        l.mla_q_a_norm.is_empty(),
+        "no q_a_norm without a low-rank q"
+    );
+    assert_eq!(
+        l.mla_q_b.len(),
+        heads * cfg.qk_nope_head_dim * d,
+        "q_b [heads*nope, d]"
+    );
+    assert_eq!(
+        l.mla_q_rope.len(),
+        heads * cfg.qk_rope_head_dim * d,
+        "q_rope [heads*rope, d]"
+    );
+}
+
+/// The reference forward must stay finite on the no-low-rank-q path too — that
+/// is the shape a real DeepSeek-V2-Lite checkpoint takes.
+#[test]
+fn mla_without_low_rank_q_ref_forward_is_finite() {
+    let mut cfg = mla_cfg();
+    cfg.q_lora_rank = 0;
+    let w = Weights::random(&cfg, 7).unwrap();
+    let mut m = RefModel::new(cfg, w);
+    let logits = m.forward(&[5u32, 9, 3, 200]);
+    assert!(logits.iter().all(|v| v.is_finite()));
 }
 
 #[test]

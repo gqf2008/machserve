@@ -19,6 +19,24 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Which chat template `/v1/chat/completions` renders.
+///
+/// The template belongs with the checkpoint, not the request: feeding a
+/// DeepSeek checkpoint ChatML markers (`<|im_start|>`) makes it decode as if
+/// those tokens were user prose, so the server picks the format from the
+/// loaded model rather than guessing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatFormat {
+    /// Qwen / ChatML: `<|im_start|>role\ncontent<|im_end|>\n…`.
+    #[default]
+    Qwen,
+    /// DeepSeek-V2 (`tokenizer_config.json` chat template): a BOS token, then
+    /// `User: …\n\n` / `Assistant: …<eos>` turns, then a bare `Assistant:`
+    /// generation prompt. Note the template emits no trailing space — the
+    /// model's own first token supplies it.
+    DeepSeek,
+}
+
 /// Shared router state.
 #[derive(Clone)]
 pub struct AppState {
@@ -26,6 +44,8 @@ pub struct AppState {
     pub model: String,
     /// Real tokenizer when `tokenizer.json` is available (else naive bytes).
     pub tok: Option<Arc<Tokenizer>>,
+    /// Chat template for `/v1/chat/completions`.
+    pub chat_format: ChatFormat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +360,50 @@ fn qwen_chat_text(messages: &[ChatMessage]) -> String {
     out
 }
 
+/// DeepSeek-V2 special tokens. The delimiters are U+FF5C FULLWIDTH VERTICAL
+/// LINE (not ASCII `|`) and U+2581 LOWER ONE EIGHTH BLOCK (the SentencePiece
+/// word separator), exactly as `tokenizer_config.json` spells them; ASCII
+/// look-alikes would not be in the vocabulary and would encode to junk.
+const DS_BOS: &str = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+const DS_EOS: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+
+/// Formats chat messages with the DeepSeek-V2 chat template, transcribed from
+/// the checkpoint's `tokenizer_config.json`:
+/// `{{ bos_token }}` then, per message, `system` -> `{content}\n\n`, `user` ->
+/// `User: {content}\n\n`, `assistant` -> `Assistant: {content}{eos}`, closing
+/// with the `Assistant:` generation prompt.
+fn deepseek_chat_text(messages: &[ChatMessage]) -> String {
+    let mut out = String::from(DS_BOS);
+    for m in messages {
+        match m.role.as_str() {
+            "user" => out.push_str(&format!("User: {}\n\n", m.content)),
+            "assistant" => out.push_str(&format!("Assistant: {}{}", m.content, DS_EOS)),
+            // The template falls through to the system spelling for any other
+            // role (e.g. `system`, `tool`), as the Jinja source does.
+            _ => out.push_str(&format!("{}\n\n", m.content)),
+        }
+    }
+    out.push_str("Assistant:");
+    out
+}
+
+/// The end-of-turn token string for `format`, used to derive the request's
+/// stop token id from the tokenizer's specials.
+fn chat_eos_text(format: ChatFormat) -> &'static str {
+    match format {
+        ChatFormat::Qwen => "<|im_end|>",
+        ChatFormat::DeepSeek => DS_EOS,
+    }
+}
+
+/// Renders `messages` in the server's configured chat format.
+fn chat_text(format: ChatFormat, messages: &[ChatMessage]) -> String {
+    match format {
+        ChatFormat::Qwen => qwen_chat_text(messages),
+        ChatFormat::DeepSeek => deepseek_chat_text(messages),
+    }
+}
+
 /// Builds sampling params from optional request fields (greedy by default).
 fn sampling_params(
     temperature: Option<f32>,
@@ -587,7 +651,7 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let text = qwen_chat_text(&req.messages);
+    let text = chat_text(state.chat_format, &req.messages);
     let tokens = match &state.tok {
         Some(t) => t.encode(&text),
         None => naive_encode(&text),
@@ -596,7 +660,7 @@ pub async fn chat_completions(
     let eos = state
         .tok
         .as_ref()
-        .and_then(|t| t.special_token_id("<|im_end|>"));
+        .and_then(|t| t.special_token_id(chat_eos_text(state.chat_format)));
     let stop = stop_seqs(&state.tok, &req.stop);
     let bias = logit_bias_pairs(&req.logit_bias);
     // top_logprobs only applies when logprobs are requested (OpenAI).
@@ -770,5 +834,63 @@ mod tests {
             text,
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    /// The DeepSeek template transcribes the checkpoint's Jinja verbatim: BOS,
+    /// `User: …\n\n`, then a bare `Assistant:` prompt with no trailing space.
+    #[test]
+    fn deepseek_chat_template_user_only() {
+        let text = deepseek_chat_text(&[msg("user", "hello")]);
+        assert_eq!(text, format!("{DS_BOS}User: hello\n\nAssistant:"));
+    }
+
+    #[test]
+    fn deepseek_chat_template_with_system_and_history() {
+        let text = deepseek_chat_text(&[
+            msg("system", "You are helpful."),
+            msg("user", "hi"),
+            msg("assistant", "Hello!"),
+            msg("user", "again"),
+        ]);
+        assert_eq!(
+            text,
+            format!(
+                "{DS_BOS}You are helpful.\n\nUser: hi\n\nAssistant: Hello!{DS_EOS}User: again\n\nAssistant:"
+            )
+        );
+    }
+
+    /// The delimiters are U+FF5C (fullwidth vertical line) and U+2581 — an
+    /// ASCII `|` would not be an in-vocabulary special token.
+    #[test]
+    fn deepseek_special_tokens_use_fullwidth_delimiters() {
+        assert_eq!(DS_BOS, "<｜begin▁of▁sentence｜>");
+        assert_eq!(DS_EOS, "<｜end▁of▁sentence｜>");
+        assert!(!DS_EOS.contains('|'));
+    }
+
+    /// `chat_text` dispatches on the configured format, so a DeepSeek
+    /// checkpoint never gets ChatML markers rendered into its prompt.
+    #[test]
+    fn chat_text_dispatches_on_format() {
+        let msgs = [msg("user", "hi")];
+        assert_eq!(
+            chat_text(ChatFormat::DeepSeek, &msgs),
+            deepseek_chat_text(&msgs)
+        );
+        assert_eq!(chat_text(ChatFormat::Qwen, &msgs), qwen_chat_text(&msgs));
+        assert_ne!(
+            chat_text(ChatFormat::DeepSeek, &msgs),
+            chat_text(ChatFormat::Qwen, &msgs)
+        );
+        assert_eq!(chat_eos_text(ChatFormat::Qwen), "<|im_end|>");
+        assert_eq!(chat_eos_text(ChatFormat::DeepSeek), DS_EOS);
+    }
+
+    /// `AppState` defaults to the Qwen format so existing callers are
+    /// unaffected.
+    #[test]
+    fn chat_format_defaults_to_qwen() {
+        assert_eq!(ChatFormat::default(), ChatFormat::Qwen);
     }
 }

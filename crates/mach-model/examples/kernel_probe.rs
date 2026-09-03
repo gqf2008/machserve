@@ -4,7 +4,7 @@
 #[cfg(feature = "hip")]
 fn main() {
     use mach_kernel_sys::hip::{self, Hip};
-    use mach_model::kernels::HipKernels;
+    use mach_model::kernels::{HipKernels, RopeParams};
     use std::sync::Arc;
 
     let h: Arc<Hip> = hip::hip().expect("hip");
@@ -113,7 +113,18 @@ fn main() {
             n_heads as i32,
             n_kv as i32,
             hd as i32,
-            1_000_000.0,
+            RopeParams {
+                theta: 1_000_000.0,
+                yarn: 0,
+                factor: 0.0,
+                beta_fast: 0.0,
+                beta_slow: 0.0,
+                orig_len: 0,
+                attn_factor: 1.0,
+                // MACH_ROPE_INTERLEAVE=1 exercises the DeepSeek-V2 adjacent-pair
+                // convention; default 0 is the Qwen3/Llama split-halves one.
+                interleave: i32::from(std::env::var("MACH_ROPE_INTERLEAVE").as_deref() == Ok("1")),
+            },
         )
         .unwrap();
         let mut y = vec![0.0f32; total];

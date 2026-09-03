@@ -205,6 +205,44 @@ impl Q4Tensor {
         Self::quantize(&v)
     }
 
+    /// Byte/scale-identical row-block split of a `[rows, kk]` quantized matrix.
+    ///
+    /// `blocks` are `(start_row, n_rows)` ranges; each piece keeps the packed
+    /// bytes and scales of exactly its own rows, so nothing is requantized.
+    /// Requires `kk` to be a multiple of [`Q4_GROUP`] (and therefore each
+    /// block's element count to be too), which holds for every real fused-MLA
+    /// projection (`kk` = `d_model` or `q_lora_rank`, both 32-aligned).
+    ///
+    /// Used to break a fused `q_proj`/`q_b_proj` `[heads*(nope+rope), kk]` into
+    /// the per-head non-RoPE and RoPE halves the runtime keeps separate.
+    #[must_use]
+    pub fn split_row_blocks(&self, kk: usize, blocks: &[(usize, usize)]) -> Vec<Self> {
+        assert!(
+            kk.is_multiple_of(Q4_GROUP),
+            "q4 row split: kk={kk} is not a multiple of Q4_GROUP"
+        );
+        let g_per_row = kk / Q4_GROUP;
+        blocks
+            .iter()
+            .map(|&(r0, nr)| {
+                let i0 = r0 * kk;
+                let i1 = i0 + nr * kk;
+                assert!(
+                    i1 <= self.n,
+                    "q4 row split: rows {r0}..{} out of range",
+                    r0 + nr
+                );
+                let g0 = r0 * g_per_row;
+                let g1 = (r0 + nr) * g_per_row;
+                Self {
+                    q: self.q[i0 / 2..i1 / 2].to_vec(),
+                    scales: self.scales[g0..g1].to_vec(),
+                    n: nr * kk,
+                }
+            })
+            .collect()
+    }
+
     /// Single-pass append of `parts` in order, O(total) bytes — folding
     /// [`Self::concat`] instead re-clones the growing prefix per part
     /// (O(n²) over many MoE experts). Byte/scale-identical to that fold

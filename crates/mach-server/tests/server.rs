@@ -10,7 +10,7 @@ use mach_model::continuous::ContinuousModel;
 use mach_model::sampling::SamplingParams;
 use mach_model::tokenizer::Tokenizer;
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
-use mach_server::{AppState, ServerEngine, router};
+use mach_server::{AppState, ChatFormat, ServerEngine, router};
 use tower::ServiceExt;
 
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
@@ -61,6 +61,7 @@ async fn completions_endpoint_matches_direct_engine() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -138,6 +139,7 @@ async fn completions_endpoint_moe_matches_direct_engine() {
         engine,
         model: "tiny-moe".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -185,6 +187,7 @@ async fn completions_endpoint_q4_matches_direct_engine() {
         engine,
         model: "tiny-moe-q4".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -235,6 +238,7 @@ async fn completions_endpoint_fp8_matches_direct_engine() {
         engine,
         model: "tiny-moe-fp8".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -256,6 +260,7 @@ async fn healthz_and_text_prompt() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -328,6 +333,7 @@ async fn sampling_params_flow_through_http() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
     let body = serde_json::json!({
@@ -404,6 +410,7 @@ async fn streaming_matches_non_streaming_with_same_seed() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -487,6 +494,7 @@ async fn text_prompt_uses_real_tokenizer_when_available() {
         engine,
         model: "tiny".into(),
         tok: Some(tok.clone()),
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -573,6 +581,7 @@ async fn n_returns_multiple_distinct_choices() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
     let body = serde_json::json!({
@@ -633,6 +642,7 @@ async fn logprobs_are_returned_when_requested() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
     let body = serde_json::json!({
@@ -676,6 +686,7 @@ async fn busy_engine_returns_openai_error_json() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
     let body = serde_json::json!({ "prompt": [1, 2, 3], "max_tokens": 4 });
@@ -772,6 +783,7 @@ async fn top_logprobs_returned_when_requested() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -859,6 +871,7 @@ async fn invalid_request_returns_openai_error_json() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
     let cases = [
@@ -919,6 +932,7 @@ async fn usage_is_reported() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
     let body = serde_json::json!({ "prompt": prompt, "max_tokens": 4 });
@@ -963,6 +977,7 @@ async fn spec_mode_serves_greedy_and_rejects_non_greedy() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -1057,6 +1072,7 @@ async fn completions_endpoint_mla_matches_direct_engine() {
         engine,
         model: "tiny-mla".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -1122,6 +1138,7 @@ async fn completions_endpoint_paged_shared_prefix_matches_direct_engine() {
         engine,
         model: "tiny".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
@@ -1206,6 +1223,7 @@ async fn completions_endpoint_q4_paged_reuses_shared_prefix() {
         engine,
         model: "tiny-q4".into(),
         tok: None,
+        chat_format: ChatFormat::default(),
     };
     let app = router(state);
 
