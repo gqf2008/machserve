@@ -1247,7 +1247,8 @@
     (GPT-NeoX / HF `rotate_half`,坐标 `d` 配 `d + head_dim/2`)是 Llama /
     Qwen2 / Qwen3 的约定;DeepSeek 用**相邻对**(坐标 `2d` 配 `2d+1`),
     其 `apply_rotary_pos_emb` 先做 `view(d//2,2).transpose(4,3)` 置换再套
-    `rotate_half`,transformers 内建则直接 `view_as_complex(x.reshape(-1,2))`。
+    `rotate_half`,即最终一起旋转的那一对来自**相邻坐标**(transformers 侧对应
+    按 checkpoint 选择的 `apply_rotary_pos_emb_interleave`,非默认路径)。
     此前统一按半半配对实现,DeepSeek 每个 `pos>0` 的位置都被破坏。
     - **数值隔离证据**:`inv_freq` 两者一致(rel 1.0e-08,错的不是频率);
       施加 RoPE 后与 HF 的差 —— 相邻对 1.5e-07(吻合),半半配对 ~2.0
@@ -1256,15 +1257,37 @@
       sin=0 让 RoPE 退化为恒等),同理 `pos 0` 时 T=1、softmax 退化为常数,
       softmax_scale 错也不可见。#85 的 30B 验证只查了"logits 全有限 + 两遍
       greedy 逐位稳定"(确定性),未查连贯性,且半半配对对 Qwen3 恰好正确。
-    - **修复**:`Config::rope_interleave`(5 个构造函数默认 false);
+    - **修复**:`Config::rope_interleave`(非 MLA 的 4 个构造函数默认 false);
       两个 HIP rope 内核加 `int interleave` 参数;ref_model / fp64_ref 的
-      CPU 参考同步;`mach-server` 按 `model_type` 的 `deepseek` 前缀判定
-      (该约定属于 checkpoint 自带建模代码,不是超参,无法从配置推导);
-      `kernel_probe` 支持 `MACH_ROPE_INTERLEAVE=1`。
+      CPU 参考同步;`mach-server` 按 **白名单** `deepseekv2` / `deepseekv3` /
+      `deepseekvlv2` 判定(该约定属于 checkpoint 自带建模代码,不是超参,
+      无法从配置推导);`kernel_probe` 支持 `MACH_ROPE_INTERLEAVE=1`。
+      `Config::mla()` 默认改为 `true` —— MLA 即 DeepSeek 的注意力,默认 false
+      会与它要描述的真实检查点相反,且让相邻对分支在模型级零覆盖。
+    - **判定必须是白名单,不能用 `starts_with("deepseek")`**:model_type 为
+      `"deepseek"` 的是 DeepSeek-**V1** / DeepSeekMoE,其建模代码是 Llama 抄本
+      (半半配对、无 permute),且为 dense 形状 —— 加载不报错,却在每个
+      `pos > 0` 被静默写坏,且无错误路径可拦。第 2 版实现正是踩了这个坑。
+    - **两个族名来源要归一化**:`model_type` 是 snake_case(`deepseek_v2`),
+      `architectures[0]` 回退是 PascalCase 类名
+      (`DeepseekV2ForCausalLM`);只 `to_lowercase` 得到
+      `deepseekv2forcausallm`,永远匹配不上白名单 —— 缺 `model_type` 的检查点
+      会静默漏掉修复。归一化为"仅保留 ASCII 字母数字 + 小写"后两者都收敛到
+      `deepseekv2`。此缺陷由补写的
+      `rope_interleave_falls_back_to_architectures` 当场抓出。
     - **防回归**:新增 `apply_rope_interleave_pairs_adjacent_coordinates`
       与 `rope_conventions_agree_at_pos_zero_and_differ_after`,后者双向
       钉住"pos 0 必须一致(<1e-6)、pos 5 必须不同(>1e-2)",使 pos-0 对拍
       这种无效比较无法再伪装成通过。
+    - **顺带修掉两处同源缺陷**:
+      - `examples/ref_cpu.rs` 的 `rope()` **硬编码相邻对**,但它自称对拍的
+        `tools/ref_llama.py:62-66` 用的是半半配对(注释即 "matching HF
+        rotate_half"),且该文件只处理 llama/qwen 配置 —— 于是它在**任何
+        `pos > 0`** 与自己的 Python 参考静默不一致。同样因 pos 0 不可见而
+        一直没暴露。已改为按 `cfg.rope_interleave` 选约定(仓库内无已提交的
+        由它生成的 golden JSON,不影响既有数据)。
+      - 内核侧注明"配对约定 ≠ 输出重排":旋转结果写回**读出的同一对槽位**
+        (两种模式皆然),HF 的 permute 是被**消去**而非遗漏,照抄会写坏。
   - **对齐/已核对无误**(对照 numpy 独立参考实现):`mla_assemble_kv_batched`
     的 k_nope/v 切分顺序、MLA softmax scale(`192^-0.5 × mscale² =
     0.114721`)、YaRN inv_freq 用 rope 维 64、shared experts 的 SwiGLU 后
