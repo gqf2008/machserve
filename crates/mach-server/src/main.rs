@@ -42,7 +42,7 @@ use mach_model::tokenizer::Tokenizer;
 #[cfg(feature = "hip")]
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
-use mach_server::{AppState, ServerEngine, router};
+use mach_server::{AppState, ChatFormat, ServerEngine, router};
 #[cfg(feature = "hip")]
 use std::path::PathBuf;
 
@@ -57,10 +57,20 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let kv = v["num_key_value_heads"].as_u64().unwrap_or(heads as u64) as usize;
     let vocab = v["vocab_size"].as_u64().unwrap_or(151936) as usize;
     let inter = v["intermediate_size"].as_u64().unwrap_or(4 * hidden as u64) as usize;
-    let max_seq = v["max_position_embeddings"]
-        .as_u64()
-        .unwrap_or(2048)
-        .min(8192) as usize;
+    // DeepSeek-V2-Lite declares `max_position_embeddings: 163840`, but the
+    // preallocated KV cache is `max_seq_len`-sized per slot (MLA: ~552 KB per
+    // token across 27 layers), so honoring it verbatim would try to reserve
+    // gigabytes per slot. Clamp to 8192 unless MACH_MAX_SEQ says otherwise.
+    let max_seq = match std::env::var("MACH_MAX_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) => n,
+        None => v["max_position_embeddings"]
+            .as_u64()
+            .unwrap_or(2048)
+            .min(8192) as usize,
+    };
     let eps = v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
     let theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
     let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);
@@ -93,10 +103,63 @@ fn config_from_json(path: &std::path::Path) -> Config {
         cfg.n_kv_heads = cfg.n_heads;
     }
     // MoE (Qwen2.5-MoE style): num_experts / num_experts_per_tok.
-    cfg.num_experts = v["num_experts"].as_u64().unwrap_or(0) as usize;
+    // DeepSeek-V2 names the routed experts `n_routed_experts`.
+    cfg.num_experts = v["num_experts"]
+        .as_u64()
+        .or_else(|| v["n_routed_experts"].as_u64())
+        .unwrap_or(0) as usize;
     cfg.num_experts_per_tok = v["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
     // Qwen-MoE expert FFN width (moe_intermediate_size); 0 = use intermediate_size.
     cfg.moe_intermediate_size = v["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
+    // DeepSeek-V2 always-routed "shared experts" (`n_shared_experts`), fused
+    // into a single `moe_intermediate_size * n_shared_experts`-wide MLP whose
+    // output is added to the routed sum. 0 = none (Qwen-MoE).
+    cfg.n_shared_experts = v["n_shared_experts"].as_u64().unwrap_or(0) as usize;
+    // Top-k weighting convention. HF `MoEGate` renormalizes the selected
+    // probabilities when `norm_topk_prob` is set (Qwen-MoE); DeepSeek-V2 sets
+    // it false and multiplies by `routed_scaling_factor` instead.
+    cfg.moe_norm_topk = v["norm_topk_prob"].as_bool().unwrap_or(true);
+    cfg.moe_routed_scale = v["routed_scaling_factor"].as_f64().unwrap_or(1.0) as f32;
+    // The router the kernels implement is softmax-scored greedy top-k. HF
+    // supports `sigmoid` scoring and `group_limited_greedy` selection
+    // (DeepSeek-V3 / Qwen3), which would silently decode garbage, so fail fast
+    // instead. DeepSeek-V2-Lite is `softmax` + `greedy` with `n_group: 1`.
+    let scoring = v["scoring_func"].as_str().unwrap_or("softmax");
+    if scoring != "softmax" {
+        panic!("unsupported MoE scoring_func {scoring:?}: only softmax is implemented");
+    }
+    let topk_method = v["topk_method"].as_str().unwrap_or("greedy");
+    if topk_method != "greedy" {
+        panic!("unsupported MoE topk_method {topk_method:?}: only greedy is implemented");
+    }
+    // YaRN RoPE (`rope_scaling.type == "yarn"`, DeepSeek-V2). The kernel takes
+    // the raw parameters and reproduces HF's ramp mask + cos/sin
+    // `attention_factor`; the `mscale^2` logit correction is derived from
+    // `mscale_all_dim` in `Config::attn_scale`.
+    if let Some(rs) = v["rope_scaling"].as_object() {
+        match rs.get("type").and_then(|t| t.as_str()) {
+            Some("yarn") => {
+                cfg.rope_yarn_factor = rs["factor"].as_f64().unwrap_or(1.0) as f32;
+                cfg.rope_yarn_orig_len =
+                    rs["original_max_position_embeddings"].as_u64().unwrap_or(0) as usize;
+                cfg.rope_yarn_beta_fast = rs["beta_fast"].as_f64().unwrap_or(32.0) as f32;
+                cfg.rope_yarn_beta_slow = rs["beta_slow"].as_f64().unwrap_or(1.0) as f32;
+                // HF `MoEGate`-style config defaults: `mscale` falls back to 1
+                // and `mscale_all_dim` to 0 (which disables the logit fixup).
+                cfg.rope_yarn_mscale = rs["mscale"].as_f64().unwrap_or(1.0) as f32;
+                cfg.rope_yarn_mscale_all_dim = rs["mscale_all_dim"].as_f64().unwrap_or(0.0) as f32;
+                if !cfg.yarn() {
+                    panic!(
+                        "rope_scaling.type=yarn requires factor > 1 and \
+                         original_max_position_embeddings > 0 (got factor={}, orig={})",
+                        cfg.rope_yarn_factor, cfg.rope_yarn_orig_len
+                    );
+                }
+            }
+            Some(other) => panic!("unsupported rope_scaling type {other:?}: only yarn"),
+            None => {}
+        }
+    }
     // Qwen3 QK-norm: HF configs express it via `model_type` ("qwen3" /
     // "qwen3_moe") rather than an explicit flag, so default to ON for those
     // and honor an explicit `use_qk_norm` / `qk_norm` key when present.
@@ -119,6 +182,26 @@ fn config_from_json(path: &std::path::Path) -> Config {
     // bracketing, reported after each decode step.
     cfg.step_profile = std::env::var("MACH_STEP_PROFILE").is_ok_and(|v| v != "0");
     cfg
+}
+
+/// Picks the chat template for a checkpoint's `model_type`.
+///
+/// The template is a property of the checkpoint, not of the request: rendering
+/// ChatML markers into a DeepSeek prompt makes the model treat them as prose.
+/// Unknown model types keep the Qwen/ChatML default, which is what every model
+/// served before DeepSeek used.
+#[cfg(feature = "hip")]
+fn chat_format_from_json(path: &std::path::Path) -> ChatFormat {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ChatFormat::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return ChatFormat::default();
+    };
+    match v["model_type"].as_str() {
+        Some(t) if t.starts_with("deepseek") => ChatFormat::DeepSeek,
+        _ => ChatFormat::default(),
+    }
 }
 
 /// Total weight-payload size for the VRAM preflight: a single checkpoint file,
@@ -541,7 +624,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("bound http://{addr} (preflight passed)");
 
     // Load the real tokenizer when available; fall back to naive bytes.
-    let tok_path = root.join(&tokenizer_name);
+    // A directory checkpoint (HF layout) ships its own `tokenizer.json`, so
+    // look there first: pointing MACH_MODEL at a directory must not silently
+    // pick up some other model's vocabulary from the models root (a
+    // DeepSeek checkpoint would then be served with Qwen's 151k vocab).
+    let tok_path = match std::env::var_os("MACH_TOKENIZER") {
+        Some(t) => root.join(t),
+        None => {
+            let in_model = root.join(&model_name).join("tokenizer.json");
+            if in_model.is_file() {
+                in_model
+            } else {
+                root.join(&tokenizer_name)
+            }
+        }
+    };
     let tok = if tok_path.exists() {
         let t = Tokenizer::from_path(&tok_path).expect("load tokenizer");
         println!(
@@ -683,6 +780,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         model: model_name,
         tok,
+        chat_format: chat_format_from_json(&root.join(&config_name)),
     };
     let app = router(state);
     println!(
@@ -863,6 +961,72 @@ mod tests {
         assert_eq!(cfg.n_kv_heads * cfg.head_dim, 512);
         assert_eq!(cfg.num_experts, 128);
         assert_eq!(cfg.expert_size(), 768);
+    }
+
+    /// DeepSeek-V2-Lite: `n_routed_experts` (not `num_experts`), shared
+    /// experts, `norm_topk_prob: false` + `routed_scaling_factor`, YaRN rope
+    /// scaling, and `q_lora_rank: null` (the fused-`q_proj` shape).
+    #[test]
+    fn config_parses_deepseek_v2_lite() {
+        let cfg = parse_json(
+            r#"{
+              "model_type": "deepseek_v2",
+              "hidden_size": 2048,
+              "num_hidden_layers": 27,
+              "num_attention_heads": 16,
+              "num_key_value_heads": 16,
+              "vocab_size": 102400,
+              "intermediate_size": 10944,
+              "moe_intermediate_size": 1408,
+              "n_routed_experts": 64,
+              "n_shared_experts": 2,
+              "num_experts_per_tok": 6,
+              "norm_topk_prob": false,
+              "routed_scaling_factor": 1.0,
+              "scoring_func": "softmax",
+              "topk_method": "greedy",
+              "first_k_dense_replace": 1,
+              "q_lora_rank": null,
+              "kv_lora_rank": 512,
+              "qk_nope_head_dim": 128,
+              "qk_rope_head_dim": 64,
+              "v_head_dim": 128,
+              "max_position_embeddings": 163840,
+              "rope_theta": 10000,
+              "rope_scaling": {
+                "type": "yarn",
+                "factor": 40,
+                "original_max_position_embeddings": 4096,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 0.707,
+                "mscale_all_dim": 0.707
+              }
+            }"#,
+        );
+        assert_eq!(cfg.num_experts, 64, "n_routed_experts -> num_experts");
+        assert_eq!(cfg.num_experts_per_tok, 6);
+        assert_eq!(cfg.n_shared_experts, 2);
+        assert_eq!(cfg.shared_size(), 2 * 1408);
+        assert!(!cfg.moe_norm_topk, "norm_topk_prob: false");
+        assert_eq!(cfg.moe_routed_scale, 1.0);
+        // `q_lora_rank: null` -> 0, so the loader reads the fused q_proj.
+        assert_eq!(cfg.q_lora_rank, 0);
+        assert_eq!(cfg.kv_lora_rank, 512);
+        assert_eq!(cfg.head_dim, 128 + 64);
+        assert!(cfg.yarn(), "yarn scaling must engage");
+        assert_eq!(cfg.rope_yarn_factor, 40.0);
+        assert_eq!(cfg.rope_yarn_orig_len, 4096);
+        assert_eq!(cfg.rope_yarn_beta_fast, 32.0);
+        assert_eq!(cfg.rope_yarn_beta_slow, 1.0);
+        // Both mscales are 0.707, so the cos/sin attention_factor is exactly
+        // 1.0; the logit correction is what actually bites.
+        assert!((cfg.yarn_attention_factor() - 1.0).abs() < 1e-6);
+        let mscale = 0.1 * 0.707 * 40.0f32.ln() + 1.0;
+        assert!((cfg.attn_scale(192) - mscale * mscale / 192.0f32.sqrt()).abs() < 1e-5);
+        // 163840 would reserve ~90 GB of MLA KV per slot; clamped without
+        // MACH_MAX_SEQ.
+        assert_eq!(cfg.max_seq_len, 8192);
     }
 
     #[test]

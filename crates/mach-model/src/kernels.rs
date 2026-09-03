@@ -1630,11 +1630,13 @@ extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short
 /// `topk` highest-probability experts (ties: lower index, matching the CPU
 /// reference), and emit per-slot weights.
 ///
-/// `norm_topk` selects the two checkpoint conventions: Qwen-MoE renormalizes
-/// the selected probabilities to sum to 1 (`w = p / sum(p)`), DeepSeek-V2 sets
-/// `norm_topk_prob=false` and instead multiplies by `routed_scaling_factor`
-/// (`w = p * rscale`). Both are then scaled by `rscale`, which is 1.0 for
-/// Qwen-MoE.
+/// `norm_topk` selects the two checkpoint conventions, matching HF
+/// `MoEGate.forward` exactly: renormalizing divides the selected
+/// probabilities by their sum and applies **no** `routed_scaling_factor`
+/// (`w = p / sum(p)`), while DeepSeek-V2's `norm_topk_prob=false` leaves the
+/// softmax scores alone and multiplies by `routed_scaling_factor`
+/// (`w = p * rscale`). HF also skips renormalization when `top_k == 1`, so
+/// that guard is part of the branch.
 const MOE_ROUTER: &str = r#"
 extern "C" __global__ void moe_router(
     const float* __restrict__ logits,
@@ -1689,8 +1691,7 @@ extern "C" __global__ void moe_router(
         }
         for (int k = 0; k < topk; k++) {
             float p = probs[out_ids[k]];
-            out_w[k] = norm_topk ? p / norm : p;
-            out_w[k] *= rscale;
+            out_w[k] = (norm_topk && topk > 1) ? p / norm : p * rscale;
         }
     }
 }
@@ -1834,8 +1835,7 @@ extern "C" __global__ void moe_router_batched(
     if (threadIdx.x == 0) {
         for (int k = 0; k < topk; k++) {
             float p = probs[ids[k]];
-            w[k] = norm_topk ? p / norm : p;
-            w[k] *= rscale;
+            w[k] = (norm_topk && topk > 1) ? p / norm : p * rscale;
         }
     }
 }

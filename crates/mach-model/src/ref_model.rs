@@ -169,16 +169,17 @@ impl RefModel {
                         eh[i] = silu(gate[i]) * up[i];
                     }
                     let down = matvec_t(&eh, wd, d);
-                    // Qwen-MoE renormalizes the top-k probabilities to sum to
-                    // 1; DeepSeek-V2 leaves the softmax scores alone and
-                    // applies `routed_scaling_factor` instead.
-                    let w = if cfg.moe_norm_topk {
+                    // HF `MoEGate.forward`: renormalize only when
+                    // `top_k > 1 && norm_topk_prob` (`p / sum(p)`, no
+                    // `routed_scaling_factor`); otherwise the softmax score
+                    // is kept and scaled by `routed_scaling_factor`.
+                    let w = if cfg.moe_norm_topk && topk > 1 {
                         probs[e] / norm
                     } else {
-                        probs[e]
+                        probs[e] * cfg.moe_routed_scale
                     };
                     for i in 0..d {
-                        h[i] += cfg.moe_routed_scale * w * down[i];
+                        h[i] += w * down[i];
                     }
                 }
                 // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
@@ -635,4 +636,227 @@ pub(crate) fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 
 pub(crate) fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Independent transcription of HF's YaRN rotary
+    /// (`modeling_deepseek.DeepseekV2YarnRotaryEmbedding` plus the three
+    /// `yarn_*` helpers), used to pin `rope_freq` / `apply_rope`. Deliberately
+    /// written in the source's own shape — `arange(0, dim, 2)` pair indices,
+    /// `floor`/`ceil` on the correction range, the `1 - ramp` mask, and the
+    /// `_mscale` ratio on cos/sin — rather than reusing the implementation it
+    /// checks, so a shared misreading would not pass.
+    struct HfYarn {
+        cos: Vec<f32>,
+        sin: Vec<f32>,
+    }
+
+    fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
+        if scale <= 1.0 {
+            return 1.0;
+        }
+        0.1 * mscale * scale.ln() + 1.0
+    }
+
+    /// cos/sin per pair index at `pos`, plus the `inv_freq` HF would cache.
+    fn hf_yarn_cos_sin(cfg: Config, pos: usize) -> (HfYarn, Vec<f64>) {
+        let dim = cfg.qk_rope_head_dim.max(cfg.head_dim);
+        let base = f64::from(cfg.rope_theta);
+        let factor = f64::from(cfg.rope_yarn_factor);
+        let orig = cfg.rope_yarn_orig_len as f64;
+        let pairs = dim / 2;
+
+        // `arange(0, dim, 2) / dim`, then `base ** that`.
+        let pow: Vec<f64> = (0..pairs)
+            .map(|d| base.powf((2 * d) as f64 / dim as f64))
+            .collect();
+        let freq_extra: Vec<f64> = pow.iter().map(|p| 1.0 / p).collect();
+        let freq_inter: Vec<f64> = pow.iter().map(|p| 1.0 / (factor * p)).collect();
+
+        // yarn_find_correction_dim(num_rotations, dim, base, max_pos)
+        let correction_dim = |num_rotations: f64| -> f64 {
+            (dim as f64 * (orig / (num_rotations * 2.0 * std::f64::consts::PI)).ln())
+                / (2.0 * base.ln())
+        };
+        // yarn_find_correction_range(beta_fast, beta_slow, dim, ...)
+        let low = correction_dim(f64::from(cfg.rope_yarn_beta_fast)).floor();
+        let high = correction_dim(f64::from(cfg.rope_yarn_beta_slow)).ceil();
+        let low = low.max(0.0);
+        let mut high = high.min(dim as f64 - 1.0);
+        if high == low {
+            high += 0.001;
+        }
+        // yarn_linear_ramp_mask(low, high, dim // 2)
+        let mask: Vec<f64> = (0..pairs)
+            .map(|d| 1.0 - (((d as f64 - low) / (high - low)).clamp(0.0, 1.0)))
+            .collect();
+        let inv_freq: Vec<f64> = (0..pairs)
+            .map(|d| freq_inter[d] * (1.0 - mask[d]) + freq_extra[d] * mask[d])
+            .collect();
+
+        let mscale = yarn_get_mscale(factor, f64::from(cfg.rope_yarn_mscale));
+        let mscale_all_dim = yarn_get_mscale(factor, f64::from(cfg.rope_yarn_mscale_all_dim));
+        let attn_factor = mscale / mscale_all_dim;
+        let t = pos as f64;
+        (
+            HfYarn {
+                cos: inv_freq
+                    .iter()
+                    .map(|f| ((t * f).cos() * attn_factor) as f32)
+                    .collect(),
+                sin: inv_freq
+                    .iter()
+                    .map(|f| ((t * f).sin() * attn_factor) as f32)
+                    .collect(),
+            },
+            inv_freq,
+        )
+    }
+
+    fn yarn_cfg(rope_dim: usize) -> Config {
+        let mut cfg = Config::tiny();
+        cfg.qk_rope_head_dim = rope_dim;
+        cfg.head_dim = rope_dim;
+        cfg.rope_theta = 10_000.0;
+        cfg.rope_yarn_factor = 40.0;
+        cfg.rope_yarn_orig_len = 4096;
+        cfg.rope_yarn_beta_fast = 32.0;
+        cfg.rope_yarn_beta_slow = 1.0;
+        // Asymmetric so the cos/sin `_mscale` ratio is not trivially 1.0
+        // (DeepSeek-V2-Lite ships 0.707/0.707, which would hide a swapped or
+        // dropped term).
+        cfg.rope_yarn_mscale = 1.0;
+        cfg.rope_yarn_mscale_all_dim = 0.707;
+        cfg
+    }
+
+    #[test]
+    fn yarn_inv_freq_matches_hf() {
+        let cfg = yarn_cfg(64);
+        for d in 0..32 {
+            let want = hf_yarn_cos_sin(cfg, 0).1[d];
+            let got = f64::from(rope_freq(d, cfg.qk_rope_head_dim, cfg));
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs(),
+                "d={d}: got {got} want {want}"
+            );
+        }
+    }
+
+    /// With YaRN off, `rope_freq` must be plain `theta^(-2d/hd)`.
+    #[test]
+    fn rope_freq_without_yarn_is_plain() {
+        let mut cfg = yarn_cfg(64);
+        cfg.rope_yarn_factor = 0.0;
+        cfg.rope_yarn_orig_len = 0;
+        assert!(!cfg.yarn());
+        for d in 0..32 {
+            let want = 10_000.0f32.powf(-(2.0 * d as f32) / 64.0);
+            assert!((rope_freq(d, 64, cfg) - want).abs() <= 1e-6 * want, "d={d}");
+        }
+    }
+
+    /// `apply_rope` must reproduce HF's `rotate_half` pair rotation with the
+    /// YaRN cos/sin, including the `_mscale` ratio folded into both.
+    #[test]
+    fn apply_rope_matches_hf_rotate_half_with_yarn() {
+        let cfg = yarn_cfg(64);
+        let pos = 7usize;
+        let (hf, _) = hf_yarn_cos_sin(cfg, pos);
+        let heads = 2usize;
+        let half = 32usize;
+        let mut x: Vec<f32> = (0..heads * 64)
+            .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+            .collect();
+        let orig = x.clone();
+        apply_rope(&mut x, heads, 64, pos, cfg);
+        for h in 0..heads {
+            for d in 0..half {
+                let a = orig[h * 64 + d];
+                let b = orig[h * 64 + d + half];
+                let c = hf.cos[d];
+                let s = hf.sin[d];
+                // HF: q * cos + rotate_half(q) * sin, with rotate_half
+                // mapping (a, b) -> (-b, a).
+                let want_a = a * c - b * s;
+                let want_b = b * c + a * s;
+                let got_a = x[h * 64 + d];
+                let got_b = x[h * 64 + d + half];
+                let tol = 1e-3 + 1e-3 * want_a.abs().max(want_b.abs());
+                assert!(
+                    (got_a - want_a).abs() <= tol && (got_b - want_b).abs() <= tol,
+                    "h={h} d={d}: got ({got_a}, {got_b}) want ({want_a}, {want_b})"
+                );
+            }
+        }
+    }
+
+    /// The cos/sin factor is `mscale(factor) / mscale_all_dim(factor)`, so it
+    /// must move away from 1.0 when the two differ — and be exactly 1.0 for
+    /// DeepSeek-V2-Lite, which ships 0.707 for both.
+    #[test]
+    fn yarn_attention_factor_is_mscale_ratio() {
+        let cfg = yarn_cfg(64);
+        let ln = 40.0f64.ln();
+        let want = (0.1 * 1.0 * ln + 1.0) / (0.1 * 0.707 * ln + 1.0);
+        assert!(
+            (f64::from(cfg.yarn_attention_factor()) - want).abs() < 1e-6,
+            "got {} want {want}",
+            cfg.yarn_attention_factor()
+        );
+        let mut lite = cfg;
+        lite.rope_yarn_mscale = 0.707;
+        assert!((lite.yarn_attention_factor() - 1.0).abs() < 1e-6);
+        // YaRN off: 1.0 regardless of the mscale fields.
+        let mut off = cfg;
+        off.rope_yarn_factor = 0.0;
+        off.rope_yarn_orig_len = 0;
+        assert_eq!(off.yarn_attention_factor(), 1.0);
+    }
+
+    /// The `mscale^2` logit correction uses `mscale_all_dim`, not `mscale`
+    /// (HF computes `mscale = yarn_get_mscale(factor, mscale_all_dim)` and
+    /// multiplies `softmax_scale` by it twice).
+    #[test]
+    fn attn_scale_applies_mscale_all_dim_squared() {
+        let cfg = yarn_cfg(64);
+        let m = 0.1 * 0.707 * 40.0f64.ln() + 1.0;
+        let want = m * m / 192.0f64.sqrt();
+        assert!(
+            (f64::from(cfg.attn_scale(192)) - want).abs() < 1e-6,
+            "got {} want {want}",
+            cfg.attn_scale(192)
+        );
+        // `mscale_all_dim = 0` (the HF default) disables the correction.
+        let mut no_dim = cfg;
+        no_dim.rope_yarn_mscale_all_dim = 0.0;
+        assert!((no_dim.attn_scale(192) - 1.0 / 192.0f32.sqrt()).abs() < 1e-6);
+    }
+
+    /// HF builds the ramp mask over `dim // 2` entries but clamps `high` to
+    /// `dim - 1`, so `high` can exceed the last pair index; clamping to the
+    /// pair count instead would silently shrink the ramp.
+    #[test]
+    fn yarn_ramp_uses_head_dim_clamp_not_pair_clamp() {
+        let cfg = yarn_cfg(64);
+        // beta_fast=32, beta_slow=1, orig=4096, base=10000, dim=64.
+        let low = (64.0 * (4096.0 / (32.0 * 2.0 * std::f64::consts::PI)).ln()
+            / (2.0 * 10_000f64.ln()))
+        .floor();
+        let high = (64.0 * (4096.0 / (1.0 * 2.0 * std::f64::consts::PI)).ln()
+            / (2.0 * 10_000f64.ln()))
+        .ceil();
+        assert_eq!(low, 10.0, "low");
+        assert_eq!(high, 23.0, "high");
+        // d=0 -> ramp 0 (pure freq_extra); d=31 -> ramp 1 (pure freq_inter).
+        let f0 = f64::from(rope_freq(0, 64, cfg));
+        let extra0 = 1.0 / 10_000f64.powf(0.0);
+        assert!((f0 - extra0).abs() < 1e-6, "d=0 must be pure freq_extra");
+        let f31 = f64::from(rope_freq(31, 64, cfg));
+        let inter31 = 1.0 / (40.0 * 10_000f64.powf((2 * 31) as f64 / 64.0));
+        assert!((f31 - inter31).abs() < 1e-9, "d=31 must be pure freq_inter");
+    }
 }

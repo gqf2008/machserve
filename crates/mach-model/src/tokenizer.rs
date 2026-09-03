@@ -529,6 +529,104 @@ mod tests {
         assert_eq!(tok.encode(text), want, "special-token encode mismatch");
     }
 
+    /// DeepSeek-V2-Lite (`tokenizer_config` differs from Qwen's in the three
+    /// ways that change token ids: no NFC normalizer, a two-step `Split`
+    /// pre-tokenizer chain, and a ByteLevel decoder with
+    /// `add_prefix_space: true`). Opt-in: `.models/` is gitignored, so the
+    /// test skips when the checkpoint is absent.
+    fn deepseek_golden_path() -> Option<PathBuf> {
+        [
+            PathBuf::from("tests/data/tok_golden_deepseek.json"),
+            PathBuf::from("../../tests/data/tok_golden_deepseek.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    fn deepseek_tokenizer_path() -> Option<PathBuf> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        [
+            root.join("..")
+                .join("..")
+                .join(".models")
+                .join("deepseek-v2-lite-chat")
+                .join("tokenizer.json"),
+            root.join(".models")
+                .join("deepseek-v2-lite-chat")
+                .join("tokenizer.json"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    #[test]
+    fn deepseek_golden_encode_matches_hf() {
+        let Some(gp) = deepseek_golden_path() else {
+            eprintln!("skipping: tok_golden_deepseek.json missing");
+            return;
+        };
+        let Some(tj) = deepseek_tokenizer_path() else {
+            eprintln!("skipping: DeepSeek-V2-Lite tokenizer.json missing");
+            return;
+        };
+        let tok = Tokenizer::from_path(&tj).expect("load DeepSeek tokenizer");
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(gp).expect("read golden"))
+                .expect("parse golden");
+        for (key, case) in golden["enc"].as_object().expect("enc object") {
+            let text = case["text"].as_str().expect("text");
+            let want: Vec<u32> = case["ids"]
+                .as_array()
+                .expect("ids")
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let got = tok.encode(text);
+            assert_eq!(got, want, "DeepSeek encode mismatch {key}: {text:?}");
+        }
+        for case in golden["dec"].as_array().expect("dec array") {
+            let ids: Vec<u32> = case["ids"]
+                .as_array()
+                .expect("ids")
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let want = case["text"].as_str().expect("text");
+            let got = tok.decode(&ids);
+            assert_eq!(&got, want, "DeepSeek decode mismatch for ids {ids:?}");
+        }
+        // `add_special_tokens` is not modelled by `encode`, so both HF rows
+        // must agree with it — the server's chat template emits BOS itself.
+        let extra = &golden["extra"];
+        let want: Vec<u32> = extra["encode_with_special"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(tok.encode("hi"), want, "DeepSeek 'hi' encode mismatch");
+        let want_no: Vec<u32> = extra["encode_without_special"]
+            .as_array()
+            .expect("ids")
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(
+            want, want_no,
+            "DeepSeek tokenizer.json must not add BOS in `encode` \
+             (the chat template does)"
+        );
+        // The server stops generation on this id; a wrong special id would
+        // decode past the end of the answer forever. Delimiters are U+FF5C
+        // (fullwidth vertical line) and U+2581 — not ASCII `|`.
+        let eos: u32 = extra["eos_id"].as_u64().unwrap() as u32;
+        let eos_text = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+        assert_eq!(tok.special_token_id(eos_text), Some(eos), "eos id");
+        let bos: u32 = extra["bos_id"].as_u64().unwrap() as u32;
+        let bos_text = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+        assert_eq!(tok.special_token_id(bos_text), Some(bos), "bos id");
+    }
+
     #[test]
     fn round_trip_preserves_text() {
         let Some(tok) = load() else {

@@ -298,18 +298,18 @@ pub fn moe_route(xn: &[f64], lw: &LayerWeights64, cfg: &Config) -> (Vec<i32>, Ve
         norm += probs[e];
     }
     let ids: Vec<i32> = chosen.iter().map(|&e| e as i32).collect();
-    // Qwen-MoE renormalizes the top-k probabilities; DeepSeek-V2 leaves the
-    // softmax scores alone and applies `routed_scaling_factor` instead.
+    // HF `MoEGate.forward`: renormalize only when `top_k > 1 &&
+    // norm_topk_prob` (`p / sum(p)`, no `routed_scaling_factor`); otherwise
+    // keep the softmax score and scale it by `routed_scaling_factor`.
     let rscale = f64::from(cfg.moe_routed_scale);
     let weights: Vec<f64> = chosen
         .iter()
         .map(|&e| {
-            let p = if cfg.moe_norm_topk {
+            if cfg.moe_norm_topk && topk > 1 {
                 probs[e] / norm
             } else {
-                probs[e]
-            };
-            rscale * p
+                probs[e] * rscale
+            }
         })
         .collect();
     (ids, weights)
