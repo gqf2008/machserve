@@ -1,7 +1,13 @@
 # MachServe 路线图
 
-> 目标:除内核外全部 Rust,端到端性能超越 TokenSpeed。
+> 目标:除内核外全部 Rust,端到端性能对标并超越 **TokenSpeed 与 FreeToken**。
 > 验收:同模型、同权重、同请求分布,对比 TTFT / TPOT / 吞吐 / GPU 利用率。
+> 平台(2026-09-04 修订):**芯片平台全都要支持** —— 当前已实现 AMD
+> (ROCm/HIP,gfx1100);macOS / Windows / Linux 皆为终态,`mach-kernel-sys`
+> 唯一 FFI 边界与预留的 `cuda` feature 即为此服务。本机现阶段可复跑的对标
+> 是 llama.cpp(Vulkan);TokenSpeed/FreeToken 为跨平台归一的目标对手。
+> 节奏:**模型覆盖渐进添加,底子优先** —— 新模型族(如 Qwen3.8 混合线性
+> 注意力)以层类型抽象进入,不做单检查点补丁。
 
 ## 分阶段
 
