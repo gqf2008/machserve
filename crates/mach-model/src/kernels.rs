@@ -5365,6 +5365,476 @@ mod gpu_tests {
         }
     }
 
+    /// Spec-based Q4 reader for the tests below: the DOCUMENTED layout (low
+    /// nibble = even element, one scale per 32 consecutive elements),
+    /// implemented independently of `Q4Tensor`'s own dequantize so a shared
+    /// writer/reader convention bug cannot make both sides of a comparison
+    /// wrong the same way.
+    fn spec_dequant(q: &crate::q4::Q4Tensor) -> Vec<f32> {
+        let qb = q.q_bytes();
+        let sc = q.scales();
+        (0..q.len())
+            .map(|i| {
+                let b = qb[i / 2];
+                let nib = if i % 2 == 0 { b & 0x0F } else { b >> 4 };
+                let v = if nib < 8 {
+                    i32::from(nib)
+                } else {
+                    i32::from(nib) - 16
+                };
+                v as f32 * sc[i / crate::q4::Q4_GROUP]
+            })
+            .collect()
+    }
+
+    /// Pin the WRITE side of the quantize seam: every spec-dequantized value
+    /// must lie within half a quantization step of the original weight
+    /// (round-to-nearest with `scale = max|w|/7` bounds `|w_hat - w| <= s/2`
+    /// up to f32 division rounding; `+1e-6` covers that and the reconstruct
+    /// multiply — `s <= 0.5/7` here, so the margin is far below any real
+    /// convention error). Without this, a nibble-order or group-formula bug
+    /// in `Q4Tensor::quantize` would pass every kernel comparison above —
+    /// kernel and spec reader decode the same wrong bytes with the same
+    /// convention — and would equally pass the Q4_DEVICE on/off A/B (both
+    /// paths decode the same bytes). Convention-level, so pinned once in the
+    /// small-pool test.
+    fn pin_quantize_writer(name: &str, w: &[f32], q: &crate::q4::Q4Tensor) {
+        let hat = spec_dequant(q);
+        let sc = q.scales();
+        for (i, (got, want)) in hat.iter().zip(w).enumerate() {
+            let bound = sc[i / crate::q4::Q4_GROUP] * 0.5 + 1e-6;
+            assert!(
+                (got - want).abs() <= bound,
+                "{name}: quantize writer drifted at [{i}] (got {got}, want {want}, bound {bound}) \
+                 — round-to-nearest must stay within half a step"
+            );
+        }
+    }
+
+    /// Storage-Q4 grouped GEMV kernels (`moe_grouped_gate_up_q4` /
+    /// `moe_grouped_down_q4`) vs the spec-dequantized CPU reference. #85
+    /// shipped them with no direct coverage — every test reached them only
+    /// through whole-model layers, and every launch site fed contiguous
+    /// expert ids — so the id-gather arithmetic (`wbase` from `ids[r]`, group
+    /// scales indexed GLOBALLY across the pool tensor) had no way to fail a
+    /// gate. #107 (DeepSeek Q4-on-device incoherence) named them the top
+    /// suspect; this pins the quantize -> raw-upload -> in-kernel-dequant seam
+    /// across id patterns the benches never used: all-rows-one-expert,
+    /// repeated ids across the pool range, and a multi-token token-major
+    /// batch (row r's token is r/topk, one expert appearing in BOTH tokens).
+    #[test]
+    fn moe_grouped_q4_gemv_matches_dequantized_cpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let ne = 16usize;
+        let einter = 96usize;
+        let d = 256usize;
+        let topk = 6usize;
+        let mut rng = lcg(31);
+        let wg: Vec<f32> = (0..ne * einter * d).map(|_| rng()).collect();
+        let wu: Vec<f32> = (0..ne * einter * d).map(|_| rng()).collect();
+        let wd: Vec<f32> = (0..ne * d * einter).map(|_| rng()).collect();
+        let (qwg, qwu, qwd) = (
+            crate::q4::Q4Tensor::quantize(&wg),
+            crate::q4::Q4Tensor::quantize(&wu),
+            crate::q4::Q4Tensor::quantize(&wd),
+        );
+        // The kernel comparisons below decode the packed bytes, so they pin
+        // the reader side; this pins the WRITER side (see helper doc).
+        pin_quantize_writer("wg", &wg, &qwg);
+        pin_quantize_writer("wu", &wu, &qwu);
+        pin_quantize_writer("wd", &wd, &qwd);
+        // Reference weights = what the packed bytes actually encode (not the
+        // pre-quantization values): the kernels can only be as good as their
+        // Q4 input, so quantization error itself must not count as a diff.
+        let (rg, ru, rd) = (spec_dequant(&qwg), spec_dequant(&qwu), spec_dequant(&qwd));
+
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let ibytes = |n: usize| n * std::mem::size_of::<i32>();
+        let dwgq = hip::malloc(&h, qwg.q_bytes().len()).unwrap();
+        let dwgs = hip::malloc(&h, bytes(qwg.scales().len())).unwrap();
+        let dwuq = hip::malloc(&h, qwu.q_bytes().len()).unwrap();
+        let dwus = hip::malloc(&h, bytes(qwu.scales().len())).unwrap();
+        let dwdq = hip::malloc(&h, qwd.q_bytes().len()).unwrap();
+        let dwds = hip::malloc(&h, bytes(qwd.scales().len())).unwrap();
+        let cp = |dst: *mut std::ffi::c_void, src: &[u8]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+        };
+        cp(dwgq, qwg.q_bytes());
+        cp(dwuq, qwu.q_bytes());
+        cp(dwdq, qwd.q_bytes());
+        // SAFETY: exact-length byte views of the scale vectors; the
+        // destination buffers were sized to match.
+        unsafe {
+            cp(
+                dwgs,
+                std::slice::from_raw_parts(
+                    qwg.scales().as_ptr() as *const u8,
+                    bytes(qwg.scales().len()),
+                ),
+            );
+            cp(
+                dwus,
+                std::slice::from_raw_parts(
+                    qwu.scales().as_ptr() as *const u8,
+                    bytes(qwu.scales().len()),
+                ),
+            );
+            cp(
+                dwds,
+                std::slice::from_raw_parts(
+                    qwd.scales().as_ptr() as *const u8,
+                    bytes(qwd.scales().len()),
+                ),
+            );
+        }
+
+        let cases: &[&[i32]] = &[
+            &[0, 1, 2, 3, 4, 5],       // contiguous (the only pattern any bench ever fed)
+            &[15, 15, 15, 15, 15, 15], // every row the SAME (highest) expert
+            &[15, 0, 15, 7, 15, 3],    // repeats across the pool range
+            &[15, 0, 15, 7, 15, 3, 2, 2, 2, 9, 9, 0], // batch=2 token-major, expert 0 in BOTH tokens
+        ];
+        for (ci, &ids) in cases.iter().enumerate() {
+            let rows = ids.len();
+            let batch = rows / topk;
+            let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
+            // down's input is fed directly (not via gate_up+silu): the two
+            // kernels are isolated, and SILU_MUL is covered by the f32
+            // pipeline test above.
+            let eh: Vec<f32> = (0..rows * einter).map(|_| rng()).collect();
+            let dx = hip::malloc(&h, bytes(x.len())).unwrap();
+            let de = hip::malloc(&h, ibytes(ids.len())).unwrap();
+            let deh = hip::malloc(&h, bytes(eh.len())).unwrap();
+            let gate = hip::malloc(&h, bytes(rows * einter)).unwrap();
+            let up = hip::malloc(&h, bytes(rows * einter)).unwrap();
+            let down = hip::malloc(&h, bytes(rows * d)).unwrap();
+            // SAFETY: exact-length byte views; device buffers sized to match.
+            unsafe {
+                cp(
+                    dx,
+                    std::slice::from_raw_parts(x.as_ptr() as *const u8, bytes(x.len())),
+                );
+                cp(
+                    de,
+                    std::slice::from_raw_parts(ids.as_ptr() as *const u8, ibytes(ids.len())),
+                );
+                cp(
+                    deh,
+                    std::slice::from_raw_parts(eh.as_ptr() as *const u8, bytes(eh.len())),
+                );
+            }
+            k.launch_moe_grouped_gate_up_q4(
+                dx as *const f32,
+                de as *const i32,
+                dwgq as *const u8,
+                dwgs as *const f32,
+                dwuq as *const u8,
+                dwus as *const f32,
+                gate as *mut f32,
+                up as *mut f32,
+                rows as i32,
+                einter as i32,
+                d as i32,
+                topk as i32,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+            k.launch_moe_grouped_down_q4(
+                deh as *const f32,
+                de as *const i32,
+                dwdq as *const u8,
+                dwds as *const f32,
+                down as *mut f32,
+                rows as i32,
+                d as i32,
+                einter as i32,
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+            k.sync().unwrap();
+            let readback = |p: *mut std::ffi::c_void, n: usize| -> Vec<f32> {
+                let mut v = vec![0f32; n];
+                hip::memcpy(
+                    &h,
+                    v.as_mut_ptr() as *mut std::ffi::c_void,
+                    p,
+                    bytes(n),
+                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                )
+                .unwrap();
+                v
+            };
+            let got_gate = readback(gate, rows * einter);
+            let got_up = readback(up, rows * einter);
+            let got_down = readback(down, rows * d);
+
+            // CPU reference: per routed row, the dot of the spec-dequantized
+            // expert row with row r's token (gate_up) / row r's eh (down).
+            let mut want_gate = vec![0f32; rows * einter];
+            let mut want_up = vec![0f32; rows * einter];
+            let mut want_down = vec![0f32; rows * d];
+            for r in 0..rows {
+                let t = r / topk;
+                let e = ids[r] as usize;
+                for o in 0..einter {
+                    let (mut g, mut u) = (0f32, 0f32);
+                    for i in 0..d {
+                        let w = (e * einter + o) * d + i;
+                        g += x[t * d + i] * rg[w];
+                        u += x[t * d + i] * ru[w];
+                    }
+                    want_gate[r * einter + o] = g;
+                    want_up[r * einter + o] = u;
+                }
+                for o in 0..d {
+                    let mut acc = 0f32;
+                    for i in 0..einter {
+                        acc += eh[r * einter + i] * rd[(e * d + o) * einter + i];
+                    }
+                    want_down[r * d + o] = acc;
+                }
+            }
+            let check = |name: &str, got: &[f32], want: &[f32]| {
+                let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let (mut worst, mut at) = (0.0f32, 0usize);
+                for (i, (a, b)) in got.iter().zip(want).enumerate() {
+                    let dd = (a - b).abs();
+                    if dd > worst {
+                        worst = dd;
+                        at = i;
+                    }
+                }
+                assert!(
+                    worst <= 1e-4 + 1e-4 * scale,
+                    "{name} case {ci} (ids {ids:?}) diff {worst} at [{at}] (got {}, want {}, scale {scale})",
+                    got[at],
+                    want[at]
+                );
+            };
+            check("gate_up_q4 gate", &got_gate, &want_gate);
+            check("gate_up_q4 up", &got_up, &want_up);
+            check("down_q4", &got_down, &want_down);
+            // Release the per-case allocations (module convention).
+            for p in [dx, de, deh, gate, up, down] {
+                hip::free(&h, p).unwrap();
+            }
+        }
+        for p in [dwgq, dwgs, dwuq, dwus, dwdq, dwds] {
+            hip::free(&h, p).unwrap();
+        }
+    }
+
+    /// The same Q4 seam at DeepSeek-V2-Lite row widths (d=2048, einter=1408,
+    /// topk=6, batch=2): the byte/group arithmetic is width-dependent — one
+    /// gate_up weight row spans 1024 bytes / 64 groups, one down row 704
+    /// bytes / 44 groups — so the small-pool test alone does not pin the
+    /// production alignment.
+    #[test]
+    fn moe_grouped_q4_real_dims_matches_cpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let ne = 8usize;
+        let einter = 1408usize;
+        let d = 2048usize;
+        let topk = 6usize;
+        let ids: Vec<i32> = vec![7, 0, 7, 3, 7, 1, 5, 5, 5, 2, 0, 7]; // batch 2, expert 7 in both tokens
+        let rows = ids.len();
+        let batch = rows / topk;
+        let mut rng = lcg(37);
+        let wg: Vec<f32> = (0..ne * einter * d).map(|_| rng()).collect();
+        let wu: Vec<f32> = (0..ne * einter * d).map(|_| rng()).collect();
+        let wd: Vec<f32> = (0..ne * d * einter).map(|_| rng()).collect();
+        let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
+        let eh: Vec<f32> = (0..rows * einter).map(|_| rng()).collect();
+        let (qwg, qwu, qwd) = (
+            crate::q4::Q4Tensor::quantize(&wg),
+            crate::q4::Q4Tensor::quantize(&wu),
+            crate::q4::Q4Tensor::quantize(&wd),
+        );
+        let (rg, ru, rd) = (spec_dequant(&qwg), spec_dequant(&qwu), spec_dequant(&qwd));
+
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let ibytes = |n: usize| n * std::mem::size_of::<i32>();
+        let dwgq = hip::malloc(&h, qwg.q_bytes().len()).unwrap();
+        let dwgs = hip::malloc(&h, bytes(qwg.scales().len())).unwrap();
+        let dwuq = hip::malloc(&h, qwu.q_bytes().len()).unwrap();
+        let dwus = hip::malloc(&h, bytes(qwu.scales().len())).unwrap();
+        let dwdq = hip::malloc(&h, qwd.q_bytes().len()).unwrap();
+        let dwds = hip::malloc(&h, bytes(qwd.scales().len())).unwrap();
+        let dx = hip::malloc(&h, bytes(x.len())).unwrap();
+        let de = hip::malloc(&h, ibytes(ids.len())).unwrap();
+        let deh = hip::malloc(&h, bytes(eh.len())).unwrap();
+        let gate = hip::malloc(&h, bytes(rows * einter)).unwrap();
+        let up = hip::malloc(&h, bytes(rows * einter)).unwrap();
+        let down = hip::malloc(&h, bytes(rows * d)).unwrap();
+        let cp = |dst: *mut std::ffi::c_void, src: &[u8]| {
+            hip::memcpy(
+                &h,
+                dst,
+                src.as_ptr() as *const std::ffi::c_void,
+                src.len(),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+        };
+        cp(dwgq, qwg.q_bytes());
+        cp(dwuq, qwu.q_bytes());
+        cp(dwdq, qwd.q_bytes());
+        // SAFETY: exact-length byte views; device buffers sized to match.
+        unsafe {
+            cp(
+                dx,
+                std::slice::from_raw_parts(x.as_ptr() as *const u8, bytes(x.len())),
+            );
+            cp(
+                de,
+                std::slice::from_raw_parts(ids.as_ptr() as *const u8, ibytes(ids.len())),
+            );
+            cp(
+                deh,
+                std::slice::from_raw_parts(eh.as_ptr() as *const u8, bytes(eh.len())),
+            );
+            cp(
+                dwgs,
+                std::slice::from_raw_parts(
+                    qwg.scales().as_ptr() as *const u8,
+                    bytes(qwg.scales().len()),
+                ),
+            );
+            cp(
+                dwus,
+                std::slice::from_raw_parts(
+                    qwu.scales().as_ptr() as *const u8,
+                    bytes(qwu.scales().len()),
+                ),
+            );
+            cp(
+                dwds,
+                std::slice::from_raw_parts(
+                    qwd.scales().as_ptr() as *const u8,
+                    bytes(qwd.scales().len()),
+                ),
+            );
+        }
+        k.launch_moe_grouped_gate_up_q4(
+            dx as *const f32,
+            de as *const i32,
+            dwgq as *const u8,
+            dwgs as *const f32,
+            dwuq as *const u8,
+            dwus as *const f32,
+            gate as *mut f32,
+            up as *mut f32,
+            rows as i32,
+            einter as i32,
+            d as i32,
+            topk as i32,
+            std::ptr::null_mut(),
+        )
+        .unwrap();
+        k.launch_moe_grouped_down_q4(
+            deh as *const f32,
+            de as *const i32,
+            dwdq as *const u8,
+            dwds as *const f32,
+            down as *mut f32,
+            rows as i32,
+            d as i32,
+            einter as i32,
+            std::ptr::null_mut(),
+        )
+        .unwrap();
+        k.sync().unwrap();
+        let readback = |p: *mut std::ffi::c_void, n: usize| -> Vec<f32> {
+            let mut v = vec![0f32; n];
+            hip::memcpy(
+                &h,
+                v.as_mut_ptr() as *mut std::ffi::c_void,
+                p,
+                bytes(n),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+            v
+        };
+        let got_gate = readback(gate, rows * einter);
+        let got_up = readback(up, rows * einter);
+        let got_down = readback(down, rows * d);
+
+        let mut want_gate = vec![0f32; rows * einter];
+        let mut want_up = vec![0f32; rows * einter];
+        let mut want_down = vec![0f32; rows * d];
+        for r in 0..rows {
+            let t = r / topk;
+            let e = ids[r] as usize;
+            for o in 0..einter {
+                let (mut g, mut u) = (0f32, 0f32);
+                for i in 0..d {
+                    let w = (e * einter + o) * d + i;
+                    g += x[t * d + i] * rg[w];
+                    u += x[t * d + i] * ru[w];
+                }
+                want_gate[r * einter + o] = g;
+                want_up[r * einter + o] = u;
+            }
+            for o in 0..d {
+                let mut acc = 0f32;
+                for i in 0..einter {
+                    acc += eh[r * einter + i] * rd[(e * d + o) * einter + i];
+                }
+                want_down[r * d + o] = acc;
+            }
+        }
+        let check = |name: &str, got: &[f32], want: &[f32]| {
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let (mut worst, mut at) = (0.0f32, 0usize);
+            for (i, (a, b)) in got.iter().zip(want).enumerate() {
+                let dd = (a - b).abs();
+                if dd > worst {
+                    worst = dd;
+                    at = i;
+                }
+            }
+            assert!(
+                worst <= 1e-4 + 1e-4 * scale,
+                "{name} (real dims) diff {worst} at [{at}] (got {}, want {}, scale {scale})",
+                got[at],
+                want[at]
+            );
+        };
+        check("gate_up_q4 gate", &got_gate, &want_gate);
+        check("gate_up_q4 up", &got_up, &want_up);
+        check("down_q4", &got_down, &want_down);
+        // Release every device allocation (module convention).
+        for p in [
+            dwgq, dwgs, dwuq, dwus, dwdq, dwds, dx, de, deh, gate, up, down,
+        ] {
+            hip::free(&h, p).unwrap();
+        }
+    }
+
     /// GEMV_F16 vs the rocBLAS m=1 path (gemm_f16) on a 2048×2048 decode
     /// shape: the GEMV keeps f32 results directly (no f16 `yh` rounding), so
     /// the tolerance covers the reference's f16 output rounding. Also prints
