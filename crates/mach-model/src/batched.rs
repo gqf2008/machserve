@@ -2082,6 +2082,9 @@ impl BatchedModel {
 
     /// Turns the layer dump off (files stay on disk). The dump example uses
     /// this before generating, so the prompt's final-step files survive.
+    /// Graph capture stays disabled — re-enabling is the caller's call
+    /// ([`Self::set_decode_graph_enabled`]); the prior setting is not
+    /// remembered.
     pub fn clear_layer_dump(&mut self) {
         self.layer_dump = None;
     }
@@ -2240,8 +2243,8 @@ impl BatchedModel {
         if let Some(dir) = &self.layer_dump {
             let mut hs = vec![0.0f32; d as usize];
             self.k.sync()?;
-            let src =
-                (self.x as usize + (b - 1) as usize * d as usize * 4) as *const core::ffi::c_void;
+            let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
+                as *const core::ffi::c_void;
             hip::memcpy(
                 self.k.hip(),
                 hs.as_mut_ptr() as *mut core::ffi::c_void,
@@ -2771,7 +2774,7 @@ impl BatchedModel {
             if let Some(dir) = &self.layer_dump {
                 let mut hs = vec![0.0f32; d as usize];
                 self.k.sync()?;
-                let src = (self.x as usize + (b - 1) as usize * d as usize * 4)
+                let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
                     as *const core::ffi::c_void;
                 hip::memcpy(
                     self.k.hip(),
@@ -3171,7 +3174,7 @@ impl BatchedModel {
             if let Some(dir) = &self.layer_dump {
                 let mut hs = vec![0.0f32; d as usize];
                 self.k.sync()?;
-                let src = (self.x as usize + (b - 1) as usize * d as usize * 4)
+                let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
                     as *const core::ffi::c_void;
                 hip::memcpy(
                     self.k.hip(),
@@ -3188,7 +3191,7 @@ impl BatchedModel {
                     let topk = c.num_experts_per_tok.min(c.num_experts);
                     let mut ids = vec![0i32; topk];
                     let mut wts = vec![0.0f32; topk];
-                    let off = (b - 1) as usize * topk;
+                    let off = b.saturating_sub(1) as usize * topk;
                     hip::memcpy(
                         self.k.hip(),
                         ids.as_mut_ptr() as *mut core::ffi::c_void,

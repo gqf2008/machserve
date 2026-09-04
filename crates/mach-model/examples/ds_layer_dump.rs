@@ -140,7 +140,9 @@ fn main() {
         .map(|s| s.parse().expect("token id"))
         .collect();
     assert!(!ids.is_empty(), "empty prompt");
-    assert!(ids.len() <= 500, "prompt longer than max_seq headroom");
+    // max_seq is 512 and the generation loop below walks 24 more steps; keep
+    // the prompt short enough that greedy decode cannot run past the cache.
+    assert!(ids.len() + 24 < 512, "prompt longer than max_seq headroom");
     println!("prompt ids ({}): {ids:?}", ids.len());
 
     let t0 = std::time::Instant::now();

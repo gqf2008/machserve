@@ -1364,10 +1364,19 @@
     `examples/ds_layer_dump.rs`(MACH_PROMPT_IDS 从 np_ref 回读 token,
     Rust 分词器刻意不用,杜绝分词差异混入对拍);`.scratch/np_ref.py`
     的 FAKE_TIE/REC_MOE 等留作后续逐层定位的模板。
-  - **同源潜在缺陷(记录未修)**:`model.rs`(单序列 GpuModel)存在
-    相同的 `!lw.shared_wg.is_null()` 守卫,但其 Q4/FP8 上传路径把全部
-    MoE/MLA/shared 权重置空(MoE 单序列只有 dense F16 一条可达路径),
-    目前不可达;若将来补单序列 MoE Q4 上传,须一并换 `has_shared`。
+  - **同源缺陷(对抗审查抓出,记录未修,均先于本 PR 存在)**:
+    1. `model.rs`(单序列 GpuModel)同款 `!lw.shared_wg.is_null()` 守卫 ——
+       其 Q4/FP8 上传把全部 MoE/MLA/shared 权重置空;但 **plain F16 + MoE +
+       shared 今天就丢 shared**(f32 `moe_router`/`moe_w*` 在 F16 上传不置空、
+       只有 shared 走 `upload_mat32(f16)→null`,且单序列 `LayerDevF16` 无
+       shared 字段,f16 权重根本没处放)—— 仅因服务端不走 GpuModel 而未暴露。
+       修它需要给 model.rs 的 f16 表补 shared 三件套,不是换一个标志就完。
+    2. **CPU 专家 offload 路径**(`expert_slots < num_experts` 的 F32 模型,
+       `forward_moe_cpu_batched` / `moe_offload.rs::moe_batch_cpu_residual`)
+       只累加路由专家,无 shared 项 —— offload 模式跑 DeepSeek 型检查点同样
+       静默丢 shared。
+    两处另立后续 issue;若将来补单序列 MoE 量化上传或改 offload 路径,须一并
+    处理。
   - **性能数据待重测**:修复让 MoE 层恢复了 shared 的三个 GEMM(此前
     被跳过),既有 25.73 tok/s 是"少干活"的数字,不再代表修复后路径。
 
