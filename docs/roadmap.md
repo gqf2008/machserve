@@ -1375,7 +1375,7 @@
        `forward_moe_cpu_batched` / `moe_offload.rs::moe_batch_cpu_residual`)
        只累加路由专家,无 shared 项 —— offload 模式跑 DeepSeek 型检查点同样
        静默丢 shared。
-    两处另立后续 issue;若将来补单序列 MoE 量化上传或改 offload 路径,须一并
+    两处另立 #111 追踪;若将来补单序列 MoE 量化上传或改 offload 路径,须一并
     处理。
   - **性能数据待重测**:修复让 MoE 层恢复了 shared 的三个 GEMM(此前
     被跳过),既有 25.73 tok/s 是"少干活"的数字,不再代表修复后路径。
