@@ -2069,6 +2069,11 @@ impl BatchedModel {
     /// capture off — the per-layer D2H read cannot be captured. Library-code
     /// debug hook: the server/examples choose the directory; no env is read
     /// here.
+    ///
+    /// Interaction caveat: the per-layer sync + D2H + file write lands inside
+    /// the [`MACH_STEP_PROFILE`] phase brackets, so phase timings measured
+    /// with the dump armed include dump I/O — don't combine the two knobs for
+    /// performance analysis.
     pub fn set_layer_dump(&mut self, dir: impl Into<std::path::PathBuf>) -> Result<(), Error> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
@@ -2087,6 +2092,31 @@ impl BatchedModel {
     /// remembered.
     pub fn clear_layer_dump(&mut self) {
         self.layer_dump = None;
+    }
+
+    /// Debug (issue #107): syncs the engine stream and snapshots the LAST
+    /// active row of the residual `self.x` (`d` f32) to `<dir>/<name>.npy`.
+    /// Shared by the embedding / mid-layer / layer-tail dump sites, which
+    /// only vary in the file name.
+    fn dump_last_x_row(
+        &self,
+        dir: &std::path::Path,
+        name: &str,
+        b: i32,
+        d: i32,
+    ) -> Result<(), Error> {
+        let mut hs = vec![0.0f32; d as usize];
+        self.k.sync()?;
+        let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
+            as *const core::ffi::c_void;
+        hip::memcpy(
+            self.k.hip(),
+            hs.as_mut_ptr() as *mut core::ffi::c_void,
+            src,
+            d as usize * 4,
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )?;
+        write_npy_f32(&dir.join(name), &hs)
     }
 
     /// Number of captured decode graphs (one per active-row-count bucket seen
@@ -2241,18 +2271,7 @@ impl BatchedModel {
         // Debug (issue #107): pre-layer-0 embedding snapshot (row 0 of the
         // diff chain — if this is off, nothing downstream matters).
         if let Some(dir) = &self.layer_dump {
-            let mut hs = vec![0.0f32; d as usize];
-            self.k.sync()?;
-            let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
-                as *const core::ffi::c_void;
-            hip::memcpy(
-                self.k.hip(),
-                hs.as_mut_ptr() as *mut core::ffi::c_void,
-                src,
-                d as usize * 4,
-                hip::HIP_MEMCPY_DEVICE_TO_HOST,
-            )?;
-            write_npy_f32(&dir.join("hs_emb.npy"), &hs)?;
+            self.dump_last_x_row(dir, "hs_emb.npy", b, d)?;
         }
         // Step profiler (MACH_STEP_PROFILE): whole-step start bracket.
         if let Some(pf_state) = &self.prof {
@@ -2772,18 +2791,7 @@ impl BatchedModel {
             // landed, MLP/MoE not yet run. Together with the layer-tail dump
             // this splits a divergent layer into its attention vs MLP halves.
             if let Some(dir) = &self.layer_dump {
-                let mut hs = vec![0.0f32; d as usize];
-                self.k.sync()?;
-                let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
-                    as *const core::ffi::c_void;
-                hip::memcpy(
-                    self.k.hip(),
-                    hs.as_mut_ptr() as *mut core::ffi::c_void,
-                    src,
-                    d as usize * 4,
-                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                )?;
-                write_npy_f32(&dir.join(format!("hsMid_L{li:02}.npy")), &hs)?;
+                self.dump_last_x_row(dir, &format!("hsMid_L{li:02}.npy"), b, d)?;
             }
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
             // Per-layer MoE dispatch: mixed checkpoints (Qwen3-MoE style) have
@@ -3105,6 +3113,20 @@ impl BatchedModel {
                         // testing them silently dropped the shared experts
                         // there (#107).
                         if lw.has_shared {
+                            // Freeze the invariant the three construction sites
+                            // must keep: has_shared (derived from the host
+                            // weights) implies one dtype's pointer set was
+                            // actually uploaded — otherwise the GEMMs below
+                            // read a null weight pointer (a silent-garbage or
+                            // illegal-address failure of the #107 class).
+                            debug_assert!(
+                                if f16 {
+                                    l16.is_some_and(|l| !l.shared_wg.is_null())
+                                } else {
+                                    !lw.shared_wg.is_null()
+                                },
+                                "has_shared but no f32/f16 shared-expert weights uploaded"
+                            );
                             let shinter = c.shared_size() as i32;
                             gemm(
                                 self.gate,
@@ -3172,23 +3194,15 @@ impl BatchedModel {
             // against the numpy reference (`np_ref.py` records the same point).
             // Syncs per layer; debug-only (set_layer_dump).
             if let Some(dir) = &self.layer_dump {
-                let mut hs = vec![0.0f32; d as usize];
-                self.k.sync()?;
-                let src = (self.x as usize + b.saturating_sub(1) as usize * d as usize * 4)
-                    as *const core::ffi::c_void;
-                hip::memcpy(
-                    self.k.hip(),
-                    hs.as_mut_ptr() as *mut core::ffi::c_void,
-                    src,
-                    d as usize * 4,
-                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                )?;
-                write_npy_f32(&dir.join(format!("hs_L{li:02}.npy")), &hs)?;
+                self.dump_last_x_row(dir, &format!("hs_L{li:02}.npy"), b, d)?;
                 // MoE layers: also snapshot this row's routing (expert ids +
                 // weights) — a top-k flip between the f16 device router and the
-                // f64 reference would masquerade as numeric divergence.
-                if c.num_experts > 0 && !lw.moe_router.is_null() {
-                    let topk = c.num_experts_per_tok.min(c.num_experts);
+                // f64 reference would masquerade as numeric divergence. topk > 0
+                // is required for buffer existence: alloc_buffers skips the MoE
+                // scratch entirely when num_experts_per_tok == 0 (the forward
+                // itself treats topk == 0 as "MoE contributes nothing").
+                let topk = c.num_experts_per_tok.min(c.num_experts);
+                if c.num_experts > 0 && topk > 0 && !lw.moe_router.is_null() {
                     let mut ids = vec![0i32; topk];
                     let mut wts = vec![0.0f32; topk];
                     let off = b.saturating_sub(1) as usize * topk;
@@ -3212,40 +3226,72 @@ impl BatchedModel {
                     )?;
                     write_npy_f32(&dir.join(format!("route_w_L{li:02}.npy")), &wts)?;
                 }
-                // Layer 1 (first MoE layer) gets the full intermediate trace:
-                // router logits, xn2, per-slot gate/up/eh/down, h_acc, and the
-                // shared-expert chain — every buffer still holds this layer's
-                // values at the layer tail. Localizes a MoE-path bug to the
-                // exact kernel. Guarded like the routing dump above: the MoE
-                // scratch buffers are only allocated for MoE models.
-                if li == 1 && c.num_experts > 0 && !lw.moe_router.is_null() {
-                    let topk6 = c.num_experts_per_tok.min(c.num_experts);
+                // Layer 1 (the first MoE layer on DeepSeek-V2-style checkpoints
+                // with first_k_dense_replace = 1) gets the full intermediate
+                // trace: router logits, xn2, the LAST active token's per-slot
+                // gate/up/eh/down, h_acc, and the shared-expert chain — matching
+                // the row the hs_/route_ dumps above snapshot. Only meaningful
+                // on the grouped on-device decode path, the only one that leaves
+                // these buffers token-major for this layer: the hipBLAS prefill
+                // path overwrites gate/up/eh per expert segment and packs
+                // down_all expert-major, and the CPU-offload path
+                // (forward_moe_cpu_batched) never writes them at all. Models
+                // whose first MoE layer is not index 1 need this index adjusted.
+                let grouped = (self.moe_grouped && decode_only) || !self.q4_experts.is_empty();
+                let offload = self.prefetch.is_none() && self.expert_slots < c.num_experts;
+                if li == 1
+                    && c.num_experts > 0
+                    && topk > 0
+                    && grouped
+                    && !offload
+                    && !lw.moe_router.is_null()
+                {
                     let einter = c.expert_size();
                     let ne = c.num_experts;
                     let shinter = c.shared_size();
-                    let grab = |name: &str, base: *mut f32, n: usize| -> Result<(), Error> {
-                        let mut v = vec![0.0f32; n];
-                        let src = base as *const core::ffi::c_void;
-                        hip::memcpy(
-                            self.k.hip(),
-                            v.as_mut_ptr() as *mut core::ffi::c_void,
-                            src,
-                            n * 4,
-                            hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                        )?;
-                        write_npy_f32(&dir.join(format!("moe_{name}.npy")), &v)
-                    };
-                    grab("router", self.router, ne)?;
-                    grab("xn2", self.xn2, d as usize)?;
-                    grab("gate_all", self.gate_all, topk6 * einter)?;
-                    grab("up_all", self.up_all, topk6 * einter)?;
-                    grab("eh_all", self.eh_all, topk6 * einter)?;
-                    grab("down_all", self.down_all, topk6 * d as usize)?;
-                    grab("h_acc", self.h_acc, d as usize)?;
-                    grab("sh_gate", self.gate, shinter)?;
-                    grab("sh_up", self.up, shinter)?;
-                    grab("sh_h", self.h, shinter)?;
-                    grab("sh_proj", self.proj, d as usize)?;
+                    let d_us = d as usize;
+                    let last = b.saturating_sub(1) as usize;
+                    // Element offset of the LAST active row: [rows, width]
+                    // buffers are row-major, and the grouped kernels pack the
+                    // per-slot rows token-major (row r = token r/topk, slot
+                    // r%topk), so token `last`'s topk slots start at row
+                    // last*topk.
+                    let grab =
+                        |name: &str, base: *mut f32, off: usize, n: usize| -> Result<(), Error> {
+                            let mut v = vec![0.0f32; n];
+                            let src = unsafe { base.add(off) } as *const core::ffi::c_void;
+                            hip::memcpy(
+                                self.k.hip(),
+                                v.as_mut_ptr() as *mut core::ffi::c_void,
+                                src,
+                                n * 4,
+                                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                            )?;
+                            write_npy_f32(&dir.join(format!("moe_{name}.npy")), &v)
+                        };
+                    grab("router", self.router, last * ne, ne)?;
+                    grab("xn2", self.xn2, last * d_us, d_us)?;
+                    grab(
+                        "gate_all",
+                        self.gate_all,
+                        last * topk * einter,
+                        topk * einter,
+                    )?;
+                    grab("up_all", self.up_all, last * topk * einter, topk * einter)?;
+                    grab("eh_all", self.eh_all, last * topk * einter, topk * einter)?;
+                    grab("down_all", self.down_all, last * topk * d_us, topk * d_us)?;
+                    grab("h_acc", self.h_acc, last * d_us, d_us)?;
+                    // The shared-expert chain only exists when this layer has
+                    // shared experts; otherwise gate/up/h/proj hold values from
+                    // some other consumer (dense MLP of an earlier layer, the
+                    // attention projection) and dumping them as "sh_*" would
+                    // mislead the diff.
+                    if lw.has_shared {
+                        grab("sh_gate", self.gate, last * shinter, shinter)?;
+                        grab("sh_up", self.up, last * shinter, shinter)?;
+                        grab("sh_h", self.h, last * shinter, shinter)?;
+                        grab("sh_proj", self.proj, last * d_us, d_us)?;
+                    }
                 }
             }
             // Step profiler: MLP/MoE phase done (dense MLP or routed experts).
@@ -3811,5 +3857,55 @@ mod paged_support_tests {
         assert!(BatchedModel::check_paged_support(&mla, 64).is_err());
         mla.dtype = ModelDType::F32;
         assert!(BatchedModel::check_paged_support(&mla, 64).is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod npy_writer_tests {
+    use super::*;
+
+    /// `write_npy_f32` emits a numpy 1.0 file `np.load` can read: magic,
+    /// version, u16-LE header length, a 64-byte-aligned header block
+    /// terminated by a newline, then little-endian f32 payload. The padding
+    /// arithmetic is exactly the kind that breaks silently, so pin the bytes.
+    #[test]
+    fn write_npy_f32_header_and_payload() {
+        let dir = std::env::temp_dir().join(format!("mach_npy_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Non-empty vector: shape (3,), three LE f32 values.
+        let path = dir.join("t.npy");
+        write_npy_f32(&path, &[1.5f32, -2.25, 0.0]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..6], b"\x93NUMPY", "magic");
+        assert_eq!(&bytes[6..8], &[1u8, 0], "format version 1.0");
+        let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        assert_eq!(10 + hlen, bytes.len() - 3 * 4, "payload size");
+        assert_eq!((10 + hlen) % 64, 0, "header block 64-byte alignment");
+        let hdr = core::str::from_utf8(&bytes[10..10 + hlen]).unwrap();
+        assert!(hdr.ends_with('\n'), "header terminated by newline");
+        assert!(hdr.contains("'descr': '<f4'"), "{hdr}");
+        assert!(hdr.contains("'fortran_order': False"), "{hdr}");
+        assert!(hdr.contains("'shape': (3,)"), "{hdr}");
+        let mut want = Vec::new();
+        want.extend_from_slice(&1.5f32.to_le_bytes());
+        want.extend_from_slice(&(-2.25f32).to_le_bytes());
+        want.extend_from_slice(&0.0f32.to_le_bytes());
+        assert_eq!(&bytes[10 + hlen..], want.as_slice(), "LE f32 payload");
+
+        // Empty vector: shape (0,), zero payload — every `grab` offset in the
+        // layer dump can hit this when a width is 0.
+        let empty = dir.join("empty.npy");
+        write_npy_f32(&empty, &[]).unwrap();
+        let bytes = std::fs::read(&empty).unwrap();
+        let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        assert_eq!(10 + hlen, bytes.len(), "no payload");
+        assert_eq!((10 + hlen) % 64, 0, "header block 64-byte alignment");
+        let hdr = core::str::from_utf8(&bytes[10..10 + hlen]).unwrap();
+        assert!(hdr.contains("'shape': (0,)"), "{hdr}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&empty);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

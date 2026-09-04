@@ -46,7 +46,6 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let hidden = v["hidden_size"].as_u64().unwrap_or(2048) as usize;
     let layers = v["num_hidden_layers"].as_u64().unwrap_or(27) as usize;
     let heads = v["num_attention_heads"].as_u64().unwrap_or(16) as usize;
-    let kv = v["num_key_value_heads"].as_u64().unwrap_or(heads as u64) as usize;
     let vocab = v["vocab_size"].as_u64().unwrap_or(102400) as usize;
     let inter = v["intermediate_size"].as_u64().unwrap_or(4 * hidden as u64) as usize;
     // The dump only walks a short prompt; a small max_seq keeps the
@@ -55,7 +54,10 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let max_seq = 512usize;
     let eps = v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
     let theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
-    let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);
+    // n_kv_heads is a placeholder for the MLA constructor below (MLA has no
+    // separate KV heads): `cfg.n_kv_heads = cfg.n_heads` is applied once the
+    // MLA dims are parsed.
+    let mut cfg = Config::llama(hidden, layers, heads, heads, vocab, max_seq);
     cfg.intermediate_size = inter;
     cfg.rms_eps = eps;
     cfg.rope_theta = theta;
@@ -161,11 +163,16 @@ fn main() {
     drop(w);
 
     let dump_dir = PathBuf::from(".scratch/dump_ds");
-    model.set_layer_dump(&dump_dir).expect("layer dump dir");
 
-    // One token per decode_step: every step rewrites the per-layer files, so
-    // after the loop they hold the LAST position's trace (REC_POS = len-1).
-    for &t in &ids {
+    // One token per decode_step. Only the FINAL step needs the trace (the
+    // hook rewrites the per-layer files on every forward, so anything but the
+    // last step's files would be overwritten anyway) — arm the dump for that
+    // step only, or a long prompt pays the per-layer sync + dump I/O N times
+    // for nothing.
+    for (i, &t) in ids.iter().enumerate() {
+        if i + 1 == ids.len() {
+            model.set_layer_dump(&dump_dir).expect("layer dump dir");
+        }
         model.decode_step(&[t]).expect("decode step");
     }
     println!(
@@ -184,34 +191,41 @@ fn main() {
     let tok = mach_model::tokenizer::Tokenizer::from_path(&model_dir.join("tokenizer.json"))
         .expect("load tokenizer");
     model.clear_layer_dump();
-    let mut cur = *ids.last().expect("non-empty");
     let mut out_ids = Vec::new();
     for step in 0..24 {
         let logits = model.read_logits().expect("logits");
+        // total_cmp: a garbage-decode run can legitimately produce NaN logits;
+        // the diagnostic must print them, not panic on them.
         let next = logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i as u32)
             .unwrap();
-        println!(
-            "out_ids step {step}: argmax={next} ({:.2}) top2 margin {:.2}",
-            logits[next as usize],
-            {
-                let mut s: Vec<f32> = logits.to_vec();
-                s.select_nth_unstable_by(cfg.vocab_size - 2, |a, b| a.partial_cmp(b).unwrap());
-                logits[next as usize] - s[cfg.vocab_size - 2]
+        // Top-2 margin via a running scan (no vocab-sized clone + partial
+        // sort per step). NaN compares false against everything, so it never
+        // enters the top-2 and the margin stays finite.
+        let mut best = f32::NEG_INFINITY;
+        let mut second = f32::NEG_INFINITY;
+        for &l in logits.iter() {
+            if l > best {
+                second = best;
+                best = l;
+            } else if l > second {
+                second = l;
             }
+        }
+        println!(
+            "out_ids step {step}: argmax={next} ({best:.2}) top2 margin {:.2}",
+            best - second
         );
         out_ids.push(next);
         if next == 100001 {
             break; // <|end▁of▁sentence|>
         }
-        cur = next;
-        model.decode_step(&[cur]).expect("decode step");
+        model.decode_step(&[next]).expect("decode step");
     }
     println!("GENERATED: {}", tok.decode(&out_ids));
-    let _ = cur;
 }
 
 #[cfg(not(feature = "hip"))]
