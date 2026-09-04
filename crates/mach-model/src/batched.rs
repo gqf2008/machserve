@@ -56,6 +56,13 @@ struct LayerDev {
     shared_wg: *mut f32,
     shared_wu: *mut f32,
     shared_wd: *mut f32,
+    /// Whether this layer HAS shared experts — dtype-independent existence
+    /// flag. The f32 pointers above are null in every F16 upload path (the
+    /// weights live in `LayerDevF16` only), so testing them silently SKIPPED
+    /// the shared experts for all F16/Q4/FP8 models (issue #107: DeepSeek-V2
+    /// Q4-on-device decoded garbage; Qwen-MoE was unaffected because it ships
+    /// no shared experts).
+    has_shared: bool,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -365,6 +372,38 @@ pub struct BatchedModel {
     /// stream replay survived 12k steps, so the knob stays opt-in until the
     /// driver-side behavior is re-verified on a newer ROCm.
     graph_enabled: bool,
+    /// Debug (issue #107 layer-divergence localization): when set, every
+    /// forward snapshots the LAST active row's residual (`self.x`) to
+    /// `<dir>/hs_L{li:02}.npy` after each layer body — the same per-layer
+    /// hidden-state trace `.scratch/np_ref.py` records at `REC_POS` — so the
+    /// first layer where the device forward diverges from the host reference
+    /// can be read straight off the files. Syncs per layer and is mutually
+    /// exclusive with graph capture (see [`Self::graph_capture_ok`]).
+    layer_dump: Option<std::path::PathBuf>,
+}
+
+/// Minimal NumPy `.npy` writer (f32, C-order, format version 1.0) for the
+/// `layer_dump` debug hook — hand-rolled so the diagnostic path pulls no
+/// extra dependency. `np.load` reads what this emits.
+fn write_npy_f32(path: &std::path::Path, v: &[f32]) -> Result<(), Error> {
+    let mut hdr = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}",
+        v.len()
+    );
+    // numpy pads the header so the total prefix (8 magic + 2 len) is a
+    // multiple of 64 and terminates it with a newline.
+    let pad = (64 - (10 + hdr.len() + 1) % 64) % 64;
+    hdr.push_str(&" ".repeat(pad));
+    hdr.push('\n');
+    let mut buf = Vec::with_capacity(10 + hdr.len() + v.len() * 4);
+    buf.extend_from_slice(b"\x93NUMPY\x01\x00");
+    buf.extend_from_slice(&(hdr.len() as u16).to_le_bytes());
+    buf.extend_from_slice(hdr.as_bytes());
+    for f in v {
+        buf.extend_from_slice(&f.to_le_bytes());
+    }
+    std::fs::write(path, buf)
+        .map_err(|e| Error::Model(format!("layer dump write {}: {e}", path.display())))
 }
 
 impl BatchedModel {
@@ -908,6 +947,7 @@ impl BatchedModel {
             decode_graphs: std::collections::HashMap::new(),
             greedy_graph: None,
             graph_enabled: std::env::var("MACH_GRAPH").is_ok_and(|v| v == "1"),
+            layer_dump: None,
         };
         m.alloc_buffers()?;
         upload(&mut m)?;
@@ -1371,6 +1411,7 @@ impl BatchedModel {
                     self.upload(p, &lw.shared_wd)?;
                     p
                 },
+                has_shared: !lw.shared_wg.is_empty(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1488,6 +1529,7 @@ impl BatchedModel {
                 shared_wg: std::ptr::null_mut(),
                 shared_wu: std::ptr::null_mut(),
                 shared_wd: std::ptr::null_mut(),
+                has_shared: !lw.shared_wg.is_empty(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1637,6 +1679,7 @@ impl BatchedModel {
                 shared_wg: std::ptr::null_mut(),
                 shared_wu: std::ptr::null_mut(),
                 shared_wd: std::ptr::null_mut(),
+                has_shared: !lw.shared_wg.is_empty(),
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1977,6 +2020,7 @@ impl BatchedModel {
         if !(self.graph_enabled && decode_only)
             || self.prof.is_some()
             || self.prefetch.is_some()
+            || self.layer_dump.is_some()
             || self.cfg.dtype != ModelDType::F16
             || n == 0
             || n > GEMV_MAX_M as usize
@@ -2016,6 +2060,30 @@ impl BatchedModel {
     /// env). Existing captured graphs stay cached.
     pub fn set_decode_graph_enabled(&mut self, on: bool) {
         self.graph_enabled = on;
+    }
+
+    /// Debug (issue #107): after every forward, write the LAST active row's
+    /// per-layer residual (post full layer — attention + MLP/MoE residual, the
+    /// same point `.scratch/np_ref.py` records) to `<dir>/hs_L{li:02}.npy`
+    /// (f32, C-order). Files always carry the most recent step. Forces graph
+    /// capture off — the per-layer D2H read cannot be captured. Library-code
+    /// debug hook: the server/examples choose the directory; no env is read
+    /// here.
+    pub fn set_layer_dump(&mut self, dir: impl Into<std::path::PathBuf>) -> Result<(), Error> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::Model(format!("layer dump dir {}: {e}", dir.display())))?;
+        self.graph_enabled = false;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
+        self.layer_dump = Some(dir);
+        Ok(())
+    }
+
+    /// Turns the layer dump off (files stay on disk). The dump example uses
+    /// this before generating, so the prompt's final-step files survive.
+    pub fn clear_layer_dump(&mut self) {
+        self.layer_dump = None;
     }
 
     /// Number of captured decode graphs (one per active-row-count bucket seen
@@ -2166,6 +2234,22 @@ impl BatchedModel {
             k.launch_embed_f16(self.tokens_dev, self.emb_f16, self.x, d, b)?;
         } else {
             k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
+        }
+        // Debug (issue #107): pre-layer-0 embedding snapshot (row 0 of the
+        // diff chain — if this is off, nothing downstream matters).
+        if let Some(dir) = &self.layer_dump {
+            let mut hs = vec![0.0f32; d as usize];
+            self.k.sync()?;
+            let src =
+                (self.x as usize + (b - 1) as usize * d as usize * 4) as *const core::ffi::c_void;
+            hip::memcpy(
+                self.k.hip(),
+                hs.as_mut_ptr() as *mut core::ffi::c_void,
+                src,
+                d as usize * 4,
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )?;
+            write_npy_f32(&dir.join("hs_emb.npy"), &hs)?;
         }
         // Step profiler (MACH_STEP_PROFILE): whole-step start bracket.
         if let Some(pf_state) = &self.prof {
@@ -2681,6 +2765,23 @@ impl BatchedModel {
                     )?;
                 }
             }
+            // Debug (issue #107): mid-layer snapshot — attention residual has
+            // landed, MLP/MoE not yet run. Together with the layer-tail dump
+            // this splits a divergent layer into its attention vs MLP halves.
+            if let Some(dir) = &self.layer_dump {
+                let mut hs = vec![0.0f32; d as usize];
+                self.k.sync()?;
+                let src = (self.x as usize + (b - 1) as usize * d as usize * 4)
+                    as *const core::ffi::c_void;
+                hip::memcpy(
+                    self.k.hip(),
+                    hs.as_mut_ptr() as *mut core::ffi::c_void,
+                    src,
+                    d as usize * 4,
+                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                )?;
+                write_npy_f32(&dir.join(format!("hsMid_L{li:02}.npy")), &hs)?;
+            }
             k.launch_rms_norm(self.x, lw.rms_mlp, self.xn2, b, d, c.rms_eps)?;
             // Per-layer MoE dispatch: mixed checkpoints (Qwen3-MoE style) have
             // dense layers with empty MoE tensors alongside routed-expert
@@ -2995,8 +3096,12 @@ impl BatchedModel {
                         // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of
                         // width `n_shared_experts * expert_size` on the same
                         // normalized input, ADDED on top of the routed
-                        // experts' weighted sum in `h_acc`.
-                        if !lw.shared_wg.is_null() {
+                        // experts' weighted sum in `h_acc`. Existence is the
+                        // dtype-independent `has_shared` flag — the f32
+                        // pointers are null on every F16 upload path, and
+                        // testing them silently dropped the shared experts
+                        // there (#107).
+                        if lw.has_shared {
                             let shinter = c.shared_size() as i32;
                             gemm(
                                 self.gate,
@@ -3058,6 +3163,87 @@ impl BatchedModel {
                     inter,
                 )?;
                 k.launch_add(self.x, self.proj, b * d)?;
+            }
+            // Debug (issue #107): the layer's final residual add has landed —
+            // snapshot the last active row for the per-layer divergence diff
+            // against the numpy reference (`np_ref.py` records the same point).
+            // Syncs per layer; debug-only (set_layer_dump).
+            if let Some(dir) = &self.layer_dump {
+                let mut hs = vec![0.0f32; d as usize];
+                self.k.sync()?;
+                let src = (self.x as usize + (b - 1) as usize * d as usize * 4)
+                    as *const core::ffi::c_void;
+                hip::memcpy(
+                    self.k.hip(),
+                    hs.as_mut_ptr() as *mut core::ffi::c_void,
+                    src,
+                    d as usize * 4,
+                    hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                )?;
+                write_npy_f32(&dir.join(format!("hs_L{li:02}.npy")), &hs)?;
+                // MoE layers: also snapshot this row's routing (expert ids +
+                // weights) — a top-k flip between the f16 device router and the
+                // f64 reference would masquerade as numeric divergence.
+                if c.num_experts > 0 && !lw.moe_router.is_null() {
+                    let topk = c.num_experts_per_tok.min(c.num_experts);
+                    let mut ids = vec![0i32; topk];
+                    let mut wts = vec![0.0f32; topk];
+                    let off = (b - 1) as usize * topk;
+                    hip::memcpy(
+                        self.k.hip(),
+                        ids.as_mut_ptr() as *mut core::ffi::c_void,
+                        (self.exp_ids as usize + off * 4) as *const core::ffi::c_void,
+                        topk * 4,
+                        hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                    )?;
+                    hip::memcpy(
+                        self.k.hip(),
+                        wts.as_mut_ptr() as *mut core::ffi::c_void,
+                        (self.exp_w as usize + off * 4) as *const core::ffi::c_void,
+                        topk * 4,
+                        hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                    )?;
+                    write_npy_f32(
+                        &dir.join(format!("route_ids_L{li:02}.npy")),
+                        &ids.iter().map(|&e| e as f32).collect::<Vec<_>>(),
+                    )?;
+                    write_npy_f32(&dir.join(format!("route_w_L{li:02}.npy")), &wts)?;
+                }
+                // Layer 1 (first MoE layer) gets the full intermediate trace:
+                // router logits, xn2, per-slot gate/up/eh/down, h_acc, and the
+                // shared-expert chain — every buffer still holds this layer's
+                // values at the layer tail. Localizes a MoE-path bug to the
+                // exact kernel. Guarded like the routing dump above: the MoE
+                // scratch buffers are only allocated for MoE models.
+                if li == 1 && c.num_experts > 0 && !lw.moe_router.is_null() {
+                    let topk6 = c.num_experts_per_tok.min(c.num_experts);
+                    let einter = c.expert_size();
+                    let ne = c.num_experts;
+                    let shinter = c.shared_size();
+                    let grab = |name: &str, base: *mut f32, n: usize| -> Result<(), Error> {
+                        let mut v = vec![0.0f32; n];
+                        let src = base as *const core::ffi::c_void;
+                        hip::memcpy(
+                            self.k.hip(),
+                            v.as_mut_ptr() as *mut core::ffi::c_void,
+                            src,
+                            n * 4,
+                            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+                        )?;
+                        write_npy_f32(&dir.join(format!("moe_{name}.npy")), &v)
+                    };
+                    grab("router", self.router, ne)?;
+                    grab("xn2", self.xn2, d as usize)?;
+                    grab("gate_all", self.gate_all, topk6 * einter)?;
+                    grab("up_all", self.up_all, topk6 * einter)?;
+                    grab("eh_all", self.eh_all, topk6 * einter)?;
+                    grab("down_all", self.down_all, topk6 * d as usize)?;
+                    grab("h_acc", self.h_acc, d as usize)?;
+                    grab("sh_gate", self.gate, shinter)?;
+                    grab("sh_up", self.up, shinter)?;
+                    grab("sh_h", self.h, shinter)?;
+                    grab("sh_proj", self.proj, d as usize)?;
+                }
             }
             // Step profiler: MLP/MoE phase done (dense MLP or routed experts).
             if let Some(pf_state) = &self.prof
