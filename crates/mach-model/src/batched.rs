@@ -1417,7 +1417,17 @@ impl BatchedModel {
             let state_zeros =
                 vec![0.0f32; self.batch * c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim];
             let conv_zeros = vec![0.0f32; self.batch * conv_dim * keep];
-            for _ in 0..c.n_layers {
+            for li in 0..c.n_layers {
+                // Full-attn layers never launch the GDN kernels, so they get
+                // null entries (indexed by absolute layer id like the real
+                // ones; every consumer is `has_gdn`-gated). Dense allocation
+                // would waste batch × 3.1MB per full-attn layer on the 27B
+                // (16 × 25MB at capacity 8) beyond what estimate_vram counts.
+                if c.layer_is_full_attn(li) {
+                    self.gdn_state.push(std::ptr::null_mut());
+                    self.gdn_conv.push(std::ptr::null_mut());
+                    continue;
+                }
                 let s = self.dalloc(state_zeros.len() * 4)?;
                 self.upload(s, &state_zeros)?;
                 let cv = self.dalloc(conv_zeros.len() * 4)?;
@@ -2223,13 +2233,20 @@ impl BatchedModel {
             }
         }
         // GDN recurrent + conv state back to the pos-0 state (S = 0, empty
-        // conv window) — same contract as the KV caches above.
+        // conv window) — same contract as the KV caches above. Full-attn
+        // layers carry no GDN buffers (null entries — see the build-time
+        // alloc), and the byte count must match the ALLOCATION formula
+        // (`vh * hd * hd`), not the full kd×vd dims: memset past a
+        // per-layer buffer would smash the neighboring device allocations.
         if !self.gdn_state.is_empty() {
             let c = self.cfg;
-            let state_bytes = self.batch * c.gdn_v_heads * c.gdn_key_dim() * c.gdn_value_dim() * 4;
+            let state_bytes = self.batch * c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim * 4;
             let conv_dim = 2 * c.gdn_key_dim() + c.gdn_value_dim();
             let conv_bytes = self.batch * conv_dim * (c.gdn_conv_kernel - 1) * 4;
             for (&s, &cv) in self.gdn_state.iter().zip(&self.gdn_conv) {
+                if s.is_null() {
+                    continue; // full-attn layer: no GDN buffers
+                }
                 unsafe {
                     hip::check(
                         self.k.hip(),
@@ -2259,6 +2276,50 @@ impl BatchedModel {
             )?;
         }
         self.k.sync()?;
+        Ok(())
+    }
+
+    /// Returns one slot's GDN recurrent + conv state to the pos-0 state
+    /// (S = 0, empty conv window) — the admission contract for GDN models.
+    ///
+    /// The recurrence reads the per-slot state unconditionally at every
+    /// step, so a slot retired from a finished sequence MUST be cleared
+    /// before a new sequence runs on it, or the new sequence inherits the
+    /// retired one's context (KV caches are lens-masked and need no clear;
+    /// GDN state is not). ~vh·hd²+conv floats per layer per slot (~3MB on
+    /// the 27B) — dwarfed by one prompt-forward. No-op on non-GDN models.
+    pub fn clear_gdn_slot(&mut self, slot: usize) -> Result<(), Error> {
+        if self.gdn_state.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(slot < self.batch, "slot out of batch range");
+        let c = self.cfg;
+        let state_bytes = c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim * 4;
+        let conv_dim = 2 * c.gdn_key_dim() + c.gdn_value_dim();
+        let conv_bytes = conv_dim * (c.gdn_conv_kernel - 1) * 4;
+        for (&s, &cv) in self.gdn_state.iter().zip(&self.gdn_conv) {
+            if s.is_null() {
+                continue; // full-attn layer: no GDN buffers
+            }
+            unsafe {
+                hip::check(
+                    self.k.hip(),
+                    (self.k.hip().api.hip_memset)(
+                        s.add(slot * (state_bytes / 4)) as *mut _,
+                        0,
+                        state_bytes,
+                    ),
+                )?;
+                hip::check(
+                    self.k.hip(),
+                    (self.k.hip().api.hip_memset)(
+                        cv.add(slot * (conv_bytes / 4)) as *mut _,
+                        0,
+                        conv_bytes,
+                    ),
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -4048,6 +4109,16 @@ impl BatchedModel {
     #[must_use]
     pub const fn max_seq_len(&self) -> usize {
         self.cfg.max_seq_len
+    }
+
+    /// Whether this model carries GDN (hybrid linear-attention) layers.
+    /// Such models apply the per-slot recurrent state exactly once per step
+    /// row, so callers must keep one row per slot: sequential prefill (one
+    /// prompt token per step) instead of token-major packing (the chunked
+    /// prefill scan is #112 Stage B).
+    #[must_use]
+    pub fn is_gdn(&self) -> bool {
+        self.cfg.gdn_enabled()
     }
 
     #[allow(clippy::too_many_arguments)]

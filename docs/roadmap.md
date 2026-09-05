@@ -1533,3 +1533,41 @@
     逐层对拍(复用 #107 的 ds_layer_dump/np_ref.py 模板);性能遗留:
     GEMV_Q4 大 m 仍走 warp-per-row(对比 hipBLAS 的取舍待测),GDN_STEP
     LDS tiling 未做。
+
+- **Qwen3.8-27B Stage A 收尾(二):真实 checkpoint 上机(#112,2026-09-06)**
+  - **加载链全通**:18 分片 BF16 → Q4 量化加载 → dense Q4-on-device 上传
+    → 60 内核编译 → 服务监听。预检估算 18.94GiB vs 空闲 23.84GiB(含
+    GDN 状态项)。启动参数:`MACH_Q4=1 MACH_Q4_DEVICE=2
+    MACH_CAPACITY=8 MACH_MAX_SEQ=4096`。
+  - **真 bug 一:GDN 与 token-major chunked prefill 互斥**——continuous
+    组步把一个长 T 的 prompt 排成 T 行同 slot(MLA 无害),GDN 每行
+    应用一次递归状态,守卫正确拒绝(真实 27B 首请求即 engine panic)。
+    修复:GDN 模型 prefill 退化为每步每 slot 一 token 的顺序递归(与
+    e2e 对拍 RefModel 的逐步语义一致);chunked prefill scan 留给
+    Stage B。非 GDN 路径不变。
+  - **真 bug 二:slot 复用泄漏 GDN 递归状态**——KV 有 len 掩码,陈旧行
+    永不被读,slot 复用从不清设备状态;GDN 状态每步无条件读,顺序请求
+    下后一请求继承前一请求的上下文(实测:算术题的答案渗进下一个
+    "介绍上海"请求,贪心重跑结果不同=确定性证明)。修复:`add()`
+    里 `clear_gdn_slot(slot)`(每层 memset 该 slot 的 state+conv
+    切片,~3MB/层,远小于一次 prefill);`reset_state` 同补 GDN
+    清理。
+  - **真 bug 三:reset_state 的 GDN state_bytes 用旧公式** kd×vd 而分配
+    已改 vh×hd²——27B 上 memset 会从每层 25MB 缓冲写出 2.1GB 砸穿相邻
+    显存分配。修正为与分配一致。
+  - **顺带:GDN 状态只为 GDN 层分配**(全注意力层填 null,消费者全部
+    has_gdn 门控),27B 回收 16×25MB=400MB,与 estimate_vram 口径一致;
+    model.rs(单序列)同修。
+  - **测试**:`continuous_prefill_sequential_matches_ref_f32`
+    (双序列交错 prefill/decode,顺序链对拍 RefModel);
+    `gdn_slot_reuse_clears_recurrent_state`(复用槽生成必须与
+    全新引擎逐 token 相同,禁用清理即失败——已验证钉得住)。
+  - **验收(真实 27B,Q4 全量)**:身份(通义千问自述)✓、回文函数
+    (干净 Python)✓、一句话介绍上海 ✓、算术(加长 max_tokens 后)✓;
+    贪心确定性跨请求复用成立。生成速度 ~4-5 tok/s(batch 1 顺序
+    prefill 的量级,Stage B chunked scan + GEMV_Q4 大 m 优化是主要
+    提升空间)。
+  - **遗留**:numpy 逐层对拍(小模型 e2e 已钉住内核/图数值,真实权重
+    映射由加载器 expect 硬失败+连贯性验收覆盖,深度对拍可并入 Stage B
+    的数值 oracle);GEMV_Q4 大 m warp-per-row vs hipBLAS 待 A/B;
+    GDN_STEP LDS tiling;fused Q4-QKV GEMV。

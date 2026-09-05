@@ -396,6 +396,16 @@ impl ContinuousModel {
         capacity: usize,
         state_reuse: StateReuse,
     ) -> Result<Self, Error> {
+        // Anchors carry KV only; GDN layers would restore prefix KV over a
+        // zeroed recurrent state (silently wrong). Loud reject until anchors
+        // snapshot the GDN state too.
+        if cfg.gdn_enabled() {
+            return Err(Error::InvalidArgument(
+                "state reuse does not support GDN models yet (anchors carry KV \
+                 only; the recurrent state is not snapshotted)"
+                    .into(),
+            ));
+        }
         let mut m = Self::with_prefill_rows(hip, cfg, w, capacity, capacity)?;
         m.state_reuse = Some(state_reuse);
         Ok(m)
@@ -625,6 +635,14 @@ impl ContinuousModel {
         let id = self.next_id;
         self.next_id += 1;
         let slot = self.active;
+        // GDN admission contract: the recurrent state is read
+        // unconditionally at every step, so a reused slot must return to
+        // the pos-0 state or the new sequence inherits the retired one's
+        // context (observed on the real 27B: an arithmetic answer bleeding
+        // into the next request). KV is lens-masked and needs no clear.
+        // Runs before the state-reuse restore below — an anchor restore
+        // overwrites the cleared state with its own.
+        self.model.clear_gdn_slot(slot)?;
         // State reuse: restore the longest matching prefix anchor and prefill
         // only the delta (incremental prefill).
         let mut len = 0usize;
@@ -761,7 +779,21 @@ impl ContinuousModel {
                 continue;
             }
             if !s.prompt.is_empty() {
-                let take = s.prompt.len().min(budget);
+                // GDN (hybrid linear-attention) models apply the per-slot
+                // recurrent state exactly once per row, so the token-major
+                // packing (one row per prompt token) is rejected by
+                // `decode_step_explicit` — two rows on one slot would
+                // double-apply the delta rule. Sequential prefill (one prompt
+                // token per step per slot) is the exact recurrence the e2e
+                // tests verify against RefModel; the chunked prefill scan is
+                // #112 Stage B. Prompt cost becomes one decode-latency step
+                // per token, with all prefilling slots advancing in parallel
+                // (the row budget still bounds rows per step).
+                let take = if self.model.is_gdn() {
+                    1 // budget >= 1 (checked above)
+                } else {
+                    s.prompt.len().min(budget)
+                };
                 for j in 0..take {
                     tokens.push(s.prompt[j]);
                     lens.push((s.len + j) as u32);
