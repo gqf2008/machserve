@@ -113,6 +113,9 @@ fn main() {
             n_heads as i32,
             n_kv as i32,
             hd as i32,
+            // Full-head rotation (rot_dim == head_dim reproduces the classic
+            // whole-head RoPE; Qwen3.5 passes 0.25 * head_dim here).
+            hd as i32,
             RopeParams {
                 theta: 1_000_000.0,
                 yarn: 0,
