@@ -658,7 +658,9 @@ impl GpuModel {
             self.gdn_a = self.dalloc(c.gdn_v_heads * 4)?;
             self.gdn_b = self.dalloc(c.gdn_v_heads * 4)?;
             self.gdn_o = self.dalloc(vd * 4)?;
-            let zeros = vec![0.0f32; c.gdn_v_heads * kd * vd];
+            // Per-head recurrent state is [hd, hd] (GDN_STEP's layout
+            // `[vh, hd, hd]`) — NOT kd×vd, see the batched.rs twin.
+            let zeros = vec![0.0f32; c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim];
             let conv_zeros = vec![0.0f32; conv_dim * keep];
             for _ in 0..c.n_layers {
                 let s = self.dalloc(zeros.len() * 4)?;

@@ -1839,7 +1839,7 @@ extern "C" __global__ void attn_prefill_f16(
 "#;
 
 /// fp16 embedding gather -> f32 activations (matches `crate::fp16::f16_to_f32`).
-const EMBED_GATHER_F16: &str = r#" 
+const EMBED_GATHER_F16: &str = r#"
 __device__ inline float f16_to_f32(unsigned short h) {
     union { _Float16 h; unsigned short u; } c;
     c.u = h;
@@ -1851,6 +1851,100 @@ extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short
     int s = blockIdx.y;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < cols) x[(long long)s * cols + i] = f16_to_f32(emb[(long long)tok[s] * cols + i]);
+}
+"#;
+
+/// Q4-on-device GEMV: dense projections kept as raw packed int4 + per-group
+/// f32 scales, dequantized in-kernel — the memory path for DENSE 27B-class
+/// checkpoints (Qwen3.8-27B: all-Q4 ~13.5GB fits VRAM, dequantized f16
+/// ~54GB does not). Layout: `wq` [n, ceil(d/2)] nibbles (LOW nibble first,
+/// matching `Q4Tensor`), `ws` FLAT per-group scales over the whole tensor
+/// (group = 32 elements of the flat index — a row whose length is not a
+/// multiple of 32 starts mid-group, so scale indices come from the flat
+/// element index, never a per-row restart). Warp-per-(row, batch) like
+/// GEMV_F16; each lane loads u32 = 8 consecutive elements, and an 8-aligned
+/// flat span can never straddle a 32-element group (8 | 32), so ONE scale
+/// serves the whole u32. When `d*4 > 48KB` the x staging is skipped and x
+/// is read straight from global/L2 — the 27B dense down-proj contracts
+/// over 17408, over the shared limit that forces GEMV_F16 onto hipBLAS.
+/// Odd `d` (test configs) takes a portable byte path; rows of a
+/// `d % 8 != 0` tensor are not u32-aligned.
+const GEMV_Q4: &str = r#"
+extern "C" __global__ void gemv_q4(
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ wq,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    int n, int d, int batch) {
+    const int b = blockIdx.y;
+    const float* xb = x + (long long)b * d;
+    extern __shared__ float sx[];
+    if ((long long)d * 4 <= 48 * 1024) {
+        for (int j = threadIdx.x; j < d; j += blockDim.x) sx[j] = xb[j];
+        __syncthreads();
+        xb = sx;
+    }
+    const int warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (warp >= n) return;
+    const long long base = (long long)warp * d;   // flat element base of the row
+    const unsigned char* wrow = wq + base / 2;
+    float acc = 0.f;
+    if (d % 8 == 0) {
+        const int nq = d / 8;
+        for (int j4 = lane; j4 < nq; j4 += 32) {
+            unsigned int w8 = *(const unsigned int*)(wrow + 4 * (long long)j4);
+            const float s = ws[(base + 8 * j4) >> 5];
+            float p = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 4; t++) {
+                const unsigned int byte = (w8 >> (8 * t)) & 0xFFu;
+                int lo = (int)(byte & 0xFu);
+                int hi = (int)((byte >> 4) & 0xFu);
+                lo = lo < 8 ? lo : lo - 16;
+                hi = hi < 8 ? hi : hi - 16;
+                p += (float)lo * xb[8 * j4 + 2 * t]
+                   + (float)hi * xb[8 * j4 + 2 * t + 1];
+            }
+            acc += p * s;
+        }
+    } else {
+        const int nb = ((d + 1) / 2);
+        for (int j = lane; j < nb; j += 32) {
+            const unsigned int byte = wrow[j];
+            int lo = (int)(byte & 0xFu);
+            int hi = (int)((byte >> 4) & 0xFu);
+            lo = lo < 8 ? lo : lo - 16;
+            hi = hi < 8 ? hi : hi - 16;
+            const float s = ws[(base + 2 * j) >> 5];
+            float p = (float)lo * xb[2 * j];
+            if (2 * j + 1 < d) p += (float)hi * xb[2 * j + 1];
+            acc += p * s;
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
+    if (lane == 0) out[(long long)b * n + warp] = acc;
+}
+"#;
+
+/// Q4 embedding gather: token rows of a Q4-on-device embedding table,
+/// dequantized (nibble * group scale) straight to f32 activations. Scales
+/// are FLAT over the tensor (see [`GEMV_Q4`]) — the group index comes from
+/// the flat element offset `tok * cols + i`, not a per-row restart.
+const EMBED_GATHER_Q4: &str = r#"
+extern "C" __global__ void embed_gather_q4(const int* tok,
+                                           const unsigned char* eq,
+                                           const float* es,
+                                           float* x, int cols, int batch) {
+    const int s = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const long long base = (long long)tok[s] * cols;
+    const unsigned char* qrow = eq + base / 2;
+    const unsigned int byte = qrow[i >> 1];
+    int nib = (i & 1) == 0 ? (int)(byte & 0xFu) : (int)((byte >> 4) & 0xFu);
+    nib = nib < 8 ? nib : nib - 16;
+    x[(long long)s * cols + i] = (float)nib * es[(base + i) >> 5];
 }
 "#;
 
@@ -2602,7 +2696,9 @@ pub struct HipKernels {
     cast_f16_f32: HipKernelModule,
     gemv_f16: HipKernelModule,
     gemv_f16_qkv: HipKernelModule,
+    gemv_q4: HipKernelModule,
     embed_f16: HipKernelModule,
+    embed_gather_q4: HipKernelModule,
     kv_store_f16: HipKernelModule,
     attn_f16_gqa: HipKernelModule,
     attn_prefill_f16: HipKernelModule,
@@ -2754,7 +2850,9 @@ impl HipKernels {
             cast_f16_f32: compile_cached(&arch, CAST_F16_F32, "cast_f16_f32")?,
             gemv_f16: compile_cached(&arch, GEMV_F16, "gemv_f16")?,
             gemv_f16_qkv: compile_cached(&arch, GEMV_F16_QKV, "gemv_f16_qkv")?,
+            gemv_q4: compile_cached(&arch, GEMV_Q4, "gemv_q4")?,
             embed_f16: compile_cached(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
+            embed_gather_q4: compile_cached(&arch, EMBED_GATHER_Q4, "embed_gather_q4")?,
             kv_store_f16: compile_cached(&arch, KV_F16, "kv_store_batched_f16")?,
             attn_f16_gqa: compile_cached(
                 &arch,
@@ -3935,6 +4033,88 @@ impl HipKernels {
             .launch([blocks, batch as u32, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    /// Q4-on-device GEMV (see the [`GEMV_Q4`] contract): `wq`/`ws` are the
+    /// packed nibbles and per-group scales of an `[n, d]` weight kept raw on
+    /// device. `d % 8 != 0` takes the kernel's portable byte path; `d*4`
+    /// over 48 KB skips the x staging (kernel reads x from global/L2) so the
+    /// shared limit that GEMV_F16 asserts against does not apply here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gemv_q4(
+        &self,
+        x: *const f32,
+        wq: *const u8,
+        ws: *const f32,
+        out: *mut f32,
+        n: i32,
+        d: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        let xp = x;
+        let wqp = wq;
+        let wsp = ws;
+        let op = out;
+        let ni = n;
+        let di = d;
+        let bi = batch;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &wqp as *const *const u8 as *mut core::ffi::c_void,
+            &wsp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &ni as *const i32 as *mut core::ffi::c_void,
+            &di as *const i32 as *mut core::ffi::c_void,
+            &bi as *const i32 as *mut core::ffi::c_void,
+        ];
+        let warps_per_block = 256 / 32;
+        let blocks = (n as u32).div_ceil(warps_per_block);
+        let shmem = if (d as u64) * 4 <= 48 * 1024 {
+            (d as u32) * 4
+        } else {
+            0
+        };
+        Ok(self.gemv_q4.launch_shmem(
+            [blocks, batch as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shmem,
+        )?)
+    }
+
+    /// Q4 embedding gather (see the [`EMBED_GATHER_Q4`] contract): token rows
+    /// of a Q4-on-device embedding table, dequantized straight to f32.
+    pub fn launch_embed_gather_q4(
+        &self,
+        tok: *const i32,
+        eq: *const u8,
+        es: *const f32,
+        x: *mut f32,
+        cols: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        let tp = tok;
+        let eqp = eq;
+        let esp = es;
+        let xp = x;
+        let cp = cols;
+        let bp = batch;
+        let mut p = vec![
+            &tp as *const *const i32 as *mut core::ffi::c_void,
+            &eqp as *const *const u8 as *mut core::ffi::c_void,
+            &esp as *const *const f32 as *mut core::ffi::c_void,
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &cp as *const i32 as *mut core::ffi::c_void,
+            &bp as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (cols as u32).div_ceil(256);
+        Ok(self.embed_gather_q4.launch(
+            [blocks, batch as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
     /// fp16 GEMM for m = 1: `out[1, n] = x[1, k] @ w16^T`. Hidden layers output
     /// fp16 (`yh` scratch) then cast to f32: rocBLAS fp16 C is far faster than
     /// fp32 C for the tall-skinny shapes. `xh`/`yh` are fp16 scratch of `k`/`n`.
@@ -5079,6 +5259,8 @@ mod offline_tests {
         ATTN_DECODE_BATCHED_F16_GQA,
         ATTN_PREFILL_F16,
         EMBED_GATHER_F16,
+        GEMV_Q4,
+        EMBED_GATHER_Q4,
         MOE_ROUTER,
         MOE_GATHER_WEIGHTS,
         MOE_ACCUMULATE,
@@ -5112,7 +5294,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            58,
+            60,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
@@ -6784,6 +6966,194 @@ mod gpu_tests {
             dq, dkc, dvc, dkrow, dk_pool, dv_pool, dout_c, dout_p, dpos, dslots, dtables, doffs,
             dstore_c,
         ] {
+            hip::free(&h, p).unwrap();
+        }
+    }
+
+    /// `gemv_q4` vs the CPU dequantized dot: multiple shapes covering both
+    /// kernel paths — u32 loads with x staged in shared (d % 8 == 0, d*4 <=
+    /// 48 KB), the portable byte path (d % 8 != 0, odd nibble tail), u32
+    /// loads with x read straight from global (d*4 > 48 KB — the 27B dense
+    /// down-proj shape class, d=16384), and a batch > 1 (blockIdx.y rows).
+    #[test]
+    fn gemv_q4_matches_dequantized_cpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let mut rng = lcg(71);
+
+        // (n, d, batch): staged-u32 / byte-path-odd-tail / global-x /
+        // multi-row staged.
+        for (n, d, batch) in [
+            (33usize, 64usize, 1usize),
+            (17, 12, 2),
+            (21, 16_384, 1),
+            (24, 96, 3),
+        ] {
+            let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
+            let w: Vec<f32> = (0..n * d).map(|_| rng()).collect();
+            let wq4 = crate::q4::Q4Tensor::quantize(&w);
+            let wdeq = wq4.dequantize();
+
+            let dx = hip::malloc(&h, bytes(x.len())).unwrap();
+            let dwq = hip::malloc(&h, wq4.q_bytes().len()).unwrap();
+            let dws = hip::malloc(&h, bytes(wq4.scales().len())).unwrap();
+            let dout = hip::malloc(&h, bytes(n * batch)).unwrap();
+            hip::memcpy(
+                &h,
+                dx,
+                x.as_ptr() as *const std::ffi::c_void,
+                bytes(x.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dwq,
+                wq4.q_bytes().as_ptr() as *const std::ffi::c_void,
+                wq4.q_bytes().len(),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dws,
+                wq4.scales().as_ptr() as *const std::ffi::c_void,
+                bytes(wq4.scales().len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            k.launch_gemv_q4(
+                dx as *const f32,
+                dwq as *const u8,
+                dws as *const f32,
+                dout as *mut f32,
+                n as i32,
+                d as i32,
+                batch as i32,
+            )
+            .unwrap();
+            k.sync().unwrap();
+            let mut got = vec![0f32; batch * n];
+            hip::memcpy(
+                &h,
+                got.as_mut_ptr() as *mut std::ffi::c_void,
+                dout,
+                bytes(got.len()),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+            // CPU reference: f32 dot on the SAME dequantized values the
+            // kernel computes — bit-identical source, so only reduction
+            // order differs (tight bound).
+            for b in 0..batch {
+                for row in 0..n {
+                    let mut acc = 0f32;
+                    for i in 0..d {
+                        acc += x[b * d + i] * wdeq[row * d + i];
+                    }
+                    let g = got[b * n + row];
+                    let want_scale = acc.abs().max(1.0);
+                    assert!(
+                        (g - acc).abs() <= 1e-3 * want_scale,
+                        "gemv_q4 (n={n}, d={d}, batch={batch}) row {row}: got {g}, want {acc}"
+                    );
+                }
+            }
+            for p in [dx, dwq, dws, dout] {
+                hip::free(&h, p).unwrap();
+            }
+        }
+    }
+
+    /// `embed_gather_q4` vs the CPU dequantized row gather (batch of token
+    /// ids, duplicate ids included to pin the read-only row reuse).
+    #[test]
+    fn embed_gather_q4_matches_dequantized_cpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let mut rng = lcg(73);
+        let vocab = 29usize;
+        let cols = 76usize; // odd per-row nibble tail: 76 -> 38 bytes
+        let batch = 4usize;
+        let table: Vec<f32> = (0..vocab * cols).map(|_| rng()).collect();
+        let eq4 = crate::q4::Q4Tensor::quantize(&table);
+        let deq = eq4.dequantize();
+        let toks = [3i32, 3, 28, 0]; // duplicate + first + last rows
+
+        let dtok = hip::malloc(&h, toks.len() * 4).unwrap();
+        let deq_ = hip::malloc(&h, eq4.q_bytes().len()).unwrap();
+        let des = hip::malloc(&h, bytes(eq4.scales().len())).unwrap();
+        let dx = hip::malloc(&h, bytes(batch * cols)).unwrap();
+        hip::memcpy(
+            &h,
+            dtok,
+            toks.as_ptr() as *const std::ffi::c_void,
+            toks.len() * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            deq_,
+            eq4.q_bytes().as_ptr() as *const std::ffi::c_void,
+            eq4.q_bytes().len(),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            des,
+            eq4.scales().as_ptr() as *const std::ffi::c_void,
+            bytes(eq4.scales().len()),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        k.launch_embed_gather_q4(
+            dtok as *const i32,
+            deq_ as *const u8,
+            des as *const f32,
+            dx as *mut f32,
+            cols as i32,
+            batch as i32,
+        )
+        .unwrap();
+        k.sync().unwrap();
+        let mut got = vec![0f32; batch * cols];
+        hip::memcpy(
+            &h,
+            got.as_mut_ptr() as *mut std::ffi::c_void,
+            dx,
+            bytes(got.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        for (b, &t) in toks.iter().enumerate() {
+            for i in 0..cols {
+                let want = deq[t as usize * cols + i];
+                assert_eq!(
+                    got[b * cols + i],
+                    want,
+                    "embed_gather_q4 row {t} col {i}: dequantized nibble * group scale must be bit-exact"
+                );
+            }
+        }
+        for p in [dtok, deq_, des, dx] {
             hip::free(&h, p).unwrap();
         }
     }

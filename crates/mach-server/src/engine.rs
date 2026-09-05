@@ -373,6 +373,46 @@ impl ServerEngine {
             .expect("spawn engine thread"))
     }
 
+    /// Spawns a dense Q4-on-device engine (`MACH_Q4_DEVICE=2`): the expert
+    /// pool AND every big dense GEMM tensor stay raw Q4 on device
+    /// (in-kernel dequant) — the memory path for DENSE 27B-class checkpoints
+    /// whose dequantized f16 weights would not fit in VRAM.
+    pub fn spawn_q4_all(
+        self: Arc<Self>,
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: WeightsQ4,
+    ) -> Result<std::thread::JoinHandle<()>, EngineError> {
+        if self.offload_slots.is_some() {
+            return Err(EngineError::InvalidRequest(
+                "Q4 mode does not support MACH_MOE_SLOTS (cpu-backend offload needs f32 Weights)"
+                    .into(),
+            ));
+        }
+        let mut model = if let Some(tpp) = self.paged_tpp {
+            ContinuousModel::with_paged_prefill_rows_q4_all(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+                tpp,
+            )?
+        } else {
+            ContinuousModel::with_prefill_rows_q4_all(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
+            )?
+        };
+        Ok(std::thread::Builder::new()
+            .name("mach-engine".into())
+            .spawn(move || self.run(&mut model))
+            .expect("spawn engine thread"))
+    }
+
     /// Spawns a storage-FP8 engine thread: weights are dequantized to f16 per
     /// tensor during upload, so host RAM stays ~= the packed FP8 weights.
     /// Experts stay fully GPU-resident (the cpu-backend offload path needs f32

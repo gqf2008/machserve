@@ -319,6 +319,26 @@ impl ContinuousModel {
         ))
     }
 
+    /// Dense Q4-on-device variant (`MACH_Q4_DEVICE=2`): every big dense
+    /// tensor AND the expert pool stay raw Q4 on device — the memory path
+    /// for DENSE 27B-class checkpoints (see `BatchedModel::with_rows_q4_all`).
+    pub fn with_prefill_rows_q4_all(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+    ) -> Result<Self, Error> {
+        let model =
+            BatchedModel::with_rows_q4_all(hip, cfg, w, capacity, prefill_rows.max(capacity))?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
+    }
+
     /// Builds a continuous-batching engine from storage-FP8 weights: each GEMM
     /// tensor is dequantized to f16 during upload, so host RAM stays ~= the
     /// packed FP8 weights (experts stay fully GPU-resident).
@@ -453,6 +473,32 @@ impl ContinuousModel {
         tokens_per_page: usize,
     ) -> Result<Self, Error> {
         let model = BatchedModel::with_paged_kv_rows_q4_device(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        ))
+    }
+
+    /// Paged dense Q4-on-device variant (`MACH_Q4_DEVICE=2`; see
+    /// `BatchedModel::with_rows_q4_all`).
+    pub fn with_paged_prefill_rows_q4_all(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_q4_all(
             hip,
             cfg,
             w,
