@@ -698,6 +698,171 @@ extern "C" __global__ void gdn_gated_norm(
 }
 "#;
 
+/// Gated-DeltaNet chunked prefill, conv stage (`#112` Stage B): the depthwise
+/// causal conv + silu over `c` tokens of ONE slot's fused qkv stream, plus
+/// the conv-window shift. One thread per channel runs the tokens serially
+/// with a register window seeded from the persistent conv state (layout
+/// `[slots, conv_dim, keep]`, the newest tap last) — channels are fully
+/// parallel; the per-token taps are the SAME dots the sequential
+/// `gdn_conv_update` computes, so values are bit-compatible.
+const GDN_CONV_CHUNK: &str = r#"
+extern "C" __global__ void gdn_conv_chunk(
+    const float* __restrict__ pre,   // [c, conv_dim] raw projections
+    float* __restrict__ st,          // [slots, conv_dim, keep] in/out window
+    float* __restrict__ qkv,         // [c, conv_dim] silu(conv) out
+    const float* __restrict__ w,     // [conv_dim, keep+1] taps (newest last)
+    int slot, int c, int conv_dim, int keep) {
+    for (int ch = blockIdx.x * blockDim.x + threadIdx.x; ch < conv_dim;
+         ch += gridDim.x * blockDim.x) {
+        const float* wc = w + (long long)ch * (keep + 1);
+        float* sw = st + ((long long)slot * conv_dim + ch) * keep;
+        float win[8];  // register window; keep <= 8 enforced by the launcher
+        for (int j = 0; j < keep; j++) win[j] = sw[j];
+        for (int t = 0; t < c; t++) {
+            float s = 0.0f;
+            for (int j = 0; j < keep; j++) s += win[j] * wc[j];
+            float x = pre[(long long)t * conv_dim + ch];
+            s += x * wc[keep];
+            qkv[(long long)t * conv_dim + ch] = s / (1.0f + __expf(-s));
+            for (int j = 0; j + 1 < keep; j++) win[j] = win[j + 1];
+            win[keep - 1] = x;
+        }
+        for (int j = 0; j < keep; j++) sw[j] = win[j];
+    }
+}
+"#;
+
+/// Gated-DeltaNet chunked prefill, recurrence stage (`#112` Stage B): the
+/// WY-form chunked delta rule of `gdn_step`, `c` tokens of ONE slot in one
+/// launch. One block per v-head; shared memory (sized by the launcher):
+///   K/Q/V/U [c,hd] · K0/Q0 [c,hd] · A/B [c,c] · lpi/beta [c]
+/// Phases: load+gates -> K0/Q0 (S0 streamed from global) -> A (k·kᵀ) and B
+/// (k·qᵀ) -> W -> forward substitution (I+A)⁻¹ in place on W/U -> S update
+/// -> outputs. Matches the CPU oracle `ref_model::gdn_core_chunk` (which
+/// pins the math against the sequential recurrence): the query-side beta_t
+/// folds into A's row; o reads the own-write-inclusive state.
+const GDN_CHUNK: &str = r#"
+extern "C" __global__ void gdn_chunk(
+    const float* __restrict__ qkv,     // [c, conv_dim] normed q|k, v
+    float* __restrict__ state,         // [slots, vh, hd, hd]
+    float* __restrict__ o,             // [c, vd] out (pre gated-norm)
+    const float* __restrict__ a_log,   // [vh]
+    const float* __restrict__ dt_bias, // [vh]
+    const float* __restrict__ a_in,    // [c, vh]
+    const float* __restrict__ b_in,    // [c, vh]
+    int slot, int c, int vh, int kh, int hd, int conv_dim) {
+    extern __shared__ float sm[];
+    float* K = sm;                    // [c, hd]
+    float* Q = K + c * hd;            // [c, hd]
+    float* V = Q + c * hd;            // [c, hd]
+    float* U = V + c * hd;            // [c, hd] (W, then substituted u in place)
+    float* K0 = U + c * hd;           // [c, hd] Pi_t * S0^T k_t
+    float* Q0 = K0 + c * hd;          // [c, hd] Pi_t * S0^T q_t
+    float* A = Q0 + c * hd;           // [c, c] strictly lower
+    float* B = A + c * c;             // [c, c] causal inclusive
+    float* lpi = B + c * c;           // [c] cumsum log decay
+    float* beta = lpi + c;            // [c]
+    int i = blockIdx.x;               // v-head
+    int kd = kh * hd;
+    int rep = vh / kh;
+    int kh_off = (i / rep) * hd;
+    float* S = state + ((long long)slot * vh + i) * hd * hd;
+
+    // Load K/Q/V rows and the per-token gates.
+    for (int idx = threadIdx.x; idx < c * hd; idx += blockDim.x) {
+        int t = idx / hd, j = idx % hd;
+        K[idx] = qkv[(long long)t * conv_dim + kd + kh_off + j];
+        Q[idx] = qkv[(long long)t * conv_dim + kh_off + j];
+        V[idx] = qkv[(long long)t * conv_dim + 2 * kd + i * hd + j];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float acc = 0.0f;
+        for (int t = 0; t < c; t++) {
+            float sp = a_in[(long long)t * vh + i] + dt_bias[i];
+            float softplus = (sp > 20.0f) ? sp : __logf(1.0f + __expf(sp));
+            acc += -__expf(a_log[i]) * softplus;
+            lpi[t] = acc;
+            beta[t] = 1.0f / (1.0f + __expf(-b_in[(long long)t * vh + i]));
+        }
+    }
+    __syncthreads();
+
+    // K0/Q0: Pi_t * (S0^T k_t) and Pi_t * (S0^T q_t), S0 streamed from
+    // global (each element read once; the [hd,hd] block exceeds LDS at
+    // real head dims).
+    for (int idx = threadIdx.x; idx < c * hd; idx += blockDim.x) {
+        int t = idx / hd, m = idx % hd;
+        float sk = 0.0f, sq = 0.0f;
+        for (int kk = 0; kk < hd; kk++) {
+            float s0 = S[kk * hd + m];
+            sk += K[t * hd + kk] * s0;
+            sq += Q[t * hd + kk] * s0;
+        }
+        float pi_t = __expf(lpi[t]);
+        K0[idx] = pi_t * sk;
+        Q0[idx] = pi_t * sq;
+    }
+    __syncthreads();
+
+    // A[t,s] = beta_t (Pi_t/Pi_s)(k_s.k_t), s<t;  B[t,s] = (Pi_t/Pi_s)(k_s.q_t), s<=t.
+    for (int idx = threadIdx.x; idx < c * c; idx += blockDim.x) {
+        int t = idx / c, s = idx % c;
+        if (s <= t) {
+            float dot_b = 0.0f, dot_a = 0.0f;
+            for (int kk = 0; kk < hd; kk++) {
+                float ks = K[s * hd + kk];
+                dot_b += ks * Q[t * hd + kk];
+                if (s < t) dot_a += ks * K[t * hd + kk];
+            }
+            float r = __expf(lpi[t] - lpi[s]);
+            A[idx] = (s < t) ? beta[t] * r * dot_a : 0.0f;
+            B[idx] = r * dot_b;
+        } else {
+            A[idx] = 0.0f;
+            B[idx] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // W[t] = beta_t (v_t - K0[t]) in place into U, then forward
+    // substitution: u_t = W_t - sum_{s<t} A[t,s] u_s (row t overwrites W
+    // after it is consumed).
+    for (int idx = threadIdx.x; idx < c * hd; idx += blockDim.x)
+        U[idx] = beta[idx / hd] * (V[idx] - K0[idx]);
+    __syncthreads();
+    for (int t = 0; t < c; t++) {
+        for (int m = threadIdx.x; m < hd; m += blockDim.x) {
+            float acc = U[t * hd + m];
+            for (int s = 0; s < t; s++) acc -= A[t * c + s] * U[s * hd + m];
+            U[t * hd + m] = acc;
+        }
+        __syncthreads();
+    }
+
+    // S <- Pi_C S0 + sum_s (Pi_C/Pi_s) k_s (x) u_s.
+    {
+        float pc = lpi[c - 1];
+        for (int idx = threadIdx.x; idx < hd * hd; idx += blockDim.x) {
+            int kk = idx / hd, m = idx % hd;
+            float acc = __expf(pc) * S[idx];
+            for (int s = 0; s < c; s++)
+                acc += __expf(pc - lpi[s]) * K[s * hd + kk] * U[s * hd + m];
+            S[idx] = acc;
+        }
+    }
+    __syncthreads();
+
+    // o_t = Q0[t] + sum_{s<=t} B[t,s] u_s  (Q0 already carries Pi_t).
+    for (int idx = threadIdx.x; idx < c * hd; idx += blockDim.x) {
+        int t = idx / hd, m = idx % hd;
+        float acc = Q0[idx];
+        for (int s = 0; s <= t; s++) acc += B[t * c + s] * U[s * hd + m];
+        o[(long long)t * (vh * hd) + (long long)i * hd + m] = acc;
+    }
+}
+"#;
+
 /// Batched KV store: each sequence writes its k/v row at its own position.
 const KV_STORE_BATCHED: &str = r#"
 extern "C" __global__ void kv_store_batched(const float* kv, float* cache,
@@ -2683,6 +2848,8 @@ pub struct HipKernels {
     gdn_l2norm_qk: HipKernelModule,
     gdn_step: HipKernelModule,
     gdn_gated_norm: HipKernelModule,
+    gdn_conv_chunk: HipKernelModule,
+    gdn_chunk: HipKernelModule,
     kv_store_batched: HipKernelModule,
     attn_decode_batched: HipKernelModule,
     kv_store_paged: HipKernelModule,
@@ -2829,6 +2996,8 @@ impl HipKernels {
             gdn_l2norm_qk: compile_cached(&arch, GDN_L2NORM_QK, "gdn_l2norm_qk")?,
             gdn_step: compile_cached(&arch, GDN_STEP, "gdn_step")?,
             gdn_gated_norm: compile_cached(&arch, GDN_GATED_NORM, "gdn_gated_norm")?,
+            gdn_conv_chunk: compile_cached(&arch, GDN_CONV_CHUNK, "gdn_conv_chunk")?,
+            gdn_chunk: compile_cached(&arch, GDN_CHUNK, "gdn_chunk")?,
             kv_store_batched: compile_cached(&arch, KV_STORE_BATCHED, "kv_store_batched")?,
             attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
             kv_store_paged: compile_cached(&arch, KV_STORE_PAGED, "kv_store_paged")?,
@@ -3624,6 +3793,90 @@ impl HipKernels {
         let shared = (256 / 32) * 4;
         Ok(self.gdn_gated_norm.launch_shmem(
             [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
+    /// GDN chunked prefill, conv stage (`#112` Stage B): `c` tokens of one
+    /// slot's fused qkv stream through the depthwise causal conv + silu,
+    /// shifting the persistent window. `keep` must be <= 8 (register window).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gdn_conv_chunk(
+        &self,
+        pre: *const f32,
+        st: *mut f32,
+        qkv: *mut f32,
+        w: *const f32,
+        slot: i32,
+        c: i32,
+        conv_dim: i32,
+        keep: i32,
+    ) -> Result<(), Error> {
+        if keep > 8 {
+            return Err(Error::Model(format!(
+                "gdn_conv_chunk: conv kernel {keep} exceeds the register-window bound 8"
+            )));
+        }
+        let mut p = vec![
+            &pre as *const *const f32 as *mut core::ffi::c_void,
+            &st as *const *mut f32 as *mut core::ffi::c_void,
+            &qkv as *const *mut f32 as *mut core::ffi::c_void,
+            &w as *const *const f32 as *mut core::ffi::c_void,
+            &slot as *const i32 as *mut core::ffi::c_void,
+            &c as *const i32 as *mut core::ffi::c_void,
+            &conv_dim as *const i32 as *mut core::ffi::c_void,
+            &keep as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.gdn_conv_chunk.launch(
+            [((conv_dim + 255) / 256) as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
+    /// GDN chunked prefill, recurrence stage (`#112` Stage B): `c` tokens of
+    /// one slot through the WY-form chunked delta rule (one block per
+    /// v-head). Shared memory is sized from `(c, hd)`; the caller keeps it
+    /// within the launch budget (c <= 12 at hd=128 fits 48 KB).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gdn_chunk(
+        &self,
+        qkv: *const f32,
+        state: *mut f32,
+        o: *mut f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        a_in: *const f32,
+        b_in: *const f32,
+        slot: i32,
+        c: i32,
+        vh: i32,
+        kh: i32,
+        hd: i32,
+        conv_dim: i32,
+    ) -> Result<(), Error> {
+        let mut p = vec![
+            &qkv as *const *const f32 as *mut core::ffi::c_void,
+            &state as *const *mut f32 as *mut core::ffi::c_void,
+            &o as *const *mut f32 as *mut core::ffi::c_void,
+            &a_log as *const *const f32 as *mut core::ffi::c_void,
+            &dt_bias as *const *const f32 as *mut core::ffi::c_void,
+            &a_in as *const *const f32 as *mut core::ffi::c_void,
+            &b_in as *const *const f32 as *mut core::ffi::c_void,
+            &slot as *const i32 as *mut core::ffi::c_void,
+            &c as *const i32 as *mut core::ffi::c_void,
+            &vh as *const i32 as *mut core::ffi::c_void,
+            &kh as *const i32 as *mut core::ffi::c_void,
+            &hd as *const i32 as *mut core::ffi::c_void,
+            &conv_dim as *const i32 as *mut core::ffi::c_void,
+        ];
+        let shared = (6 * c * hd + 2 * c * c + 2 * c) as u32 * 4;
+        Ok(self.gdn_chunk.launch_shmem(
+            [vh as u32, 1, 1],
             [256, 1, 1],
             &mut p,
             self.stream,
@@ -5261,6 +5514,8 @@ mod offline_tests {
         EMBED_GATHER_F16,
         GEMV_Q4,
         EMBED_GATHER_Q4,
+        GDN_CONV_CHUNK,
+        GDN_CHUNK,
         MOE_ROUTER,
         MOE_GATHER_WEIGHTS,
         MOE_ACCUMULATE,
@@ -5294,7 +5549,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            60,
+            62,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
@@ -7155,6 +7410,337 @@ mod gpu_tests {
         }
         for p in [dtok, deq_, des, dx] {
             hip::free(&h, p).unwrap();
+        }
+    }
+
+    /// `gdn_conv_chunk` vs the sequential per-token taps: odd `conv_dim`, a
+    /// nonzero starting window, `keep` of the real kernel (3), a slot other
+    /// than 0 (pins slot-indexed state), and the window shift checked after
+    /// the run. Same tap order as the CPU loop, so the bound is fma-tight.
+    #[test]
+    fn gdn_conv_chunk_matches_cpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let mut rng = lcg(79);
+        let conv_dim = 37usize;
+        let ck = 4usize;
+        let keep = ck - 1;
+        let c = 5usize;
+        let slots = 2usize;
+        let slot = 1usize;
+        let pre: Vec<f32> = (0..c * conv_dim).map(|_| rng()).collect();
+        let st: Vec<f32> = (0..slots * conv_dim * keep).map(|_| rng()).collect();
+        let w: Vec<f32> = (0..conv_dim * ck).map(|_| rng()).collect();
+
+        // CPU: per-channel register window, identical tap order.
+        let mut qkv = vec![0.0f32; c * conv_dim];
+        let mut st_want = st.clone();
+        for ch in 0..conv_dim {
+            let wc = &w[ch * ck..ch * ck + ck];
+            let sw = &mut st_want[(slot * conv_dim + ch) * keep..][..keep];
+            let mut win = [0.0f32; 8];
+            win[..keep].copy_from_slice(sw);
+            for t in 0..c {
+                let mut s = 0.0f32;
+                for j in 0..keep {
+                    s += win[j] * wc[j];
+                }
+                let x = pre[t * conv_dim + ch];
+                s += x * wc[keep];
+                qkv[t * conv_dim + ch] = s / (1.0 + (-s).exp());
+                for j in 0..keep - 1 {
+                    win[j] = win[j + 1];
+                }
+                win[keep - 1] = x;
+            }
+            sw.copy_from_slice(&win[..keep]);
+        }
+
+        let dpre = hip::malloc(&h, bytes(pre.len())).unwrap();
+        let dst = hip::malloc(&h, bytes(st.len())).unwrap();
+        let dqkv = hip::malloc(&h, bytes(qkv.len())).unwrap();
+        let dw = hip::malloc(&h, bytes(w.len())).unwrap();
+        hip::memcpy(
+            &h,
+            dpre,
+            pre.as_ptr() as *const _,
+            bytes(pre.len()),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            dst,
+            st.as_ptr() as *const _,
+            bytes(st.len()),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            dw,
+            w.as_ptr() as *const _,
+            bytes(w.len()),
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+        )
+        .unwrap();
+        k.launch_gdn_conv_chunk(
+            dpre as *const f32,
+            dst as *mut f32,
+            dqkv as *mut f32,
+            dw as *const f32,
+            slot as i32,
+            c as i32,
+            conv_dim as i32,
+            keep as i32,
+        )
+        .unwrap();
+        k.sync().unwrap();
+        let mut got_qkv = vec![0f32; qkv.len()];
+        let mut got_st = vec![0f32; st.len()];
+        hip::memcpy(
+            &h,
+            got_qkv.as_mut_ptr() as *mut _,
+            dqkv,
+            bytes(qkv.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        hip::memcpy(
+            &h,
+            got_st.as_mut_ptr() as *mut _,
+            dst,
+            bytes(st.len()),
+            hip::HIP_MEMCPY_DEVICE_TO_HOST,
+        )
+        .unwrap();
+        for (g, want) in got_qkv.iter().zip(&qkv) {
+            assert!(
+                (g - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                "gdn_conv_chunk qkv: got {g} want {want}"
+            );
+        }
+        assert_eq!(
+            got_st, st_want,
+            "conv window (incl. untouched slot 0) must match exactly"
+        );
+        for p in [dpre, dst, dqkv, dw] {
+            hip::free(&h, p).unwrap();
+        }
+    }
+
+    /// `gdn_chunk` (WY-form chunked delta rule) vs the CPU oracle
+    /// `ref_model::gdn_core_chunk` across head dims and chunk lengths
+    /// (including c == the launcher's practical cap class). Nonzero initial
+    /// state, a non-zero slot (pin `state` slot indexing AND that slot 0
+    /// stays untouched), l2-normed q/k with the q scale — the exact layout
+    /// the engine will feed.
+    #[test]
+    fn gdn_chunk_matches_cpu_core() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let mut rng = lcg(83);
+
+        // (hd, c): tiny odd, mid, and the c=16 launcher-budget class.
+        for (hd, c) in [(8usize, 5usize), (16, 7), (32, 16)] {
+            let vh = 2usize;
+            let kh = 1usize;
+            let kd = kh * hd;
+            let vd = vh * hd;
+            let conv_dim = 2 * kd + vd;
+            let slots = 2usize;
+            let slot = 1usize;
+            let qs = 1.0 / (hd as f32).sqrt();
+
+            // Normed q/k, scaled q; raw v. Layout [c, conv_dim] = q|k|v.
+            let mut qkv = vec![0.0f32; c * conv_dim];
+            for t in 0..c {
+                for half in 0..2 {
+                    let base = t * conv_dim + half * kd;
+                    let mut ss = 0.0f32;
+                    for j in 0..hd {
+                        let v = rng();
+                        qkv[base + j] = v;
+                        ss += v * v;
+                    }
+                    let inv = 1.0 / (ss + 1e-6).sqrt();
+                    for j in 0..hd {
+                        qkv[base + j] *= if half == 0 { inv * qs } else { inv };
+                    }
+                }
+                for j in 0..vd {
+                    qkv[t * conv_dim + 2 * kd + j] = rng();
+                }
+            }
+            let a_log: Vec<f32> = (0..vh).map(|_| rng()).collect();
+            let dt_bias: Vec<f32> = (0..vh).map(|_| rng()).collect();
+            let a_in: Vec<f32> = (0..c * vh).map(|_| rng()).collect();
+            let b_in: Vec<f32> = (0..c * vh).map(|_| rng()).collect();
+            let state: Vec<f32> = (0..slots * vh * hd * hd).map(|_| rng() * 0.5).collect();
+
+            // CPU oracle per v-head on the same inputs.
+            let mut want_o = vec![0.0f32; c * vd];
+            let mut state_want = state.clone();
+            let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+            for i in 0..vh {
+                let mut kb = vec![0.0f32; c * hd];
+                let mut qb = vec![0.0f32; c * hd];
+                let mut vb = vec![0.0f32; c * hd];
+                let mut gl = vec![0.0f32; c];
+                let mut beta = vec![0.0f32; c];
+                for t in 0..c {
+                    kb[t * hd..(t + 1) * hd]
+                        .copy_from_slice(&qkv[t * conv_dim + kd..t * conv_dim + kd + hd]);
+                    qb[t * hd..(t + 1) * hd].copy_from_slice(&qkv[t * conv_dim..t * conv_dim + hd]);
+                    vb[t * hd..(t + 1) * hd].copy_from_slice(
+                        &qkv[t * conv_dim + 2 * kd + i * hd..t * conv_dim + 2 * kd + (i + 1) * hd],
+                    );
+                    gl[t] = -a_log[i].exp() * softplus(a_in[t * vh + i] + dt_bias[i]);
+                    beta[t] = 1.0 / (1.0 + (-b_in[t * vh + i]).exp());
+                }
+                let mut ob = vec![0.0f32; c * hd];
+                crate::ref_model::gdn_core_chunk(
+                    &mut state_want[(slot * vh + i) * hd * hd..][..hd * hd],
+                    &kb,
+                    &qb,
+                    &vb,
+                    &gl,
+                    &beta,
+                    c,
+                    hd,
+                    &mut ob,
+                );
+                for t in 0..c {
+                    want_o[t * vd + i * hd..t * vd + (i + 1) * hd]
+                        .copy_from_slice(&ob[t * hd..(t + 1) * hd]);
+                }
+            }
+
+            let dqkv = hip::malloc(&h, bytes(qkv.len())).unwrap();
+            let dst = hip::malloc(&h, bytes(state.len())).unwrap();
+            let dou = hip::malloc(&h, bytes(want_o.len())).unwrap();
+            let dal = hip::malloc(&h, bytes(a_log.len())).unwrap();
+            let ddt = hip::malloc(&h, bytes(dt_bias.len())).unwrap();
+            let dai = hip::malloc(&h, bytes(a_in.len())).unwrap();
+            let dbi = hip::malloc(&h, bytes(b_in.len())).unwrap();
+            hip::memcpy(
+                &h,
+                dqkv,
+                qkv.as_ptr() as *const _,
+                bytes(qkv.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dst,
+                state.as_ptr() as *const _,
+                bytes(state.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dal,
+                a_log.as_ptr() as *const _,
+                bytes(a_log.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                ddt,
+                dt_bias.as_ptr() as *const _,
+                bytes(dt_bias.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dai,
+                a_in.as_ptr() as *const _,
+                bytes(a_in.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dbi,
+                b_in.as_ptr() as *const _,
+                bytes(b_in.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            k.launch_gdn_chunk(
+                dqkv as *const f32,
+                dst as *mut f32,
+                dou as *mut f32,
+                dal as *const f32,
+                ddt as *const f32,
+                dai as *const f32,
+                dbi as *const f32,
+                slot as i32,
+                c as i32,
+                vh as i32,
+                kh as i32,
+                hd as i32,
+                conv_dim as i32,
+            )
+            .unwrap();
+            k.sync().unwrap();
+            let mut got_o = vec![0f32; want_o.len()];
+            let mut got_st = vec![0f32; state.len()];
+            hip::memcpy(
+                &h,
+                got_o.as_mut_ptr() as *mut _,
+                dou,
+                bytes(got_o.len()),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                got_st.as_mut_ptr() as *mut _,
+                dst,
+                bytes(got_st.len()),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+            for (g, want) in got_o.iter().zip(&want_o) {
+                assert!(
+                    (g - want).abs() <= 2e-4 * (1.0 + want.abs()),
+                    "gdn_chunk (hd={hd}, c={c}) o: got {g} want {want}"
+                );
+            }
+            for (g, want) in got_st.iter().zip(&state_want) {
+                assert!(
+                    (g - want).abs() <= 2e-4 * (1.0 + want.abs()),
+                    "gdn_chunk (hd={hd}, c={c}) state: got {g} want {want}"
+                );
+            }
+            // Slot 0 untouched.
+            for (g, orig) in got_st[..vh * hd * hd].iter().zip(&state[..vh * hd * hd]) {
+                assert_eq!(g, orig, "gdn_chunk must not touch other slots");
+            }
+            for p in [dqkv, dst, dou, dal, ddt, dai, dbi] {
+                hip::free(&h, p).unwrap();
+            }
         }
     }
 }

@@ -826,6 +826,257 @@ fn decode_step_gdn(
     }
 }
 
+/// Chunked GDN layer forward (`#112` Stage B oracle): `xs` holds `C` tokens'
+/// residual-stream rows, processed through one gated-DeltaNet layer in place
+/// (state/conv continue from the previous step). Token-local stages reuse the
+/// sequential path's math; the conv window and the delta-rule recurrence are
+/// the sequential parts, the latter in WY-style chunked form:
+///
+/// Per v-head, with per-token log-decay `g_t` (so `λ_t = e^{g_t}`, `Π_t =
+/// e^{Σ_{s≤t} g_s}`):
+///   `u_t + Σ_{s<t} A[t,s]·u_s = β_t·(v_t − Π_t·S₀ᵀk_t)`,  `A[t,s] =
+///   β_t·(Π_t/Π_s)·(k_s·k_t)` (strictly lower; the query-side `β_t` folds
+///   into the row — it scales the whole delta, retro-retrieval included) —
+///   forward substitution over `t`.
+///   `S_C = Π_C·S₀ + Σ_s (Π_C/Π_s)·k_s⊗u_s`
+///   `o_t = Π_t·S₀ᵀq_t + Σ_{s≤t} (Π_t/Π_s)·(k_s·q_t)·u_s`  (own write included,
+///   matching the decode kernel's read-after-write `o = Sᵀq`).
+///
+/// Reassociates the recurrence's sums, so it matches [`decode_step_gdn`]
+/// applied `C` times only to f32 reassociation tolerance (pinned by test).
+// Whole-model chunked prefill wiring lands with Stage B batch 2; until then
+// this is exercised by the layer-level chunk-vs-sequential test below.
+#[allow(dead_code, clippy::needless_range_loop)]
+pub(crate) fn decode_chunk_gdn(
+    xs: &mut [Vec<f32>],
+    lw: &LayerWeights,
+    state: &mut [f32],
+    conv: &mut [f32],
+    cfg: Config,
+) {
+    let d = cfg.d_model;
+    let kh = cfg.gdn_k_heads;
+    let vh = cfg.gdn_v_heads;
+    let hd = cfg.gdn_head_dim;
+    let kd = kh * hd;
+    let vd = vh * hd;
+    let conv_dim = 2 * kd + vd;
+    let ck = cfg.gdn_conv_kernel;
+    let keep = ck - 1;
+    let c = xs.len();
+
+    // 1-2) per-token projections + conv + silu. The conv window is a fixed
+    // `ck`-tap causal dot with no cross-token carry beyond the window: run
+    // the same state machine as the sequential path (bit-identical values;
+    // a GPU kernel computes the same taps per token in parallel).
+    let mut ks = vec![0.0f32; c * kd];
+    let mut qs = vec![0.0f32; c * kd];
+    let mut vs = vec![0.0f32; c * vd];
+    let mut zs = vec![0.0f32; c * vd];
+    let mut gl = vec![0.0f32; c * vh]; // per-(token, v-head) log decay
+    let mut betas = vec![0.0f32; c * vh];
+    let qs_scale = 1.0 / (hd as f32).sqrt();
+    for (t, x) in xs.iter_mut().enumerate() {
+        let xn = rms_norm(x, &lw.rms_attn, cfg.rms_eps);
+        let qkv_pre = matvec_t(&xn, &lw.gdn_in_qkv, conv_dim);
+        let z = matvec_t(&xn, &lw.gdn_in_z, vd);
+        let a = matvec_t(&xn, &lw.gdn_in_a, vh);
+        let b = matvec_t(&xn, &lw.gdn_in_b, vh);
+        let mut qkv = vec![0.0f32; conv_dim];
+        for ci in 0..conv_dim {
+            let w = &lw.gdn_conv_w[ci * ck..ci * ck + ck];
+            let mut s = 0.0;
+            for j in 0..keep {
+                s += conv[ci * keep + j] * w[j];
+            }
+            s += qkv_pre[ci] * w[keep];
+            qkv[ci] = silu(s);
+        }
+        for ci in 0..conv_dim {
+            for j in 0..keep - 1 {
+                conv[ci * keep + j] = conv[ci * keep + j + 1];
+            }
+            conv[ci * keep + keep - 1] = qkv_pre[ci];
+        }
+        // split + per-head l2norm + q scale (same as sequential stages 3).
+        for h in 0..kh {
+            let q_dst = &mut qs[t * kd + h * hd..t * kd + (h + 1) * hd];
+            q_dst.copy_from_slice(&qkv[h * hd..(h + 1) * hd]);
+            let k_dst = &mut ks[t * kd + h * hd..t * kd + (h + 1) * hd];
+            k_dst.copy_from_slice(&qkv[kd + h * hd..kd + (h + 1) * hd]);
+            l2norm(q_dst);
+            l2norm(k_dst);
+            for v in q_dst.iter_mut() {
+                *v *= qs_scale;
+            }
+        }
+        vs[t * vd..(t + 1) * vd].copy_from_slice(&qkv[2 * kd..]);
+        zs[t * vd..(t + 1) * vd].copy_from_slice(&z);
+        for i in 0..vh {
+            gl[t * vh + i] = -lw.gdn_a_log[i].exp() * softplus(a[i] + lw.gdn_dt_bias[i]);
+            betas[t * vh + i] = 1.0 / (1.0 + (-b[i]).exp());
+        }
+    }
+
+    // 3) chunked recurrence per v-head, then per-token gated norm.
+    let rep = vh / kh;
+    let mut os = vec![0.0f32; c * vd];
+    let mut kh_buf = vec![0.0f32; c * hd];
+    let mut qh_buf = vec![0.0f32; c * hd];
+    let mut vh_buf = vec![0.0f32; c * hd];
+    let mut oh_buf = vec![0.0f32; c * hd];
+    let mut gl_buf = vec![0.0f32; c];
+    let mut beta_buf = vec![0.0f32; c];
+    for i in 0..vh {
+        let kh_off = (i / rep) * hd;
+        for t in 0..c {
+            kh_buf[t * hd..(t + 1) * hd]
+                .copy_from_slice(&ks[t * kd + kh_off..t * kd + kh_off + hd]);
+            qh_buf[t * hd..(t + 1) * hd]
+                .copy_from_slice(&qs[t * kd + kh_off..t * kd + kh_off + hd]);
+            vh_buf[t * hd..(t + 1) * hd]
+                .copy_from_slice(&vs[t * vd + i * hd..t * vd + (i + 1) * hd]);
+            gl_buf[t] = gl[t * vh + i];
+            beta_buf[t] = betas[t * vh + i];
+        }
+        gdn_core_chunk(
+            &mut state[i * hd * hd..(i + 1) * hd * hd],
+            &kh_buf,
+            &qh_buf,
+            &vh_buf,
+            &gl_buf,
+            &beta_buf,
+            c,
+            hd,
+            &mut oh_buf,
+        );
+        for t in 0..c {
+            os[t * vd + i * hd..t * vd + (i + 1) * hd]
+                .copy_from_slice(&oh_buf[t * hd..(t + 1) * hd]);
+        }
+    }
+
+    // 4) per-token gated RMSNorm + out projection + residual.
+    for (t, x) in xs.iter_mut().enumerate() {
+        let o = &mut os[t * vd..(t + 1) * vd];
+        for i in 0..vh {
+            let oh = &mut o[i * hd..(i + 1) * hd];
+            let mut ss = 0.0;
+            for &v in oh.iter() {
+                ss += v * v;
+            }
+            let inv = 1.0 / (ss / hd as f32 + cfg.rms_eps).sqrt();
+            let zh = &zs[t * vd + i * hd..t * vd + (i + 1) * hd];
+            for (j, val) in oh.iter_mut().enumerate() {
+                *val = *val * inv * lw.gdn_norm[j] * silu(zh[j]);
+            }
+        }
+        let out = matvec_t(o, &lw.gdn_out, d);
+        for i in 0..d {
+            x[i] += out[i];
+        }
+    }
+}
+
+/// Per-v-head chunked delta-rule core — the `#112` Stage B recurrence and
+/// the shared numeric oracle for the GPU `gdn_chunk` kernel. `s` is the
+/// k-major `[hd, hd]` recurrent state (updated in place to `S_C`), `k`/`q`/
+/// `v` are `[c, hd]` per-head rows (already l2-normed, q pre-scaled), `gl`
+/// the per-token log-decay and `beta` the per-token gate. Writes the `[c,
+/// hd]` pre-norm outputs `o`. Derivation in [`decode_chunk_gdn`].
+#[allow(dead_code, clippy::needless_range_loop, clippy::too_many_arguments)]
+pub(crate) fn gdn_core_chunk(
+    s: &mut [f32],
+    k: &[f32],
+    q: &[f32],
+    v: &[f32],
+    gl: &[f32],
+    beta: &[f32],
+    c: usize,
+    hd: usize,
+    o: &mut [f32],
+) {
+    // Cumulative log decay within the chunk (Π_t = exp(lpi[t])).
+    let mut lpi = vec![0.0f32; c];
+    let mut acc = 0.0;
+    for t in 0..c {
+        acc += gl[t];
+        lpi[t] = acc;
+    }
+    // K0[t] = S₀ᵀk_t, Q0[t] = S₀ᵀq_t (S is k-major [hd, hd]).
+    let mut k0 = vec![0.0f32; c * hd];
+    let mut q0 = vec![0.0f32; c * hd];
+    for t in 0..c {
+        for m in 0..hd {
+            let mut sk = 0.0;
+            let mut sq = 0.0;
+            for kk in 0..hd {
+                let s0 = s[kk * hd + m];
+                sk += k[t * hd + kk] * s0;
+                sq += q[t * hd + kk] * s0;
+            }
+            k0[t * hd + m] = sk;
+            q0[t * hd + m] = sq;
+        }
+    }
+    // W[t] = β_t (v_t − Π_t K0[t]);  A[t,s] = β_t (Π_t/Π_s)(k_s·k_t), s<t.
+    let mut w = vec![0.0f32; c * hd];
+    let mut a_mat = vec![0.0f32; c * c];
+    for t in 0..c {
+        let pi_t = lpi[t].exp();
+        for m in 0..hd {
+            w[t * hd + m] = beta[t] * (v[t * hd + m] - pi_t * k0[t * hd + m]);
+        }
+        for s in 0..t {
+            let mut dot = 0.0;
+            for kk in 0..hd {
+                dot += k[s * hd + kk] * k[t * hd + kk];
+            }
+            a_mat[t * c + s] = beta[t] * (lpi[t] - lpi[s]).exp() * dot;
+        }
+    }
+    // Forward substitution: u_t = W_t − Σ_{s<t} A[t,s] u_s.
+    let mut u = vec![0.0f32; c * hd];
+    for t in 0..c {
+        for m in 0..hd {
+            let mut acc = w[t * hd + m];
+            for s in 0..t {
+                acc -= a_mat[t * c + s] * u[s * hd + m];
+            }
+            u[t * hd + m] = acc;
+        }
+    }
+    // S ← Π_C S₀ + Σ_s (Π_C/Π_s) k_s ⊗ u_s.
+    let pi_c = lpi[c - 1].exp();
+    for kk in 0..hd {
+        for m in 0..hd {
+            let mut acc = pi_c * s[kk * hd + m];
+            for s2 in 0..c {
+                acc += (lpi[c - 1] - lpi[s2]).exp() * k[s2 * hd + kk] * u[s2 * hd + m];
+            }
+            s[kk * hd + m] = acc;
+        }
+    }
+    // o_t = Π_t Q0[t] + Σ_{s≤t} (Π_t/Π_s)(k_s·q_t) u_s  (inclusive).
+    let mut b_mat = vec![0.0f32; c * c];
+    for t in 0..c {
+        for s in 0..=t {
+            let mut dot = 0.0;
+            for kk in 0..hd {
+                dot += k[s * hd + kk] * q[t * hd + kk];
+            }
+            b_mat[t * c + s] = (lpi[t] - lpi[s]).exp() * dot;
+        }
+        for m in 0..hd {
+            let mut acc = lpi[t].exp() * q0[t * hd + m];
+            for s in 0..=t {
+                acc += b_mat[t * c + s] * u[s * hd + m];
+            }
+            o[t * hd + m] = acc;
+        }
+    }
+}
+
 #[allow(clippy::needless_range_loop)]
 fn attention_decode(q: &[f32], kc: &[f32], vc: &[f32], pos: usize, cfg: Config) -> Vec<f32> {
     let hd = cfg.head_dim;
@@ -1459,6 +1710,78 @@ mod tests {
         assert!((softplus(1.0) - 1.3132616).abs() < 1e-6);
         assert!((softplus(25.0) - 25.0).abs() < 1e-5, "linear above 20");
         assert!((softplus(-30.0) - 0.0).abs() < 1e-6);
+    }
+
+    /// Chunked GDN layer (`decode_chunk_gdn`, the #112 Stage B oracle) must
+    /// reproduce the sequential `decode_step_gdn` over the same token rows:
+    /// after a warmup (nonzero recurrent/conv state), C rows through both
+    /// paths must agree on every output row and the final recurrent state
+    /// (f32 reassociation tolerance — the chunk form reorders the
+    /// recurrence's sums); the conv window is a fixed per-token tap dot and
+    /// must match bit-exactly.
+    #[test]
+    fn gdn_chunk_layer_matches_sequential() {
+        let cfg = Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 64, 2, 4, 8, 4);
+        let w = Weights::random(&cfg, 61).unwrap();
+        let lw = &w.layers[0]; // GDN layer (layer 3 is the full-attention one)
+        let d = cfg.d_model;
+        let kd = cfg.gdn_key_dim();
+        let vd = cfg.gdn_value_dim();
+        let conv_dim = 2 * kd + vd;
+        let keep = cfg.gdn_conv_kernel - 1;
+        let state_len = cfg.gdn_v_heads * cfg.gdn_head_dim * cfg.gdn_head_dim;
+
+        // Deterministic varied rows: x[t][i] in [-1, 1).
+        let row = |t: usize| -> Vec<f32> {
+            (0..d)
+                .map(|i| (((t * 7 + i * 13 + 5) % 21) as f32) / 7.0 - 1.0)
+                .collect()
+        };
+        let warmup: Vec<Vec<f32>> = (0..3).map(row).collect();
+        let chunk_rows: Vec<Vec<f32>> = (3..11).map(row).collect();
+
+        // Shared warmup leaves both paths at the same (nonzero) state.
+        let mut state_w = vec![0.0f32; state_len];
+        let mut conv_w = vec![0.0f32; conv_dim * keep];
+        for x in &warmup {
+            let mut xr = x.clone();
+            let xn = rms_norm(&xr, &lw.rms_attn, cfg.rms_eps);
+            decode_step_gdn(&mut xr, &xn, lw, &mut state_w, &mut conv_w, cfg);
+        }
+
+        // Path A: the same rows one at a time.
+        let mut state_a = state_w.clone();
+        let mut conv_a = conv_w.clone();
+        let mut outs_a = Vec::new();
+        for x in &chunk_rows {
+            let mut xr = x.clone();
+            let xn = rms_norm(&xr, &lw.rms_attn, cfg.rms_eps);
+            decode_step_gdn(&mut xr, &xn, lw, &mut state_a, &mut conv_a, cfg);
+            outs_a.push(xr);
+        }
+
+        // Path B: the same rows as ONE chunk.
+        let mut state_b = state_w.clone();
+        let mut conv_b = conv_w.clone();
+        let mut chunk_b = chunk_rows.clone();
+        decode_chunk_gdn(&mut chunk_b, lw, &mut state_b, &mut conv_b, cfg);
+
+        assert_eq!(conv_a, conv_b, "conv window must match bit-exactly");
+        for (t, (a, b)) in outs_a.iter().zip(&chunk_b).enumerate() {
+            for i in 0..d {
+                let (av, bv) = (a[i], b[i]);
+                assert!(
+                    (av - bv).abs() <= 1e-4 * (1.0 + av.abs()),
+                    "row {t} dim {i}: seq {av:?} chunk {bv:?}"
+                );
+            }
+        }
+        for (ia, ib) in state_a.iter().zip(&state_b) {
+            assert!(
+                (ia - ib).abs() <= 1e-4 * (1.0 + ia.abs()),
+                "state: seq {ia:?} chunk {ib:?}"
+            );
+        }
     }
 
     /// Hand-computed f64 transcription of the Qwen3.5 gated full-attention
