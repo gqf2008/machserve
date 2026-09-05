@@ -260,6 +260,16 @@ mod gpu {
     /// staggered sequences (different prompt lengths, so prefill and decode
     /// rows interleave) must complete and generate the same greedy tokens as
     /// the step-by-step reference chains.
+    /// Greedy engine generation vs the sequential RefModel chain. Chunked
+    /// GDN prefill (#112 Stage B) REASSOCIATES the recurrence's sums, so at
+    /// near-tied logits the argmax may flip without a semantic error
+    /// (per-position logits stay within the row tolerance — pinned by
+    /// `batched_gdn_chunk_step_matches_sequential`; the repo lesson: judge
+    /// synthetic-random-weight argmax flips by the top1-top2 margin). Where
+    /// the reference IS decisive (margin >= `CHAIN_TIE`) the engine must
+    /// follow it; after a tolerated flip the chain continues from the
+    /// engine's actual token (teacher forcing), keeping later steps
+    /// meaningful.
     #[test]
     fn continuous_prefill_sequential_matches_ref_f32() {
         let Some(hip) = hip_ctx() else { return };
@@ -282,27 +292,33 @@ mod gpu {
             );
         }
         while !eng.all_done() {
-            // Duplicate-slot packing would surface as the engine-step error
-            // here; greedy engine tokens must equal the reference chain.
+            // Chunk-contract violations would surface as the engine-step
+            // error here.
             eng.step().unwrap();
         }
+        const CHAIN_TIE: f32 = 2e-2;
         for ((prompt, max_new), &id) in jobs.iter().zip(&ids) {
             let got = eng.generated(id);
             let mut cpu = RefModel::new(cfg, w.clone());
-            let mut last = None;
+            let mut logits = None;
             for &t in prompt {
-                last = Some(cpu.decode_step(t));
+                logits = Some(cpu.decode_step(t));
             }
-            let mut tok = argmax(last.as_ref().unwrap()) as u32;
-            let mut want = vec![tok];
-            for _ in 1..*max_new {
-                tok = argmax(&cpu.decode_step(tok)) as u32;
-                want.push(tok);
+            for (i, &tok) in got.iter().enumerate() {
+                let l = logits.as_ref().expect("prompt consumed");
+                let want = argmax(l);
+                if tok as usize != want {
+                    let mut sorted: Vec<f32> = l.clone();
+                    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                    let margin = sorted[0] - sorted[1];
+                    assert!(
+                        margin < CHAIN_TIE,
+                        "seq {prompt:?} step {i}: engine={got:?} diverged at a DECISIVE step (margin {margin:.4}, want {want})",
+                    );
+                }
+                logits = Some(cpu.decode_step(tok));
             }
-            assert_eq!(
-                got, want,
-                "seq {prompt:?}: engine={got:?} sequential-ref={want:?}"
-            );
+            assert_eq!(got.len(), *max_new);
         }
     }
 
@@ -373,6 +389,80 @@ mod gpu {
         );
     }
 
+    /// Compaction must move the GDN recurrent state with the sequence (#112):
+    /// when a lower slot retires mid-life of a later sequence, the moved
+    /// sequence keeps its recurrence. Caught live by the chunked-prefill
+    /// engine test (chunking changed prefill pacing so an earlier slot
+    /// finished first and the later one compacted onto its stale state —
+    /// a DECISIVE 0.07-margin argmax flip, not tolerance noise). This test
+    /// pins the same scenario directly: the compacted run must equal an
+    /// uncompacted control token for token.
+    #[test]
+    fn gdn_compaction_moves_recurrent_state() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F32);
+        let w = Weights::random(&cfg, 59).unwrap();
+        let prompt_b = vec![90u32, 7, 42, 5];
+        let max_new_b = 5usize;
+        // Control: sequence B alone (capacity 2, one admission — no
+        // compaction ever).
+        let control = {
+            let mut eng = ContinuousModel::new(Arc::clone(&hip), cfg, &w, 2).unwrap();
+            let id = eng
+                .add(
+                    &prompt_b,
+                    max_new_b,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    SamplingParams::default(),
+                )
+                .unwrap();
+            while !eng.all_done() {
+                eng.step().unwrap();
+            }
+            eng.generated(id)
+        };
+        // Sequence A (slot 0) finishes after one token; B (slot 1) is still
+        // prefilling/decoding, so B compacts onto slot 0 mid-life.
+        let mut eng = ContinuousModel::new(Arc::clone(&hip), cfg, &w, 2).unwrap();
+        let a = eng
+            .add(
+                &[3u32, 17],
+                1,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        let b = eng
+            .add(
+                &prompt_b,
+                max_new_b,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !eng.all_done() {
+            eng.step().unwrap();
+        }
+        assert_eq!(eng.generated(a).len(), 1, "A finished after one token");
+        assert!(
+            !eng.is_done(b) || eng.generated(b).len() == max_new_b,
+            "B ran to its budget"
+        );
+        assert_eq!(
+            eng.generated(b),
+            control,
+            "compaction lost/corrupted B's GDN state: compacted={:?} control={:?}",
+            eng.generated(b),
+            control
+        );
+    }
+
     /// Batched decode of two interleaved sequences: each row's logits vs its
     /// own single-sequence reference — pins that the SLOT-indexed GDN state
     /// keeps the sequences isolated while they share steps.
@@ -381,7 +471,7 @@ mod gpu {
         let cfg = small_cfg(dtype);
         let w = Weights::random(&cfg, 37).unwrap();
         let batch = 2usize;
-        let mut m = BatchedModel::new(Arc::clone(&hip), cfg, &w, batch).unwrap();
+        let mut m = BatchedModel::with_rows(Arc::clone(&hip), cfg, &w, batch, 8).unwrap();
         let mut rows: Vec<RefModel> = (0..batch).map(|_| RefModel::new(cfg, w.clone())).collect();
         let streams = [[3u32, 17, 42, 5], [90u32, 7, 64, 21]];
         for step in 0..streams[0].len() {
@@ -410,6 +500,122 @@ mod gpu {
     #[test]
     fn batched_matches_ref_f16() {
         batched_matches_ref(ModelDType::F16);
+    }
+
+    /// Stage B chunked scan (#112): one `decode_step_explicit` carrying a
+    /// 5-row GDN chunk of slot 0 PLUS a single decode row of slot 1 must
+    /// reproduce the sequential per-token recurrence — every chunk row's
+    /// logits match the RefModel chain at the same position (the chunk
+    /// reassociates the recurrence's sums, so the tolerance is the same
+    /// reassociation class the layer/kernel tests pin, not bit equality).
+    /// Also pins the mixed-step contract: runs partition ALL rows, so the
+    /// lone decode row of slot 1 rides along correctly.
+    #[test]
+    fn batched_gdn_chunk_step_matches_sequential() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F32);
+        let w = Weights::random(&cfg, 51).unwrap();
+        let chunk: [u32; 5] = [3, 17, 42, 5, 11];
+        let lone = 90u32;
+        let batch = 2usize;
+        let mut m = BatchedModel::with_rows(Arc::clone(&hip), cfg, &w, batch, 8).unwrap();
+        // rows: slot 0 chunk (positions 0..5), then slot 1 single row.
+        let tokens: Vec<u32> = chunk.iter().copied().chain([lone]).collect();
+        let lens: Vec<u32> = [0u32, 1, 2, 3, 4].iter().copied().chain([0]).collect();
+        let slots: Vec<u32> = [0u32, 0, 0, 0, 0].iter().copied().chain([1]).collect();
+        let params: Vec<SamplingParams> = (0..tokens.len())
+            .map(|_| SamplingParams::default())
+            .collect();
+        let counts: Vec<Vec<(u32, u32)>> = (0..tokens.len()).map(|_| Vec::new()).collect();
+        let bias: Vec<Vec<(u32, f32)>> = (0..tokens.len()).map(|_| Vec::new()).collect();
+        let mut params = params;
+        m.decode_step_explicit(&tokens, &lens, &slots, &mut params, &counts, &bias, false)
+            .unwrap();
+        let logits = m.read_logits_rows(tokens.len()).unwrap();
+        let vocab = cfg.vocab_size;
+        // Slot 0: sequential chain, every position compared.
+        let mut cpu = RefModel::new(cfg, w.clone());
+        for (t, tok) in chunk.iter().enumerate() {
+            let cpu_logits = cpu.decode_step(*tok);
+            let gpu_row = &logits[t * vocab..(t + 1) * vocab];
+            check_row(
+                &format!("chunk row {t}"),
+                ModelDType::F32,
+                gpu_row,
+                &cpu_logits,
+            );
+            assert_eq!(
+                argmax(gpu_row),
+                argmax(&cpu_logits),
+                "chunk row {t} argmax flipped"
+            );
+        }
+        // Slot 1's lone row: its own reference (fresh state).
+        let mut cpu1 = RefModel::new(cfg, w.clone());
+        let cpu1_logits = cpu1.decode_step(lone);
+        check_row(
+            "lone decode row",
+            ModelDType::F32,
+            &logits[5 * vocab..6 * vocab],
+            &cpu1_logits,
+        );
+    }
+
+    /// The chunk contract must be enforced loudly: a slot split across two
+    /// blocks (the #116 double-application shape) is rejected instead of
+    /// silently corrupting the recurrent state.
+    #[test]
+    fn gdn_chunk_rejects_split_slot_blocks() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F32);
+        let w = Weights::random(&cfg, 53).unwrap();
+        let mut m = BatchedModel::with_rows(Arc::clone(&hip), cfg, &w, 2, 8).unwrap();
+        type RowExtras = (
+            Vec<SamplingParams>,
+            Vec<Vec<(u32, u32)>>,
+            Vec<Vec<(u32, f32)>>,
+        );
+        let mk = |n: usize| -> RowExtras {
+            (
+                (0..n).map(|_| SamplingParams::default()).collect(),
+                (0..n).map(|_| Vec::new()).collect(),
+                (0..n).map(|_| Vec::new()).collect(),
+            )
+        };
+        // slot 0, slot 1, slot 0 again: two blocks on slot 0.
+        let (mut p3, c3, b3) = mk(3);
+        let err = m
+            .decode_step_explicit(
+                &[3u32, 90, 17],
+                &[0u32, 0, 1],
+                &[0u32, 1, 0],
+                &mut p3,
+                &c3,
+                &b3,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("contiguous"),
+            "expected a contiguity rejection, got: {err}"
+        );
+        // Non-consecutive positions inside one block are rejected too.
+        let (mut p2, c2, b2) = mk(2);
+        let err = m
+            .decode_step_explicit(
+                &[3u32, 17],
+                &[0u32, 2],
+                &[0u32, 0],
+                &mut p2,
+                &c2,
+                &b2,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("consecutive"),
+            "expected a position-order rejection, got: {err}"
+        );
     }
 
     /// Dequantizes storage-Q4 weights back to exact f32 (`nibble * group

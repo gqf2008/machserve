@@ -779,18 +779,18 @@ impl ContinuousModel {
                 continue;
             }
             if !s.prompt.is_empty() {
-                // GDN (hybrid linear-attention) models apply the per-slot
-                // recurrent state exactly once per row, so the token-major
-                // packing (one row per prompt token) is rejected by
-                // `decode_step_explicit` — two rows on one slot would
-                // double-apply the delta rule. Sequential prefill (one prompt
-                // token per step per slot) is the exact recurrence the e2e
-                // tests verify against RefModel; the chunked prefill scan is
-                // #112 Stage B. Prompt cost becomes one decode-latency step
-                // per token, with all prefilling slots advancing in parallel
-                // (the row budget still bounds rows per step).
+                // GDN (hybrid linear-attention) models prefill through the
+                // Stage B chunked scan (#112): each step packs up to
+                // `GDN_CHUNK_MAX` prompt tokens of the slot as contiguous
+                // consecutive-position rows — one WY chunk per layer —
+                // instead of one decode-latency step per token. The full-
+                // attn layers handle those rows via the shared KV (each row
+                // stores at its own position and attends over [0..pos]).
                 let take = if self.model.is_gdn() {
-                    1 // budget >= 1 (checked above)
+                    s.prompt
+                        .len()
+                        .min(budget)
+                        .min(crate::batched::GDN_CHUNK_MAX)
                 } else {
                     s.prompt.len().min(budget)
                 };
@@ -1110,7 +1110,9 @@ impl ContinuousModel {
             self.active -= 1;
             return;
         }
-        // Compact: move every sequence above `slot` down by one, copying KV.
+        // Compact: move every sequence above `slot` down by one, copying KV
+        // AND the GDN recurrent state (#112): a moved sequence must keep its
+        // recurrence, or it reads the retired slot's context.
         for i in (slot + 1)..self.active {
             let from = i;
             let to = i - 1;
@@ -1118,6 +1120,9 @@ impl ContinuousModel {
             self.model
                 .copy_seq_kv(from, to, len)
                 .expect("compaction KV copy");
+            self.model
+                .copy_gdn_slot(from, to)
+                .expect("compaction GDN state copy");
             self.seqs[to] = self.seqs[i].take();
         }
         self.seqs[self.active - 1] = None;

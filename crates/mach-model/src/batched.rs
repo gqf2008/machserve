@@ -265,6 +265,12 @@ impl Drop for ProfState {
 /// 30B decode); above it, weight reuse across rows makes hipBLAS tensor-core
 /// GEMMs win (a 512-row prefill re-reads the weights m× through the GEMV).
 const GEMV_MAX_M: i32 = 8;
+
+/// GDN chunked-scan cap (#112 Stage B): max rows of one slot per step. The
+/// `gdn_chunk` kernel's dynamic shared memory `(6·c·hd + 2·c² + 2·c)·4` must
+/// fit the 48 KB default budget — c = 12 at the 27B's hd = 128 uses 37 KB
+/// (c = 15 would be the exact ceiling; 12 keeps margin for the launch).
+pub const GDN_CHUNK_MAX: usize = 12;
 /// Max reduction width the GEMV kernel can stage in its 48 KB shared row
 /// buffer (`d * 4` bytes): dispatch sites must fall back to hipBLAS above
 /// this (e.g. f16 MLA o_proj with DeepSeek-V2-level kk = 128 heads × 192).
@@ -295,6 +301,10 @@ pub struct BatchedModel {
     runs_dev: *mut i32,
     run_mask_host: *mut i32,
     run_mask_dev: *mut i32,
+    /// GDN chunked-scan run descriptors `[row_base, count, pos_base, slot] x
+    /// batch` (#112 Stage B): one per slot with rows in this step, built by
+    /// `decode_step_explicit`. Host-read only (the launches are per-run).
+    gdn_runs_host: *mut i32,
     // activations
     x: *mut f32,
     xn: *mut f32,
@@ -1028,6 +1038,7 @@ impl BatchedModel {
             runs_dev: std::ptr::null_mut(),
             run_mask_host: std::ptr::null_mut(),
             run_mask_dev: std::ptr::null_mut(),
+            gdn_runs_host: std::ptr::null_mut(),
             x: std::ptr::null_mut(),
             xn: std::ptr::null_mut(),
             xn2: std::ptr::null_mut(),
@@ -1311,6 +1322,10 @@ impl BatchedModel {
         self.slots_host = sh as *mut i32;
         self.runs_host = rh as *mut i32;
         self.run_mask_host = mh as *mut i32;
+        // GDN run descriptors: at most one run per slot (== batch entries).
+        let grh = hip::host_malloc(self.k.hip(), b * 4 * 4)?;
+        self.gdn_runs_host = grh as *mut i32;
+        self.host_pins.push(grh);
         self.host_pins.push(th);
         self.host_pins.push(ph);
         self.host_pins.push(sh);
@@ -2421,6 +2436,7 @@ impl BatchedModel {
             self.run_mask_dev,
             true,
             0,
+            0,
         )?;
         let next = self.sample(self.batch)?;
         // Step profiler: the sampling sync above drained the stream, so all
@@ -2686,6 +2702,7 @@ impl BatchedModel {
                 self.run_mask_dev,
                 true,
                 0,
+                0,
             )?;
             self.sample_device(self.batch)
         })();
@@ -2731,7 +2748,7 @@ impl BatchedModel {
         }
         let record = (|| {
             self.upload_decode_inputs(n as usize)?;
-            self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0)?;
+            self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0, 0)?;
             self.sampler.sample_batched_upload(n as usize)?;
             self.sampler
                 .sample_batched_kernel(self.logits, n, self.cfg.vocab_size)
@@ -2764,6 +2781,7 @@ impl BatchedModel {
         run_mask: *const i32,
         decode_only: bool,
         num_runs: i32,
+        gdn_runs: i32,
     ) -> Result<(), Error> {
         let c = self.cfg;
         let b = count;
@@ -3060,10 +3078,13 @@ impl BatchedModel {
             } else if lw.has_gdn {
                 // Qwen3.5 hybrid: linear-attention layer (gated DeltaNet).
                 // Weights-driven dispatch (`has_gdn`, dtype-independent). The
-                // kernels index the persistent state by SLOT via `slots`;
-                // one row per slot per step — chunked prefill (several rows
-                // of one sequence in a single step) is Stage B (#112), the
-                // graph/prefill guards below keep this path decode-shaped.
+                // kernels index the persistent state by SLOT via `slots`.
+                // Pure decode steps (gdn_runs == 0: one row per slot) take
+                // the legacy per-row kernels — the same launches the decode
+                // graphs record. Steps carrying chunk runs (#112 Stage B:
+                // contiguous consecutive-position rows of one slot = one WY
+                // chunk) instead walk the per-run chunked kernels; runs are
+                // host-side descriptors partitioning ALL rows.
                 let kd = (c.gdn_k_heads * c.gdn_head_dim) as i32;
                 let vd = (c.gdn_v_heads * c.gdn_head_dim) as i32;
                 let kh = c.gdn_k_heads as i32;
@@ -3071,6 +3092,9 @@ impl BatchedModel {
                 let hd = c.gdn_head_dim as i32;
                 let conv_dim = 2 * kd + vd;
                 let keep = c.gdn_conv_kernel as i32 - 1;
+                let conv_dim_u = conv_dim as usize;
+                let vd_u = vd as usize;
+                let vh_u = vh as usize;
                 gemm(
                     self.gdn_qkv_pre,
                     self.xn,
@@ -3107,33 +3131,90 @@ impl BatchedModel {
                     vh,
                     d,
                 )?;
-                k.launch_gdn_conv_update(
-                    self.gdn_qkv,
-                    self.gdn_qkv_pre,
-                    self.gdn_conv[li],
-                    slots,
-                    b,
-                    conv_dim,
-                    keep,
-                    lw.gdn_conv_w,
-                )?;
-                k.launch_gdn_l2norm_qk(self.gdn_qkv, b, kh, hd, conv_dim)?;
-                k.launch_gdn_step(
-                    self.gdn_qkv,
-                    self.gdn_state[li],
-                    self.gdn_o,
-                    slots,
-                    lw.gdn_a_log,
-                    lw.gdn_dt_bias,
-                    self.gdn_a,
-                    self.gdn_b,
-                    b,
-                    vh,
-                    kh,
-                    hd,
-                    conv_dim,
-                )?;
-                k.launch_gdn_gated_norm(self.gdn_o, self.gdn_z, lw.gdn_norm, b, vh, hd, c.rms_eps)?;
+                if gdn_runs > 0 {
+                    // SAFETY: `gdn_runs_host` (pinned, owned by `self`) holds
+                    // `gdn_runs` validated descriptors written this step.
+                    let runs = self.gdn_runs_host;
+                    for ri in 0..gdn_runs {
+                        // [row_base, count, pos_base, slot]
+                        let (r0, cc, slot) = unsafe {
+                            (
+                                *runs.add(ri as usize * 4) as usize,
+                                *runs.add(ri as usize * 4 + 1),
+                                *runs.add(ri as usize * 4 + 3),
+                            )
+                        };
+                        let pre = unsafe { self.gdn_qkv_pre.add(r0 * conv_dim_u) };
+                        let qkv = unsafe { self.gdn_qkv.add(r0 * conv_dim_u) };
+                        let o = unsafe { self.gdn_o.add(r0 * vd_u) };
+                        let z = unsafe { self.gdn_z.add(r0 * vd_u) };
+                        let a = unsafe { self.gdn_a.add(r0 * vh_u) };
+                        let bi = unsafe { self.gdn_b.add(r0 * vh_u) };
+                        k.launch_gdn_conv_chunk(
+                            pre,
+                            self.gdn_conv[li],
+                            qkv,
+                            lw.gdn_conv_w,
+                            slot,
+                            cc,
+                            conv_dim,
+                            keep,
+                        )?;
+                        k.launch_gdn_l2norm_qk(qkv, cc, kh, hd, conv_dim)?;
+                        k.launch_gdn_chunk(
+                            qkv,
+                            self.gdn_state[li],
+                            o,
+                            lw.gdn_a_log,
+                            lw.gdn_dt_bias,
+                            a,
+                            bi,
+                            slot,
+                            cc,
+                            vh,
+                            kh,
+                            hd,
+                            conv_dim,
+                        )?;
+                        k.launch_gdn_gated_norm(o, z, lw.gdn_norm, cc, vh, hd, c.rms_eps)?;
+                    }
+                } else {
+                    k.launch_gdn_conv_update(
+                        self.gdn_qkv,
+                        self.gdn_qkv_pre,
+                        self.gdn_conv[li],
+                        slots,
+                        b,
+                        conv_dim,
+                        keep,
+                        lw.gdn_conv_w,
+                    )?;
+                    k.launch_gdn_l2norm_qk(self.gdn_qkv, b, kh, hd, conv_dim)?;
+                    k.launch_gdn_step(
+                        self.gdn_qkv,
+                        self.gdn_state[li],
+                        self.gdn_o,
+                        slots,
+                        lw.gdn_a_log,
+                        lw.gdn_dt_bias,
+                        self.gdn_a,
+                        self.gdn_b,
+                        b,
+                        vh,
+                        kh,
+                        hd,
+                        conv_dim,
+                    )?;
+                    k.launch_gdn_gated_norm(
+                        self.gdn_o,
+                        self.gdn_z,
+                        lw.gdn_norm,
+                        b,
+                        vh,
+                        hd,
+                        c.rms_eps,
+                    )?;
+                }
                 gemm(
                     self.proj,
                     self.gdn_o,
@@ -4155,19 +4236,60 @@ impl BatchedModel {
                 self.batch
             )));
         }
-        // GDN (hybrid linear-attention) layers apply the per-slot recurrent
-        // update exactly once per step: two rows on one slot would
-        // double-apply the delta rule. Chunked/packed prefill for GDN models
-        // is Stage B (#112) — reject duplicate slots loudly instead of
-        // corrupting the state silently.
+        // GDN (hybrid linear-attention) layers run the Stage B chunked scan
+        // (#112): rows of one slot are one WY chunk — they must form a single
+        // contiguous block with consecutive ascending positions (the chunk
+        // kernel consumes them in order in one launch). Anything else
+        // (a slot split across two blocks, gaps or repeated positions,
+        // over-length runs) would silently corrupt the recurrent state, so
+        // it is rejected loudly here. Pure decode steps (one row per slot)
+        // build no runs and keep the legacy per-row kernels.
+        let mut num_gdn_runs = 0i32;
         if self.cfg.gdn_enabled() {
+            let mut any_chunk = false;
             let mut seen = vec![false; self.batch];
-            for &s in slots {
-                if std::mem::replace(&mut seen[s as usize], true) {
+            let mut i = 0usize;
+            while i < n {
+                let s = slots[i] as usize;
+                if std::mem::replace(&mut seen[s], true) {
                     return Err(Error::InvalidArgument(format!(
-                        "slot {s} appears twice in one step; GDN models need one row per slot (chunked prefill is #112 Stage B)"
+                        "slot {} appears in two row blocks; GDN rows of one slot must be contiguous",
+                        s
                     )));
                 }
+                let mut j = i + 1;
+                while j < n && slots[j] as usize == s {
+                    if lens[j] != lens[j - 1] + 1 {
+                        return Err(Error::InvalidArgument(format!(
+                            "GDN rows of slot {s} must carry consecutive positions (got {} after {})",
+                            lens[j],
+                            lens[j - 1]
+                        )));
+                    }
+                    j += 1;
+                }
+                let cc = (j - i) as u32;
+                any_chunk |= cc > 1;
+                if cc > GDN_CHUNK_MAX as u32 {
+                    return Err(Error::InvalidArgument(format!(
+                        "GDN chunk of slot {s} has {cc} rows; the chunk cap is {GDN_CHUNK_MAX} (shared-memory budget)"
+                    )));
+                }
+                // Record every block; the count is committed below only when
+                // a real chunk is present (else the legacy path covers all
+                // rows and the descriptors are ignored).
+                unsafe {
+                    let r = self.gdn_runs_host.add(num_gdn_runs as usize * 4);
+                    *r = i as i32;
+                    *r.add(1) = cc as i32;
+                    *r.add(2) = lens[i] as i32;
+                    *r.add(3) = s as i32;
+                }
+                num_gdn_runs += 1;
+                i = j;
+            }
+            if !any_chunk {
+                num_gdn_runs = 0;
             }
         }
         // Prefill-attention runs are currently disabled: the naive shared-KV
@@ -4195,7 +4317,9 @@ impl BatchedModel {
         // run eagerly below or are recorded inside the decode graph.
         self.sampler.sample_batched_stage(params, counts, bias)?;
         let vocab = self.cfg.vocab_size;
-        if self.graph_capture_ok(n, decode_only) {
+        // Graphs record the legacy one-row-per-slot GDN kernels; a chunked
+        // step (mixed prefill rows) must stay on the eager per-run path.
+        if num_gdn_runs == 0 && self.graph_capture_ok(n, decode_only) {
             let key = n as i32;
             if !self.decode_graphs.contains_key(&key) {
                 self.capture_decode_graph(key)?;
@@ -4215,6 +4339,7 @@ impl BatchedModel {
             self.run_mask_dev,
             decode_only,
             num_runs,
+            num_gdn_runs,
         )?;
         self.sampler
             .sample_batched_after_stage(self.logits, params, vocab)
@@ -4499,6 +4624,50 @@ impl BatchedModel {
                     hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Copies the persistent GDN recurrent + conv state of slot `from` to
+    /// slot `to` (every GDN layer) — compaction support (#112): a sequence
+    /// moving down a slot keeps its recurrence, exactly like `copy_seq_kv`
+    /// keeps its KV. Without this the moved sequence reads the retired
+    /// slot's state (context bleed). No-op for non-GDN models.
+    pub fn copy_gdn_slot(&self, from: usize, to: usize) -> Result<(), Error> {
+        if self.gdn_state.is_empty() {
+            return Ok(());
+        }
+        let c = self.cfg;
+        let per_slot_state = c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim * 4;
+        let conv_dim = 2 * c.gdn_key_dim() + c.gdn_value_dim();
+        let per_slot_conv = conv_dim * (c.gdn_conv_kernel - 1) * 4;
+        for li in 0..c.n_layers {
+            // Full-attn layers hold null entries.
+            if self.gdn_state[li].is_null() {
+                continue;
+            }
+            let s_state = self.gdn_state[li];
+            let s_conv = self.gdn_conv[li];
+            let src = s_state as usize + from * per_slot_state;
+            let dst = s_state as usize + to * per_slot_state;
+            // SAFETY: same-sized allocations; `from`/`to` < batch (callers
+            // are the engine's compaction loop over active slots).
+            hip::memcpy(
+                self.k.hip(),
+                dst as *mut core::ffi::c_void,
+                src as *const core::ffi::c_void,
+                per_slot_state,
+                hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )?;
+            let src = s_conv as usize + from * per_slot_conv;
+            let dst = s_conv as usize + to * per_slot_conv;
+            hip::memcpy(
+                self.k.hip(),
+                dst as *mut core::ffi::c_void,
+                src as *const core::ffi::c_void,
+                per_slot_conv,
+                hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )?;
         }
         Ok(())
     }

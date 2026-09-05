@@ -1611,3 +1611,43 @@ oracle 与两枚 HIP 内核,全部对拍钉死。**engine 接线留给下一批*
   slot 仍一行)、全注意力层对 chunk 行的 prefill attention 重启用、
   GEMV_Q4 batch=C 投影、整模 chunked CPU 前向作 e2e oracle、
   continuous.rs `take = min(prompt_len, C)`。
+
+## Qwen3.8-27B Stage B(二):GDN chunked prefill 引擎接线(#112,2026-09-06)
+
+数值底座(PR #117)接入引擎:GDN 模型 prefill 从每步每 slot 一 token
+的顺序递归升级为每步 `GDN_CHUNK_MAX=12` 行的 WY chunk。**接线过程抓出
+GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。**
+
+- **chunk 契约与接线**:`decode_step_explicit` 把同 slot 的行识别
+  为 per-slot run 描述符 `[row_base, count, pos_base, slot]`,三重校验
+  响亮拒绝:同 slot 分裂成两块(#116 双重应用形状)、块内位置非连续
+  递增、块长超 12(shmem 预算)。纯 decode 步(每 slot 一行,gdn_runs
+  =0)保持 legacy 逐行内核——与 decode 图录制的发射完全一致;chunk 步
+  逐 run 走 conv_chunk→l2norm→chunk→gated_norm,投影按行批
+  (GEMV_Q4/hipBLAS 既有路径)。图路径排除 chunk 步。
+- **全注意力层不新增机制**:chunk 行各自按 pos 写共享 KV,decode
+  attention 天然覆盖 [0..pos](含本步更早行)——因果正确且复用全部
+  既有内核。continuous 的 GDN take = min(剩余, budget, 12)。
+- **真 bug 四:compaction 丢 GDN 状态**——#114 GDN 落地起
+  `copy_seq_kv` 就只搬 KV;旧调度(逐 token 交错推进)恰好从不
+  在序列存活中段触发 compaction,chunking 改变节奏后前一序列先退休、
+  后一序列搬到它的 slot 读到残留状态。e2e 以 **0.07 margin 的决断
+  argmax 翻转**暴露(近平局 margin 判据立功:决断步必须一致、近平局步
+  容忍并 teacher-force 续链——与既有量化对拍教训同判据)。修复:
+  `copy_gdn_slot`(逐 GDN 层 state+conv D2D)与 KV 拷贝同点调用;
+  红检钉死(禁用→[3,16,22,72,78] vs 对照 [62,29,89,31,48])。
+- **定位链**:内核/引擎逐行对拍(batched 层四种调度形状全部 1e-5 匹配
+  RefModel)排除数值路径 → 打点引擎实际调度发现 compaction 时序变化 →
+  读 compaction 代码找到缺失的状态搬运。batched 层的正确性由
+  `batched_gdn_chunk_step_matches_sequential`(5 行 chunk + 孤
+  decode 行,全位置对拍+argmax)与
+  `gdn_chunk_rejects_split_slot_blocks`(坏布局拒绝)直接钉住;
+  `gdn_compaction_moves_recurrent_state`(压紧运行 = 无压紧对照
+  逐 token)钉住 compaction。
+- **效果量级与真机验收(Q4 全量)**:GDN 步进/内核发射数 ÷12
+  (130-token prompt = 11 chunk 步)。五例验收全绿:17×23=391 ✓、
+  同 prompt 两遍逐字节一致(slot 复用隔离+贪心确定性)✓、巴黎 ✓、
+  130-token 长文阅读理解答对(多 chunk prefill)✓。batch-1 贪心
+  decode ≈6-7 tok/s(Stage A 顺序期 ~4-5),chunk 步 wall ≈0.6-1.1s
+  /12 行——投影按行批摊销后 prefill 每 token 成本降至 decode 量级,
+  长 prompt TTFT 相应大幅缩短(顺序期 130 步 → 11 步)。
