@@ -66,6 +66,22 @@ struct LayerDev {
     shared_wg: *mut f32,
     shared_wu: *mut f32,
     shared_wd: *mut f32,
+    /// Gated DeltaNet (Qwen3.5 linear-attention layers). Null on full-attn
+    /// layers (and non-GDN models): `gdn_in_qkv` is the layer-type dispatch
+    /// marker, mirroring the weights-driven dispatch of the CPU reference.
+    gdn_in_qkv: *mut f32,
+    gdn_in_z: *mut f32,
+    gdn_in_a: *mut f32,
+    gdn_in_b: *mut f32,
+    gdn_out: *mut f32,
+    /// Depthwise conv taps `[conv_dim, k]` (newest last) — f32 even on the
+    /// F16 path (tiny, elementwise).
+    gdn_conv_w: *mut f32,
+    /// Bare per-v-head scalars `A_log` / `dt_bias` and the shared gated-norm
+    /// weight `[head_dim]`.
+    gdn_a_log: *mut f32,
+    gdn_dt_bias: *mut f32,
+    gdn_norm: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -78,6 +94,13 @@ struct LayerDevF16 {
     wg: *mut u16,
     wu: *mut u16,
     wd: *mut u16,
+    /// GDN GEMM matrices mirrored in f16 (a/b are [vh, d] matrices, not
+    /// small vectors — they contract over d like the other projections).
+    gdn_in_qkv: *mut u16,
+    gdn_in_z: *mut u16,
+    gdn_in_a: *mut u16,
+    gdn_in_b: *mut u16,
+    gdn_out: *mut u16,
 }
 
 /// The GPU transformer.
@@ -146,6 +169,24 @@ pub struct GpuModel {
     mla_kv_a_n: *mut f32,
     mla_kv: *mut f32,
     mla_attn: *mut f32,
+    // Qwen3.5 `attn_output_gate` scratch (full-attn layers): the doubled
+    // q_proj output before the per-head [query | gate] split, and the gate.
+    qg: *mut f32,
+    attn_gate: *mut f32,
+    // Qwen3.5 GDN (linear-attention) decode scratch, one row (batch = 1).
+    gdn_qkv_pre: *mut f32,
+    gdn_qkv: *mut f32,
+    gdn_z: *mut f32,
+    gdn_a: *mut f32,
+    gdn_b: *mut f32,
+    gdn_o: *mut f32,
+    // Per GDN layer recurrent state [vh, kd, vd] and conv state
+    // [conv_dim, k-1] — single sequence, must be zeroed at build (the
+    // recurrence reads S=0 at pos 0; hipMalloc does not zero).
+    gdn_state: Vec<*mut f32>,
+    gdn_conv: Vec<*mut f32>,
+    // Constant-zero slot table for the slot-indexed GDN kernels.
+    dev_slot0: *mut i32,
     // KV caches: (k, v) per layer
     kv_cache: Vec<(*mut f32, *mut f32)>,
     /// MLA KV caches (kv_lora_rank > 0): expanded per-head
@@ -253,6 +294,17 @@ impl GpuModel {
             mla_kv_a_n: std::ptr::null_mut(),
             mla_kv: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
+            qg: std::ptr::null_mut(),
+            attn_gate: std::ptr::null_mut(),
+            gdn_qkv_pre: std::ptr::null_mut(),
+            gdn_qkv: std::ptr::null_mut(),
+            gdn_z: std::ptr::null_mut(),
+            gdn_a: std::ptr::null_mut(),
+            gdn_b: std::ptr::null_mut(),
+            gdn_o: std::ptr::null_mut(),
+            gdn_state: Vec::new(),
+            gdn_conv: Vec::new(),
+            dev_slot0: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             allocs: Vec::new(),
@@ -357,6 +409,17 @@ impl GpuModel {
             mla_kv_a_n: std::ptr::null_mut(),
             mla_kv: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
+            qg: std::ptr::null_mut(),
+            attn_gate: std::ptr::null_mut(),
+            gdn_qkv_pre: std::ptr::null_mut(),
+            gdn_qkv: std::ptr::null_mut(),
+            gdn_z: std::ptr::null_mut(),
+            gdn_a: std::ptr::null_mut(),
+            gdn_b: std::ptr::null_mut(),
+            gdn_o: std::ptr::null_mut(),
+            gdn_state: Vec::new(),
+            gdn_conv: Vec::new(),
+            dev_slot0: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             allocs: Vec::new(),
@@ -460,6 +523,17 @@ impl GpuModel {
             mla_kv_a_n: std::ptr::null_mut(),
             mla_kv: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
+            qg: std::ptr::null_mut(),
+            attn_gate: std::ptr::null_mut(),
+            gdn_qkv_pre: std::ptr::null_mut(),
+            gdn_qkv: std::ptr::null_mut(),
+            gdn_z: std::ptr::null_mut(),
+            gdn_a: std::ptr::null_mut(),
+            gdn_b: std::ptr::null_mut(),
+            gdn_o: std::ptr::null_mut(),
+            gdn_state: Vec::new(),
+            gdn_conv: Vec::new(),
+            dev_slot0: std::ptr::null_mut(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             allocs: Vec::new(),
@@ -564,6 +638,46 @@ impl GpuModel {
                 let vv = self.dalloc(kv_bytes)?;
                 self.kv_cache.push((kk, vv));
             }
+        }
+        // Qwen3.5 `attn_output_gate`: the doubled q_proj output + gate split.
+        if c.attn_output_gate {
+            self.qg = self.dalloc(2 * nq * 4)?;
+            self.attn_gate = self.dalloc(nq * 4)?;
+        }
+        // Qwen3.5 GDN decode scratch + per-layer recurrent/conv state. The
+        // states MUST start zeroed (the pos-0 recurrence reads S = 0 and an
+        // empty conv window); hipMalloc does not zero, so upload zeros.
+        if c.gdn_enabled() {
+            let kd = c.gdn_key_dim();
+            let vd = c.gdn_value_dim();
+            let conv_dim = 2 * kd + vd;
+            let keep = c.gdn_conv_kernel - 1;
+            self.gdn_qkv_pre = self.dalloc(conv_dim * 4)?;
+            self.gdn_qkv = self.dalloc(conv_dim * 4)?;
+            self.gdn_z = self.dalloc(vd * 4)?;
+            self.gdn_a = self.dalloc(c.gdn_v_heads * 4)?;
+            self.gdn_b = self.dalloc(c.gdn_v_heads * 4)?;
+            self.gdn_o = self.dalloc(vd * 4)?;
+            let zeros = vec![0.0f32; c.gdn_v_heads * kd * vd];
+            let conv_zeros = vec![0.0f32; conv_dim * keep];
+            for _ in 0..c.n_layers {
+                let s = self.dalloc(zeros.len() * 4)?;
+                self.upload(s, &zeros)?;
+                let cv = self.dalloc(conv_zeros.len() * 4)?;
+                self.upload(cv, &conv_zeros)?;
+                self.gdn_state.push(s);
+                self.gdn_conv.push(cv);
+            }
+            let slot0 = self.dalloc(4)? as *mut i32;
+            let zero_i = [0i32];
+            hip::memcpy(
+                self.k.hip(),
+                slot0 as *mut core::ffi::c_void,
+                zero_i.as_ptr() as *const core::ffi::c_void,
+                4,
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
+            self.dev_slot0 = slot0;
         }
         if c.kv_lora_rank > 0 {
             let qlr = c.q_lora_rank;
@@ -702,26 +816,35 @@ impl GpuModel {
                 shared_wg: std::ptr::null_mut(),
                 shared_wu: std::ptr::null_mut(),
                 shared_wd: std::ptr::null_mut(),
+                // GDN: the GEMM matrices dequantize to f16 (LayerDevF16
+                // below); only the small f32 tensors live here.
+                gdn_in_qkv: std::ptr::null_mut(),
+                gdn_in_z: std::ptr::null_mut(),
+                gdn_in_a: std::ptr::null_mut(),
+                gdn_in_b: std::ptr::null_mut(),
+                gdn_out: std::ptr::null_mut(),
+                gdn_conv_w: self.upload_opt(&lw.gdn_conv_w)?,
+                gdn_a_log: self.upload_opt(&lw.gdn_a_log)?,
+                gdn_dt_bias: self.upload_opt(&lw.gdn_dt_bias)?,
+                gdn_norm: self.upload_opt(&lw.gdn_norm)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
             self.layers_dev.push(l);
             let l16 = LayerDevF16 {
-                wq: self.alloc_f16(lw.wq.len())?,
-                wk: self.alloc_f16(lw.wk.len())?,
-                wv: self.alloc_f16(lw.wv.len())?,
-                wo: self.alloc_f16(lw.wo.len())?,
-                wg: self.alloc_f16(lw.wg.len())?,
-                wu: self.alloc_f16(lw.wu.len())?,
-                wd: self.alloc_f16(lw.wd.len())?,
+                wq: self.upload_q4_f16(&lw.wq)?,
+                wk: self.upload_q4_f16(&lw.wk)?,
+                wv: self.upload_q4_f16(&lw.wv)?,
+                wo: self.upload_q4_f16(&lw.wo)?,
+                wg: self.upload_q4_f16(&lw.wg)?,
+                wu: self.upload_q4_f16(&lw.wu)?,
+                wd: self.upload_q4_f16(&lw.wd)?,
+                gdn_in_qkv: self.upload_q4_f16(&lw.gdn_in_qkv)?,
+                gdn_in_z: self.upload_q4_f16(&lw.gdn_in_z)?,
+                gdn_in_a: self.upload_f16_mat(&lw.gdn_in_a)?,
+                gdn_in_b: self.upload_f16_mat(&lw.gdn_in_b)?,
+                gdn_out: self.upload_q4_f16(&lw.gdn_out)?,
             };
-            self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
-            self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
-            self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
-            self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
-            self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
-            self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
-            self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
             self.layers_f16.push(l16);
         }
         Ok(())
@@ -770,26 +893,35 @@ impl GpuModel {
                 shared_wg: std::ptr::null_mut(),
                 shared_wu: std::ptr::null_mut(),
                 shared_wd: std::ptr::null_mut(),
+                // GDN: the GEMM matrices dequantize to f16 (LayerDevF16
+                // below); only the small f32 tensors live here.
+                gdn_in_qkv: std::ptr::null_mut(),
+                gdn_in_z: std::ptr::null_mut(),
+                gdn_in_a: std::ptr::null_mut(),
+                gdn_in_b: std::ptr::null_mut(),
+                gdn_out: std::ptr::null_mut(),
+                gdn_conv_w: self.upload_opt(&lw.gdn_conv_w)?,
+                gdn_a_log: self.upload_opt(&lw.gdn_a_log)?,
+                gdn_dt_bias: self.upload_opt(&lw.gdn_dt_bias)?,
+                gdn_norm: self.upload_opt(&lw.gdn_norm)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
             self.layers_dev.push(l);
             let l16 = LayerDevF16 {
-                wq: self.alloc_f16(lw.wq.len())?,
-                wk: self.alloc_f16(lw.wk.len())?,
-                wv: self.alloc_f16(lw.wv.len())?,
-                wo: self.alloc_f16(lw.wo.len())?,
-                wg: self.alloc_f16(lw.wg.len())?,
-                wu: self.alloc_f16(lw.wu.len())?,
-                wd: self.alloc_f16(lw.wd.len())?,
+                wq: self.upload_fp8_f16(&lw.wq)?,
+                wk: self.upload_fp8_f16(&lw.wk)?,
+                wv: self.upload_fp8_f16(&lw.wv)?,
+                wo: self.upload_fp8_f16(&lw.wo)?,
+                wg: self.upload_fp8_f16(&lw.wg)?,
+                wu: self.upload_fp8_f16(&lw.wu)?,
+                wd: self.upload_fp8_f16(&lw.wd)?,
+                gdn_in_qkv: self.upload_fp8_f16(&lw.gdn_in_qkv)?,
+                gdn_in_z: self.upload_fp8_f16(&lw.gdn_in_z)?,
+                gdn_in_a: self.upload_f16_mat(&lw.gdn_in_a)?,
+                gdn_in_b: self.upload_f16_mat(&lw.gdn_in_b)?,
+                gdn_out: self.upload_fp8_f16(&lw.gdn_out)?,
             };
-            self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
-            self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
-            self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
-            self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
-            self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
-            self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
-            self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
             self.layers_f16.push(l16);
         }
         Ok(())
@@ -803,12 +935,48 @@ impl GpuModel {
 
     /// Allocates + uploads an f32 matrix, or returns null on the F16 path
     /// (fp16 weights live in `LayerDevF16`; the f32 copy is not needed).
+    /// Empty slices (absent tensors, e.g. wq on a GDN layer) return null on
+    /// both paths — no zero-byte allocation.
     fn upload_mat32(&mut self, src: &[f32], f16: bool) -> Result<*mut f32, Error> {
-        if f16 {
+        if src.is_empty() || f16 {
             Ok(std::ptr::null_mut())
         } else {
             let p = self.dalloc(src.len() * 4)?;
             self.upload(p, src)?;
+            Ok(p)
+        }
+    }
+
+    /// Allocates + uploads an optional f16 matrix (empty -> null device
+    /// pointer): the F16-path mirror of [`Self::upload_mat32`].
+    fn upload_f16_mat(&mut self, src: &[f32]) -> Result<*mut u16, Error> {
+        if src.is_empty() {
+            Ok(std::ptr::null_mut())
+        } else {
+            let p = self.alloc_f16(src.len())?;
+            self.upload_f16(p, src)?;
+            Ok(p)
+        }
+    }
+
+    /// Allocates + dequantizes-to-f16 + uploads an optional Q4 matrix.
+    fn upload_q4_f16(&mut self, t: &crate::q4::Q4Tensor) -> Result<*mut u16, Error> {
+        if t.is_empty() {
+            Ok(std::ptr::null_mut())
+        } else {
+            let p = self.alloc_f16(t.len())?;
+            self.upload_f16_bits(p, &t.dequantize_f16())?;
+            Ok(p)
+        }
+    }
+
+    /// Allocates + dequantizes-to-f16 + uploads an optional FP8 matrix.
+    fn upload_fp8_f16(&mut self, t: &crate::fp8::Fp8Tensor) -> Result<*mut u16, Error> {
+        if t.is_empty() {
+            Ok(std::ptr::null_mut())
+        } else {
+            let p = self.alloc_f16(t.len())?;
+            self.upload_f16_bits(p, &t.dequantize_f16())?;
             Ok(p)
         }
     }
@@ -971,6 +1139,17 @@ impl GpuModel {
                 shared_wg: self.upload_mat32(&lw.shared_wg, f16)?,
                 shared_wu: self.upload_mat32(&lw.shared_wu, f16)?,
                 shared_wd: self.upload_mat32(&lw.shared_wd, f16)?,
+                // GDN tensors (empty on full-attn layers / non-GDN models —
+                // upload_mat32/upload_opt return null then).
+                gdn_in_qkv: self.upload_mat32(&lw.gdn_in_qkv, f16)?,
+                gdn_in_z: self.upload_mat32(&lw.gdn_in_z, f16)?,
+                gdn_in_a: self.upload_mat32(&lw.gdn_in_a, f16)?,
+                gdn_in_b: self.upload_mat32(&lw.gdn_in_b, f16)?,
+                gdn_out: self.upload_mat32(&lw.gdn_out, f16)?,
+                gdn_conv_w: self.upload_opt(&lw.gdn_conv_w)?,
+                gdn_a_log: self.upload_opt(&lw.gdn_a_log)?,
+                gdn_dt_bias: self.upload_opt(&lw.gdn_dt_bias)?,
+                gdn_norm: self.upload_opt(&lw.gdn_norm)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -999,21 +1178,19 @@ impl GpuModel {
             self.layers_dev.push(l);
             if c.dtype == ModelDType::F16 {
                 let l16 = LayerDevF16 {
-                    wq: self.alloc_f16(lw.wq.len())?,
-                    wk: self.alloc_f16(lw.wk.len())?,
-                    wv: self.alloc_f16(lw.wv.len())?,
-                    wo: self.alloc_f16(lw.wo.len())?,
-                    wg: self.alloc_f16(lw.wg.len())?,
-                    wu: self.alloc_f16(lw.wu.len())?,
-                    wd: self.alloc_f16(lw.wd.len())?,
+                    wq: self.upload_f16_mat(&lw.wq)?,
+                    wk: self.upload_f16_mat(&lw.wk)?,
+                    wv: self.upload_f16_mat(&lw.wv)?,
+                    wo: self.upload_f16_mat(&lw.wo)?,
+                    wg: self.upload_f16_mat(&lw.wg)?,
+                    wu: self.upload_f16_mat(&lw.wu)?,
+                    wd: self.upload_f16_mat(&lw.wd)?,
+                    gdn_in_qkv: self.upload_f16_mat(&lw.gdn_in_qkv)?,
+                    gdn_in_z: self.upload_f16_mat(&lw.gdn_in_z)?,
+                    gdn_in_a: self.upload_f16_mat(&lw.gdn_in_a)?,
+                    gdn_in_b: self.upload_f16_mat(&lw.gdn_in_b)?,
+                    gdn_out: self.upload_f16_mat(&lw.gdn_out)?,
                 };
-                self.upload_f16(l16.wq, &lw.wq)?;
-                self.upload_f16(l16.wk, &lw.wk)?;
-                self.upload_f16(l16.wv, &lw.wv)?;
-                self.upload_f16(l16.wo, &lw.wo)?;
-                self.upload_f16(l16.wg, &lw.wg)?;
-                self.upload_f16(l16.wu, &lw.wu)?;
-                self.upload_f16(l16.wd, &lw.wd)?;
                 self.layers_f16.push(l16);
             }
         }
@@ -1127,6 +1304,7 @@ impl GpuModel {
                     heads,
                     heads,
                     rope,
+                    rope,
                     RopeParams::from(c),
                 )?;
                 // compressed_kv = kv_a(xn); latent rms; k_rope (shared) + RoPE.
@@ -1146,6 +1324,7 @@ impl GpuModel {
                     self.dev_pos,
                     1,
                     1,
+                    rope,
                     rope,
                     RopeParams::from(c),
                 )?;
@@ -1186,15 +1365,115 @@ impl GpuModel {
                 )?;
                 k.gemm(self.proj, self.mla_attn, lw.mla_o, d, heads * v_hd)?;
                 k.launch_add(self.x, self.proj, d)?;
-            } else {
+            } else if c.gdn_enabled() && !c.layer_is_full_attn(li) {
+                // Qwen3.5 hybrid: linear-attention layer (gated DeltaNet).
+                // DISPATCH IS CONFIG-DRIVEN, not `!lw.gdn_in_qkv.is_null()`:
+                // that f32 pointer is null on every quantized upload path
+                // (F16/Q4/FP8 null the f32 copy), which silently routed GDN
+                // layers into the full-attention branch with a null f16 wq
+                // — gemv_f16 then faulted the device (#107 lesson: existence
+                // guards must be dtype-independent). All kernels take the
+                // constant-zero slot table (single sequence) and mutate the
+                // per-layer state in place.
+                let kd = (c.gdn_k_heads * c.gdn_head_dim) as i32;
+                let vd = (c.gdn_v_heads * c.gdn_head_dim) as i32;
+                let kh = c.gdn_k_heads as i32;
+                let vh = c.gdn_v_heads as i32;
+                let hd = c.gdn_head_dim as i32;
+                let conv_dim = 2 * kd + vd;
+                let keep = c.gdn_conv_kernel as i32 - 1;
                 gemm(
-                    self.q,
+                    self.gdn_qkv_pre,
+                    self.xn,
+                    lw.gdn_in_qkv,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_qkv),
+                    conv_dim,
+                    d,
+                )?;
+                gemm(
+                    self.gdn_z,
+                    self.xn,
+                    lw.gdn_in_z,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_z),
+                    vd,
+                    d,
+                )?;
+                gemm(
+                    self.gdn_a,
+                    self.xn,
+                    lw.gdn_in_a,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_a),
+                    vh,
+                    d,
+                )?;
+                gemm(
+                    self.gdn_b,
+                    self.xn,
+                    lw.gdn_in_b,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_b),
+                    vh,
+                    d,
+                )?;
+                k.launch_gdn_conv_update(
+                    self.gdn_qkv,
+                    self.gdn_qkv_pre,
+                    self.gdn_conv[li],
+                    self.dev_slot0,
+                    1,
+                    conv_dim,
+                    keep,
+                    lw.gdn_conv_w,
+                )?;
+                k.launch_gdn_l2norm_qk(self.gdn_qkv, 1, kh, hd, conv_dim)?;
+                k.launch_gdn_step(
+                    self.gdn_qkv,
+                    self.gdn_state[li],
+                    self.gdn_o,
+                    self.dev_slot0,
+                    lw.gdn_a_log,
+                    lw.gdn_dt_bias,
+                    self.gdn_a,
+                    self.gdn_b,
+                    1,
+                    vh,
+                    kh,
+                    hd,
+                    conv_dim,
+                )?;
+                k.launch_gdn_gated_norm(self.gdn_o, self.gdn_z, lw.gdn_norm, 1, vh, hd, c.rms_eps)?;
+                gemm(
+                    self.proj,
+                    self.gdn_o,
+                    lw.gdn_out,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_out),
+                    d,
+                    vd,
+                )?;
+                k.launch_add(self.x, self.proj, d)?;
+            } else {
+                // Qwen3.5 `attn_output_gate`: the doubled q_proj carries each
+                // head's block as [query | gate]; split before QK-norm (the
+                // gate skips norm + RoPE) and apply sigmoid after attention.
+                let gate_on = c.attn_output_gate;
+                let nq_rows = if gate_on { 2 * nq } else { nq };
+                gemm(
+                    if gate_on { self.qg } else { self.q },
                     self.xn,
                     lw.wq,
                     l16.map_or(std::ptr::null_mut(), |l| l.wq),
-                    nq,
+                    nq_rows,
                     d,
                 )?;
+                if gate_on {
+                    k.launch_qg_split(
+                        self.qg,
+                        self.q,
+                        self.attn_gate,
+                        1,
+                        c.n_heads as i32,
+                        c.head_dim as i32,
+                    )?;
+                }
                 gemm(
                     self.k_buf,
                     self.xn,
@@ -1235,6 +1514,10 @@ impl GpuModel {
                         c.rms_eps,
                     )?;
                 }
+                // Partial rotary (Qwen3.5 full-attn layers): only the first
+                // `attn_rotary_dim` coordinates rotate (== head_dim for every
+                // pre-Qwen3.5 family).
+                let rot = c.attn_rotary_dim() as i32;
                 k.launch_rope(
                     self.q,
                     self.k_buf,
@@ -1242,6 +1525,7 @@ impl GpuModel {
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
+                    rot,
                     RopeParams::from(c),
                 )?;
 
@@ -1275,6 +1559,9 @@ impl GpuModel {
                     scale,
                     c.max_seq_len as i32,
                 )?;
+                if gate_on {
+                    k.launch_attn_gate_apply(self.attn, self.attn_gate, nq as usize)?;
+                }
                 gemm(
                     self.proj,
                     self.attn,

@@ -201,12 +201,17 @@ __device__ __forceinline__ float yarn_freq(int d, int head_dim, float theta,
 }
 
 extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
-                                int n_heads, int n_kv_heads, int head_dim, float theta,
+                                int n_heads, int n_kv_heads, int head_dim,
+                                int rot_dim, float theta,
                                 int yarn, float factor, float beta_fast, float beta_slow,
                                 float orig_len, float attn_factor, int interleave) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int pos = *pos_buf;
-    int half = head_dim / 2;
+    // Partial rotary (Qwen3.5 full-attn layers): only the first `rot_dim`
+    // coordinates of each head rotate; the tail passes through unchanged. The
+    // frequency basis is `rot_dim` (HF computes inv_freq over the rotating
+    // width), so passing rot_dim == head_dim reproduces full rotary exactly.
+    int half = rot_dim / 2;
     int total_q = n_heads * head_dim;
     int total_k = n_kv_heads * head_dim;
     // Pairing convention. `d` is the PAIR index (0..half-1) and also the
@@ -218,7 +223,7 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
         int h = i / head_dim;
         int d = i % head_dim;
         if (d < half) {
-            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+            float freq = yarn_freq(d, rot_dim, theta, yarn, factor, beta_fast,
                                     beta_slow, orig_len);
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
@@ -242,7 +247,7 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
         int h = i / head_dim;
         int d = i % head_dim;
         if (d < half) {
-            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+            float freq = yarn_freq(d, rot_dim, theta, yarn, factor, beta_fast,
                                     beta_slow, orig_len);
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
@@ -448,12 +453,14 @@ __device__ __forceinline__ float yarn_freq(int d, int head_dim, float theta,
 
 extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
                                         int batch, int n_heads, int n_kv_heads,
-                                        int head_dim, float theta,
+                                        int head_dim, int rot_dim, float theta,
                                         int yarn, float factor, float beta_fast,
                                         float beta_slow, float orig_len,
                                         float attn_factor, int interleave) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int half = head_dim / 2;
+    // Partial rotary: same contract as the single-row `rope` kernel — the
+    // frequency basis is `rot_dim` and coordinates beyond it pass through.
+    int half = rot_dim / 2;
     int total_q = batch * n_heads * head_dim;
     int total_k = batch * n_kv_heads * head_dim;
     if (idx < total_q) {
@@ -463,7 +470,7 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
         int d = rem % head_dim;
         if (d < half) {
             int pos = pos_buf[s];
-            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+            float freq = yarn_freq(d, rot_dim, theta, yarn, factor, beta_fast,
                                     beta_slow, orig_len);
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
@@ -482,7 +489,7 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
         int d = rem % head_dim;
         if (d < half) {
             int pos = pos_buf[s];
-            float freq = yarn_freq(d, head_dim, theta, yarn, factor, beta_fast,
+            float freq = yarn_freq(d, rot_dim, theta, yarn, factor, beta_fast,
                                     beta_slow, orig_len);
             float ang = (float)pos * freq;
             float c = cosf(ang) * attn_factor, sn = sinf(ang) * attn_factor;
@@ -494,6 +501,200 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
             p[d1] = a * sn + b * c;
         }
     }
+}
+"#;
+
+/// Splits the doubled `attn_output_gate` q_proj output (Qwen3.5 full-attn
+/// layers): `qg[b, h, 2*D]` carries each head's block as `[query | gate]`
+/// (HF `chunk(2, dim=-1)`), written here into separate dense `q`/`gate`
+/// rows. Batch-capable (single-row models pass batch=1).
+const QG_SPLIT: &str = r#"
+extern "C" __global__ void qg_split(const float* __restrict__ qg,
+                                    float* __restrict__ q,
+                                    float* __restrict__ gate,
+                                    int batch, int heads, int head_dim) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)batch * heads * head_dim;
+    if (i >= total) return;
+    long long hd = head_dim;
+    long long b = i / (heads * hd);
+    long long h = (i / hd) % heads;
+    long long j = i % hd;
+    const float* src = qg + (b * heads * 2 + h * 2) * hd + j;
+    q[i] = src[0];
+    gate[i] = src[hd];
+}
+"#;
+
+/// Applies the attention output gate: `attn *= sigmoid(gate)` elementwise
+/// (Qwen3.5 `attn_output_gate` — before the o_proj).
+const ATTN_GATE_APPLY: &str = r#"
+extern "C" __global__ void attn_gate_apply(float* __restrict__ attn,
+                                           const float* __restrict__ gate,
+                                           int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = gate[i];
+        attn[i] *= 1.0f / (1.0f + __expf(-g));
+    }
+}
+"#;
+
+/// Gated-DeltaNet decode, stage 1: depthwise causal conv1d + silu over the
+/// fused qkv stream, in-place conv-state shift. The conv state holds the RAW
+/// pre-conv inputs of the last `keep = k - 1` positions (what conv1d consumed,
+/// not its post-silu output) and is indexed by SLOT (persistent per request),
+/// not by batch row. `qkv_pre` is this row's raw projection.
+const GDN_CONV_UPDATE: &str = r#"
+extern "C" __global__ void gdn_conv_update(
+    float* __restrict__ qkv,           // [batch, conv_dim] out (silu'd)
+    const float* __restrict__ qkv_pre, // [batch, conv_dim] raw projection
+    float* __restrict__ conv_state,    // [slots, conv_dim, keep]
+    const int* __restrict__ slots,     // [batch] row -> slot
+    int batch, int conv_dim, int keep,
+    const float* __restrict__ w) {     // [conv_dim, keep + 1], newest tap last
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * conv_dim) return;
+    int b = i / conv_dim;
+    int c = i % conv_dim;
+    float* st = conv_state + ((long long)slots[b] * conv_dim + c) * keep;
+    const float* wc = w + (long long)c * (keep + 1);
+    float s = 0.0f;
+    for (int j = 0; j < keep; j++) s += st[j] * wc[j];
+    s += qkv_pre[i] * wc[keep];
+    qkv[i] = s / (1.0f + __expf(-s));
+    // Shift the state left, appending the raw new input.
+    for (int j = 0; j < keep - 1; j++) st[j] = st[j + 1];
+    st[keep - 1] = qkv_pre[i];
+}
+"#;
+
+/// Gated-DeltaNet decode, stage 2: per-head l2norm of the q and k halves of
+/// the conv output (`qkv = [q(kd) | k(kd) | v(vd)]`), then the q scale
+/// `head_dim^-0.5` (applied after the norm, matching the reference order).
+/// The eps lives INSIDE the square root (eps=1e-6, FLA-aligned). One block
+/// per (batch row, q-or-k head).
+const GDN_L2NORM_QK: &str = r#"
+extern "C" __global__ void gdn_l2norm_qk(float* __restrict__ qkv,
+                                         int batch, int k_heads, int head_dim,
+                                         int conv_dim) {
+    extern __shared__ float red[];   // [blockDim.x / 32]
+    int b = blockIdx.x / (2 * k_heads);
+    int h = blockIdx.x % (2 * k_heads);
+    bool is_q = h < k_heads;
+    float* vec = qkv + (long long)b * conv_dim
+               + (is_q ? (long long)h * head_dim
+                       : (long long)k_heads * head_dim
+                             + (long long)(h - k_heads) * head_dim);
+    float part = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x)
+        part += vec[j] * vec[j];
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down(part, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x >> 5)) ? red[threadIdx.x] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
+        if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    float inv = rsqrtf(red[0] + 1e-6f);
+    if (is_q) inv *= rsqrtf((float)head_dim);
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) vec[j] *= inv;
+}
+"#;
+
+/// Gated-DeltaNet decode, stage 3: the per-v-head delta-rule recurrence on
+/// the recurrent state `S` (slot-indexed, `[slots, vh, hd, hd]`):
+///   g = -exp(A_log) * softplus(a + dt_bias); decay = exp(g); beta = sigmoid(b)
+///   S <- S * decay; kv_mem = S^T k; S <- S + k (x) (v - kv_mem) * beta;
+///   o = S^T q  (reading the UPDATED S)
+/// k head for v-head i is `i / (vh / k_heads)` — k heads repeat across v
+/// heads. One block per (v-head, batch row); global-memory S (the 27B's
+/// hd=128 S block is 64 KB, over the LDS budget — a tiled-LDS rewrite is a
+/// perf follow-up, not a correctness concern).
+const GDN_STEP: &str = r#"
+extern "C" __global__ void gdn_step(
+    const float* __restrict__ qkv,      // [batch, conv_dim]: normed q|k, v
+    float* __restrict__ state,          // [slots, vh, hd, hd]
+    float* __restrict__ o,              // [batch, vd] out (pre gated-norm)
+    const int* __restrict__ slots,
+    const float* __restrict__ a_log,    // [vh]
+    const float* __restrict__ dt_bias,  // [vh]
+    const float* __restrict__ a_in,     // [batch, vh]
+    const float* __restrict__ b_in,     // [batch, vh]
+    int batch, int vh, int kh, int hd, int conv_dim) {
+    int i = blockIdx.x;   // v-head
+    int b = blockIdx.y;   // batch row
+    int rep = vh / kh;
+    float* S = state + ((long long)slots[b] * vh + i) * hd * hd;
+    float sp = a_in[(long long)b * vh + i] + dt_bias[i];
+    float softplus = (sp > 20.0f) ? sp : __logf(1.0f + __expf(sp));
+    float decay = __expf(-__expf(a_log[i]) * softplus);
+    float beta = 1.0f / (1.0f + __expf(-b_in[(long long)b * vh + i]));
+    const float* qh = qkv + (long long)b * conv_dim + (long long)(i / rep) * hd;
+    const float* kv = qkv + (long long)b * conv_dim + (long long)kh * hd
+                    + (long long)(i / rep) * hd;
+    const float* vv = qkv + (long long)b * conv_dim + (long long)2 * kh * hd
+                    + (long long)i * hd;
+    float* oh = o + ((long long)b * vh + i) * hd;
+    int n = hd * hd;
+    // 1) S <- S * decay
+    for (int t = threadIdx.x; t < n; t += blockDim.x) S[t] *= decay;
+    __syncthreads();
+    // 2) kv_mem = S^T k
+    extern __shared__ float kmem[];   // [hd]
+    for (int m = threadIdx.x; m < hd; m += blockDim.x) {
+        float acc = 0.0f;
+        for (int kk = 0; kk < hd; kk++) acc += kv[kk] * S[kk * hd + m];
+        kmem[m] = acc;
+    }
+    __syncthreads();
+    // 3) S <- S + k (x) (v - kv_mem) * beta
+    for (int t = threadIdx.x; t < n; t += blockDim.x) {
+        int kk = t / hd, m = t % hd;
+        S[t] += kv[kk] * (vv[m] - kmem[m]) * beta;
+    }
+    __syncthreads();
+    // 4) o = S^T q on the UPDATED S
+    for (int m = threadIdx.x; m < hd; m += blockDim.x) {
+        float acc = 0.0f;
+        for (int kk = 0; kk < hd; kk++) acc += qh[kk] * S[kk * hd + m];
+        oh[m] = acc;
+    }
+}
+"#;
+
+/// Gated-DeltaNet decode, stage 4: per-head gated RMSNorm over the v dim —
+/// `o_h = o_h * rms(o_h)^-1 * w[j] * silu(z[j])`, the norm weight shared
+/// across v-heads (ones-init plain multiply in the checkpoint — NOT the
+/// zero-centered shift of the layer norms). One block per (row, v-head).
+const GDN_GATED_NORM: &str = r#"
+extern "C" __global__ void gdn_gated_norm(
+    float* __restrict__ o,             // [batch, vd] in/out
+    const float* __restrict__ z,       // [batch, vd]
+    const float* __restrict__ w,       // [hd]
+    int batch, int vh, int head_dim, float eps) {
+    extern __shared__ float red[];   // [blockDim.x / 32]
+    int b = blockIdx.x / vh;
+    int i = blockIdx.x % vh;
+    float* oh = o + ((long long)b * vh + i) * head_dim;
+    const float* zh = z + ((long long)b * vh + i) * head_dim;
+    float part = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x)
+        part += oh[j] * oh[j];
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down(part, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < (blockDim.x >> 5)) ? red[threadIdx.x] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
+        if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    float inv = rsqrtf(red[0] / (float)head_dim + eps);
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x)
+        oh[j] = oh[j] * inv * w[j] * (zh[j] / (1.0f + __expf(-zh[j])));
 }
 "#;
 
@@ -2382,6 +2583,12 @@ pub struct HipKernels {
     rope: HipKernelModule,
     embed_batched: HipKernelModule,
     rope_batched: HipKernelModule,
+    qg_split: HipKernelModule,
+    attn_gate_apply: HipKernelModule,
+    gdn_conv_update: HipKernelModule,
+    gdn_l2norm_qk: HipKernelModule,
+    gdn_step: HipKernelModule,
+    gdn_gated_norm: HipKernelModule,
     kv_store_batched: HipKernelModule,
     attn_decode_batched: HipKernelModule,
     kv_store_paged: HipKernelModule,
@@ -2520,6 +2727,12 @@ impl HipKernels {
             rope: compile_cached(&arch, ROPE, "rope")?,
             embed_batched: compile_cached(&arch, EMBED_BATCHED, "embed_batched")?,
             rope_batched: compile_cached(&arch, ROPE_BATCHED, "rope_batched")?,
+            qg_split: compile_cached(&arch, QG_SPLIT, "qg_split")?,
+            attn_gate_apply: compile_cached(&arch, ATTN_GATE_APPLY, "attn_gate_apply")?,
+            gdn_conv_update: compile_cached(&arch, GDN_CONV_UPDATE, "gdn_conv_update")?,
+            gdn_l2norm_qk: compile_cached(&arch, GDN_L2NORM_QK, "gdn_l2norm_qk")?,
+            gdn_step: compile_cached(&arch, GDN_STEP, "gdn_step")?,
+            gdn_gated_norm: compile_cached(&arch, GDN_GATED_NORM, "gdn_gated_norm")?,
             kv_store_batched: compile_cached(&arch, KV_STORE_BATCHED, "kv_store_batched")?,
             attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
             kv_store_paged: compile_cached(&arch, KV_STORE_PAGED, "kv_store_paged")?,
@@ -3102,7 +3315,8 @@ impl HipKernels {
         )?)
     }
 
-    /// Applies rotary position embeddings to q and k in place.
+    /// Applies rotary position embeddings to q and k in place. `rot_dim` is
+    /// the rotating width (partial rotary); pass `head_dim` for full rotary.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_rope(
         &self,
@@ -3112,6 +3326,7 @@ impl HipKernels {
         n_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
+        rot_dim: i32,
         rp: RopeParams,
     ) -> Result<(), Error> {
         let qp = q;
@@ -3124,6 +3339,7 @@ impl HipKernels {
             &n_heads as *const i32 as *mut core::ffi::c_void,
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,
             &head_dim as *const i32 as *mut core::ffi::c_void,
+            &rot_dim as *const i32 as *mut core::ffi::c_void,
             &rp.theta as *const f32 as *mut core::ffi::c_void,
             &rp.yarn as *const i32 as *mut core::ffi::c_void,
             &rp.factor as *const f32 as *mut core::ffi::c_void,
@@ -3138,6 +3354,183 @@ impl HipKernels {
         Ok(self
             .rope
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Splits the doubled `attn_output_gate` q_proj output `qg[batch,
+    /// heads*2*head_dim]` into `q` and `gate` (per-head `[query | gate]`
+    /// blocks).
+    pub fn launch_qg_split(
+        &self,
+        qg: *const f32,
+        q: *mut f32,
+        gate: *mut f32,
+        batch: i32,
+        heads: i32,
+        head_dim: i32,
+    ) -> Result<(), Error> {
+        let mut p = vec![
+            &qg as *const *const f32 as *mut core::ffi::c_void,
+            &q as *const *mut f32 as *mut core::ffi::c_void,
+            &gate as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch as u32 * heads as u32 * head_dim as u32).div_ceil(256);
+        Ok(self
+            .qg_split
+            .launch([total, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// `attn[i] *= sigmoid(gate[i])` over `n` elements (attention output
+    /// gate, before the o_proj).
+    pub fn launch_attn_gate_apply(
+        &self,
+        attn: *mut f32,
+        gate: *const f32,
+        n: usize,
+    ) -> Result<(), Error> {
+        let nn = n as i32;
+        let mut p = vec![
+            &attn as *const *mut f32 as *mut core::ffi::c_void,
+            &gate as *const *const f32 as *mut core::ffi::c_void,
+            &nn as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (n as u32).div_ceil(256);
+        Ok(self
+            .attn_gate_apply
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// GDN stage 1: depthwise conv + silu + conv-state shift (slot-indexed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gdn_conv_update(
+        &self,
+        qkv: *mut f32,
+        qkv_pre: *const f32,
+        conv_state: *mut f32,
+        slots: *const i32,
+        batch: i32,
+        conv_dim: i32,
+        keep: i32,
+        w: *const f32,
+    ) -> Result<(), Error> {
+        let mut p = vec![
+            &qkv as *const *mut f32 as *mut core::ffi::c_void,
+            &qkv_pre as *const *const f32 as *mut core::ffi::c_void,
+            &conv_state as *const *mut f32 as *mut core::ffi::c_void,
+            &slots as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &conv_dim as *const i32 as *mut core::ffi::c_void,
+            &keep as *const i32 as *mut core::ffi::c_void,
+            &w as *const *const f32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (batch as u32 * conv_dim as u32).div_ceil(256);
+        Ok(self
+            .gdn_conv_update
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// GDN stage 2: per-head l2norm of the q/k halves + the q scale.
+    pub fn launch_gdn_l2norm_qk(
+        &self,
+        qkv: *mut f32,
+        batch: i32,
+        k_heads: i32,
+        head_dim: i32,
+        conv_dim: i32,
+    ) -> Result<(), Error> {
+        let mut p = vec![
+            &qkv as *const *mut f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &k_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &conv_dim as *const i32 as *mut core::ffi::c_void,
+        ];
+        let grid = (batch * 2 * k_heads) as u32;
+        let shared = (256 / 32) * 4;
+        Ok(self.gdn_l2norm_qk.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
+    /// GDN stage 3: the per-v-head delta-rule recurrence (slot-indexed S).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gdn_step(
+        &self,
+        qkv: *const f32,
+        state: *mut f32,
+        o: *mut f32,
+        slots: *const i32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        a_in: *const f32,
+        b_in: *const f32,
+        batch: i32,
+        vh: i32,
+        kh: i32,
+        hd: i32,
+        conv_dim: i32,
+    ) -> Result<(), Error> {
+        let mut p = vec![
+            &qkv as *const *const f32 as *mut core::ffi::c_void,
+            &state as *const *mut f32 as *mut core::ffi::c_void,
+            &o as *const *mut f32 as *mut core::ffi::c_void,
+            &slots as *const *const i32 as *mut core::ffi::c_void,
+            &a_log as *const *const f32 as *mut core::ffi::c_void,
+            &dt_bias as *const *const f32 as *mut core::ffi::c_void,
+            &a_in as *const *const f32 as *mut core::ffi::c_void,
+            &b_in as *const *const f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &vh as *const i32 as *mut core::ffi::c_void,
+            &kh as *const i32 as *mut core::ffi::c_void,
+            &hd as *const i32 as *mut core::ffi::c_void,
+            &conv_dim as *const i32 as *mut core::ffi::c_void,
+        ];
+        // shared: [hd] floats for kv_mem.
+        Ok(self.gdn_step.launch_shmem(
+            [vh as u32, batch as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            hd as u32 * 4,
+        )?)
+    }
+
+    /// GDN stage 4: per-head gated RMSNorm (`* w * silu(z)`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gdn_gated_norm(
+        &self,
+        o: *mut f32,
+        z: *const f32,
+        w: *const f32,
+        batch: i32,
+        vh: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> Result<(), Error> {
+        let mut p = vec![
+            &o as *const *mut f32 as *mut core::ffi::c_void,
+            &z as *const *const f32 as *mut core::ffi::c_void,
+            &w as *const *const f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &vh as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &eps as *const f32 as *mut core::ffi::c_void,
+        ];
+        let grid = (batch * vh) as u32;
+        let shared = (256 / 32) * 4;
+        Ok(self.gdn_gated_norm.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
     }
 
     /// `out[1, n] = x[1, k] @ W^T` where `w` is `[n, k]` row-major.
@@ -3238,6 +3631,7 @@ impl HipKernels {
         n_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
+        rot_dim: i32,
         rp: RopeParams,
     ) -> Result<(), Error> {
         let qp = q;
@@ -3251,6 +3645,7 @@ impl HipKernels {
             &n_heads as *const i32 as *mut core::ffi::c_void,
             &n_kv_heads as *const i32 as *mut core::ffi::c_void,
             &head_dim as *const i32 as *mut core::ffi::c_void,
+            &rot_dim as *const i32 as *mut core::ffi::c_void,
             &rp.theta as *const f32 as *mut core::ffi::c_void,
             &rp.yarn as *const i32 as *mut core::ffi::c_void,
             &rp.factor as *const f32 as *mut core::ffi::c_void,
@@ -4662,6 +5057,12 @@ mod offline_tests {
         MLA_ATTN_DECODE,
         EMBED_BATCHED,
         ROPE_BATCHED,
+        QG_SPLIT,
+        ATTN_GATE_APPLY,
+        GDN_CONV_UPDATE,
+        GDN_L2NORM_QK,
+        GDN_STEP,
+        GDN_GATED_NORM,
         KV_STORE_BATCHED,
         ATTN_DECODE_BATCHED,
         MLA_ASSEMBLE_Q_BATCHED,
@@ -4711,7 +5112,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            52,
+            58,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }

@@ -65,12 +65,16 @@ fn config_from_json(path: &std::path::Path) -> Config {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).expect("read config"))
             .expect("parse config");
-    let hidden = v["hidden_size"].as_u64().unwrap_or(896) as usize;
-    let layers = v["num_hidden_layers"].as_u64().unwrap_or(24) as usize;
-    let heads = v["num_attention_heads"].as_u64().unwrap_or(14) as usize;
-    let kv = v["num_key_value_heads"].as_u64().unwrap_or(heads as u64) as usize;
-    let vocab = v["vocab_size"].as_u64().unwrap_or(151936) as usize;
-    let inter = v["intermediate_size"].as_u64().unwrap_or(4 * hidden as u64) as usize;
+    // Multi-modal checkpoints (Qwen3.5 `Qwen3_5ForConditionalGeneration`) nest
+    // the text stack under `text_config`; single-modality configs are flat.
+    // Every text-model parameter below reads from `t`, never `v` directly.
+    let t = v.get("text_config").filter(|x| x.is_object()).unwrap_or(&v);
+    let hidden = t["hidden_size"].as_u64().unwrap_or(896) as usize;
+    let layers = t["num_hidden_layers"].as_u64().unwrap_or(24) as usize;
+    let heads = t["num_attention_heads"].as_u64().unwrap_or(14) as usize;
+    let kv = t["num_key_value_heads"].as_u64().unwrap_or(heads as u64) as usize;
+    let vocab = t["vocab_size"].as_u64().unwrap_or(151936) as usize;
+    let inter = t["intermediate_size"].as_u64().unwrap_or(4 * hidden as u64) as usize;
     // DeepSeek-V2-Lite declares `max_position_embeddings: 163840`, but the
     // preallocated KV cache is `max_seq_len`-sized per slot (MLA: ~552 KB per
     // token across 27 layers), so honoring it verbatim would try to reserve
@@ -80,18 +84,22 @@ fn config_from_json(path: &std::path::Path) -> Config {
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
-        None => v["max_position_embeddings"]
+        None => t["max_position_embeddings"]
             .as_u64()
             .unwrap_or(2048)
             .min(8192) as usize,
     };
-    let eps = v["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
-    let theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
+    let eps = t["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
+    // Qwen3.5 ships theta inside `rope_parameters` instead of the flat key.
+    let theta = t["rope_theta"]
+        .as_f64()
+        .or_else(|| t["rope_parameters"]["rope_theta"].as_f64())
+        .unwrap_or(10000.0) as f32;
     let mut cfg = Config::llama(hidden, layers, heads, kv, vocab, max_seq);
     // Some configs (e.g. Qwen3-30B-A3B) ship an explicit `head_dim` that
     // differs from hidden/n_heads (q/o width = n_heads*head_dim is wider
     // than hidden). Honor it, or the loader under-sizes q/o projections.
-    if let Some(hd) = v["head_dim"].as_u64() {
+    if let Some(hd) = t["head_dim"].as_u64() {
         cfg.head_dim = hd as usize;
     }
     cfg.intermediate_size = inter;
@@ -122,11 +130,11 @@ fn config_from_json(path: &std::path::Path) -> Config {
         .iter()
         .any(|p| family.starts_with(p));
     // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace q/k/v/o.
-    cfg.q_lora_rank = v["q_lora_rank"].as_u64().unwrap_or(0) as usize;
-    cfg.kv_lora_rank = v["kv_lora_rank"].as_u64().unwrap_or(0) as usize;
-    cfg.qk_nope_head_dim = v["qk_nope_head_dim"].as_u64().unwrap_or(0) as usize;
-    cfg.qk_rope_head_dim = v["qk_rope_head_dim"].as_u64().unwrap_or(0) as usize;
-    cfg.v_head_dim = v["v_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.q_lora_rank = t["q_lora_rank"].as_u64().unwrap_or(0) as usize;
+    cfg.kv_lora_rank = t["kv_lora_rank"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_nope_head_dim = t["qk_nope_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.qk_rope_head_dim = t["qk_rope_head_dim"].as_u64().unwrap_or(0) as usize;
+    cfg.v_head_dim = t["v_head_dim"].as_u64().unwrap_or(0) as usize;
     if cfg.kv_lora_rank > 0 {
         // MLA: per-head q is (nope + rope); the expanded KV cache is per-head
         // f32. head_dim from hidden/heads would be too small and under-size the
@@ -142,17 +150,17 @@ fn config_from_json(path: &std::path::Path) -> Config {
     }
     // MoE (Qwen2.5-MoE style): num_experts / num_experts_per_tok.
     // DeepSeek-V2 names the routed experts `n_routed_experts`.
-    cfg.num_experts = v["num_experts"]
+    cfg.num_experts = t["num_experts"]
         .as_u64()
-        .or_else(|| v["n_routed_experts"].as_u64())
+        .or_else(|| t["n_routed_experts"].as_u64())
         .unwrap_or(0) as usize;
-    cfg.num_experts_per_tok = v["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
+    cfg.num_experts_per_tok = t["num_experts_per_tok"].as_u64().unwrap_or(0) as usize;
     // Qwen-MoE expert FFN width (moe_intermediate_size); 0 = use intermediate_size.
-    cfg.moe_intermediate_size = v["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
+    cfg.moe_intermediate_size = t["moe_intermediate_size"].as_u64().unwrap_or(0) as usize;
     // DeepSeek-V2 always-routed "shared experts" (`n_shared_experts`), fused
     // into a single `moe_intermediate_size * n_shared_experts`-wide MLP whose
     // output is added to the routed sum. 0 = none (Qwen-MoE).
-    cfg.n_shared_experts = v["n_shared_experts"].as_u64().unwrap_or(0) as usize;
+    cfg.n_shared_experts = t["n_shared_experts"].as_u64().unwrap_or(0) as usize;
     // Top-k weighting convention. HF `MoEGate` renormalizes the selected
     // probabilities when `norm_topk_prob` is set (Qwen-MoE); DeepSeek-V2 sets
     // it false and multiplies by `routed_scaling_factor` instead.
@@ -162,11 +170,11 @@ fn config_from_json(path: &std::path::Path) -> Config {
     // supports `sigmoid` scoring and `group_limited_greedy` selection
     // (DeepSeek-V3 / Qwen3), which would silently decode garbage, so fail fast
     // instead. DeepSeek-V2-Lite is `softmax` + `greedy` with `n_group: 1`.
-    let scoring = v["scoring_func"].as_str().unwrap_or("softmax");
+    let scoring = t["scoring_func"].as_str().unwrap_or("softmax");
     if scoring != "softmax" {
         panic!("unsupported MoE scoring_func {scoring:?}: only softmax is implemented");
     }
-    let topk_method = v["topk_method"].as_str().unwrap_or("greedy");
+    let topk_method = t["topk_method"].as_str().unwrap_or("greedy");
     if topk_method != "greedy" {
         panic!("unsupported MoE topk_method {topk_method:?}: only greedy is implemented");
     }
@@ -174,7 +182,7 @@ fn config_from_json(path: &std::path::Path) -> Config {
     // the raw parameters and reproduces HF's ramp mask + cos/sin
     // `attention_factor`; the `mscale^2` logit correction is derived from
     // `mscale_all_dim` in `Config::attn_scale`.
-    if let Some(rs) = v["rope_scaling"].as_object() {
+    if let Some(rs) = t["rope_scaling"].as_object() {
         match rs.get("type").and_then(|t| t.as_str()) {
             Some("yarn") => {
                 cfg.rope_yarn_factor = rs["factor"].as_f64().unwrap_or(1.0) as f32;
@@ -201,14 +209,90 @@ fn config_from_json(path: &std::path::Path) -> Config {
     // Qwen3 QK-norm: HF configs express it via `model_type` ("qwen3" /
     // "qwen3_moe") rather than an explicit flag, so default to ON for those
     // and honor an explicit `use_qk_norm` / `qk_norm` key when present.
-    cfg.qk_norm = v["model_type"]
+    cfg.qk_norm = t["model_type"]
         .as_str()
-        .is_some_and(|t| t.starts_with("qwen3"));
-    if let Some(qk) = v["use_qk_norm"]
+        .or_else(|| v["model_type"].as_str())
+        .is_some_and(|mt| mt.starts_with("qwen3"));
+    if let Some(qk) = t["use_qk_norm"]
         .as_bool()
-        .or_else(|| v["qk_norm"].as_bool())
+        .or_else(|| t["qk_norm"].as_bool())
     {
         cfg.qk_norm = qk;
+    }
+    // Qwen3.5 (Qwen3.8 family): hybrid full-attention / gated-DeltaNet stack.
+    // Like qk_norm above, the family constants are modeling-code facts keyed
+    // off model_type: full-attn layers carry a sigmoid attention output gate
+    // (doubled q_proj), and RMSNorm weights ship zero-centered (`x * (1+w)`)
+    // — the loader assumes both, so they must be set here, not left at the
+    // Llama defaults.
+    let qwen35 = family.starts_with("qwen35");
+    cfg.attn_output_gate = t["attn_output_gate"].as_bool().unwrap_or(qwen35);
+    if qwen35 {
+        cfg.zero_centered_norm = true;
+    }
+    if let Some(z) = t["zero_centered_norm"].as_bool() {
+        cfg.zero_centered_norm = z;
+    }
+    if qwen35 {
+        // Only the leading `partial_rotary_factor` slice of each head
+        // rotates; the tail passes through (Config::attn_rotary_dim).
+        cfg.rope_rotary_pct = t["partial_rotary_factor"].as_f64().unwrap_or(0.25) as f32;
+        cfg.full_attention_interval = t["full_attention_interval"].as_u64().unwrap_or(4) as usize;
+        cfg.gdn_k_heads = t["linear_num_key_heads"].as_u64().unwrap_or(16) as usize;
+        cfg.gdn_v_heads = t["linear_num_value_heads"].as_u64().unwrap_or(48) as usize;
+        // The GDN kernels implement ONE shared head dim for k and v.
+        let kd = t["linear_key_head_dim"].as_u64().unwrap_or(128) as usize;
+        let vd = t["linear_value_head_dim"].as_u64().unwrap_or(128) as usize;
+        if kd != vd {
+            panic!(
+                "qwen3_5 with linear_key_head_dim={kd} != linear_value_head_dim={vd}: \
+                 a single shared GDN head dim is implemented"
+            );
+        }
+        cfg.gdn_head_dim = kd;
+        cfg.gdn_conv_kernel = t["linear_conv_kernel_dim"].as_u64().unwrap_or(4) as usize;
+        if !cfg.gdn_enabled() {
+            panic!(
+                "qwen3_5 config must set linear_num_value_heads > 0 and \
+                 full_attention_interval > 0 (GDN is not optional in this family)"
+            );
+        }
+        // The checkpoint spells out the hybrid layout in `layer_types`; the
+        // engine derives it from the interval. A mismatch would silently load
+        // every layer as the wrong kind, so verify instead of trusting.
+        if let Some(types) = t["layer_types"].as_array() {
+            if types.len() != cfg.n_layers {
+                panic!(
+                    "layer_types has {} entries but num_hidden_layers is {}",
+                    types.len(),
+                    cfg.n_layers
+                );
+            }
+            for (li, ty) in types.iter().enumerate() {
+                let expect = if cfg.layer_is_full_attn(li) {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                };
+                let got = ty.as_str().unwrap_or_default();
+                if got != expect {
+                    panic!(
+                        "layer_types[{li}] = {got:?} but the interval-derived \
+                         pattern says {expect:?}"
+                    );
+                }
+            }
+        }
+        // `rope_parameters.rope_type` must be the plain default: other
+        // scalings would silently decode garbage. (M-RoPE degenerates to
+        // standard sequential rope for text-only input, so `default` needs
+        // no special handling.)
+        if let Some(rt) = t["rope_parameters"]["rope_type"].as_str() {
+            assert!(
+                rt == "default",
+                "unsupported rope_parameters.rope_type {rt:?}: only default"
+            );
+        }
     }
     // MACH_MOE_GROUPED=0 (default on): batched-MoE decode falls back to the
     // hipBLAS host loop. Parsed HERE, in the server's env-knob area, not in
@@ -1115,6 +1199,91 @@ mod tests {
         // 163840 would reserve ~90 GB of MLA KV per slot; clamped without
         // MACH_MAX_SEQ.
         assert_eq!(cfg.max_seq_len, 8192);
+    }
+
+    /// Qwen3.5 (Qwen3.8-27B): multimodal checkpoints nest the text stack
+    /// under `text_config`, theta lives in `rope_parameters`, and the hybrid
+    /// GDN hyperparameters are `linear_*` keys. Mirror the real config shape.
+    #[test]
+    fn config_parses_qwen3_5_nested_text() {
+        let cfg = parse_json(
+            r#"{
+              "model_type": "qwen3_5",
+              "architectures": ["Qwen3_5ForConditionalGeneration"],
+              "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "intermediate_size": 512,
+                "vocab_size": 1024,
+                "max_position_embeddings": 262144,
+                "rms_norm_eps": 1e-6,
+                "attn_output_gate": true,
+                "full_attention_interval": 4,
+                "partial_rotary_factor": 0.25,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention"],
+                "rope_parameters": {"rope_type": "default", "rope_theta": 10000000}
+              },
+              "vision_config": {"model_type": "qwen3_5"}
+            }"#,
+        );
+        assert_eq!(cfg.d_model, 128, "text_config.hidden_size");
+        assert_eq!(cfg.n_layers, 8);
+        assert_eq!(cfg.head_dim, 16);
+        assert!(cfg.qk_norm, "qwen3_5_text starts with qwen3");
+        assert!(cfg.attn_output_gate);
+        assert!(cfg.zero_centered_norm);
+        assert_eq!(cfg.rope_theta, 10_000_000.0, "theta from rope_parameters");
+        assert_eq!(cfg.rope_rotary_pct, 0.25);
+        assert_eq!(cfg.attn_rotary_dim(), 4, "0.25 * 16");
+        assert_eq!(cfg.full_attention_interval, 4);
+        assert!(cfg.gdn_enabled());
+        assert_eq!(cfg.gdn_k_heads, 2);
+        assert_eq!(cfg.gdn_v_heads, 4);
+        assert_eq!(cfg.gdn_head_dim, 8);
+        assert_eq!(cfg.gdn_conv_kernel, 4);
+        assert_eq!(cfg.gdn_key_dim(), 16);
+        assert_eq!(cfg.gdn_value_dim(), 32);
+        assert!(cfg.layer_is_full_attn(3));
+        assert!(!cfg.layer_is_full_attn(0));
+        assert_eq!(cfg.max_seq_len, 8192, "262144 clamped");
+        assert!(!cfg.rope_interleave, "Qwen family pairs half-split");
+    }
+
+    /// A pure-text Qwen3.5 checkpoint (flat config, `model_type:
+    /// qwen3_5_text`) must classify identically — the family detection must
+    /// not depend on the multimodal nesting.
+    #[test]
+    fn config_parses_qwen3_5_flat_text() {
+        let cfg = parse_json(
+            r#"{"model_type":"qwen3_5_text","hidden_size":128,"num_hidden_layers":8,"num_attention_heads":4,"vocab_size":1024,"intermediate_size":512,"head_dim":16,"max_position_embeddings":4096,"full_attention_interval":4,"linear_num_key_heads":2,"linear_num_value_heads":4,"linear_key_head_dim":8,"linear_value_head_dim":8,"linear_conv_kernel_dim":4}"#,
+        );
+        assert!(cfg.attn_output_gate);
+        assert!(cfg.zero_centered_norm);
+        assert!(cfg.gdn_enabled());
+        assert_eq!(
+            cfg.attn_rotary_dim(),
+            4,
+            "default partial_rotary_factor 0.25"
+        );
+    }
+
+    /// `layer_types` disagreeing with the interval must fail loudly: a silent
+    /// mismatch would load every layer as the wrong kind.
+    #[test]
+    #[should_panic(expected = "layer_types[1]")]
+    fn config_rejects_layer_types_mismatch() {
+        parse_json(
+            r#"{"model_type":"qwen3_5","text_config":{"hidden_size":128,"num_hidden_layers":8,"num_attention_heads":4,"vocab_size":1024,"head_dim":16,"max_position_embeddings":4096,"full_attention_interval":4,"linear_num_key_heads":2,"linear_num_value_heads":4,"linear_key_head_dim":8,"linear_value_head_dim":8,"linear_conv_kernel_dim":4,"layer_types":["linear_attention","full_attention","linear_attention","full_attention","linear_attention","linear_attention","linear_attention","full_attention"]}}"#,
+        );
     }
 
     #[test]

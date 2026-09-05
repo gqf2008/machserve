@@ -63,6 +63,23 @@ struct LayerDev {
     /// Q4-on-device decoded garbage; Qwen-MoE was unaffected because it ships
     /// no shared experts).
     has_shared: bool,
+    /// Gated DeltaNet (Qwen3.5 linear-attention layers). Null on full-attn
+    /// layers: `gdn_in_qkv` doubles as the layer-type dispatch marker
+    /// (dtype-independent, unlike the f32 pointers — see `has_shared`).
+    has_gdn: bool,
+    gdn_in_qkv: *mut f32,
+    gdn_in_z: *mut f32,
+    gdn_in_a: *mut f32,
+    gdn_in_b: *mut f32,
+    gdn_out: *mut f32,
+    /// Depthwise conv taps `[conv_dim, k]` (newest last) — f32 even on the
+    /// F16 path (tiny, elementwise).
+    gdn_conv_w: *mut f32,
+    /// Bare per-v-head scalars `A_log` / `dt_bias` and the shared gated-norm
+    /// weight `[head_dim]`.
+    gdn_a_log: *mut f32,
+    gdn_dt_bias: *mut f32,
+    gdn_norm: *mut f32,
 }
 
 /// Per-layer fp16 device weight pointers (dtype = F16 only).
@@ -91,6 +108,13 @@ struct LayerDevF16 {
     mla_kv_a: *mut u16,
     mla_kv_b: *mut u16,
     mla_o: *mut u16,
+    /// GDN GEMM matrices mirrored in f16 (a/b are [vh, d] matrices, not
+    /// small vectors — they contract over d like the other projections).
+    gdn_in_qkv: *mut u16,
+    gdn_in_z: *mut u16,
+    gdn_in_a: *mut u16,
+    gdn_in_b: *mut u16,
+    gdn_out: *mut u16,
 }
 
 /// Storage-Q4 expert weights on device (Q4-on-device mode): the raw packed
@@ -285,6 +309,23 @@ pub struct BatchedModel {
     mla_kv: *mut f32,
     mla_k_rope: *mut f32,
     mla_attn: *mut f32,
+    // Qwen3.5 `attn_output_gate` scratch: the doubled q_proj output before
+    // the per-head [query | gate] split, and the gate.
+    qg: *mut f32,
+    attn_gate: *mut f32,
+    // Qwen3.5 GDN decode scratch (row-capacity sized).
+    gdn_qkv_pre: *mut f32,
+    gdn_qkv: *mut f32,
+    gdn_z: *mut f32,
+    gdn_a: *mut f32,
+    gdn_b: *mut f32,
+    gdn_o: *mut f32,
+    /// Per GDN layer recurrent `[batch, vh, kd, vd]` / conv `[batch,
+    /// conv_dim, k-1]` state, SLOT-indexed by the kernels via `slots_dev`;
+    /// zeroed at build and in `reset_state` (the pos-0 recurrence reads
+    /// S = 0 and an empty conv window; hipMalloc does not zero).
+    gdn_state: Vec<*mut f32>,
+    gdn_conv: Vec<*mut f32>,
     /// KV caches: (k, v) per layer, layout `[batch, max_seq, kv_heads, head_dim]`.
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
@@ -553,6 +594,16 @@ impl BatchedModel {
                 "paged-KV mode supports MLA in F32 only (got {:?})",
                 cfg.dtype
             )));
+        }
+        // GDN (hybrid linear-attention) layers carry recurrent state OUTSIDE
+        // the KV pages: a shared-prefix reuse would restore only the
+        // full-attn layers' KV and silently desync the hybrid stack. Stage B
+        // (#112, chunked scan + state-aware reuse) revisits; contiguous-KV
+        // decode supports GDN today.
+        if cfg.gdn_enabled() {
+            return Err(Error::InvalidArgument(
+                "paged-KV mode does not support GDN (hybrid linear-attention) models yet".into(),
+            ));
         }
         Ok(())
     }
@@ -924,6 +975,16 @@ impl BatchedModel {
             mla_kv: std::ptr::null_mut(),
             mla_k_rope: std::ptr::null_mut(),
             mla_attn: std::ptr::null_mut(),
+            qg: std::ptr::null_mut(),
+            attn_gate: std::ptr::null_mut(),
+            gdn_qkv_pre: std::ptr::null_mut(),
+            gdn_qkv: std::ptr::null_mut(),
+            gdn_z: std::ptr::null_mut(),
+            gdn_a: std::ptr::null_mut(),
+            gdn_b: std::ptr::null_mut(),
+            gdn_o: std::ptr::null_mut(),
+            gdn_state: Vec::new(),
+            gdn_conv: Vec::new(),
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
@@ -1093,12 +1154,26 @@ impl BatchedModel {
 
     /// Allocates + uploads an f32 matrix, or returns null on the F16 path
     /// (fp16 weights live in `LayerDevF16`; the f32 copy is not needed).
+    /// Empty slices (absent tensors, e.g. wq on a GDN layer) return null on
+    /// both paths — no zero-byte allocation.
     fn upload_mat32(&mut self, src: &[f32], f16: bool) -> Result<*mut f32, Error> {
-        if f16 {
+        if src.is_empty() || f16 {
             Ok(std::ptr::null_mut())
         } else {
             let p = self.dalloc(src.len() * 4)?;
             self.upload(p, src)?;
+            Ok(p)
+        }
+    }
+
+    /// Allocates + uploads an optional f16 matrix (empty -> null device
+    /// pointer): the F16-path mirror of [`Self::upload_mat32`].
+    fn upload_f16_mat(&mut self, src: &[f32]) -> Result<*mut u16, Error> {
+        if src.is_empty() {
+            Ok(std::ptr::null_mut())
+        } else {
+            let p = self.alloc_f16(src.len())?;
+            self.upload_f16(p, src)?;
             Ok(p)
         }
     }
@@ -1206,6 +1281,37 @@ impl BatchedModel {
                 let vv = self.dalloc(v_bytes)?;
                 self.mla_kv_cache
                     .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
+            }
+        }
+        // Qwen3.5 `attn_output_gate`: the doubled q_proj output + gate split.
+        if c.attn_output_gate {
+            self.qg = self.dalloc(b * 2 * nq * 4)?;
+            self.attn_gate = self.dalloc(b * nq * 4)?;
+        }
+        // Qwen3.5 GDN decode scratch (row-sized) + per-layer SLOT-sized
+        // recurrent/conv state (persistent per request; zeroed — the pos-0
+        // recurrence reads S = 0 and an empty conv window, and hipMalloc
+        // does not zero).
+        if c.gdn_enabled() {
+            let kd = c.gdn_key_dim();
+            let vd = c.gdn_value_dim();
+            let conv_dim = 2 * kd + vd;
+            let keep = c.gdn_conv_kernel - 1;
+            self.gdn_qkv_pre = self.dalloc(b * conv_dim * 4)?;
+            self.gdn_qkv = self.dalloc(b * conv_dim * 4)?;
+            self.gdn_z = self.dalloc(b * vd * 4)?;
+            self.gdn_a = self.dalloc(b * c.gdn_v_heads * 4)?;
+            self.gdn_b = self.dalloc(b * c.gdn_v_heads * 4)?;
+            self.gdn_o = self.dalloc(b * vd * 4)?;
+            let state_zeros = vec![0.0f32; self.batch * c.gdn_v_heads * kd * vd];
+            let conv_zeros = vec![0.0f32; self.batch * conv_dim * keep];
+            for _ in 0..c.n_layers {
+                let s = self.dalloc(state_zeros.len() * 4)?;
+                self.upload(s, &state_zeros)?;
+                let cv = self.dalloc(conv_zeros.len() * 4)?;
+                self.upload(cv, &conv_zeros)?;
+                self.gdn_state.push(s);
+                self.gdn_conv.push(cv);
             }
         }
         if c.num_experts > 0 {
@@ -1412,6 +1518,48 @@ impl BatchedModel {
                     p
                 },
                 has_shared: !lw.shared_wg.is_empty(),
+                // GDN tensors (empty on full-attn layers / non-GDN models);
+                // `has_gdn` is the dtype-independent dispatch flag.
+                has_gdn: !lw.gdn_in_qkv.is_empty(),
+                gdn_in_qkv: if f16 || lw.gdn_in_qkv.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.gdn_in_qkv.len() * 4)?;
+                    self.upload(p, &lw.gdn_in_qkv)?;
+                    p
+                },
+                gdn_in_z: if f16 || lw.gdn_in_z.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.gdn_in_z.len() * 4)?;
+                    self.upload(p, &lw.gdn_in_z)?;
+                    p
+                },
+                gdn_in_a: if f16 || lw.gdn_in_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.gdn_in_a.len() * 4)?;
+                    self.upload(p, &lw.gdn_in_a)?;
+                    p
+                },
+                gdn_in_b: if f16 || lw.gdn_in_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.gdn_in_b.len() * 4)?;
+                    self.upload(p, &lw.gdn_in_b)?;
+                    p
+                },
+                gdn_out: if f16 || lw.gdn_out.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let p = self.dalloc(lw.gdn_out.len() * 4)?;
+                    self.upload(p, &lw.gdn_out)?;
+                    p
+                },
+                gdn_conv_w: self.upload_opt(&lw.gdn_conv_w)?,
+                gdn_a_log: self.upload_opt(&lw.gdn_a_log)?,
+                gdn_dt_bias: self.upload_opt(&lw.gdn_dt_bias)?,
+                gdn_norm: self.upload_opt(&lw.gdn_norm)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1451,6 +1599,11 @@ impl BatchedModel {
                     shared_wg: self.alloc_f16(lw.shared_wg.len())?,
                     shared_wu: self.alloc_f16(lw.shared_wu.len())?,
                     shared_wd: self.alloc_f16(lw.shared_wd.len())?,
+                    gdn_in_qkv: self.upload_f16_mat(&lw.gdn_in_qkv)?,
+                    gdn_in_z: self.upload_f16_mat(&lw.gdn_in_z)?,
+                    gdn_in_a: self.upload_f16_mat(&lw.gdn_in_a)?,
+                    gdn_in_b: self.upload_f16_mat(&lw.gdn_in_b)?,
+                    gdn_out: self.upload_f16_mat(&lw.gdn_out)?,
                 };
                 self.upload_f16(l16.wq, &lw.wq)?;
                 self.upload_f16(l16.wk, &lw.wk)?;
@@ -1530,6 +1683,19 @@ impl BatchedModel {
                 shared_wu: std::ptr::null_mut(),
                 shared_wd: std::ptr::null_mut(),
                 has_shared: !lw.shared_wg.is_empty(),
+                // GDN: the GEMM matrices live in the f16 copy below; the small
+                // f32 tensors (conv taps, A_log/dt_bias, gated-norm weight)
+                // stay f32. `has_gdn` is the dtype-independent dispatch flag.
+                has_gdn: !lw.gdn_in_qkv.is_empty(),
+                gdn_in_qkv: std::ptr::null_mut(),
+                gdn_in_z: std::ptr::null_mut(),
+                gdn_in_a: std::ptr::null_mut(),
+                gdn_in_b: std::ptr::null_mut(),
+                gdn_out: std::ptr::null_mut(),
+                gdn_conv_w: self.upload_opt(&lw.gdn_conv_w)?,
+                gdn_a_log: self.upload_opt(&lw.gdn_a_log)?,
+                gdn_dt_bias: self.upload_opt(&lw.gdn_dt_bias)?,
+                gdn_norm: self.upload_opt(&lw.gdn_norm)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1567,6 +1733,31 @@ impl BatchedModel {
                 shared_wg: self.alloc_f16(lw.shared_wg.len())?,
                 shared_wu: self.alloc_f16(lw.shared_wu.len())?,
                 shared_wd: self.alloc_f16(lw.shared_wd.len())?,
+                gdn_in_qkv: if lw.gdn_in_qkv.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_qkv.len())?
+                },
+                gdn_in_z: if lw.gdn_in_z.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_z.len())?
+                },
+                gdn_in_a: if lw.gdn_in_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_a.len())?
+                },
+                gdn_in_b: if lw.gdn_in_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_b.len())?
+                },
+                gdn_out: if lw.gdn_out.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_out.len())?
+                },
             };
             self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
             self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
@@ -1608,6 +1799,15 @@ impl BatchedModel {
             self.upload_f16_bits(l16.shared_wg, &lw.shared_wg.dequantize_f16())?;
             self.upload_f16_bits(l16.shared_wu, &lw.shared_wu.dequantize_f16())?;
             self.upload_f16_bits(l16.shared_wd, &lw.shared_wd.dequantize_f16())?;
+            // GDN (Qwen3.5): qkv/z/out dequantize from the packed tensor; a/b
+            // are stored f32 and convert like the other f16 GEMM matrices.
+            if !lw.gdn_in_qkv.is_empty() {
+                self.upload_f16_bits(l16.gdn_in_qkv, &lw.gdn_in_qkv.dequantize_f16())?;
+                self.upload_f16_bits(l16.gdn_in_z, &lw.gdn_in_z.dequantize_f16())?;
+                self.upload_f16_bits(l16.gdn_out, &lw.gdn_out.dequantize_f16())?;
+                self.upload_f16(l16.gdn_in_a, &lw.gdn_in_a)?;
+                self.upload_f16(l16.gdn_in_b, &lw.gdn_in_b)?;
+            }
             self.layers_f16.push(l16);
         }
         Ok(())
@@ -1680,6 +1880,19 @@ impl BatchedModel {
                 shared_wu: std::ptr::null_mut(),
                 shared_wd: std::ptr::null_mut(),
                 has_shared: !lw.shared_wg.is_empty(),
+                // GDN: the GEMM matrices live in the f16 copy below; the small
+                // f32 tensors (conv taps, A_log/dt_bias, gated-norm weight)
+                // stay f32. `has_gdn` is the dtype-independent dispatch flag.
+                has_gdn: !lw.gdn_in_qkv.is_empty(),
+                gdn_in_qkv: std::ptr::null_mut(),
+                gdn_in_z: std::ptr::null_mut(),
+                gdn_in_a: std::ptr::null_mut(),
+                gdn_in_b: std::ptr::null_mut(),
+                gdn_out: std::ptr::null_mut(),
+                gdn_conv_w: self.upload_opt(&lw.gdn_conv_w)?,
+                gdn_a_log: self.upload_opt(&lw.gdn_a_log)?,
+                gdn_dt_bias: self.upload_opt(&lw.gdn_dt_bias)?,
+                gdn_norm: self.upload_opt(&lw.gdn_norm)?,
             };
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
@@ -1705,6 +1918,31 @@ impl BatchedModel {
                 shared_wg: self.alloc_f16(lw.shared_wg.len())?,
                 shared_wu: self.alloc_f16(lw.shared_wu.len())?,
                 shared_wd: self.alloc_f16(lw.shared_wd.len())?,
+                gdn_in_qkv: if lw.gdn_in_qkv.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_qkv.len())?
+                },
+                gdn_in_z: if lw.gdn_in_z.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_z.len())?
+                },
+                gdn_in_a: if lw.gdn_in_a.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_a.len())?
+                },
+                gdn_in_b: if lw.gdn_in_b.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_in_b.len())?
+                },
+                gdn_out: if lw.gdn_out.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    self.alloc_f16(lw.gdn_out.len())?
+                },
             };
             self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
             self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
@@ -1728,6 +1966,15 @@ impl BatchedModel {
             self.upload_f16_bits(l16.shared_wg, &lw.shared_wg.dequantize_f16())?;
             self.upload_f16_bits(l16.shared_wu, &lw.shared_wu.dequantize_f16())?;
             self.upload_f16_bits(l16.shared_wd, &lw.shared_wd.dequantize_f16())?;
+            // GDN (Qwen3.5): qkv/z/out dequantize from the packed tensor; a/b
+            // are stored f32 and convert like the other f16 GEMM matrices.
+            if !lw.gdn_in_qkv.is_empty() {
+                self.upload_f16_bits(l16.gdn_in_qkv, &lw.gdn_in_qkv.dequantize_f16())?;
+                self.upload_f16_bits(l16.gdn_in_z, &lw.gdn_in_z.dequantize_f16())?;
+                self.upload_f16_bits(l16.gdn_out, &lw.gdn_out.dequantize_f16())?;
+                self.upload_f16(l16.gdn_in_a, &lw.gdn_in_a)?;
+                self.upload_f16(l16.gdn_in_b, &lw.gdn_in_b)?;
+            }
             self.layers_f16.push(l16);
         }
         Ok(())
@@ -1769,6 +2016,26 @@ impl BatchedModel {
                     hip::check(
                         self.k.hip(),
                         (self.k.hip().api.hip_memset)(*vc as *mut _, 0, v_bytes),
+                    )?;
+                }
+            }
+        }
+        // GDN recurrent + conv state back to the pos-0 state (S = 0, empty
+        // conv window) — same contract as the KV caches above.
+        if !self.gdn_state.is_empty() {
+            let c = self.cfg;
+            let state_bytes = self.batch * c.gdn_v_heads * c.gdn_key_dim() * c.gdn_value_dim() * 4;
+            let conv_dim = 2 * c.gdn_key_dim() + c.gdn_value_dim();
+            let conv_bytes = self.batch * conv_dim * (c.gdn_conv_kernel - 1) * 4;
+            for (&s, &cv) in self.gdn_state.iter().zip(&self.gdn_conv) {
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(s as *mut _, 0, state_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(cv as *mut _, 0, conv_bytes),
                     )?;
                 }
             }
@@ -2038,10 +2305,14 @@ impl BatchedModel {
         } else {
             // Dense/MoE: q/k/v + router + lm_head(d), o(nq), dense-MLP
             // down(inter); MoE experts ride the device-driven grouped kernels
-            // (required below), not the gemm closure.
+            // (required below), not the gemm closure. Qwen3.5 adds the GDN
+            // projections (all contract over d, except out_proj over
+            // gdn_value_dim) and the doubled q_proj row count (n, not kk —
+            // the GEMV grid scales with it, n is unbounded by GEMV_MAX_D).
             c.d_model
                 .max(c.n_heads * c.head_dim)
                 .max(c.intermediate_size)
+                .max(c.gdn_value_dim())
         };
         if max_kk > GEMV_MAX_D as usize {
             return false;
@@ -2366,6 +2637,7 @@ impl BatchedModel {
                     heads,
                     heads,
                     rope,
+                    rope,
                     RopeParams::from(c),
                 )?;
                 // compressed_kv = kv_a(xn); latent is followed by k_rope in
@@ -2396,6 +2668,7 @@ impl BatchedModel {
                     b,
                     1,
                     1,
+                    rope,
                     rope,
                     RopeParams::from(c),
                 )?;
@@ -2498,11 +2771,96 @@ impl BatchedModel {
                     heads * v_hd,
                 )?;
                 k.launch_add(self.x, self.proj, b * d)?;
+            } else if lw.has_gdn {
+                // Qwen3.5 hybrid: linear-attention layer (gated DeltaNet).
+                // Weights-driven dispatch (`has_gdn`, dtype-independent). The
+                // kernels index the persistent state by SLOT via `slots`;
+                // one row per slot per step — chunked prefill (several rows
+                // of one sequence in a single step) is Stage B (#112), the
+                // graph/prefill guards below keep this path decode-shaped.
+                let kd = (c.gdn_k_heads * c.gdn_head_dim) as i32;
+                let vd = (c.gdn_v_heads * c.gdn_head_dim) as i32;
+                let kh = c.gdn_k_heads as i32;
+                let vh = c.gdn_v_heads as i32;
+                let hd = c.gdn_head_dim as i32;
+                let conv_dim = 2 * kd + vd;
+                let keep = c.gdn_conv_kernel as i32 - 1;
+                gemm(
+                    self.gdn_qkv_pre,
+                    self.xn,
+                    lw.gdn_in_qkv,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_qkv),
+                    conv_dim,
+                    d,
+                )?;
+                gemm(
+                    self.gdn_z,
+                    self.xn,
+                    lw.gdn_in_z,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_z),
+                    vd,
+                    d,
+                )?;
+                gemm(
+                    self.gdn_a,
+                    self.xn,
+                    lw.gdn_in_a,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_a),
+                    vh,
+                    d,
+                )?;
+                gemm(
+                    self.gdn_b,
+                    self.xn,
+                    lw.gdn_in_b,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_b),
+                    vh,
+                    d,
+                )?;
+                k.launch_gdn_conv_update(
+                    self.gdn_qkv,
+                    self.gdn_qkv_pre,
+                    self.gdn_conv[li],
+                    slots,
+                    b,
+                    conv_dim,
+                    keep,
+                    lw.gdn_conv_w,
+                )?;
+                k.launch_gdn_l2norm_qk(self.gdn_qkv, b, kh, hd, conv_dim)?;
+                k.launch_gdn_step(
+                    self.gdn_qkv,
+                    self.gdn_state[li],
+                    self.gdn_o,
+                    slots,
+                    lw.gdn_a_log,
+                    lw.gdn_dt_bias,
+                    self.gdn_a,
+                    self.gdn_b,
+                    b,
+                    vh,
+                    kh,
+                    hd,
+                    conv_dim,
+                )?;
+                k.launch_gdn_gated_norm(self.gdn_o, self.gdn_z, lw.gdn_norm, b, vh, hd, c.rms_eps)?;
+                gemm(
+                    self.proj,
+                    self.gdn_o,
+                    lw.gdn_out,
+                    l16.map_or(std::ptr::null_mut(), |l| l.gdn_out),
+                    d,
+                    vd,
+                )?;
+                k.launch_add(self.x, self.proj, b * d)?;
             } else {
-                // QKV projections: small-m f16 takes the fused GEMV (one
-                // launch for q + k + v — the k/v halves alone run at only
-                // 64 blocks / 20 GB/s; the fused launch gives them the q
-                // rows' parallelism). Large-m and f32 keep hipBLAS.
+                // Qwen3.5 `attn_output_gate`: the doubled q_proj carries each
+                // head's block as [query | gate]; split before QK-norm (the
+                // gate skips norm + RoPE) and apply sigmoid after attention.
+                // Small-m f16 keeps the fused QKV GEMV (the doubled q rows
+                // are just more rows of the same GEMV).
+                let gate_on = c.attn_output_gate;
+                let nq_rows = if gate_on { 2 * nq } else { nq };
                 if f16 && b <= GEMV_MAX_M {
                     let l = l16.expect("f16 layer");
                     k.launch_gemv_f16_qkv(
@@ -2510,10 +2868,10 @@ impl BatchedModel {
                         l.wq,
                         l.wk,
                         l.wv,
-                        self.q,
+                        if gate_on { self.qg } else { self.q },
                         self.k_buf,
                         self.v_buf,
-                        nq,
+                        nq_rows,
                         nkv,
                         d,
                         b,
@@ -2521,11 +2879,11 @@ impl BatchedModel {
                     )?;
                 } else {
                     gemm(
-                        self.q,
+                        if gate_on { self.qg } else { self.q },
                         self.xn,
                         lw.wq,
                         l16.map_or(std::ptr::null_mut(), |l| l.wq),
-                        nq,
+                        nq_rows,
                         d,
                     )?;
                     gemm(
@@ -2543,6 +2901,16 @@ impl BatchedModel {
                         l16.map_or(std::ptr::null_mut(), |l| l.wv),
                         nkv,
                         d,
+                    )?;
+                }
+                if gate_on {
+                    k.launch_qg_split(
+                        self.qg,
+                        self.q,
+                        self.attn_gate,
+                        b,
+                        c.n_heads as i32,
+                        c.head_dim as i32,
                     )?;
                 }
                 // Qwen2 checkpoints ship q/k/v biases.
@@ -2569,6 +2937,10 @@ impl BatchedModel {
                         c.rms_eps,
                     )?;
                 }
+                // Partial rotary (Qwen3.5 full-attn layers): only the first
+                // `attn_rotary_dim` coordinates rotate (== head_dim for every
+                // pre-Qwen3.5 family).
+                let rot = c.attn_rotary_dim() as i32;
                 k.launch_rope_batched(
                     self.q,
                     self.k_buf,
@@ -2577,6 +2949,7 @@ impl BatchedModel {
                     c.n_heads as i32,
                     c.n_kv_heads as i32,
                     c.head_dim as i32,
+                    rot,
                     RopeParams::from(c),
                 )?;
                 let (kc, vc) = self.kv_cache[li];
@@ -2765,6 +3138,9 @@ impl BatchedModel {
                         scale,
                         c.max_seq_len as i32,
                     )?;
+                }
+                if c.attn_output_gate {
+                    k.launch_attn_gate_apply(self.attn, self.attn_gate, (b * nq) as usize)?;
                 }
                 gemm(
                     self.proj,
@@ -3450,6 +3826,21 @@ impl BatchedModel {
                 self.batch
             )));
         }
+        // GDN (hybrid linear-attention) layers apply the per-slot recurrent
+        // update exactly once per step: two rows on one slot would
+        // double-apply the delta rule. Chunked/packed prefill for GDN models
+        // is Stage B (#112) — reject duplicate slots loudly instead of
+        // corrupting the state silently.
+        if self.cfg.gdn_enabled() {
+            let mut seen = vec![false; self.batch];
+            for &s in slots {
+                if std::mem::replace(&mut seen[s as usize], true) {
+                    return Err(Error::InvalidArgument(format!(
+                        "slot {s} appears twice in one step; GDN models need one row per slot (chunked prefill is #112 Stage B)"
+                    )));
+                }
+            }
+        }
         // Prefill-attention runs are currently disabled: the naive shared-KV
         // kernel is occupancy-bound and slower than decode attention on this
         // GPU (see roadmap). All rows use decode attention (run_mask = 0).
@@ -3525,6 +3916,16 @@ impl BatchedModel {
                 "anchor token_idx {token_idx} does not match {} prefix tokens",
                 tokens.len()
             )));
+        }
+        // The anchor format carries KV + hidden state only; GDN layers would
+        // additionally need their recurrent + conv state at the boundary.
+        // Reject loudly until the anchor grows that payload (#112 follow-up)
+        // instead of restoring a silently desynced hybrid stack.
+        if self.cfg.gdn_enabled() {
+            return Err(Error::InvalidArgument(
+                "state-reuse anchors do not support GDN (hybrid linear-attention) models yet"
+                    .into(),
+            ));
         }
         self.k.sync()?;
         let c = self.cfg;

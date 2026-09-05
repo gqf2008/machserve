@@ -1,7 +1,8 @@
-//! Qwen3.5 (Qwen3.8-27B family) config plumbing: hybrid full-attention /
-//! gated-DeltaNet layer split, partial rotary, and the CPU reference forward
-//! on a small synthetic model. Kernel/GPU parity lands with the HIP kernels;
-//! these pin the host-side foundation (issue #112 Stage A).
+//! Qwen3.5 (Qwen3.8-27B family) plumbing: hybrid full-attention /
+//! gated-DeltaNet layer split, partial rotary, the CPU reference forward on a
+//! small synthetic model, and (hip feature) GPU parity for the single-seq
+//! and batched models against that reference across the hybrid stack
+//! (issue #112 Stage A).
 
 use mach_model::ref_model::RefModel;
 use mach_model::{Config, Weights};
@@ -135,5 +136,157 @@ fn ref_forward_with_gate_is_finite_across_hybrid_stack() {
     for t in [3u32, 17, 42] {
         let l = m.decode_step(t);
         assert!(l.iter().all(|v| v.is_finite()));
+    }
+}
+
+/// GPU parity for the hybrid stack: the single-sequence and batched models
+/// (f32 + f16) vs the CPU reference, across multi-token decodes — exercises
+/// the GDN kernels (conv update, l2norm, delta-rule recurrence, gated norm),
+/// the attention output gate split/apply, and partial rope end to end.
+#[cfg(feature = "hip")]
+mod gpu {
+    use super::qwen35_small;
+    use mach_kernel_sys::hip;
+    use mach_model::batched::BatchedModel;
+    use mach_model::config::ModelDType;
+    use mach_model::model::GpuModel;
+    use mach_model::ref_model::RefModel;
+    use mach_model::{Config, Weights};
+    use std::sync::Arc;
+
+    fn hip_ctx() -> Option<Arc<hip::Hip>> {
+        match hip::hip() {
+            Ok(h) => match hip::device_count() {
+                Ok(n) if n > 0 => Some(h),
+                _ => {
+                    eprintln!("skipping HIP test: no device");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("skipping HIP test: {e}");
+                None
+            }
+        }
+    }
+
+    /// GPU-vs-CPU margin. F32 keeps the repo's parity bound
+    /// (`tests/moe.rs`: 2e-3 + 2e-3 * scale). F16 rounds the projection
+    /// weights, and that noise rides the GDN recurrence: observed peak
+    /// ~1.2e-2 on random weights at step 2, DECAYING afterwards (per-token
+    /// rounding noise, not state accumulation — F32 passes the tight bound
+    /// at every step). Use the `tests/fp16.rs` convention instead: a loose
+    /// absolute bound plus greedy-argmax agreement at every step (the
+    /// functional check that actually pins the decode).
+    fn gpu_tol(dtype: ModelDType, scale: f32) -> f32 {
+        match dtype {
+            ModelDType::F16 => 5e-2,
+            _ => 2e-3 + 2e-3 * scale,
+        }
+    }
+
+    fn argmax(xs: &[f32]) -> usize {
+        let mut best = 0usize;
+        for (i, &v) in xs.iter().enumerate() {
+            if v > xs[best] {
+                best = i;
+            }
+        }
+        best
+    }
+
+    fn check_row(label: &str, dtype: ModelDType, gpu: &[f32], cpu: &[f32]) {
+        assert_eq!(gpu.len(), cpu.len(), "{label}: length mismatch");
+        let scale = gpu.iter().chain(cpu).fold(0.0f32, |m, &v| m.max(v.abs()));
+        let tol = gpu_tol(dtype, scale);
+        let diff = gpu
+            .iter()
+            .zip(cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= tol,
+            "{label}: max diff {diff:.3e} > tol {tol:.3e} (scale {scale:.3e})"
+        );
+        assert_eq!(
+            argmax(gpu),
+            argmax(cpu),
+            "{label}: greedy argmax flipped (f16 noise changed the token)"
+        );
+    }
+
+    fn small_cfg(dtype: ModelDType) -> Config {
+        let mut cfg = qwen35_small();
+        cfg.dtype = dtype;
+        cfg
+    }
+
+    /// Single-sequence decode, step by step (the GDN recurrence must track
+    /// the reference across positions, not just at the first token).
+    fn single_seq_matches_ref(dtype: ModelDType) {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(dtype);
+        let w = Weights::random(&cfg, 31).unwrap();
+        let mut cpu = RefModel::new(cfg, w.clone());
+        let mut gpu = GpuModel::new(Arc::clone(&hip), cfg, &w).unwrap();
+        for (step, &t) in [3u32, 17, 42, 5].iter().enumerate() {
+            let cpu_logits = cpu.decode_step(t);
+            let gpu_logits = gpu.decode_step(t).unwrap();
+            check_row(
+                &format!("{:?} step {step}", cfg.dtype),
+                dtype,
+                &gpu_logits,
+                &cpu_logits,
+            );
+        }
+    }
+
+    #[test]
+    fn single_seq_matches_ref_f32() {
+        single_seq_matches_ref(ModelDType::F32);
+    }
+
+    #[test]
+    fn single_seq_matches_ref_f16() {
+        single_seq_matches_ref(ModelDType::F16);
+    }
+
+    /// Batched decode of two interleaved sequences: each row's logits vs its
+    /// own single-sequence reference — pins that the SLOT-indexed GDN state
+    /// keeps the sequences isolated while they share steps.
+    fn batched_matches_ref(dtype: ModelDType) {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(dtype);
+        let w = Weights::random(&cfg, 37).unwrap();
+        let batch = 2usize;
+        let mut m = BatchedModel::new(Arc::clone(&hip), cfg, &w, batch).unwrap();
+        let mut rows: Vec<RefModel> = (0..batch).map(|_| RefModel::new(cfg, w.clone())).collect();
+        let streams = [[3u32, 17, 42, 5], [90u32, 7, 64, 21]];
+        for step in 0..streams[0].len() {
+            let toks: Vec<u32> = streams.iter().map(|s| s[step]).collect();
+            m.decode_step(&toks).unwrap();
+            let logits = m.read_logits().unwrap();
+            let vocab = cfg.vocab_size;
+            for (i, row) in rows.iter_mut().enumerate() {
+                let cpu_logits = row.decode_step(toks[i]);
+                let gpu_row = &logits[i * vocab..(i + 1) * vocab];
+                check_row(
+                    &format!("{:?} batched row {i} step {step}", cfg.dtype),
+                    dtype,
+                    gpu_row,
+                    &cpu_logits,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_matches_ref_f32() {
+        batched_matches_ref(ModelDType::F32);
+    }
+
+    #[test]
+    fn batched_matches_ref_f16() {
+        batched_matches_ref(ModelDType::F16);
     }
 }

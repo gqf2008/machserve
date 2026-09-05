@@ -1420,3 +1420,71 @@
     checkpoint Q4 量化与逐层对拍;Stage B = GDN chunked prefill,
     Stage C = 视觉塔。
 
+
+- **Qwen3.8-27B Stage A GPU 内核与全链路(#112,2026-09-06)——
+  partial rope / GDN decode 四步 / 注意力输出门上机,单序列与批量
+  GPU-CPU 对拍全绿,server qwen3_5 映射就位**:
+  - **内核(52→58,六个新内核 + ROPE 签名扩展)**:
+    1. `ROPE`/`ROPE_BATCHED` 增加 `rot_dim` 参数:基频表按 rot_dim
+       取(HF inv_freq 只对旋转宽度),rot_dim 之外坐标直通;
+       `rot_dim == head_dim` 对既有家族是恒等重构,全部老对拍不变。
+       Qwen3.5 走 `attn_rotary_dim()`(0.25×256=64)。
+    2. `QG_SPLIT`:加倍 q_proj 的逐 head `[query|gate]` 拆分
+       (gate 不吃 QK-norm/RoPE);`ATTN_GATE_APPLY`:注意力输出
+       ×`sigmoid(gate)` 后再进 o_proj。
+    3. GDN decode 四步(与 ref_model 数学逐步镜像):
+       `GDN_CONV_UPDATE`(depthwise k=4,最新 tap 在末位,**状态存
+       conv 前原始输入**,silu 在卷积之后)+ `GDN_L2NORM_QK`(eps
+       在 sqrt 内,q 额外 ×hd^-0.5)+ `GDN_STEP`(g=−e^{A_log}·
+       softplus(a+dt_bias)[>20 线性],S×decay → kv_mem=Sᵀk →
+       S+=k⊗(v−kv_mem)β → o=Sᵀq 用**更新后**的 S;β=σ(b))+
+       `GDN_GATED_NORM`(o×rms(o)^{-1}×w×silu(z),w 为 ones-init
+       非 0 中心)。
+  - **模型接线**:GpuModel(单序列,常量 `dev_slot0=[0]`)与
+    BatchedModel(批量,`slots[]` 索引)双双落地;递归状态
+    `[slots, vh, hd, hd]` / conv `[slots, conv_dim, k-1]` **建时清零**
+    (hipMalloc 不清零)+ `reset_state` 清零;分发守卫用 dtype 无关的
+    `has_gdn` 布尔(#107 教训:多 dtype 存在性守卫不得用 f32 指针);
+    f32/F16/Q4/FP8 四路上传全通(`upload_mat32` 对空张量返回 null,
+    GDN 层的 wq 等空位不再触发 0 字节分配)。
+  - **安全守卫(先拒绝后损坏)**:paged-KV × GDN 拒绝(递归状态在页
+    之外,prefix 复用会状态失同步);`decode_step_explicit` 同批重复
+    slot 拒绝(同一 token 的 delta 规则会叠加两次);GDN 模型
+    `save_anchor` 拒绝(anchor 不携带 GDN 状态);graph capture 的
+    `max_kk` 计入 `gdn_value_dim`。
+  - **server `config_from_json`**:多模态检查点参数嵌套于
+    `text_config`(以 `t` 为唯一读取源);theta 兼容
+    `rope_parameters.rope_theta`(Qwen3.5 不写平铺键);qwen35 家族
+    分支映射 `partial_rotary_factor`/`full_attention_interval`/
+    `linear_num_{key,value}_heads`/`linear_{key,value}_head_dim`
+    (kd≠vd 拒绝)/`linear_conv_kernel_dim`,`attn_output_gate`/
+    `zero_centered_norm` 按 model_type 家族定(可显式覆盖);
+    **`layer_types` 与 interval 推导逐层核对,不一致即 panic**
+    (静默错层比对拍失败更糟);`rope_parameters.rope_type` 仅接受
+    `default`。
+  - **首跑对拍抓出两个真 bug(逐级二分定位:全 attn 层 ✅ →
+    全 GDN 层 ❌ → 单内核隔离)**:
+    1. `GDN_L2NORM_QK` 的 k 半区基址写成 `2*kd`(v 区起点)——
+       归一化的是 v 的第一个 head、k 全程未归一,错位输入进递归;
+    2. **model.rs 逐层分发守卫 `!lw.gdn_in_qkv.is_null()` 读了 f32
+       指针**——F16 路径该指针恒空,GDN 层全被路由进 full-attn 分支,
+       null f16 wq 被 `gemv_f16` 解引用 → 设备页错误 → 上下文僵尸
+       (后续 `hipStreamCreate` 永久失败,报 OOM,sticky error 干净,
+       极具迷惑性)。改 config 驱动分发(`gdn_enabled() &&
+       !layer_is_full_attn(li)`,与 ref 一致);**#107 教训
+       "多 dtype 存在性守卫须 dtype 无关" 第二次踩中——batched.rs
+       用了 has_gdn,model.rs 漏改**。
+  - **F16 对拍容差**:f16 权重舍入噪声沿 GDN 递归传导,逐步测量
+    峰值 ~1.2e-2(第 2 步)后回落——是逐 token 噪声非状态累积
+    (f32 全步紧界通过);采用 `tests/fp16.rs` 惯例(宽松绝对界 +
+    每步 greedy argmax 一致),f32 保持 2e-3+2e-3·scale。
+  - **测试**:GPU 对拍 4 项(单序列/批量 × f32/f16,逐步多 token,
+    批量行各自对拍以钉住 slot 隔离)+ server config 3 项(嵌套
+    text_config 镜像真实检查点形状/纯文本平铺/layer_types 不一致
+    拒绝);内核计数门禁 58。
+  - **GEMV 边界**:GDN `in_qkv` n=10240/kk=5120 与 `out` kk=6144 均在
+    `GEMV_MAX_D` 内;融合 `GEMV_F16_QKV` 接受加倍 q 行;dense
+    down-proj kk=17408 超限 → hipBLAS 回退(性能后续项)。
+  - **下一步(Stage A 收尾)**:真实 checkpoint Q4 量化 + numpy 逐层
+    对拍 + 真机短 prompt 连贯生成(27B 必须走 Q4 路径,f32/f16
+    放不进显存);Stage B = GDN chunked prefill,Stage C = 视觉塔。
