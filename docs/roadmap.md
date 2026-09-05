@@ -1488,3 +1488,48 @@
   - **下一步(Stage A 收尾)**:真实 checkpoint Q4 量化 + numpy 逐层
     对拍 + 真机短 prompt 连贯生成(27B 必须走 Q4 路径,f32/f16
     放不进显存);Stage B = GDN chunked prefill,Stage C = 视觉塔。
+
+- **Qwen3.8-27B Stage A 收尾(一):dense Q4-on-device(#112,2026-09-06)
+  —— 27B 真机显存路径落地:所有大矩阵以原始 int4 常驻设备,内核内
+  反量化**,内核门禁 58→60:
+  - **动机**:27B 是 dense(无专家池可走 moe_grouped_*_q4),既有
+    Q4-on-device 只覆盖 MoE 专家;dense 权重解量化到 f16 ≈54GB 放不进
+    24GB 显存,全 Q4 ≈13.4GB(emb/lm_head ≈1.6GB + 64 层投影)可以。
+  - **新内核**:`GEMV_Q4`(warp-per-row,车道 u32=8 nibble,一组一个
+    scale——8 对齐的平坦跨度永不跨界 32 元素组[8|32];d%8≠0 走字节
+    路径;d×4>48KB 不上 shared 直接全局读 x,27B dense down-proj
+    kk=17408 因此可用;batch 任意,prefill 行同核)+ `EMBED_GATHER_Q4`
+    (tok_emb Q4 行内解量化 gather)。
+  - **Q4 尺度索引按张量平坦布局,不是按行重启**:`Q4Tensor::scales`
+    对整个张量平坦(groups = n/32 于平坦下标);行长非 32 倍数的行
+    起点落在组中间,按行寻址会拿错 scale(内核单测的奇形状当场抓出;
+    真实 27B 各维均 %32==0 不会踩,但正确性必须一般成立)。
+  - **BatchedModel 接线**:`Q4TensorDev`(q 字节+scales 指针对)与
+    `Q4DenseDev` 逐层表(10 个大张量),模型级 `emb_q4`/`lm_head_q4`;
+    `upload_weights_q4(w, experts, dense)` 三态;`gemm` 闭包加 Q4 对
+    参数——非空即走 `gemv_q4`(每一步,无 f16/f32 副本可回退,同专家
+    池契约);fused QKV 快路径在 Q4 模式关闭(拆 3 次独立 GEMV);
+    router/GDN a/b/shared MLP 不量化,保留 f16 副本;MLA+dense-Q4
+    先拒绝(响亮报错)。
+  - **构造链**:`with_rows_q4_all`/`with_paged_kv_rows_q4_all` →
+    `with_prefill_rows_q4_all`/`with_paged_prefill_rows_q4_all` →
+    engine `spawn_q4_all` → server `MACH_Q4_DEVICE=2`(=1 保持 MoE-only
+    兼容 30B;非 0 非 2 视为 1)。
+  - **顺带修真 bug:GDN 递归状态显存按全维而非按 head 分配**——
+    `vh*kd*vd` 应为 `vh*hd*hd`(GDN_STEP 布局 `[slots, vh, hd, hd]`),
+    27B 超配 768×(每层每槽 2.4GB vs 实际寻址 3.1MB,cap=1 即 116GB
+    必然建时 OOM);qwen35_small(hd=8)只超配 8× 无症状掩盖了它。
+    model.rs/batched.rs 两处同修。
+  - **测试**:内核级 `gemv_q4` 四形状(staged-u32/奇尾字节路径/
+    d=16384 全局 x/多 batch)与 `embed_gather_q4`(重复 token id +
+    首尾行)对拍解量化 CPU;e2e `batched_q4_all_matches_dequantized_ref`
+    (qwen35_small 全混合栈,oracle=dequantize 回 f32 的 RefModel,
+    大 GEMM 位级同源,F16 惯例容差+argmax);内核门禁 60。
+  - **预算@cap 8**:权重全 Q4 ~13.4GB + GDN 状态 8×48×3.1MB≈1.2GB +
+    KV(16 层 full-attn)~1.1GB ≈ 17GB ✓(cap 64 仅 GDN 状态 9.7GB
+    会爆,真机须调小 MACH_CAPACITY)。
+  - **下一步(Stage A 收尾二)**:真实 checkpoint 上机(MACH_Q4=1 +
+    MACH_Q4_DEVICE=2 + 小 MACH_CAPACITY),短 prompt 连贯生成 + numpy
+    逐层对拍(复用 #107 的 ds_layer_dump/np_ref.py 模板);性能遗留:
+    GEMV_Q4 大 m 仍走 warp-per-row(对比 hipBLAS 的取舍待测),GDN_STEP
+    LDS tiling 未做。

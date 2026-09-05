@@ -289,4 +289,87 @@ mod gpu {
     fn batched_matches_ref_f16() {
         batched_matches_ref(ModelDType::F16);
     }
+
+    /// Dequantizes storage-Q4 weights back to exact f32 (`nibble * group
+    /// scale` — the same values `gemv_q4`/`embed_gather_q4` compute in
+    /// kernel), giving the dense-Q4 oracle a bit-identical weight source.
+    fn dequantize_q4(wq: &mach_model::WeightsQ4) -> Weights {
+        use mach_model::weights::LayerWeights;
+        mach_model::Weights {
+            tok_emb: wq.tok_emb.dequantize(),
+            rms_final: wq.rms_final.clone(),
+            lm_head: wq.lm_head.dequantize(),
+            layers: wq
+                .layers
+                .iter()
+                .map(|l| LayerWeights {
+                    wq: l.wq.dequantize(),
+                    wk: l.wk.dequantize(),
+                    wv: l.wv.dequantize(),
+                    wo: l.wo.dequantize(),
+                    rms_attn: l.rms_attn.clone(),
+                    wg: l.wg.dequantize(),
+                    wu: l.wu.dequantize(),
+                    wd: l.wd.dequantize(),
+                    rms_mlp: l.rms_mlp.clone(),
+                    bq: l.bq.clone(),
+                    bk: l.bk.clone(),
+                    bv: l.bv.clone(),
+                    q_norm: l.q_norm.clone(),
+                    k_norm: l.k_norm.clone(),
+                    mla_q_a: l.mla_q_a.dequantize(),
+                    mla_q_a_norm: l.mla_q_a_norm.clone(),
+                    mla_q_b: l.mla_q_b.dequantize(),
+                    mla_q_rope: l.mla_q_rope.dequantize(),
+                    mla_kv_a: l.mla_kv_a.dequantize(),
+                    mla_kv_a_norm: l.mla_kv_a_norm.clone(),
+                    mla_kv_b: l.mla_kv_b.dequantize(),
+                    mla_o: l.mla_o.dequantize(),
+                    moe_router: l.moe_router.clone(),
+                    moe_wg: l.moe_wg.dequantize(),
+                    moe_wu: l.moe_wu.dequantize(),
+                    moe_wd: l.moe_wd.dequantize(),
+                    shared_wg: l.shared_wg.dequantize(),
+                    shared_wu: l.shared_wu.dequantize(),
+                    shared_wd: l.shared_wd.dequantize(),
+                    gdn_in_qkv: l.gdn_in_qkv.dequantize(),
+                    gdn_in_z: l.gdn_in_z.dequantize(),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: l.gdn_out.dequantize(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Dense Q4-on-device (server `MACH_Q4_DEVICE=2` class): every big tensor
+    /// stays raw Q4 on device, dequantized in-kernel by `gemv_q4` /
+    /// `embed_gather_q4`, vs the CPU reference on the SAME dequantized f32
+    /// weights — the big GEMMs share a bit-identical source, so the residual
+    /// diff is the f16-only tensors (GDN a/b ride the recurrence) plus GEMM
+    /// order: the F16 convention (loose bound + greedy argmax per step).
+    #[test]
+    fn batched_q4_all_matches_dequantized_ref() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F16);
+        let w = Weights::random(&cfg, 43).unwrap();
+        let wq = mach_model::WeightsQ4::from_weights(&w, &cfg);
+        let mut cpu = RefModel::new(cfg, dequantize_q4(&wq));
+        let mut m = BatchedModel::with_rows_q4_all(Arc::clone(&hip), cfg, &wq, 1, 1).unwrap();
+        for (step, &t) in [3u32, 17, 42, 5].iter().enumerate() {
+            let cpu_logits = cpu.decode_step(t);
+            m.decode_step(&[t]).unwrap();
+            let gpu_logits = m.read_logits().unwrap();
+            check_row(
+                &format!("q4-all step {step}"),
+                ModelDType::F16,
+                &gpu_logits,
+                &cpu_logits,
+            );
+        }
+    }
 }

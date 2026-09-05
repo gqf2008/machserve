@@ -131,6 +131,49 @@ struct Q4ExpertDev {
     wd_s: *mut f32,
 }
 
+/// One Q4 GEMM tensor on device: the raw packed int4 bytes + per-group f32
+/// scales, dequantized in-kernel by `gemv_q4` / `embed_gather_q4` (dense
+/// Q4-on-device mode).
+#[derive(Clone, Copy)]
+struct Q4TensorDev {
+    q: *mut u8,
+    s: *mut f32,
+}
+
+impl Q4TensorDev {
+    const EMPTY: Self = Self {
+        q: std::ptr::null_mut(),
+        s: std::ptr::null_mut(),
+    };
+
+    fn is_null(&self) -> bool {
+        self.q.is_null()
+    }
+}
+
+/// Dense (non-expert) Q4 weights per layer (dense Q4-on-device mode,
+/// `MACH_Q4_DEVICE=2`): every big GEMM tensor stays raw Q4 on device — the
+/// memory path for DENSE 27B-class checkpoints, where the dequantized f16
+/// copy (~54GB) does not fit VRAM but the all-Q4 pool (~13.5GB) does. Each
+/// GEMV runs the in-kernel-dequant `gemv_q4` for EVERY step (no f16/f32
+/// copy of these tensors exists to fall back on — same contract as the Q4
+/// expert pool). Tensors a layer type does not carry keep null pairs;
+/// layer-type dispatch itself stays dtype-independent (`has_gdn` /
+/// `moe_router`, the #107 lesson). Unquantized tensors (router, GDN a/b)
+/// and the small always-dequantized shared MLP keep their f16 copies.
+struct Q4DenseDev {
+    wq: Q4TensorDev,
+    wk: Q4TensorDev,
+    wv: Q4TensorDev,
+    wo: Q4TensorDev,
+    wg: Q4TensorDev,
+    wu: Q4TensorDev,
+    wd: Q4TensorDev,
+    gdn_in_qkv: Q4TensorDev,
+    gdn_in_z: Q4TensorDev,
+    gdn_out: Q4TensorDev,
+}
+
 /// Step profiler state (`Config.step_profile`, parsed from the server's
 /// `MACH_STEP_PROFILE`): per-layer event pairs bracketing [layer start,
 /// attention done, MoE done] plus the whole-step pair. `report` prints the
@@ -367,6 +410,16 @@ pub struct BatchedModel {
     /// in-kernel; all steps (prefill included) run the grouped path, since
     /// no f16/f32 expert copy exists for the hipBLAS path.
     q4_experts: Vec<Q4ExpertDev>,
+    /// Dense Q4-on-device weights per layer (non-empty only in the
+    /// `with_rows_q4_all` mode): the big dense GEMM tensors stay raw Q4,
+    /// read by `gemv_q4` in-kernel dequant for every step. Index-aligned
+    /// with `layers_dev` / `layers_f16`.
+    q4_layers: Vec<Q4DenseDev>,
+    /// Dense Q4-on-device embedding table (`with_rows_q4_all` mode); null
+    /// otherwise (the f16 table `emb_f16` is used).
+    emb_q4: Q4TensorDev,
+    /// Dense Q4-on-device lm_head (`with_rows_q4_all` mode); null otherwise.
+    lm_head_q4: Q4TensorDev,
     /// Step profiler (`Config.step_profile`): per-layer event pairs bracketing
     /// the attention and MoE phases plus a whole-step pair; `report` prints
     /// the per-step breakdown after the sampling sync.
@@ -531,7 +584,26 @@ impl BatchedModel {
     ) -> Result<Self, Error> {
         Self::paged_guards(&cfg, tokens_per_page)?;
         let mut m = Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
-            m.upload_weights_q4(w, true)
+            m.upload_weights_q4(w, true, false)
+        })?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// Paged dense Q4-on-device variant (see [`Self::with_rows_q4_all`]):
+    /// every big dense tensor AND the expert pool stay raw Q4 on device —
+    /// the memory path for DENSE 27B-class checkpoints under paged KV.
+    pub fn with_paged_kv_rows_q4_all(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        let mut m = Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
+            m.upload_weights_q4(w, true, true)
         })?;
         m.init_paged(tokens_per_page)?;
         Ok(m)
@@ -718,7 +790,38 @@ impl BatchedModel {
             ));
         }
         Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
-            m.upload_weights_q4(w, true)
+            m.upload_weights_q4(w, true, false)
+        })
+    }
+
+    /// Q4-everything variant of [`Self::with_rows_q4_device`] (dense
+    /// Q4-on-device, server `MACH_Q4_DEVICE=2`): the expert pool AND every
+    /// big dense GEMM tensor (q/k/v/o projections, dense MLP, GDN
+    /// projections, embedding, lm_head) stay raw Q4 on device, read with
+    /// in-kernel dequant — the memory path for DENSE 27B-class checkpoints
+    /// (all-Q4 ~13.5GB fits VRAM; the dequantized f16 copy ~54GB does not).
+    /// Small/unquantized tensors (norms, biases, router, GDN a/b) and the
+    /// shared MLP keep their f32/f16 copies as in the other Q4 modes. MLA
+    /// (`kv_lora_rank > 0`) is not wired on this path yet — loud error.
+    pub fn with_rows_q4_all(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model(
+                "from_q4 requires dtype F16 (dequantize to f16 on device)".into(),
+            ));
+        }
+        if cfg.kv_lora_rank > 0 {
+            return Err(Error::Model(
+                "dense Q4-on-device does not support MLA yet (kv_lora_rank > 0)".into(),
+            ));
+        }
+        Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
+            m.upload_weights_q4(w, true, true)
         })
     }
 
@@ -874,7 +977,7 @@ impl BatchedModel {
             ));
         }
         Self::build_common(hip, cfg, slots, rows, usize::MAX, |m| {
-            m.upload_weights_q4(w, false)
+            m.upload_weights_q4(w, false, false)
         })
     }
 
@@ -985,6 +1088,10 @@ impl BatchedModel {
             gdn_o: std::ptr::null_mut(),
             gdn_state: Vec::new(),
             gdn_conv: Vec::new(),
+            q4_experts: Vec::new(),
+            q4_layers: Vec::new(),
+            emb_q4: Q4TensorDev::EMPTY,
+            lm_head_q4: Q4TensorDev::EMPTY,
             kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
@@ -996,7 +1103,6 @@ impl BatchedModel {
             prefetch: None,
             paged: false,
             moe_grouped: cfg.moe_grouped,
-            q4_experts: Vec::new(),
             prof: None,
             tokens_per_page: 0,
             max_pages_per_seq: 0,
@@ -1303,7 +1409,13 @@ impl BatchedModel {
             self.gdn_a = self.dalloc(b * c.gdn_v_heads * 4)?;
             self.gdn_b = self.dalloc(b * c.gdn_v_heads * 4)?;
             self.gdn_o = self.dalloc(b * vd * 4)?;
-            let state_zeros = vec![0.0f32; self.batch * c.gdn_v_heads * kd * vd];
+            // Per-head recurrent state is [hd, hd] (GDN_STEP's layout
+            // `[slots, vh, hd, hd]`) — NOT kd×vd: the full dims over-allocate
+            // by (kd*vd)/(hd*hd) (768x on the 27B = 2.4GB/layer/slot vs the
+            // 3.1MB actually addressed — 116GB at capacity 1, a build-time
+            // OOM on every real-size config; the small test configs masked it).
+            let state_zeros =
+                vec![0.0f32; self.batch * c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim];
             let conv_zeros = vec![0.0f32; self.batch * conv_dim * keep];
             for _ in 0..c.n_layers {
                 let s = self.dalloc(state_zeros.len() * 4)?;
@@ -1641,11 +1753,31 @@ impl BatchedModel {
     /// bytes + per-group f32 scales) in `self.q4_experts`, dequantized
     /// in-kernel by the Q4 grouped GEMV kernels — the memory path for
     /// 30B-class checkpoints (Q4 pool ~16GB vs the dequantized f16 ~50GB).
-    fn upload_weights_q4(&mut self, w: &WeightsQ4, q4_on_device: bool) -> Result<(), Error> {
-        self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
-        self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
-        self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
-        self.upload_f16_bits(self.lm_head_f16, &w.lm_head.dequantize_f16())?;
+    /// `experts_on_device` keeps the MoE expert pool raw Q4 (`=1` mode);
+    /// `dense_on_device` additionally keeps every big dense tensor raw Q4
+    /// (`=2` mode — the embedding/lm_head + layer tables in `q4_layers`,
+    /// read by `gemv_q4`/`embed_gather_q4` with in-kernel dequant).
+    fn upload_weights_q4(
+        &mut self,
+        w: &WeightsQ4,
+        experts_on_device: bool,
+        dense_on_device: bool,
+    ) -> Result<(), Error> {
+        if dense_on_device {
+            self.emb_q4 = Q4TensorDev {
+                q: self.upload_bytes(w.tok_emb.q_bytes())?,
+                s: self.upload_f32s(w.tok_emb.scales())?,
+            };
+            self.lm_head_q4 = Q4TensorDev {
+                q: self.upload_bytes(w.lm_head.q_bytes())?,
+                s: self.upload_f32s(w.lm_head.scales())?,
+            };
+        } else {
+            self.emb_f16 = self.alloc_f16(w.tok_emb.len())?;
+            self.lm_head_f16 = self.alloc_f16(w.lm_head.len())?;
+            self.upload_f16_bits(self.emb_f16, &w.tok_emb.dequantize_f16())?;
+            self.upload_f16_bits(self.lm_head_f16, &w.lm_head.dequantize_f16())?;
+        }
         self.rms_final_dev = self.dalloc(w.rms_final.len() * 4)?;
         self.upload(self.rms_final_dev, &w.rms_final)?;
 
@@ -1700,26 +1832,59 @@ impl BatchedModel {
             self.upload(l.rms_attn, &lw.rms_attn)?;
             self.upload(l.rms_mlp, &lw.rms_mlp)?;
             self.layers_dev.push(l);
+            // Dense Q4-on-device skips the f16 copies of the big tensors:
+            // they go up as raw Q4 pairs (`Q4DenseDev`) and the f16 pointers
+            // stay null, so the GEMM dispatch reads the Q4 pair instead of
+            // ever handing a null weight to the f16 kernels.
+            let d16 = !dense_on_device;
             let l16 = LayerDevF16 {
-                wq: self.alloc_f16(lw.wq.len())?,
-                wk: self.alloc_f16(lw.wk.len())?,
-                wv: self.alloc_f16(lw.wv.len())?,
-                wo: self.alloc_f16(lw.wo.len())?,
-                wg: self.alloc_f16(lw.wg.len())?,
-                wu: self.alloc_f16(lw.wu.len())?,
-                wd: self.alloc_f16(lw.wd.len())?,
+                wq: if d16 {
+                    self.alloc_f16(lw.wq.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
+                wk: if d16 {
+                    self.alloc_f16(lw.wk.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
+                wv: if d16 {
+                    self.alloc_f16(lw.wv.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
+                wo: if d16 {
+                    self.alloc_f16(lw.wo.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
+                wg: if d16 {
+                    self.alloc_f16(lw.wg.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
+                wu: if d16 {
+                    self.alloc_f16(lw.wu.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
+                wd: if d16 {
+                    self.alloc_f16(lw.wd.len())?
+                } else {
+                    std::ptr::null_mut()
+                },
                 moe_router: self.alloc_f16(lw.moe_router.len())?,
-                moe_wg: if q4_on_device {
+                moe_wg: if experts_on_device {
                     std::ptr::null_mut()
                 } else {
                     self.alloc_f16(lw.moe_wg.len())?
                 },
-                moe_wu: if q4_on_device {
+                moe_wu: if experts_on_device {
                     std::ptr::null_mut()
                 } else {
                     self.alloc_f16(lw.moe_wu.len())?
                 },
-                moe_wd: if q4_on_device {
+                moe_wd: if experts_on_device {
                     std::ptr::null_mut()
                 } else {
                     self.alloc_f16(lw.moe_wd.len())?
@@ -1733,15 +1898,15 @@ impl BatchedModel {
                 shared_wg: self.alloc_f16(lw.shared_wg.len())?,
                 shared_wu: self.alloc_f16(lw.shared_wu.len())?,
                 shared_wd: self.alloc_f16(lw.shared_wd.len())?,
-                gdn_in_qkv: if lw.gdn_in_qkv.is_empty() {
-                    std::ptr::null_mut()
-                } else {
+                gdn_in_qkv: if d16 && !lw.gdn_in_qkv.is_empty() {
                     self.alloc_f16(lw.gdn_in_qkv.len())?
-                },
-                gdn_in_z: if lw.gdn_in_z.is_empty() {
-                    std::ptr::null_mut()
                 } else {
+                    std::ptr::null_mut()
+                },
+                gdn_in_z: if d16 && !lw.gdn_in_z.is_empty() {
                     self.alloc_f16(lw.gdn_in_z.len())?
+                } else {
+                    std::ptr::null_mut()
                 },
                 gdn_in_a: if lw.gdn_in_a.is_empty() {
                     std::ptr::null_mut()
@@ -1753,21 +1918,23 @@ impl BatchedModel {
                 } else {
                     self.alloc_f16(lw.gdn_in_b.len())?
                 },
-                gdn_out: if lw.gdn_out.is_empty() {
-                    std::ptr::null_mut()
-                } else {
+                gdn_out: if d16 && !lw.gdn_out.is_empty() {
                     self.alloc_f16(lw.gdn_out.len())?
+                } else {
+                    std::ptr::null_mut()
                 },
             };
-            self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
-            self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
-            self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
-            self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
-            self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
-            self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
-            self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
+            if d16 {
+                self.upload_f16_bits(l16.wq, &lw.wq.dequantize_f16())?;
+                self.upload_f16_bits(l16.wk, &lw.wk.dequantize_f16())?;
+                self.upload_f16_bits(l16.wv, &lw.wv.dequantize_f16())?;
+                self.upload_f16_bits(l16.wo, &lw.wo.dequantize_f16())?;
+                self.upload_f16_bits(l16.wg, &lw.wg.dequantize_f16())?;
+                self.upload_f16_bits(l16.wu, &lw.wu.dequantize_f16())?;
+                self.upload_f16_bits(l16.wd, &lw.wd.dequantize_f16())?;
+            }
             self.upload_f16(l16.moe_router, &lw.moe_router)?;
-            if q4_on_device {
+            if experts_on_device {
                 // Expert pool stays raw Q4: upload the packed bytes + per-group
                 // scales as-is (in-kernel dequant reads them directly). Mixed
                 // checkpoints (dense + MoE layers) push a zero-length entry
@@ -1801,12 +1968,33 @@ impl BatchedModel {
             self.upload_f16_bits(l16.shared_wd, &lw.shared_wd.dequantize_f16())?;
             // GDN (Qwen3.5): qkv/z/out dequantize from the packed tensor; a/b
             // are stored f32 and convert like the other f16 GEMM matrices.
+            // Dense Q4-on-device keeps qkv/z/out raw; a/b still take the f16
+            // copy (unquantized in `WeightsQ4`).
             if !lw.gdn_in_qkv.is_empty() {
-                self.upload_f16_bits(l16.gdn_in_qkv, &lw.gdn_in_qkv.dequantize_f16())?;
-                self.upload_f16_bits(l16.gdn_in_z, &lw.gdn_in_z.dequantize_f16())?;
-                self.upload_f16_bits(l16.gdn_out, &lw.gdn_out.dequantize_f16())?;
+                if d16 {
+                    self.upload_f16_bits(l16.gdn_in_qkv, &lw.gdn_in_qkv.dequantize_f16())?;
+                    self.upload_f16_bits(l16.gdn_in_z, &lw.gdn_in_z.dequantize_f16())?;
+                    self.upload_f16_bits(l16.gdn_out, &lw.gdn_out.dequantize_f16())?;
+                }
                 self.upload_f16(l16.gdn_in_a, &lw.gdn_in_a)?;
                 self.upload_f16(l16.gdn_in_b, &lw.gdn_in_b)?;
+            }
+            if dense_on_device {
+                // Local first: each field upload needs `&mut self` while the
+                // push receiver holds `self.q4_layers`.
+                let lq4 = Q4DenseDev {
+                    wq: self.upload_q4_tensor(&lw.wq)?,
+                    wk: self.upload_q4_tensor(&lw.wk)?,
+                    wv: self.upload_q4_tensor(&lw.wv)?,
+                    wo: self.upload_q4_tensor(&lw.wo)?,
+                    wg: self.upload_q4_tensor(&lw.wg)?,
+                    wu: self.upload_q4_tensor(&lw.wu)?,
+                    wd: self.upload_q4_tensor(&lw.wd)?,
+                    gdn_in_qkv: self.upload_q4_tensor(&lw.gdn_in_qkv)?,
+                    gdn_in_z: self.upload_q4_tensor(&lw.gdn_in_z)?,
+                    gdn_out: self.upload_q4_tensor(&lw.gdn_out)?,
+                };
+                self.q4_layers.push(lq4);
             }
             self.layers_f16.push(l16);
         }
@@ -1824,6 +2012,20 @@ impl BatchedModel {
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
         )?;
         Ok(p as *mut u8)
+    }
+
+    /// Uploads a Q4 tensor as its raw packed bytes + per-group scales (dense
+    /// Q4-on-device); empty tensors (absent on this layer type) return the
+    /// null pair — existence stays dtype-independent (`has_gdn` etc.).
+    fn upload_q4_tensor(&mut self, t: &crate::q4::Q4Tensor) -> Result<Q4TensorDev, Error> {
+        if t.is_empty() {
+            Ok(Q4TensorDev::EMPTY)
+        } else {
+            Ok(Q4TensorDev {
+                q: self.upload_bytes(t.q_bytes())?,
+                s: self.upload_f32s(t.scales())?,
+            })
+        }
     }
 
     /// Uploads f32s to a fresh device allocation.
@@ -2516,13 +2718,23 @@ impl BatchedModel {
         // Small m (decode rows) takes the custom GEMV kernel — rocBLAS m=1
         // runs the 30B-class decode 60x over the memory bound; large m keeps
         // hipBLAS (weight reuse across rows pays on tensor cores).
+        // `t` is the dense Q4-on-device pair for this tensor (null in every
+        // other mode): when present, the raw packed tensor + scales go to
+        // `gemv_q4` for EVERY step — no f16/f32 copy exists to fall back on
+        // (same contract as the Q4 expert pool), and that kernel is
+        // batch-general (prefill rows included) with no 48 KB staging limit
+        // (oversize contractions read x straight from global).
         let gemm = |out: *mut f32,
                     x: *const f32,
                     w32: *mut f32,
                     w16: *mut u16,
+                    t: Q4TensorDev,
                     n: i32,
                     kk: i32|
          -> Result<(), Error> {
+            if !t.is_null() {
+                return k.launch_gemv_q4(x, t.q, t.s, out, n, kk, b);
+            }
             if f16 {
                 if b <= GEMV_MAX_M && kk <= GEMV_MAX_D {
                     k.launch_gemv_f16(out, x, w16, n, kk, b, std::ptr::null_mut())
@@ -2534,7 +2746,10 @@ impl BatchedModel {
             }
         };
 
-        if f16 {
+        if !self.emb_q4.is_null() {
+            // Dense Q4-on-device: embedding rows dequantize in the gather.
+            k.launch_embed_gather_q4(self.tokens_dev, self.emb_q4.q, self.emb_q4.s, self.x, d, b)?;
+        } else if f16 {
             k.launch_embed_f16(self.tokens_dev, self.emb_f16, self.x, d, b)?;
         } else {
             k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
@@ -2560,6 +2775,10 @@ impl BatchedModel {
         }
         for (li, lw) in self.layers_dev.iter().enumerate() {
             let l16 = if f16 { Some(self.layers_f16[li]) } else { None };
+            // Dense Q4-on-device pairs for this layer's big tensors (`None`
+            // in every other mode; a layer type without the tensor maps to
+            // the null pair, so the branch is inert for it).
+            let lq4 = self.q4_layers.get(li);
             // Step profiler: bracket this layer's attention phase.
             if let Some(pf_state) = &self.prof
                 && let Some((l0, _, _)) = pf_state.events.get(li)
@@ -2595,6 +2814,7 @@ impl BatchedModel {
                         self.xn,
                         lw.mla_q_a,
                         l16.map_or(std::ptr::null_mut(), |l| l.mla_q_a),
+                        Q4TensorDev::EMPTY,
                         qlr,
                         d,
                     )?;
@@ -2617,6 +2837,7 @@ impl BatchedModel {
                     q_src,
                     lw.mla_q_b,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_q_b),
+                    Q4TensorDev::EMPTY,
                     heads * nope,
                     q_kk,
                 )?;
@@ -2626,6 +2847,7 @@ impl BatchedModel {
                     q_src,
                     lw.mla_q_rope,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_q_rope),
+                    Q4TensorDev::EMPTY,
                     heads * rope,
                     q_kk,
                 )?;
@@ -2648,6 +2870,7 @@ impl BatchedModel {
                     self.xn,
                     lw.mla_kv_a,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_kv_a),
+                    Q4TensorDev::EMPTY,
                     kvlr + rope,
                     d,
                 )?;
@@ -2678,6 +2901,7 @@ impl BatchedModel {
                     self.mla_kv_a_n,
                     lw.mla_kv_b,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_kv_b),
+                    Q4TensorDev::EMPTY,
                     heads * (nope + v_hd),
                     kvlr,
                 )?;
@@ -2767,6 +2991,7 @@ impl BatchedModel {
                     self.mla_attn,
                     lw.mla_o,
                     l16.map_or(std::ptr::null_mut(), |l| l.mla_o),
+                    Q4TensorDev::EMPTY,
                     d,
                     heads * v_hd,
                 )?;
@@ -2790,6 +3015,7 @@ impl BatchedModel {
                     self.xn,
                     lw.gdn_in_qkv,
                     l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_qkv),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.gdn_in_qkv),
                     conv_dim,
                     d,
                 )?;
@@ -2798,6 +3024,7 @@ impl BatchedModel {
                     self.xn,
                     lw.gdn_in_z,
                     l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_z),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.gdn_in_z),
                     vd,
                     d,
                 )?;
@@ -2806,6 +3033,7 @@ impl BatchedModel {
                     self.xn,
                     lw.gdn_in_a,
                     l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_a),
+                    Q4TensorDev::EMPTY,
                     vh,
                     d,
                 )?;
@@ -2814,6 +3042,7 @@ impl BatchedModel {
                     self.xn,
                     lw.gdn_in_b,
                     l16.map_or(std::ptr::null_mut(), |l| l.gdn_in_b),
+                    Q4TensorDev::EMPTY,
                     vh,
                     d,
                 )?;
@@ -2849,6 +3078,7 @@ impl BatchedModel {
                     self.gdn_o,
                     lw.gdn_out,
                     l16.map_or(std::ptr::null_mut(), |l| l.gdn_out),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.gdn_out),
                     d,
                     vd,
                 )?;
@@ -2861,7 +3091,10 @@ impl BatchedModel {
                 // are just more rows of the same GEMV).
                 let gate_on = c.attn_output_gate;
                 let nq_rows = if gate_on { 2 * nq } else { nq };
-                if f16 && b <= GEMV_MAX_M {
+                // Dense Q4-on-device has no f16 wq (the raw pair is the only
+                // copy), so the fused f16 QKV GEMV fast path is off; the
+                // generic branch below runs per-tensor Q4 GEMVs.
+                if f16 && b <= GEMV_MAX_M && lq4.map_or(Q4TensorDev::EMPTY, |l| l.wq).is_null() {
                     let l = l16.expect("f16 layer");
                     k.launch_gemv_f16_qkv(
                         self.xn,
@@ -2883,6 +3116,7 @@ impl BatchedModel {
                         self.xn,
                         lw.wq,
                         l16.map_or(std::ptr::null_mut(), |l| l.wq),
+                        lq4.map_or(Q4TensorDev::EMPTY, |l| l.wq),
                         nq_rows,
                         d,
                     )?;
@@ -2891,6 +3125,7 @@ impl BatchedModel {
                         self.xn,
                         lw.wk,
                         l16.map_or(std::ptr::null_mut(), |l| l.wk),
+                        lq4.map_or(Q4TensorDev::EMPTY, |l| l.wk),
                         nkv,
                         d,
                     )?;
@@ -2899,6 +3134,7 @@ impl BatchedModel {
                         self.xn,
                         lw.wv,
                         l16.map_or(std::ptr::null_mut(), |l| l.wv),
+                        lq4.map_or(Q4TensorDev::EMPTY, |l| l.wv),
                         nkv,
                         d,
                     )?;
@@ -3147,6 +3383,7 @@ impl BatchedModel {
                     self.attn,
                     lw.wo,
                     l16.map_or(std::ptr::null_mut(), |l| l.wo),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.wo),
                     d,
                     nq,
                 )?;
@@ -3183,11 +3420,14 @@ impl BatchedModel {
                 let einter = c.expert_size() as i32;
                 if topk > 0 {
                     // Router logits [B, ne] (shared input -> batched GEMM).
+                    // The router is unquantized (f32 in `WeightsQ4`) — no Q4
+                    // pair exists for it.
                     gemm(
                         self.router,
                         self.xn2,
                         lw.moe_router,
                         l16.map_or(std::ptr::null_mut(), |l| l.moe_router),
+                        Q4TensorDev::EMPTY,
                         ne,
                         d,
                     )?;
@@ -3509,6 +3749,7 @@ impl BatchedModel {
                                 self.xn2,
                                 lw.shared_wg,
                                 l16.map_or(std::ptr::null_mut(), |l| l.shared_wg),
+                                Q4TensorDev::EMPTY,
                                 shinter,
                                 d,
                             )?;
@@ -3517,6 +3758,7 @@ impl BatchedModel {
                                 self.xn2,
                                 lw.shared_wu,
                                 l16.map_or(std::ptr::null_mut(), |l| l.shared_wu),
+                                Q4TensorDev::EMPTY,
                                 shinter,
                                 d,
                             )?;
@@ -3527,6 +3769,7 @@ impl BatchedModel {
                                 self.h,
                                 lw.shared_wd,
                                 l16.map_or(std::ptr::null_mut(), |l| l.shared_wd),
+                                Q4TensorDev::EMPTY,
                                 d,
                                 shinter,
                             )?;
@@ -3542,6 +3785,7 @@ impl BatchedModel {
                     self.xn2,
                     lw.wg,
                     l16.map_or(std::ptr::null_mut(), |l| l.wg),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.wg),
                     inter,
                     d,
                 )?;
@@ -3550,6 +3794,7 @@ impl BatchedModel {
                     self.xn2,
                     lw.wu,
                     l16.map_or(std::ptr::null_mut(), |l| l.wu),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.wu),
                     inter,
                     d,
                 )?;
@@ -3560,6 +3805,7 @@ impl BatchedModel {
                     self.h,
                     lw.wd,
                     l16.map_or(std::ptr::null_mut(), |l| l.wd),
+                    lq4.map_or(Q4TensorDev::EMPTY, |l| l.wd),
                     d,
                     inter,
                 )?;
@@ -3691,7 +3937,19 @@ impl BatchedModel {
         // so the reported total covers the full step (final norm + lm_head in
         // the `other` bucket).
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
-        if f16 {
+        if !self.lm_head_q4.is_null() {
+            // Dense Q4-on-device: every step, any row count — the kernel is
+            // batch-general and vocab-sized n is just more blocks.
+            k.launch_gemv_q4(
+                self.xn,
+                self.lm_head_q4.q,
+                self.lm_head_q4.s,
+                self.logits,
+                c.vocab_size as i32,
+                d,
+                b,
+            )?;
+        } else if f16 {
             if b <= GEMV_MAX_M && d <= GEMV_MAX_D {
                 k.launch_gemv_f16(
                     self.logits,

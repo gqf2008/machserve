@@ -11,7 +11,11 @@
 //! host weights: int4 or E4M3, dequantized to f16 on the device),
 //! MACH_Q4_DEVICE=1 (with MACH_Q4: keep the MoE expert pool in raw Q4 on the
 //! device, dequantized in-kernel — the memory path for 30B-class checkpoints
-//! whose f16 experts would not fit in VRAM),
+//! whose f16 experts would not fit in VRAM) or MACH_Q4_DEVICE=2 (=1 PLUS every
+//! big dense tensor — q/k/v/o projections, dense MLP, GDN projections,
+//! embedding, lm_head — raw Q4 on device, `gemv_q4` in-kernel dequant; the
+//! memory path for DENSE 27B-class checkpoints whose dequantized f16 weights
+//! ~54GB would not fit in VRAM; all-Q4 ~13.5GB does),
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
 //! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
 //! engage paged KV — plain, Q4 and FP8 non-MLA). Limitations: paged KV serves
@@ -19,7 +23,7 @@
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
 //! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
 //! GEMV device path — A/B switch and ops lever). NOTE: Q4-on-device models
-//! (MACH_Q4_DEVICE=1) have no f16/f32 expert copy, so they ALWAYS run the
+//! (MACH_Q4_DEVICE>=1) have no f16/f32 expert copy, so they ALWAYS run the
 //! grouped path and this knob is a no-op for them.
 //! MACH_STEP_PROFILE=1 (diagnostic): per-layer attention/MoE HIP event
 //! bracketing printed after each decode step.
@@ -392,7 +396,31 @@ fn estimate_vram(
     } else {
         file_bytes
     };
-    let mut est = weight + (kv * cfg.n_layers) as u64 + (256 << 20);
+    // Qwen3.5 hybrid: only the full-attention layers carry a dense KV cache
+    // (the GDN layers' "KV" is the recurrent state below), and that state is
+    // a device allocation the preflight must count — [capacity, vh, hd, hd]
+    // per GDN layer (3.1MB/layer/slot on the 27B: 1.2GB at capacity 8,
+    // 9.7GB at 64) plus the small conv windows. Sizing by kd*vd instead of
+    // per-head hd*hd would over-count 768x (#112 build-time OOM class).
+    let (kv_layers, gdn_layers) = if cfg.gdn_enabled() {
+        let full = (0..cfg.n_layers)
+            .filter(|&li| cfg.layer_is_full_attn(li))
+            .count();
+        (full, cfg.n_layers - full)
+    } else {
+        (cfg.n_layers, 0)
+    };
+    let gdn_state = if gdn_layers > 0 {
+        (capacity as u64)
+            * gdn_layers as u64
+            * (cfg.gdn_v_heads * cfg.gdn_head_dim * cfg.gdn_head_dim
+                + (2 * cfg.gdn_key_dim() + cfg.gdn_value_dim()) * (cfg.gdn_conv_kernel - 1))
+                as u64
+            * 4
+    } else {
+        0
+    };
+    let mut est = weight + (kv * kv_layers) as u64 + gdn_state + (256 << 20);
     if let Some((dcfg, dfb)) = draft {
         let dkv_elem = if dcfg.dtype == ModelDType::F16 { 2 } else { 4 };
         let dkv = if dcfg.kv_lora_rank > 0 {
@@ -582,10 +610,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage-Q4 mode: weights stay packed int4 on the host (dequantized to
     // f16 per tensor on the device), cutting host RAM ~4x vs f32.
     let q4 = std::env::var("MACH_Q4").is_ok_and(|v| v != "0");
-    // Q4-on-device: the MoE expert pool stays raw Q4 on the device (in-kernel
-    // dequant) instead of the dequantized f16 pool — the memory path for
-    // 30B-class checkpoints whose f16 experts would not fit in VRAM.
-    let q4_device = std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v != "0");
+    // Q4-on-device level: 1 keeps the MoE expert pool raw Q4 on the device
+    // (in-kernel dequant); 2 additionally keeps EVERY big dense tensor raw
+    // Q4 (`gemv_q4`) — the memory path for DENSE 27B-class checkpoints whose
+    // dequantized f16 weights would not fit in VRAM.
+    let q4_device = match std::env::var("MACH_Q4_DEVICE") {
+        Ok(v) if v == "2" => 2u8,
+        Ok(v) if v != "0" && !v.is_empty() => 1u8,
+        _ => 0u8,
+    };
     // Storage-FP8 mode: weights stay E4M3 on the host (dequantized to f16
     // per tensor on the device), cutting host RAM ~2x vs f16 / ~4x vs f32.
     let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
@@ -632,9 +665,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
-    if q4_device && !q4 {
+    if q4_device != 0 && !q4 {
         eprintln!(
-            "warning: MACH_Q4_DEVICE=1 requires MACH_Q4=1 (it selects the Q4 expert-pool layout); ignoring"
+            "warning: MACH_Q4_DEVICE={} requires MACH_Q4=1 (it selects a Q4 device layout); ignoring",
+            q4_device
         );
     }
 
@@ -717,7 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         file_bytes,
         draft_est.as_ref().map(|(c, b)| (c, *b)),
         fp8,
-        q4_device,
+        q4_device != 0,
     );
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     println!(
@@ -727,9 +761,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gib(estimate)
     );
     if q4 {
-        println!(
-            "storage Q4: host weights stay packed int4 (~4x smaller than f32); device still holds dequantized f16 weights"
-        );
+        match q4_device {
+            2 => println!(
+                "storage Q4 + dense Q4-on-device: host AND device weights stay packed int4 (in-kernel dequant)"
+            ),
+            1 => println!(
+                "storage Q4 + Q4-on-device experts: the expert pool stays packed int4 on device; other weights dequantize to f16"
+            ),
+            _ => println!(
+                "storage Q4: host weights stay packed int4 (~4x smaller than f32); device still holds dequantized f16 weights"
+            ),
+        }
     }
     if estimate > free as u64 {
         eprintln!(
@@ -825,10 +867,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(tpp) => ServerEngine::with_paged(capacity, prefill_rows, tpp),
             None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
         };
-        let handle = if q4_device {
-            eng.clone().spawn_q4_device(hip, cfg, wq4)?
-        } else {
-            eng.clone().spawn_q4(hip, cfg, wq4)?
+        let handle = match q4_device {
+            2 => eng.clone().spawn_q4_all(hip, cfg, wq4)?,
+            1 => eng.clone().spawn_q4_device(hip, cfg, wq4)?,
+            _ => eng.clone().spawn_q4(hip, cfg, wq4)?,
         };
         (eng, handle)
     } else if fp8 {
@@ -1357,6 +1399,32 @@ mod tests {
         // weight term is 0.3x the file bytes.
         let q4d = estimate_vram(&cfg, 8, 1_000_000, None, false, true);
         assert_eq!(q4d, base - 700_000);
+    }
+
+    /// Hybrid (Qwen3.5) VRAM accounting: KV only for the full-attention
+    /// layers, plus the GDN recurrent state sized PER HEAD (`vh * hd * hd` +
+    /// conv windows) — the #112 over-allocation class (kd*vd = 768x on the
+    //  27B) must not come back through the estimate.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gdn_hybrid_counts_state_and_skips_gdn_kv() {
+        let mut cfg = mach_model::Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 4096, 2, 4, 8, 4);
+        cfg.dtype = ModelDType::F32;
+        let cap = 8usize;
+        let got = estimate_vram(&cfg, cap, 0, None, false, false);
+        // qwen35_small shape: interval 4 over 5 layers -> full-attn ONLY
+        // layer 3 (li where (li+1)%4==0); layers 0,1,2,4 are GDN.
+        let full_layers = (0..cfg.n_layers)
+            .filter(|&li| cfg.layer_is_full_attn(li))
+            .count();
+        assert_eq!(full_layers, 1);
+        let kv_per_layer = cap * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2 * 4;
+        let per_gdn_layer = cfg.gdn_v_heads * cfg.gdn_head_dim * cfg.gdn_head_dim
+            + (2 * cfg.gdn_key_dim() + cfg.gdn_value_dim()) * (cfg.gdn_conv_kernel - 1);
+        let want = (kv_per_layer * full_layers
+            + cap * (cfg.n_layers - full_layers) * per_gdn_layer * 4
+            + (256 << 20)) as u64;
+        assert_eq!(got, want);
     }
 
     #[test]
