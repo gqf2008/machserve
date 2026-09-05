@@ -215,6 +215,55 @@ fn batched_moe_f16_matches_single_seq() {
     }
 }
 
+/// Shared experts (DeepSeek-V2's dense `n_shared_experts` SwiGLU MLP added to
+/// the routed experts' weighted sum) must contribute on EVERY dtype path.
+/// Regression for #107: the shared block used to be guarded by the f32
+/// `shared_w*` device pointers, which are null on every F16 upload path — the
+/// weights live in the f16 table only — so F16/Q4/FP8 models silently ran
+/// without their shared experts and decoded garbage (Qwen-MoE was unaffected
+/// because it ships no shared experts). Compare the F32 and F16 batched
+/// models on identical weights: dropping the shared MLP is a gross,
+/// whole-block-sized error, far outside the f16 rounding envelope.
+/// Calibration on this config: the fixed path drifts ~1.5e-3; with the
+/// shared block dropped it is ~0.7 at the first step already — the bound
+/// below sits between with two orders of margin on each side.
+#[test]
+fn batched_f16_shared_experts_match_f32() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.n_shared_experts = 2;
+    let mut w = Weights::random(&cfg, 71).unwrap();
+    // Peak the router so both dtypes select the same experts robustly (same
+    // rationale as the f16 batched test above).
+    for lw in w.layers.iter_mut() {
+        for v in lw.moe_router.iter_mut() {
+            *v *= 6.0;
+        }
+    }
+
+    let mut f32m = BatchedModel::new(hip.clone(), cfg, &w, 1).unwrap();
+    let mut f16cfg = cfg;
+    f16cfg.dtype = ModelDType::F16;
+    let mut f16m = BatchedModel::new(hip, f16cfg, &w, 1).unwrap();
+
+    for (i, &t) in [3u32, 11, 42, 7].iter().enumerate() {
+        f32m.decode_step(&[t]).unwrap();
+        f16m.decode_step(&[t]).unwrap();
+        let a = f32m.read_logits().unwrap();
+        let b = f16m.read_logits().unwrap();
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d <= 2e-2 + 2e-2 * scale,
+            "pos {i}: f16 vs f32 logits max diff {d} (scale {scale}) — shared experts dropped on the f16 path?"
+        );
+    }
+}
+
 /// Grouped-GEMV decode pinned to the CPU reference (an implementation that
 /// shares no code with the GPU path): the strongest oracle for the new MoE
 /// kernels — stronger than the near-tie token bands, which only bound how
@@ -245,6 +294,49 @@ fn batched_moe_grouped_matches_cpu_reference() {
         assert!(
             diff <= 2e-3 + 2e-3 * scale,
             "step {i}: grouped MoE vs CPU ref: max diff {diff} (scale {scale})"
+        );
+    }
+}
+
+/// The strongest oracle for the fixed shared-experts branch (#107): the f16
+/// grouped-MoE GPU path vs the CPU reference — `RefModel` computes the shared
+/// SwiGLU on the host weights, an implementation sharing no code with the GPU
+/// path. The F16-vs-F32 test above can only catch dtype-asymmetric drops; the
+/// repo convention (每条 GPU 路径都要有 CPU 参考对拍) asks for a CPU-reference
+/// pin, and `moe_cfg()` leaves `n_shared_experts = 0`, so before this test the
+/// restored branch was the one GPU path no CPU-reference parity test exercised.
+#[test]
+fn batched_moe_shared_experts_match_cpu_reference() {
+    use mach_model::ref_model::RefModel;
+
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = moe_cfg();
+    cfg.n_shared_experts = 2;
+    cfg.dtype = ModelDType::F16;
+    let mut w = Weights::random(&cfg, 167).unwrap();
+    // Peak the router so the f16 device router and the f32 CPU reference
+    // select the same experts robustly (same rationale as the test above).
+    for lw in w.layers.iter_mut() {
+        for v in lw.moe_router.iter_mut() {
+            *v *= 6.0;
+        }
+    }
+    let mut gpu = BatchedModel::new(hip, cfg, &w, 1).unwrap();
+    let mut cpu = RefModel::new(cfg, w);
+    for (i, &t) in [3u32, 11, 42, 7].iter().enumerate() {
+        gpu.decode_step(&[t]).unwrap();
+        let got = gpu.read_logits().unwrap();
+        // RefModel is stateful: feed only the incremental token.
+        let want = cpu.forward(&[t]);
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let diff = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff <= 2e-2 + 2e-2 * scale,
+            "step {i}: f16 grouped MoE + shared vs CPU ref: max diff {diff} (scale {scale}) — shared experts dropped or miscomputed?"
         );
     }
 }

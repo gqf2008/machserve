@@ -1,7 +1,13 @@
 # MachServe 路线图
 
-> 目标:除内核外全部 Rust,端到端性能超越 TokenSpeed。
+> 目标:除内核外全部 Rust,端到端性能对标并超越 **TokenSpeed 与 FreeToken**。
 > 验收:同模型、同权重、同请求分布,对比 TTFT / TPOT / 吞吐 / GPU 利用率。
+> 平台(2026-09-04 修订):**芯片平台全都要支持** —— 当前已实现 AMD
+> (ROCm/HIP,gfx1100);macOS / Windows / Linux 皆为终态,`mach-kernel-sys`
+> 唯一 FFI 边界与预留的 `cuda` feature 即为此服务。本机现阶段可复跑的对标
+> 是 llama.cpp(Vulkan);TokenSpeed/FreeToken 为跨平台归一的目标对手。
+> 节奏:**模型覆盖渐进添加,底子优先** —— 新模型族(如 Qwen3.8 混合线性
+> 注意力)以层类型抽象进入,不做单检查点补丁。
 
 ## 分阶段
 
@@ -1314,3 +1320,63 @@
   - 验证:fmt/clippy -D warnings/check×2 全绿;CPU 全量(177 passed,含
     新增 2 个 rope 测试);GPU 全量 --test-threads 1;离线门禁 52 内核
     +计数断言。
+
+- **#107 根因:shared experts 在全部 F16 上传路径被静默丢弃(已修,
+  2026-09-04,7900 XTX)**:
+  - **定位方法:逐层分叉定位,不猜病因**。`BatchedModel` 新增
+    `set_layer_dump`/`clear_layer_dump`(每层残差/路由/中间量落
+    `.npy`,顺带禁用 graph capture);numpy 参考同步记录同一位置
+    (`np_ref.py` 的 REC 系列),`cmp_layers.py` 逐层给出
+    max/rms 漂移 + f16 包络列,直接读出第一个分叉层。
+  - **根因**:DeepSeek-V2 的 shared experts(`n_shared_experts=2`,宽度
+    `shared_size()=2816` 的 dense SwiGLU MLP,加到路由专家加权和
+    `h_acc` 上)在 run_kernels 里的守卫是 `if !lw.shared_wg.is_null()`
+    —— 而 **F16 上传路径(plain F16 / Q4 存储 / Q4-on-device / FP8)
+    的 f32 `shared_w*` 指针恒为 null**(权重只活在 `LayerDevF16` f16 表
+    里),共享专家被静默跳过。Qwen 系无 shared experts,#85 的
+    Qwen3-30B 验证因此通过 —— 恰好掩盖了这条缺陷。
+  - **排除过程的副产物(不是 bug,但值得记录)**:Rust 量化器
+    (f32 scale、f32 除法、`f32::round` 四舍五入远离零)与 numpy 复刻
+    (f64 scale、`np.round` half-even)在**精确 .5 平局**上不一致;
+    bf16 checkpoint 让平局常见(w 恰为 max/2 → q=3.5)。两者都在
+    pin_quantize_writer 的 s/2 bound 内,产生 ~2/2048 个 embed 坐标
+    ±1 个 Q4 步的差,级联引起 19/26 层路由翻转 —— 是把逐层对齐
+    "看错一层"的主要噪声源。**对策:bit-exact 权重复刻**
+    (`FAKE_TIE=server`,numpy 完全照 Rust 的 f32 舍入路径复刻量化)
+    后 emb max|d|=0,numpy 依然连贯而 server 依然乱码 → 前向 bug 实锤,
+    与量化无关。
+  - **决定性证据**(L1 MoE 中间量对拍,`cmp_moe.py` 按 expert id 配行):
+    `h_acc == Σ w·down` **逐位相等**(scatter/反量化/SwiGLU 全对),
+    但缺 `+proj`(shared down 输出)→ 代码巡视直接命中守卫。
+  - **修复**:`LayerDev` 增加 **dtype 无关的存在性标志 `has_shared:
+    bool`**(三处构造点 `has_shared: !lw.shared_wg.is_empty()`),守卫
+    改 `if lw.has_shared`。激活缓冲早已按
+    `intermediate_size.max(shared_size())` 分配,无尺寸缺口。
+  - **验证**:server 生成 **" The capital of France is Paris."** 与
+    numpy 逐 token 一致(logits 30-42,修复前 19-24);26 层路由
+    **全部 SAME**(max|dw| ≤ 0.003);逐层漂移 75.6 → 4.5(L26 尖峰
+    坐标 3%,f16 权重 + f32 累加的预期水平)。
+  - **防回归**:`batched_f16_shared_experts_match_f32`(F32 vs F16
+    batched 同权对拍,`n_shared_experts=2`)。校准:修复后漂移
+    ~1.5e-3,守卫回退(丢 shared)~0.7(step 0 即),界 2e-2+2e-2·scale
+    两侧各两个数量级余量;red-green 实测通过。
+  - **工具沉淀**:`set_layer_dump` 检查点示例
+    `examples/ds_layer_dump.rs`(MACH_PROMPT_IDS 从 np_ref 回读 token,
+    Rust 分词器刻意不用,杜绝分词差异混入对拍);`.scratch/np_ref.py`
+    的 FAKE_TIE/REC_MOE 等留作后续逐层定位的模板。
+  - **同源缺陷(对抗审查抓出,记录未修,均先于本 PR 存在)**:
+    1. `model.rs`(单序列 GpuModel)同款 `!lw.shared_wg.is_null()` 守卫 ——
+       其 Q4/FP8 上传把全部 MoE/MLA/shared 权重置空;但 **plain F16 + MoE +
+       shared 今天就丢 shared**(f32 `moe_router`/`moe_w*` 在 F16 上传不置空、
+       只有 shared 走 `upload_mat32(f16)→null`,且单序列 `LayerDevF16` 无
+       shared 字段,f16 权重根本没处放)—— 仅因服务端不走 GpuModel 而未暴露。
+       修它需要给 model.rs 的 f16 表补 shared 三件套,不是换一个标志就完。
+    2. **CPU 专家 offload 路径**(`expert_slots < num_experts` 的 F32 模型,
+       `forward_moe_cpu_batched` / `moe_offload.rs::moe_batch_cpu_residual`)
+       只累加路由专家,无 shared 项 —— offload 模式跑 DeepSeek 型检查点同样
+       静默丢 shared。
+    两处另立 #111 追踪;若将来补单序列 MoE 量化上传或改 offload 路径,须一并
+    处理。
+  - **性能数据待重测**:修复让 MoE 层恢复了 shared 的三个 GEMM(此前
+    被跳过),既有 25.73 tok/s 是"少干活"的数字,不再代表修复后路径。
+
