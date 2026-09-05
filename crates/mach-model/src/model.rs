@@ -662,7 +662,14 @@ impl GpuModel {
             // `[vh, hd, hd]`) — NOT kd×vd, see the batched.rs twin.
             let zeros = vec![0.0f32; c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim];
             let conv_zeros = vec![0.0f32; conv_dim * keep];
-            for _ in 0..c.n_layers {
+            for li in 0..c.n_layers {
+                // Full-attn layers never launch the GDN kernels — null
+                // entries (consumers are `layer_is_full_attn`-gated).
+                if c.layer_is_full_attn(li) {
+                    self.gdn_state.push(std::ptr::null_mut());
+                    self.gdn_conv.push(std::ptr::null_mut());
+                    continue;
+                }
                 let s = self.dalloc(zeros.len() * 4)?;
                 self.upload(s, &zeros)?;
                 let cv = self.dalloc(conv_zeros.len() * 4)?;
@@ -2342,6 +2349,32 @@ impl GpuModel {
                     hip::check(
                         self.k.hip(),
                         (self.k.hip().api.hip_memset)(*vc as *mut _, 0, v_bytes),
+                    )?;
+                }
+            }
+        }
+        // GDN recurrent + conv state back to the pos-0 state (S = 0, empty
+        // conv window): the recurrence reads the state unconditionally, so a
+        // generation run after `reset_state` without this would inherit the
+        // previous sequence's context. Byte count matches the allocation
+        // (`vh * hd * hd`); full-attn layers carry null entries.
+        if !self.gdn_state.is_empty() {
+            let c = self.cfg;
+            let state_bytes = c.gdn_v_heads * c.gdn_head_dim * c.gdn_head_dim * 4;
+            let conv_dim = 2 * c.gdn_key_dim() + c.gdn_value_dim();
+            let conv_bytes = conv_dim * (c.gdn_conv_kernel - 1) * 4;
+            for (&s, &cv) in self.gdn_state.iter().zip(&self.gdn_conv) {
+                if s.is_null() {
+                    continue; // full-attn layer: no GDN buffers
+                }
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(s as *mut _, 0, state_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(cv as *mut _, 0, conv_bytes),
                     )?;
                 }
             }

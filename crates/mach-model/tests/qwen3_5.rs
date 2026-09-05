@@ -149,8 +149,10 @@ mod gpu {
     use mach_kernel_sys::hip;
     use mach_model::batched::BatchedModel;
     use mach_model::config::ModelDType;
+    use mach_model::continuous::ContinuousModel;
     use mach_model::model::GpuModel;
     use mach_model::ref_model::RefModel;
+    use mach_model::sampling::SamplingParams;
     use mach_model::{Config, Weights};
     use std::sync::Arc;
 
@@ -249,6 +251,126 @@ mod gpu {
     #[test]
     fn single_seq_matches_ref_f16() {
         single_seq_matches_ref(ModelDType::F16);
+    }
+
+    /// Continuous-batching prefill on the hybrid stack: GDN models apply the
+    /// per-slot recurrent state once per step row, so the engine must prefill
+    /// sequentially (one prompt token per step per slot) — token-major packing
+    /// is #112 Stage B and is rejected by `decode_step_explicit`. Two
+    /// staggered sequences (different prompt lengths, so prefill and decode
+    /// rows interleave) must complete and generate the same greedy tokens as
+    /// the step-by-step reference chains.
+    #[test]
+    fn continuous_prefill_sequential_matches_ref_f32() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F32);
+        let w = Weights::random(&cfg, 43).unwrap();
+        let jobs: [(Vec<u32>, usize); 2] = [(vec![3, 17, 42, 5], 3), (vec![90, 7], 2)];
+        let mut eng = ContinuousModel::new(Arc::clone(&hip), cfg, &w, 2).unwrap();
+        let mut ids = Vec::new();
+        for (prompt, max_new) in &jobs {
+            ids.push(
+                eng.add(
+                    prompt,
+                    *max_new,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    SamplingParams::default(),
+                )
+                .unwrap(),
+            );
+        }
+        while !eng.all_done() {
+            // Duplicate-slot packing would surface as the engine-step error
+            // here; greedy engine tokens must equal the reference chain.
+            eng.step().unwrap();
+        }
+        for ((prompt, max_new), &id) in jobs.iter().zip(&ids) {
+            let got = eng.generated(id);
+            let mut cpu = RefModel::new(cfg, w.clone());
+            let mut last = None;
+            for &t in prompt {
+                last = Some(cpu.decode_step(t));
+            }
+            let mut tok = argmax(last.as_ref().unwrap()) as u32;
+            let mut want = vec![tok];
+            for _ in 1..*max_new {
+                tok = argmax(&cpu.decode_step(tok)) as u32;
+                want.push(tok);
+            }
+            assert_eq!(
+                got, want,
+                "seq {prompt:?}: engine={got:?} sequential-ref={want:?}"
+            );
+        }
+    }
+
+    /// Slot reuse must not leak GDN recurrent state: the recurrence reads the
+    /// per-slot state unconditionally, so a sequence admitted onto a retired
+    /// slot would inherit its context (observed on the real 27B: an
+    /// arithmetic answer bleeding into the next request). The reused-slot
+    /// generation must match a fresh-engine generation token for token.
+    #[test]
+    fn gdn_slot_reuse_clears_recurrent_state() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F32);
+        let w = Weights::random(&cfg, 47).unwrap();
+        let prompt = vec![3u32, 17, 42, 5];
+        let max_new = 4;
+        // Control: the prompt on a fresh engine.
+        let control = {
+            let mut eng = ContinuousModel::new(Arc::clone(&hip), cfg, &w, 2).unwrap();
+            let id = eng
+                .add(
+                    &prompt,
+                    max_new,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    SamplingParams::default(),
+                )
+                .unwrap();
+            while !eng.all_done() {
+                eng.step().unwrap();
+            }
+            eng.generated(id)
+        };
+        // Retire an unrelated sequence, then run the same prompt on the
+        // reused (compacted) slot.
+        let mut eng = ContinuousModel::new(Arc::clone(&hip), cfg, &w, 2).unwrap();
+        let x = eng
+            .add(
+                &[90u32, 7, 64],
+                2,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !eng.is_done(x) {
+            eng.step().unwrap();
+        }
+        assert_eq!(eng.active(), 0, "unrelated sequence retired");
+        let id = eng
+            .add(
+                &prompt,
+                max_new,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !eng.all_done() {
+            eng.step().unwrap();
+        }
+        let reused = eng.generated(id);
+        assert_eq!(
+            control, reused,
+            "slot reuse leaked GDN state: fresh={control:?} reused={reused:?}"
+        );
     }
 
     /// Batched decode of two interleaved sequences: each row's logits vs its
