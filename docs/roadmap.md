@@ -1571,3 +1571,43 @@
     映射由加载器 expect 硬失败+连贯性验收覆盖,深度对拍可并入 Stage B
     的数值 oracle);GEMV_Q4 大 m warp-per-row vs hipBLAS 待 A/B;
     GDN_STEP LDS tiling;fused Q4-QKV GEMV。
+
+## Qwen3.8-27B Stage B(一):GDN chunked prefill 内核(#112,2026-09-06)
+
+顺序 prefill(每步每 slot 一 token)是 TTFT 主瓶颈。本批把 GDN 层的
+C token 递归压成一次内核发射:推导 WY 形 chunked delta rule,落 CPU
+oracle 与两枚 HIP 内核,全部对拍钉死。**engine 接线留给下一批**——
+本批只交付数值底座(内核 + oracle + 门禁 60→62)。
+
+- **公式推导(f64 仿真仲裁)**:每 v-head 每 token 对数衰减
+  g_t(Π_t=cumprod exp)、门 β_t,
+  `u_t + Σ_(s<t) A[t,s]·u_s = β_t·(v_t − Π_t·S₀ᵀk_t)`,其中
+  `A[t,s] = β_t·(Π_t/Π_s)·(k_s·k_t)`(严格下三角;**β_t 在行/查询
+  侧**——首版丢此公因子,层级测试 1.7% 偏差 + f64 双路径仿真抓出),
+  前向替换解 u;`S_C = Π_C·S₀ + Σ_s (Π_C/Π_s)·k_s⊗u_s`;
+  `o_t = Π_t·S₀ᵀq_t + Σ_(s≤t) (Π_t/Π_s)·(k_s·q_t)·u_s`(自身写
+  **含**——与 decode 内核 read-after-write 的 `o = Sᵀq` 一致)。
+  .scratch/check_gdn_chunk.py:双路径 f64 最大偏差 1.1e-16。
+- **CPU oracle**:ref_model `decode_chunk_gdn`(整层 chunk:逐
+  token 投影/conv/silu/norm 分段暂存 → 逐头核心 → 逐 token 门控
+  norm/出投影)与 `gdn_core_chunk`(纯核心,共享给 GPU 对拍);
+  层级测试 chunk vs 顺序 8 步:conv 窗口位精确、输出/状态 1e-4。
+- **内核一 GDN_CONV_CHUNK**:conv+silu+窗口移位一线,每通道一线程,
+  寄存器窗口保留 keep≤8 tap、串行 t 步进、末尾写回状态;对拍
+  conv 窗口位精确、qkv 1e-5。
+- **内核二 GDN_CHUNK**:每 v-head 一 block,shmem 布局
+  `6·c·hd + 2·c² + 2·c` float(K/Q/V/U/K0/Q0 + A/B + lpi/beta;U 先
+  存 W 再原地前向替换),S₀ 从全局流式读([hd,hd] 块在真实 head dim
+  超 LDS),c≤12@hd=128 适配 48KB;相位:加载→门控 cumsum(单线
+  程)→K0/Q0→A/B→W→逐行替换→S 更新→o。复用 GDN_L2NORM_QK(qkv
+  [C,conv_dim] 行即 batch 行)与 GDN_GATED_NORM。
+- **对拍战果**:三形状 (hd,c)=(8,5)/(16,7)/(32,16) 全过 2e-4;修复
+  一处真错——A/B 共享 dot 循环的三元分支 `s<t ? K[t] : Q[t]` 把
+  **B 的 s<t 项污染成 k_s·k_t**(B 应恒 k_s·q_t),c=1 不可见、c≥2
+  偏 ~10-20%。定位法:形状二分(c=1 过/c=2 错)隔离跨 token 相 +
+  设备端 dump 全部 shmem 中间量逐矩阵 diff(B[1,0] 差 4 倍、其余
+  1e-8,一击定位)。
+- **下一批(engine 接线)**:decode_step_explicit 一次吃 C 行(每
+  slot 仍一行)、全注意力层对 chunk 行的 prefill attention 重启用、
+  GEMV_Q4 batch=C 投影、整模 chunked CPU 前向作 e2e oracle、
+  continuous.rs `take = min(prompt_len, C)`。
