@@ -1180,6 +1180,15 @@ mod paged_quantized_cpu_parity {
                     shared_wg: l.shared_wg.dequantize(),
                     shared_wu: l.shared_wu.dequantize(),
                     shared_wd: l.shared_wd.dequantize(),
+                    gdn_in_qkv: l.gdn_in_qkv.dequantize(),
+                    gdn_in_z: l.gdn_in_z.dequantize(),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: l.gdn_out.dequantize(),
                 })
                 .collect(),
         }
@@ -1223,6 +1232,15 @@ mod paged_quantized_cpu_parity {
                     shared_wg: l.shared_wg.dequantize(),
                     shared_wu: l.shared_wu.dequantize(),
                     shared_wd: l.shared_wd.dequantize(),
+                    gdn_in_qkv: l.gdn_in_qkv.dequantize(),
+                    gdn_in_z: l.gdn_in_z.dequantize(),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: l.gdn_out.dequantize(),
                 })
                 .collect(),
         }

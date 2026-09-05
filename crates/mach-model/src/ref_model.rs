@@ -15,6 +15,13 @@ pub struct RefModel {
     /// Per layer MLA (kv_lora_rank > 0): expanded per-head k `[n_heads,
     /// max_seq_len, qk_nope+qk_rope]` and v `[n_heads, max_seq_len, v_head_dim]`.
     mla_kv: Vec<(Vec<f32>, Vec<f32>)>,
+    /// Per GDN layer (Qwen3.5 linear attention): recurrent state
+    /// `[gdn_v_heads, k_dim, v_dim]`, v-head-major S matrices.
+    gdn_state: Vec<Vec<f32>>,
+    /// Per GDN layer: causal conv state — the last `conv_kernel - 1` RAW
+    /// pre-conv fused-qkv inputs `[2*k_dim + v_dim]` (what the depthwise
+    /// conv1d consumes before silu).
+    gdn_conv: Vec<Vec<f32>>,
     /// Number of tokens stored so far.
     pos: usize,
     /// Hidden state of the most recently processed token (after the last
@@ -47,11 +54,34 @@ impl RefModel {
         } else {
             Vec::new()
         };
+        // GDN recurrent + conv state for every layer when the config is
+        // hybrid (full-attention layers simply never touch theirs), keeping
+        // per-layer indexing uniform.
+        let gdn_state = if cfg.gdn_enabled() {
+            let kd = cfg.gdn_key_dim();
+            let vd = cfg.gdn_value_dim();
+            (0..cfg.n_layers)
+                .map(|_| vec![0.0; cfg.gdn_v_heads * kd * vd])
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let gdn_conv = if cfg.gdn_enabled() {
+            let conv_dim = 2 * cfg.gdn_key_dim() + cfg.gdn_value_dim();
+            let keep = cfg.gdn_conv_kernel - 1;
+            (0..cfg.n_layers)
+                .map(|_| vec![0.0; conv_dim * keep])
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             cfg,
             w,
             kv,
             mla_kv,
+            gdn_state,
+            gdn_conv,
             pos: 0,
             last_hidden: Vec::new(),
         }
@@ -87,12 +117,36 @@ impl RefModel {
 
         for (li, lw) in self.w.layers.iter().enumerate() {
             let xn = rms_norm(&x, &lw.rms_attn, cfg.rms_eps);
-            if cfg.kv_lora_rank > 0 {
+            if cfg.gdn_enabled() && !lw.gdn_in_qkv.is_empty() {
+                // Qwen3.5 hybrid: linear-attention layer (gated DeltaNet).
+                let st = &mut self.gdn_state[li];
+                let cv = &mut self.gdn_conv[li];
+                decode_step_gdn(&mut x, &xn, lw, st, cv, cfg);
+            } else if cfg.kv_lora_rank > 0 {
                 // MLA (DeepSeek-V2 style): low-rank Q + compressed KV.
                 let (kc, vc) = &mut self.mla_kv[li];
                 decode_step_mla(&mut x, &xn, lw, kc, vc, pos, cfg);
             } else {
-                let mut q = matvec_t(&xn, &lw.wq, cfg.n_heads * cfg.head_dim);
+                // Qwen3.5 `attn_output_gate`: q_proj carries
+                // `n_heads * head_dim * 2` rows; each head's block is
+                // `[query | gate]` (HF `chunk`s per head after the
+                // projection). The gate skips QK-norm and RoPE and scales the
+                // attention output elementwise (sigmoid) before o_proj.
+                let hd = cfg.head_dim;
+                let (mut q, gate) = if cfg.attn_output_gate {
+                    let qg = matvec_t(&xn, &lw.wq, cfg.n_heads * hd * 2);
+                    let mut q = vec![0.0f32; cfg.n_heads * hd];
+                    let mut gate = vec![0.0f32; cfg.n_heads * hd];
+                    for h in 0..cfg.n_heads {
+                        for j in 0..hd {
+                            q[h * hd + j] = qg[h * 2 * hd + j];
+                            gate[h * hd + j] = qg[h * 2 * hd + hd + j];
+                        }
+                    }
+                    (q, gate)
+                } else {
+                    (matvec_t(&xn, &lw.wq, cfg.n_heads * hd), Vec::new())
+                };
                 let mut k = matvec_t(&xn, &lw.wk, cfg.n_kv_heads * cfg.head_dim);
                 let v = matvec_t(&xn, &lw.wv, cfg.n_kv_heads * cfg.head_dim);
                 // Qwen3 QK-norm: per-head RMSNorm after projection, before RoPE.
@@ -106,15 +160,24 @@ impl RefModel {
                         cfg.rms_eps,
                     );
                 }
-                apply_rope(&mut q, cfg.n_heads, cfg.head_dim, pos, cfg);
-                apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, pos, cfg);
+                // Partial rotary (Qwen3.5 full-attn layers): only the first
+                // `attn_rotary_dim` coordinates rotate; the tail passes
+                // through unchanged.
+                let rot = cfg.attn_rotary_dim();
+                apply_rope(&mut q, cfg.n_heads, cfg.head_dim, rot, pos, cfg);
+                apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, rot, pos, cfg);
 
                 // Store into KV cache.
                 store_row(&mut self.kv[li].0, &k, pos, cfg);
                 store_row(&mut self.kv[li].1, &v, pos, cfg);
 
                 // Attention over positions 0..=pos.
-                let attn = attention_decode(&q, &self.kv[li].0, &self.kv[li].1, pos, cfg);
+                let mut attn = attention_decode(&q, &self.kv[li].0, &self.kv[li].1, pos, cfg);
+                if cfg.attn_output_gate {
+                    for (a, g) in attn.iter_mut().zip(&gate) {
+                        *a *= 1.0 / (1.0 + (-g).exp());
+                    }
+                }
                 let attn_proj = matvec_t(&attn, &lw.wo, d);
                 for i in 0..d {
                     x[i] += attn_proj[i];
@@ -451,14 +514,14 @@ fn decode_step_mla(
     };
     let q_nope = matvec_t(&q_lora, &lw.mla_q_b, heads * nope);
     let mut q_rope = matvec_t(&q_lora, &lw.mla_q_rope, heads * rope_hd);
-    apply_rope(&mut q_rope, heads, rope_hd, pos, cfg);
+    apply_rope(&mut q_rope, heads, rope_hd, rope_hd, pos, cfg);
 
     // compressed_kv = kv_a(x); kv_lora (rms) feeds kv_b; k_rope is shared
     // across heads and rotated like a single-head rope.
     let kv_a = matvec_t(xn, &lw.mla_kv_a, cfg.kv_lora_rank + rope_hd);
     let kv_lora = rms_norm(&kv_a[..cfg.kv_lora_rank], &lw.mla_kv_a_norm, cfg.rms_eps);
     let mut k_rope = kv_a[cfg.kv_lora_rank..].to_vec();
-    apply_rope(&mut k_rope, 1, rope_hd, pos, cfg);
+    apply_rope(&mut k_rope, 1, rope_hd, rope_hd, pos, cfg);
 
     // kv_b expands the latent into per-head k_nope + v.
     let kv = matvec_t(&kv_lora, &lw.mla_kv_b, heads * (nope + v_hd));
@@ -549,12 +612,24 @@ fn rope_freq(d: usize, head_dim: usize, cfg: Config) -> f32 {
     freq_inter * ramp + freq_extra * (1.0 - ramp)
 }
 
-pub(crate) fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, cfg: Config) {
-    let half = head_dim / 2;
+/// Applies rotary position embeddings to the first `rotary_dim` coordinates
+/// of each `head_dim` slice; coordinates `[rotary_dim, head_dim)` pass through
+/// unchanged (partial rotary, Qwen3.5 full-attn layers). The frequency basis
+/// is `rotary_dim` — HF computes `inv_freq` over the rotating width, not the
+/// full head dim.
+pub(crate) fn apply_rope(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    cfg: Config,
+) {
+    let half = rotary_dim / 2;
     let attn_factor = cfg.yarn_attention_factor();
     for h in 0..n_heads {
         for d in 0..half {
-            let freq = rope_freq(d, head_dim, cfg);
+            let freq = rope_freq(d, rotary_dim, cfg);
             let ang = pos as f32 * freq;
             let c = ang.cos() * attn_factor;
             let sn = ang.sin() * attn_factor;
@@ -582,6 +657,173 @@ pub(crate) fn apply_rope(x: &mut [f32], n_heads: usize, head_dim: usize, pos: us
 fn store_row(cache: &mut [f32], row: &[f32], pos: usize, cfg: Config) {
     let off = pos * cfg.n_kv_heads * cfg.head_dim;
     cache[off..off + row.len()].copy_from_slice(row);
+}
+
+/// Numerically stable softplus (`log(1 + e^x)`), linear above the standard
+/// threshold 20 (where `log1p(exp(x))` would overflow in f32).
+pub(crate) fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
+/// L2-normalizes a vector in place (the reference runs it in fp32; host math
+/// here is f32 throughout). The eps lives INSIDE the square root, matching
+/// the reference `l2norm` (eps=1e-6, aligned with the FLA kernels).
+fn l2norm(x: &mut [f32]) {
+    let mut ss = 0.0f32;
+    for &v in x.iter() {
+        ss += v * v;
+    }
+    let inv = 1.0 / (ss + 1e-6).sqrt();
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// Gated DeltaNet decode step for one position (Qwen3.5 linear-attention
+/// layers), transcribing the transformers reference math one token at a
+/// time. State lives with the caller:
+/// - `state` `[gdn_v_heads, k_dim, v_dim]`: per-v-head recurrent matrix S
+/// - `conv` `[2*k_dim + v_dim, conv_kernel - 1]`: RAW pre-conv inputs of the
+///   fused qkv stream (the conv state stores what conv1d consumed, not its
+///   post-silu output).
+///
+/// Per v-head i (k head `i / (v_heads/k_heads)` — k heads repeat across v
+/// heads):
+///   g = -exp(A_log) * softplus(a + dt_bias); decay = exp(g); beta = sigmoid(b)
+///   S <- S * decay; kv_mem = S^T k; delta = (v - kv_mem) * beta
+///   S <- S + k (x) delta; o = S^T q   (reading the UPDATED S)
+/// Then per-head gated RMSNorm over the v dim: fp32 RMS -> * w -> * silu(z),
+/// weight shared across v-heads.
+fn decode_step_gdn(
+    x: &mut [f32],
+    xn: &[f32],
+    lw: &LayerWeights,
+    state: &mut [f32],
+    conv: &mut [f32],
+    cfg: Config,
+) {
+    let d = cfg.d_model;
+    let kh = cfg.gdn_k_heads;
+    let vh = cfg.gdn_v_heads;
+    let hd = cfg.gdn_head_dim;
+    let kd = kh * hd;
+    let vd = vh * hd;
+    let conv_dim = 2 * kd + vd;
+    let ck = cfg.gdn_conv_kernel;
+    let keep = ck - 1;
+
+    // 1) projections. The fused qkv stream goes through conv+silu; z/a/b do
+    //    not.
+    let qkv_pre = matvec_t(xn, &lw.gdn_in_qkv, conv_dim);
+    let z = matvec_t(xn, &lw.gdn_in_z, vd);
+    let a = matvec_t(xn, &lw.gdn_in_a, vh);
+    let b = matvec_t(xn, &lw.gdn_in_b, vh);
+
+    // 2) depthwise causal conv1d over [state || new input], then silu. The
+    //    conv weight is `[conv_dim, ck]` (PyTorch depthwise `[out, 1, k]`
+    //    flattened); the newest tap is the LAST column.
+    let mut qkv = vec![0.0f32; conv_dim];
+    for c in 0..conv_dim {
+        let w = &lw.gdn_conv_w[c * ck..c * ck + ck];
+        let mut s = 0.0;
+        for j in 0..keep {
+            s += conv[c * keep + j] * w[j];
+        }
+        s += qkv_pre[c] * w[keep];
+        qkv[c] = silu(s);
+    }
+    // Shift the conv state left, appending the raw new input.
+    for c in 0..conv_dim {
+        for j in 0..keep - 1 {
+            conv[c * keep + j] = conv[c * keep + j + 1];
+        }
+        conv[c * keep + keep - 1] = qkv_pre[c];
+    }
+
+    // 3) split the fused stream, per-head l2norm on q/k, q scale.
+    let mut q = vec![0.0f32; kd];
+    let mut k = vec![0.0f32; kd];
+    let v = qkv[2 * kd..].to_vec();
+    q.copy_from_slice(&qkv[..kd]);
+    k.copy_from_slice(&qkv[kd..2 * kd]);
+    for h in 0..kh {
+        l2norm(&mut q[h * hd..(h + 1) * hd]);
+        l2norm(&mut k[h * hd..(h + 1) * hd]);
+    }
+    // q <- q * head_k_dim^-0.5 (after l2norm, matching the reference order).
+    let qs = 1.0 / (hd as f32).sqrt();
+    for val in q.iter_mut() {
+        *val *= qs;
+    }
+
+    // 4-5) per-v-head delta rule on the recurrent state.
+    let rep = vh / kh; // v-heads per k-head (48/16 = 3)
+    let mut o = vec![0.0f32; vd];
+    for i in 0..vh {
+        let g = -lw.gdn_a_log[i].exp() * softplus(a[i] + lw.gdn_dt_bias[i]);
+        let decay = g.exp();
+        let beta = 1.0 / (1.0 + (-b[i]).exp());
+        let so = i * hd * hd;
+        let kvec = &k[(i / rep) * hd..(i / rep) * hd + hd];
+        let vvec = &v[i * hd..(i + 1) * hd];
+        let qvec = &q[(i / rep) * hd..(i / rep) * hd + hd];
+        // S <- S * decay
+        for s in state[so..so + hd * hd].iter_mut() {
+            *s *= decay;
+        }
+        // kv_mem = S^T k
+        let mut kv_mem = vec![0.0f32; hd];
+        for kk in 0..hd {
+            let kw = kvec[kk];
+            if kw == 0.0 {
+                continue;
+            }
+            let row = &state[so + kk * hd..so + (kk + 1) * hd];
+            for (m, r) in kv_mem.iter_mut().zip(row) {
+                *m += kw * r;
+            }
+        }
+        // S <- S + k (x) delta, delta = (v - kv_mem) * beta
+        for kk in 0..hd {
+            let kw = kvec[kk];
+            let row = &mut state[so + kk * hd..so + (kk + 1) * hd];
+            for (vv, r) in row.iter_mut().enumerate() {
+                *r += kw * (vvec[vv] - kv_mem[vv]) * beta;
+            }
+        }
+        // o = S^T q, reading the UPDATED S.
+        for kk in 0..hd {
+            let qw = qvec[kk];
+            if qw == 0.0 {
+                continue;
+            }
+            let row = &state[so + kk * hd..so + (kk + 1) * hd];
+            for (m, r) in o[i * hd..i * hd + hd].iter_mut().zip(row) {
+                *m += qw * r;
+            }
+        }
+    }
+
+    // 6) per-head gated RMSNorm over the v dim, weight shared across heads,
+    //    gated by silu(z).
+    for i in 0..vh {
+        let oh = &mut o[i * hd..(i + 1) * hd];
+        let mut ss = 0.0;
+        for &t in oh.iter() {
+            ss += t * t;
+        }
+        let inv = 1.0 / (ss / hd as f32 + cfg.rms_eps).sqrt();
+        let zh = &z[i * hd..(i + 1) * hd];
+        for (j, t) in oh.iter_mut().enumerate() {
+            *t = *t * inv * lw.gdn_norm[j] * silu(zh[j]);
+        }
+    }
+
+    // 7) output projection + residual.
+    let out = matvec_t(&o, &lw.gdn_out, d);
+    for i in 0..d {
+        x[i] += out[i];
+    }
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -783,7 +1025,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.37).sin() * 3.0)
             .collect();
         let orig = x.clone();
-        apply_rope(&mut x, heads, 64, pos, cfg);
+        apply_rope(&mut x, heads, 64, 64, pos, cfg);
         for h in 0..heads {
             for d in 0..half {
                 let a = orig[h * 64 + d];
@@ -821,7 +1063,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.37).sin() * 3.0)
             .collect();
         let orig = x.clone();
-        apply_rope(&mut x, heads, 64, pos, cfg);
+        apply_rope(&mut x, heads, 64, 64, pos, cfg);
         for h in 0..heads {
             for d in 0..half {
                 let (a, b) = (orig[h * 64 + 2 * d], orig[h * 64 + 2 * d + 1]);
@@ -851,12 +1093,12 @@ mod tests {
 
         let a0 = {
             let mut v = x0.clone();
-            apply_rope(&mut v, 1, 64, 0, interleave);
+            apply_rope(&mut v, 1, 64, 64, 0, interleave);
             v
         };
         let b0 = {
             let mut v = x0.clone();
-            apply_rope(&mut v, 1, 64, 0, halves);
+            apply_rope(&mut v, 1, 64, 64, 0, halves);
             v
         };
         let d0: f32 = a0
@@ -868,12 +1110,12 @@ mod tests {
 
         let a1 = {
             let mut v = x0.clone();
-            apply_rope(&mut v, 1, 64, 5, interleave);
+            apply_rope(&mut v, 1, 64, 64, 5, interleave);
             v
         };
         let b1 = {
             let mut v = x0.clone();
-            apply_rope(&mut v, 1, 64, 5, halves);
+            apply_rope(&mut v, 1, 64, 64, 5, halves);
             v
         };
         let d1: f32 = a1
@@ -951,5 +1193,362 @@ mod tests {
         let f31 = f64::from(rope_freq(31, 64, cfg));
         let inter31 = 1.0 / (40.0 * 10_000f64.powf((2 * 31) as f64 / 64.0));
         assert!((f31 - inter31).abs() < 1e-9, "d=31 must be pure freq_inter");
+    }
+
+    // ---- Qwen3.5 partial rotary + gated DeltaNet ----
+
+    /// `attn_rotary_dim` derives the rotating width from `rope_rotary_pct`:
+    /// 0.25 of 256 -> 64, full -> head_dim, odd products rounded down to a
+    /// pair-friendly even width.
+    #[test]
+    fn attn_rotary_dim_from_pct() {
+        let mut cfg = Config::tiny();
+        cfg.head_dim = 256;
+        cfg.rope_rotary_pct = 0.25;
+        assert_eq!(cfg.attn_rotary_dim(), 64);
+        cfg.rope_rotary_pct = 1.0;
+        assert_eq!(cfg.attn_rotary_dim(), 256);
+        // 0.5 * 31 = 15.5 -> 15 & !1 = 14.
+        cfg.head_dim = 31;
+        cfg.rope_rotary_pct = 0.5;
+        assert_eq!(cfg.attn_rotary_dim(), 14);
+    }
+
+    /// Partial rotary (Qwen3.5 full-attn layers): only the first
+    /// `rotary_dim` coordinates rotate, with the frequency basis taken over
+    /// `rotary_dim` — NOT `head_dim`. A basis bug is invisible at pos 0 and
+    /// at full width, so both the tail pass-through and the basis are pinned
+    /// at pos > 0 with `rotary_dim < head_dim`.
+    #[test]
+    fn partial_rope_rotates_prefix_and_passes_tail() {
+        let mut cfg = Config::tiny();
+        cfg.rope_theta = 10_000.0;
+        let head_dim = 8usize;
+        let rotary = 4usize;
+        let pos = 3usize;
+        let mut x: Vec<f32> = (0..head_dim).map(|i| 0.3 + 0.11 * i as f32).collect();
+        let orig = x.clone();
+        apply_rope(&mut x, 1, head_dim, rotary, pos, cfg);
+
+        let basis = |d: usize| -> f64 { 10_000f64.powf(-(2.0 * d as f64) / rotary as f64) };
+        for d in 0..rotary / 2 {
+            let ang = pos as f64 * basis(d);
+            let (c, s) = (ang.cos(), ang.sin());
+            // Half-split pairing INSIDE the rotating prefix: (d, d+rotary/2).
+            let (a, b) = (orig[d] as f64, orig[d + rotary / 2] as f64);
+            let want_a = a * c - b * s;
+            let want_b = b * c + a * s;
+            assert!(
+                ((x[d] as f64 - want_a).abs() < 1e-5)
+                    && ((x[d + rotary / 2] as f64 - want_b).abs() < 1e-5),
+                "pair {d}: got ({}, {}) want ({want_a}, {want_b})",
+                x[d],
+                x[d + rotary / 2]
+            );
+        }
+        // Tail passes through untouched.
+        for i in rotary..head_dim {
+            assert_eq!(x[i], orig[i], "tail dim {i} must pass through");
+        }
+    }
+
+    /// `[n, n]` identity matrix, row-major.
+    fn identity_mat(n: usize) -> Vec<f32> {
+        let mut m = vec![0.0f32; n * n];
+        for i in 0..n {
+            m[i * n + i] = 1.0;
+        }
+        m
+    }
+
+    /// Builds the minimal 1x1-head GDN layer for the hand-computed recurrence
+    /// test: identity qkv projection, asymmetric conv taps `[1, 0, 2]`,
+    /// A_log = 0 (gate = -softplus(dt_bias)), dt_bias = 1, b-rows zero
+    /// (beta = 0.5), unit norm weight, out rows dropping o into x[0], x[1].
+    fn gdn_single_head_case() -> (Config, LayerWeights) {
+        let mut cfg = Config::tiny();
+        cfg.d_model = 6;
+        cfg.gdn_k_heads = 1;
+        cfg.gdn_v_heads = 1;
+        cfg.gdn_head_dim = 2;
+        cfg.gdn_conv_kernel = 4;
+        let lw = LayerWeights {
+            wq: Vec::new(),
+            wk: Vec::new(),
+            wv: Vec::new(),
+            wo: Vec::new(),
+            rms_attn: vec![1.0; 6],
+            wg: Vec::new(),
+            wu: Vec::new(),
+            wd: Vec::new(),
+            rms_mlp: vec![1.0; 6],
+            bq: Vec::new(),
+            bk: Vec::new(),
+            bv: Vec::new(),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            mla_q_a: Vec::new(),
+            mla_q_a_norm: Vec::new(),
+            mla_q_b: Vec::new(),
+            mla_q_rope: Vec::new(),
+            mla_kv_a: Vec::new(),
+            mla_kv_a_norm: Vec::new(),
+            mla_kv_b: Vec::new(),
+            mla_o: Vec::new(),
+            moe_router: Vec::new(),
+            moe_wg: Vec::new(),
+            moe_wu: Vec::new(),
+            moe_wd: Vec::new(),
+            shared_wg: Vec::new(),
+            shared_wu: Vec::new(),
+            shared_wd: Vec::new(),
+            gdn_in_qkv: identity_mat(6),
+            gdn_in_z: {
+                let mut m = vec![0.0f32; 2 * 6];
+                m[0] = 1.0; // z[0] = x[0]
+                m[6 + 1] = 1.0; // z[1] = x[1]
+                m
+            },
+            gdn_in_a: vec![0.0; 6],
+            gdn_in_b: vec![0.0; 6],
+            gdn_conv_w: {
+                // Per-channel taps [oldest .. newest] = [0.5, 0.25, 1, 2].
+                // Step 1 (zero state) sees only the newest tap; step 2 sees
+                // the RAW pre-conv step-1 input through tap 1 — a wrong tap
+                // order, a post-silu state, or a missing window shift all
+                // change the output.
+                let mut w = vec![0.0f32; 6 * 4];
+                for c in 0..6 {
+                    w[c * 4] = 0.5;
+                    w[c * 4 + 1] = 0.25;
+                    w[c * 4 + 2] = 1.0;
+                    w[c * 4 + 3] = 2.0;
+                }
+                w
+            },
+            gdn_a_log: vec![0.0], // exp(A_log) = 1
+            gdn_dt_bias: vec![1.0],
+            gdn_norm: vec![1.0; 2],
+            gdn_out: {
+                // `[6, 2]` row-major: o lands in x[0], x[1].
+                let mut m = vec![0.0f32; 6 * 2];
+                m[0] = 1.0; // row 0, col 0
+                m[3] = 1.0; // row 1, col 1
+                m
+            },
+        };
+        (cfg, lw)
+    }
+
+    /// Hand-computed two-token GDN recurrence in f64, structurally separate
+    /// from `decode_step_gdn` (per-scalar math instead of row loops): conv
+    /// tap order + RAW pre-conv state, decay, the delta rule with kv_mem, o
+    /// reading the UPDATED S, and the gated norm. `rms_attn` is unit weights
+    /// but still divides by the RMS, so the expected side works on the
+    /// normalized vector `u = x / rms(x)` throughout.
+    #[test]
+    fn gdn_recurrence_matches_hand_computation() {
+        let (cfg, lw) = gdn_single_head_case();
+        let eps = cfg.rms_eps as f64;
+
+        let softplus64 = |v: f64| (1.0 + v.exp()).ln();
+        let silu64 = |v: f64| v / (1.0 + (-v).exp());
+        // Unit-weight RMS norm in f64 (mirrors what the impl feeds the layer).
+        let unit_rms = |x: &[f64]| -> Vec<f64> {
+            let ss: f64 = x.iter().map(|v| v * v).sum();
+            let inv = 1.0 / (ss / x.len() as f64 + eps).sqrt();
+            x.iter().map(|v| v * inv).collect()
+        };
+
+        let x1: Vec<f64> = vec![0.6, -0.4, 0.9, 0.2, -0.7, 0.5];
+        let x2: Vec<f64> = vec![-0.3, 0.8, -0.1, 0.4, 0.55, -0.25];
+        let u1 = unit_rms(&x1);
+        let u2 = unit_rms(&x2);
+
+        // Gate values shared by both steps: g = -exp(0) * softplus(0 + 1).
+        let g = -softplus64(1.0);
+        let decay = g.exp();
+        let beta = 0.5; // sigmoid(0)
+
+        // ---- step 1 (expected values) ----
+        // Conv taps [1, 0, 2] over [0, 0, u1]: out = silu(2 * u1).
+        let qkv1: Vec<f64> = u1.iter().map(|&v| silu64(2.0 * v)).collect();
+        let norm2 = |v: &[f64]| -> Vec<f64> {
+            let n = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            vec![v[0] / n, v[1] / n]
+        };
+        let q1 = norm2(&qkv1[0..2]);
+        let k1 = norm2(&qkv1[2..4]);
+        let v1: Vec<f64> = qkv1[4..6].to_vec();
+        let qs = 1.0 / 2f64.sqrt();
+        let q1s = [q1[0] * qs, q1[1] * qs];
+        // S1 = k1 (x) (v1 * beta)   (kv_mem = 0 on a zero state).
+        let s1 = |kk: usize, vv: usize| k1[kk] * v1[vv] * beta;
+        // o1[vv] = sum_kk S1[kk, vv] * q = (k.q) * v1[vv] * beta.
+        let kq1 = k1[0] * q1s[0] + k1[1] * q1s[1];
+        let o1 = [kq1 * v1[0] * beta, kq1 * v1[1] * beta];
+        // Gated norm (w = 1): o / rms(o) * silu(z), z = (u1[0], u1[1]).
+        let rms1 = ((o1[0] * o1[0] + o1[1] * o1[1]) / 2.0 + eps).sqrt();
+        let on1 = [o1[0] / rms1 * silu64(u1[0]), o1[1] / rms1 * silu64(u1[1])];
+
+        // ---- step 2 (expected values) ----
+        // Conv state holds RAW u1 (NOT silu(2*u1)) — pins what the state
+        // stores. out = silu(1*u1 + 0 + 2*u2).
+        let qkv2: Vec<f64> = (0..6).map(|c| silu64(u1[c] * 1.0 + u2[c] * 2.0)).collect();
+        let q2 = norm2(&qkv2[0..2]);
+        let k2 = norm2(&qkv2[2..4]);
+        let v2: Vec<f64> = qkv2[4..6].to_vec();
+        let q2s = [q2[0] * qs, q2[1] * qs];
+        // S' = decay * S1; kv_mem = S'^T k2; delta = (v2 - kv_mem) * beta.
+        let kmem = [
+            s1(0, 0) * decay * k2[0] + s1(1, 0) * decay * k2[1],
+            s1(0, 1) * decay * k2[0] + s1(1, 1) * decay * k2[1],
+        ];
+        let delta2 = [(v2[0] - kmem[0]) * beta, (v2[1] - kmem[1]) * beta];
+        // S2 = S' + k2 (x) delta2; o2 = S2^T q2 (UPDATED S).
+        let s2 = |kk: usize, vv: usize| s1(kk, vv) * decay + k2[kk] * delta2[vv];
+        let o2 = [
+            s2(0, 0) * q2s[0] + s2(1, 0) * q2s[1],
+            s2(0, 1) * q2s[0] + s2(1, 1) * q2s[1],
+        ];
+        let rms2 = ((o2[0] * o2[0] + o2[1] * o2[1]) / 2.0 + eps).sqrt();
+        let on2 = [o2[0] / rms2 * silu64(u2[0]), o2[1] / rms2 * silu64(u2[1])];
+
+        // ---- run the implementation over both steps ----
+        let mut state = vec![0.0f32; 4];
+        let mut conv = vec![0.0f32; 6 * 3];
+        let mut xr = vec![0.0f32; 6];
+        let mut run_step = |x_in: &[f64], state: &mut Vec<f32>, conv: &mut Vec<f32>| {
+            for i in 0..6 {
+                xr[i] = x_in[i] as f32;
+            }
+            // Same unit-weight RMS norm the layer sees (see `unit_rms`).
+            let xn = rms_norm(&xr, &lw.rms_attn, cfg.rms_eps);
+            decode_step_gdn(&mut xr, &xn, &lw, state, conv, cfg);
+            (xr[0] as f64, xr[1] as f64)
+        };
+        let (got1a, got1b) = run_step(&x1, &mut state, &mut conv);
+        let (got2a, got2b) = run_step(&x2, &mut state, &mut conv);
+
+        // The layer output is ADDED to the residual: xr[i] = x[i] + o[i].
+        for (i, (got, want)) in [
+            (0usize, (got1a, x1[0] + on1[0])),
+            (1, (got1b, x1[1] + on1[1])),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-5 * (1.0 + want.abs()),
+                "step1 o[{i}]: got {got} want {want}"
+            );
+        }
+        for (i, (got, want)) in [
+            (0usize, (got2a, x2[0] + on2[0])),
+            (1, (got2b, x2[1] + on2[1])),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-5 * (1.0 + want.abs()),
+                "step2 o[{i}]: got {got} want {want}"
+            );
+        }
+    }
+
+    /// softplus is linear above the standard threshold 20 and exact
+    /// log1p(exp(x)) below it.
+    #[test]
+    fn softplus_threshold_behavior() {
+        assert!((softplus(0.0) - std::f32::consts::LN_2).abs() < 1e-6);
+        assert!((softplus(1.0) - 1.3132616).abs() < 1e-6);
+        assert!((softplus(25.0) - 25.0).abs() < 1e-5, "linear above 20");
+        assert!((softplus(-30.0) - 0.0).abs() < 1e-6);
+    }
+
+    /// Hand-computed f64 transcription of the Qwen3.5 gated full-attention
+    /// forward at position 0 — where softmax over the single stored position
+    /// is exactly 1 and RoPE is the identity, so the comparison isolates the
+    /// new machinery: the doubled q_proj split `[query | gate]` per head and
+    /// the sigmoid scaling between attention and o_proj. One layer, one
+    /// token; QK-norm/RoPE affect only q/k, which the position-0 output does
+    /// not read (they are pinned by the rope/qk-norm tests).
+    #[test]
+    fn gated_attention_step_matches_hand_computation() {
+        // gdn_v_heads = 0 -> full_attention_interval = 0 -> every layer full
+        // attention; the family flags (attn_output_gate, zero_centered_norm,
+        // qk_norm) stay on.
+        let cfg = Config::qwen3_5(16, 1, 2, 1, 8, 12, 11, 8, 0, 0, 4, 4);
+        let w = Weights::random(&cfg, 3).unwrap();
+        let mut m = RefModel::new(cfg, w.clone());
+        let got = m.decode_step(7);
+
+        let d = cfg.d_model;
+        let hd = cfg.head_dim;
+        let heads = cfg.n_heads;
+        let kvh = cfg.n_kv_heads;
+        let lw = &w.layers[0];
+
+        // mat @ x in f64, mat `[rows, len(x)]` row-major.
+        let matvec64 = |mat: &[f32], x: &[f64], rows: usize| -> Vec<f64> {
+            let n = x.len();
+            (0..rows)
+                .map(|r| (0..n).map(|i| mat[r * n + i] as f64 * x[i]).sum())
+                .collect()
+        };
+        let rms64 = |x: &[f64], wgt: &[f32]| -> Vec<f64> {
+            let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+            let inv = 1.0 / (ms + cfg.rms_eps as f64).sqrt();
+            x.iter()
+                .zip(wgt)
+                .map(|(&v, &g)| v * inv * g as f64)
+                .collect()
+        };
+
+        // Layer 0, position 0.
+        let x0: Vec<f64> = w.tok_emb[7 * d..8 * d].iter().map(|&v| v as f64).collect();
+        let xn = rms64(&x0, &lw.rms_attn);
+        let qg = matvec64(&lw.wq, &xn, heads * hd * 2);
+        let mut gate = vec![0.0f64; heads * hd];
+        for h in 0..heads {
+            for j in 0..hd {
+                // Per-head chunk: query = first half of each head's 2*hd
+                // block, gate = second half.
+                gate[h * hd + j] = qg[h * 2 * hd + hd + j];
+            }
+        }
+        let v = matvec64(&lw.wv, &xn, kvh * hd);
+        // Attention over one stored position: softmax([s]) = [1], so the
+        // output is the (group-broadcast) value — then the gate scales it.
+        let groups = heads / kvh;
+        let mut out = vec![0.0f64; heads * hd];
+        for h in 0..heads {
+            let kv = h / groups;
+            for j in 0..hd {
+                let s = 1.0 / (1.0 + (-gate[h * hd + j]).exp());
+                out[h * hd + j] = v[kv * hd + j] * s;
+            }
+        }
+        let mut x = x0;
+        let proj = matvec64(&lw.wo, &out, d);
+        for i in 0..d {
+            x[i] += proj[i];
+        }
+        // Dense SwiGLU MLP.
+        let silu64 = |v: f64| v / (1.0 + (-v).exp());
+        let xn2 = rms64(&x, &lw.rms_mlp);
+        let gi = matvec64(&lw.wg, &xn2, cfg.intermediate_size);
+        let ui = matvec64(&lw.wu, &xn2, cfg.intermediate_size);
+        let hi: Vec<f64> = (0..cfg.intermediate_size)
+            .map(|i| silu64(gi[i]) * ui[i])
+            .collect();
+        let down = matvec64(&lw.wd, &hi, d);
+        for i in 0..d {
+            x[i] += down[i];
+        }
+        let xf = rms64(&x, &w.rms_final);
+        let want = matvec64(&w.lm_head, &xf, cfg.vocab_size);
+
+        for (i, (g, wn)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (*g as f64 - wn).abs() < 1e-3 * (1.0 + wn.abs()),
+                "logit {i}: got {g} want {wn}"
+            );
+        }
     }
 }
