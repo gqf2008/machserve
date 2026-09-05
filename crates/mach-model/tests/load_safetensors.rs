@@ -52,13 +52,23 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
     let d = cfg.d_model;
     let nq = cfg.n_heads * cfg.head_dim;
     let nkv = cfg.n_kv_heads * cfg.head_dim;
+    // Qwen3.5 zero-centered norms: the checkpoint stores `w` with forward
+    // `x * (1 + w)`; the loader shifts +1 at load. Emit the STORED form so
+    // roundtrips compare against the runtime weights.
+    let norm = |v: &[f32]| -> Vec<f32> {
+        if cfg.zero_centered_norm {
+            v.iter().map(|x| x - 1.0).collect()
+        } else {
+            v.to_vec()
+        }
+    };
     let mut t: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
     t.push((
         "model.embed_tokens.weight".into(),
         w.tok_emb.clone(),
         vec![cfg.vocab_size, d],
     ));
-    t.push(("model.norm.weight".into(), w.rms_final.clone(), vec![d]));
+    t.push(("model.norm.weight".into(), norm(&w.rms_final), vec![d]));
     t.push((
         "lm_head.weight".into(),
         w.lm_head.clone(),
@@ -66,7 +76,61 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
     ));
     for (i, lw) in w.layers.iter().enumerate() {
         let p = |s: &str| format!("model.layers.{i}.{s}");
-        if cfg.kv_lora_rank > 0 {
+        if cfg.gdn_enabled() && !cfg.layer_is_full_attn(i) {
+            // Qwen3.5 hybrid: linear-attention layers carry `linear_attn.*`
+            // instead of `self_attn.*`. conv1d ships in PyTorch's depthwise
+            // shape `[conv_dim, 1, kernel]`.
+            let kd = cfg.gdn_key_dim();
+            let vd = cfg.gdn_value_dim();
+            let conv_dim = 2 * kd + vd;
+            t.push((
+                p("linear_attn.in_proj_qkv.weight"),
+                lw.gdn_in_qkv.clone(),
+                vec![conv_dim, d],
+            ));
+            t.push((
+                p("linear_attn.in_proj_z.weight"),
+                lw.gdn_in_z.clone(),
+                vec![vd, d],
+            ));
+            t.push((
+                p("linear_attn.in_proj_a.weight"),
+                lw.gdn_in_a.clone(),
+                vec![cfg.gdn_v_heads, d],
+            ));
+            t.push((
+                p("linear_attn.in_proj_b.weight"),
+                lw.gdn_in_b.clone(),
+                vec![cfg.gdn_v_heads, d],
+            ));
+            t.push((
+                p("linear_attn.conv1d.weight"),
+                lw.gdn_conv_w.clone(),
+                vec![conv_dim, 1, cfg.gdn_conv_kernel],
+            ));
+            // A_log/dt_bias are direct nn.Parameters — BARE names, no
+            // `.weight` suffix (real Qwen3.5 checkpoints).
+            t.push((
+                p("linear_attn.A_log"),
+                lw.gdn_a_log.clone(),
+                vec![cfg.gdn_v_heads],
+            ));
+            t.push((
+                p("linear_attn.dt_bias"),
+                lw.gdn_dt_bias.clone(),
+                vec![cfg.gdn_v_heads],
+            ));
+            t.push((
+                p("linear_attn.norm.weight"),
+                lw.gdn_norm.clone(),
+                vec![cfg.gdn_head_dim],
+            ));
+            t.push((
+                p("linear_attn.out_proj.weight"),
+                lw.gdn_out.clone(),
+                vec![d, vd],
+            ));
+        } else if cfg.kv_lora_rank > 0 {
             // MLA (DeepSeek-V2 style) replaces q/k/v/o projections.
             let nope = cfg.qk_nope_head_dim;
             let rope = cfg.qk_rope_head_dim;
@@ -124,12 +188,20 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
                 vec![d, heads * v_hd],
             ));
         } else {
-            t.push((p("self_attn.q_proj.weight"), lw.wq.clone(), vec![nq, d]));
+            // Qwen3.5 `attn_output_gate` doubles q_proj (`[q | gate]` per
+            // head); the roundtrip exercises the loader's doubled expected
+            // size.
+            let q_rows = if cfg.attn_output_gate { 2 * nq } else { nq };
+            t.push((p("self_attn.q_proj.weight"), lw.wq.clone(), vec![q_rows, d]));
             t.push((p("self_attn.k_proj.weight"), lw.wk.clone(), vec![nkv, d]));
             t.push((p("self_attn.v_proj.weight"), lw.wv.clone(), vec![nkv, d]));
             t.push((p("self_attn.o_proj.weight"), lw.wo.clone(), vec![d, nq]));
+            if !lw.q_norm.is_empty() {
+                t.push((p("self_attn.q_norm.weight"), norm(&lw.q_norm), vec![nq]));
+                t.push((p("self_attn.k_norm.weight"), norm(&lw.k_norm), vec![nkv]));
+            }
         }
-        t.push((p("input_layernorm.weight"), lw.rms_attn.clone(), vec![d]));
+        t.push((p("input_layernorm.weight"), norm(&lw.rms_attn), vec![d]));
         if cfg.num_experts == 0 {
             // MoE layers have no dense MLP tensors (expert tensors replace them).
             t.push((
@@ -150,7 +222,7 @@ fn tensor_names(cfg: &Config) -> Vec<(String, Vec<f32>, Vec<usize>)> {
         }
         t.push((
             p("post_attention_layernorm.weight"),
-            lw.rms_mlp.clone(),
+            norm(&lw.rms_mlp),
             vec![d],
         ));
         if cfg.num_experts > 0 {
@@ -234,6 +306,168 @@ fn moe_cfg() -> Config {
     cfg.num_experts = 4;
     cfg.num_experts_per_tok = 2;
     cfg
+}
+
+/// Qwen3.5 hybrid roundtrip (f32 + Q4 + FP8 loaders): `linear_attn.*`
+/// tensors land in the GDN fields on linear layers, standard `self_attn.*`
+/// on the full-attention layer (interval 4 -> only layer 3), and the Q4/FP8
+/// classifiers route the big GDN projections to quantized storage while the
+/// gate/small tensors stay f32.
+#[test]
+fn roundtrip_qwen35_gdn_load_matches_original_weights() {
+    let cfg = Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 64, 2, 4, 8, 4);
+    let path = tmp_path("roundtrip_qwen35");
+    let tensors = tensor_names(&cfg);
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    let loaded = load_safetensors(&path, &cfg, false).unwrap();
+    let original = Weights::random(&cfg, 99).unwrap();
+    let kd = cfg.gdn_key_dim();
+    let vd = cfg.gdn_value_dim();
+    // Zero-centered norms: the fixture stores `w - 1`, the loader shifts
+    // +1, so loaded == original pins the shift end to end.
+    assert_eq!(max_abs_diff(&loaded.rms_final, &original.rms_final), 0.0);
+    for (li, (a, b)) in loaded.layers.iter().zip(&original.layers).enumerate() {
+        if cfg.layer_is_full_attn(li) {
+            assert!(a.gdn_in_qkv.is_empty(), "layer {li}");
+            assert_eq!(
+                a.wq.len(),
+                2 * cfg.n_heads * cfg.head_dim * cfg.d_model,
+                "layer {li} doubled wq"
+            );
+            assert_eq!(max_abs_diff(&a.wq, &b.wq), 0.0, "layer {li} wq");
+            assert_eq!(
+                max_abs_diff(&a.q_norm, &b.q_norm),
+                0.0,
+                "layer {li} q_norm (+1 shift + broadcast)"
+            );
+            assert_eq!(max_abs_diff(&a.k_norm, &b.k_norm), 0.0, "layer {li} k_norm");
+            assert_eq!(
+                max_abs_diff(&a.rms_attn, &b.rms_attn),
+                0.0,
+                "layer {li} rms_attn (+1 shift)"
+            );
+            assert_eq!(
+                max_abs_diff(&a.rms_mlp, &b.rms_mlp),
+                0.0,
+                "layer {li} rms_mlp"
+            );
+        } else {
+            assert!(a.wq.is_empty(), "layer {li}");
+            assert_eq!(
+                a.gdn_in_qkv.len(),
+                (2 * kd + vd) * cfg.d_model,
+                "layer {li}"
+            );
+            assert_eq!(max_abs_diff(&a.gdn_in_qkv, &b.gdn_in_qkv), 0.0, "qkv {li}");
+            assert_eq!(max_abs_diff(&a.gdn_in_z, &b.gdn_in_z), 0.0, "z {li}");
+            assert_eq!(max_abs_diff(&a.gdn_in_a, &b.gdn_in_a), 0.0, "a {li}");
+            assert_eq!(max_abs_diff(&a.gdn_in_b, &b.gdn_in_b), 0.0, "b {li}");
+            assert_eq!(max_abs_diff(&a.gdn_conv_w, &b.gdn_conv_w), 0.0, "conv {li}");
+            assert_eq!(max_abs_diff(&a.gdn_a_log, &b.gdn_a_log), 0.0, "a_log {li}");
+            assert_eq!(max_abs_diff(&a.gdn_dt_bias, &b.gdn_dt_bias), 0.0, "dt {li}");
+            assert_eq!(max_abs_diff(&a.gdn_norm, &b.gdn_norm), 0.0, "norm {li}");
+            assert_eq!(max_abs_diff(&a.gdn_out, &b.gdn_out), 0.0, "out {li}");
+        }
+    }
+
+    // Q4 storage: the big GDN projections quantize; the small gate tensors
+    // copy exactly.
+    let wq4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    for (li, l) in wq4.layers.iter().enumerate() {
+        if cfg.layer_is_full_attn(li) {
+            assert!(l.gdn_in_qkv.is_empty(), "layer {li}");
+        } else {
+            assert!(!l.gdn_in_qkv.is_empty(), "layer {li}");
+            assert!(!l.gdn_out.is_empty(), "layer {li}");
+            assert_eq!(l.gdn_in_a.len(), cfg.gdn_v_heads * cfg.d_model, "a {li}");
+            assert_eq!(l.gdn_conv_w.len(), (2 * kd + vd) * 4, "conv {li}");
+            assert_eq!(l.gdn_a_log.len(), cfg.gdn_v_heads, "a_log {li}");
+            assert_eq!(l.gdn_dt_bias.len(), cfg.gdn_v_heads, "dt {li}");
+            assert_eq!(l.gdn_norm.len(), cfg.gdn_head_dim, "norm {li}");
+        }
+    }
+
+    // FP8 storage: same routing.
+    let wfp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    for (li, l) in wfp8.layers.iter().enumerate() {
+        if !cfg.layer_is_full_attn(li) {
+            assert!(!l.gdn_in_qkv.is_empty(), "layer {li}");
+            assert_eq!(l.gdn_conv_w.len(), (2 * kd + vd) * 4, "conv {li}");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Qwen3.8-27B ships as a VLM checkpoint: the text stack is namespaced under
+/// `model.language_model.*` and the file also carries `model.visual.*` and
+/// `mtp.*` stacks the text model ignores (HF's own text-only class skips
+/// `^mtp.*` / `^model.visual.*`). The loader strips the prefix at parse time
+/// and the Q4/FP8 classifiers skip the aux stacks — the mtp q_proj below is
+/// deliberately MIS-sized so a missing skip would trip the classifier's
+/// shape check loudly.
+#[test]
+fn vlm_checkpoint_prefix_and_aux_stacks() {
+    let cfg = Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 64, 2, 4, 8, 4);
+    let path = tmp_path("qwen35_vlm");
+    let mut tensors = tensor_names(&cfg);
+    for (n, _v, _s) in &mut tensors {
+        if let Some(rest) = n.strip_prefix("model.") {
+            *n = format!("model.language_model.{rest}");
+        }
+    }
+    let d = cfg.d_model;
+    tensors.push((
+        "model.visual.blocks.0.attn.qkv.weight".into(),
+        vec![0.0f32; 3 * d * d],
+        vec![3 * d, d],
+    ));
+    tensors.push((
+        "mtp.layers.0.self_attn.q_proj.weight".into(),
+        // Wrong size on purpose: the skip is the only way this loads.
+        vec![0.0f32; cfg.n_heads * cfg.head_dim],
+        vec![cfg.n_heads * cfg.head_dim, d],
+    ));
+    tensors.push((
+        "mtp.layers.0.input_layernorm.weight".into(),
+        vec![0.0f32; d],
+        vec![d],
+    ));
+    let flat: Vec<(&str, &[f32], &[usize])> = tensors
+        .iter()
+        .map(|(n, v, s)| (n.as_str(), v.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&path, &flat);
+
+    // f32: loads through the prefix remap; the doubled q_proj (attn output
+    // gate) and the full-attention layer split both survive it.
+    let loaded = load_safetensors(&path, &cfg, false).unwrap();
+    let nq = cfg.n_heads * cfg.head_dim;
+    assert_eq!(
+        loaded.layers[3].wq.len(),
+        2 * nq * d,
+        "doubled q_proj through the prefix strip"
+    );
+    assert!(
+        !loaded.layers[0].gdn_in_qkv.is_empty(),
+        "gdn through prefix"
+    );
+
+    // Q4: the aux stacks must be skipped before classification (the mis-sized
+    // mtp q_proj would otherwise fail the expected-size check).
+    let wq4 = load_safetensors_q4(&path, &cfg, false).unwrap();
+    assert!(
+        !wq4.layers[3].wq.is_empty(),
+        "q4: layer 3 wq through prefix strip"
+    );
+    // FP8: same skip.
+    let wfp8 = load_safetensors_fp8(&path, &cfg, false).unwrap();
+    assert!(!wfp8.layers[3].wq.is_empty(), "fp8: layer 3 wq");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -1007,6 +1241,15 @@ fn q4_batched_matches_dequantized_f16() {
                     shared_wg: to_f32(&l.shared_wg),
                     shared_wu: to_f32(&l.shared_wu),
                     shared_wd: to_f32(&l.shared_wd),
+                    gdn_in_qkv: to_f32(&l.gdn_in_qkv),
+                    gdn_in_z: to_f32(&l.gdn_in_z),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: to_f32(&l.gdn_out),
                 })
                 .collect(),
         };
@@ -1241,6 +1484,15 @@ fn fp8_batched_matches_dequantized_f16() {
                     shared_wg: to_f32(&l.shared_wg),
                     shared_wu: to_f32(&l.shared_wu),
                     shared_wd: to_f32(&l.shared_wd),
+                    gdn_in_qkv: to_f32(&l.gdn_in_qkv),
+                    gdn_in_z: to_f32(&l.gdn_in_z),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: to_f32(&l.gdn_out),
                 })
                 .collect(),
         };

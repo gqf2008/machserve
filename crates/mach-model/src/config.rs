@@ -44,6 +44,18 @@ pub struct Config {
     pub rope_theta: f32,
     /// QK-norm (Qwen3): per-head RMSNorm on q/k after projection, before RoPE.
     pub qk_norm: bool,
+    /// Attention output gate (Qwen3.5 `attn_output_gate`): q_proj carries
+    /// `n_heads * head_dim * 2` rows — each head's block is `[query | gate]`
+    /// (HF chunks per head after the projection). The gate skips QK-norm and
+    /// RoPE and multiplies the attention output elementwise (`sigmoid`)
+    /// before o_proj.
+    pub attn_output_gate: bool,
+    /// Zero-centered RMSNorm weights (Qwen3.5 `Qwen3_5RMSNorm`): the
+    /// checkpoint stores `w` zero-init with forward `x * (1 + w)`. The loader
+    /// shifts these tensors by +1 at load (layer norms, final norm, q/k
+    /// norms) so the runtime's plain `x * w` matches. The GDN gated norm is
+    /// ones-init and multiplies plainly — it is NOT shifted.
+    pub zero_centered_norm: bool,
     /// MLA (DeepSeek-style): q low-rank projection rank; 0 = disabled.
     pub q_lora_rank: usize,
     /// MLA: compressed KV latent rank; 0 = disabled (standard attention).
@@ -100,6 +112,29 @@ pub struct Config {
     /// RoPE the identity), so a diff taken at position 0 cannot tell them
     /// apart. Compare at `pos > 0`.
     pub rope_interleave: bool,
+    /// Partial rotary (Qwen3.5/Qwen3.8): fraction of the head dim that gets
+    /// RoPE; the tail coordinates pass through unrotated. The inv_freq table
+    /// is built over the ROTARY dim (`theta^(-2d/rotary_dim)`), not the full
+    /// head dim, and the pairing happens inside the rotary slice. 1.0 = full
+    /// rotation (all prior families).
+    pub rope_rotary_pct: f32,
+    /// Hybrid linear attention (Qwen3.5/Qwen3.8 gated DeltaNet): every Nth
+    /// layer is full attention (`li + 1) % N == 0`, e.g. interval 4 puts
+    /// full attention at layers 3, 7, 11, ... of a 64-layer stack); the rest
+    /// are linear-attention gated-DeltaNet layers. 0 = no linear-attention
+    /// layers (every layer full attention — all prior families).
+    pub full_attention_interval: usize,
+    /// GDN: number of key heads (l2-normalized; each shared by
+    /// `gdn_v_heads / gdn_k_heads` consecutive value heads via
+    /// `repeat_interleave`).
+    pub gdn_k_heads: usize,
+    /// GDN: number of value heads (also the recurrent-state head count).
+    pub gdn_v_heads: usize,
+    /// GDN: per-head dim, shared by key and value heads.
+    pub gdn_head_dim: usize,
+    /// GDN: short depthwise causal conv kernel size on the fused qkv
+    /// (Qwen3.5: 4).
+    pub gdn_conv_kernel: usize,
     /// Step profiler diagnostic: per-layer attention/MoE HIP event
     /// bracketing, reported after each decode step. The server parses
     /// `MACH_STEP_PROFILE` into this field — the library reads no env.
@@ -131,6 +166,49 @@ impl Config {
     #[must_use]
     pub fn yarn(&self) -> bool {
         self.rope_yarn_factor > 1.0 && self.rope_yarn_orig_len > 0
+    }
+
+    /// Rotary coordinates per head: `head_dim * rope_rotary_pct` (rounded
+    /// down to an even number of PAIRS). Partial-rotary checkpoints
+    /// (Qwen3.5: 0.25 of 256 = 64) rotate only this leading slice; the tail
+    /// passes through. Full rotation returns `head_dim`.
+    #[must_use]
+    pub fn attn_rotary_dim(&self) -> usize {
+        if self.rope_rotary_pct >= 1.0 {
+            self.head_dim
+        } else {
+            let dim = (self.head_dim as f32 * self.rope_rotary_pct) as usize & !1;
+            dim.max(2).min(self.head_dim)
+        }
+    }
+
+    /// Hybrid attention layout: whether layer `li` is a full-attention layer
+    /// (true) or a gated-DeltaNet linear-attention layer (false). With
+    /// `full_attention_interval == 0` every layer is full attention (all
+    /// prior families).
+    #[must_use]
+    pub fn layer_is_full_attn(&self, li: usize) -> bool {
+        self.full_attention_interval == 0 || (li + 1).is_multiple_of(self.full_attention_interval)
+    }
+
+    /// GDN enabled: the config describes a hybrid stack with linear-attention
+    /// layers (`full_attention_interval > 0` with value heads).
+    #[must_use]
+    pub fn gdn_enabled(&self) -> bool {
+        self.full_attention_interval > 0 && self.gdn_v_heads > 0
+    }
+
+    /// GDN fused q/k/v width: `gdn_k_heads * gdn_head_dim`.
+    #[must_use]
+    pub fn gdn_key_dim(&self) -> usize {
+        self.gdn_k_heads * self.gdn_head_dim
+    }
+
+    /// GDN value width: `gdn_v_heads * gdn_head_dim` (input to the gated
+    /// RMSNorm + out_proj).
+    #[must_use]
+    pub fn gdn_value_dim(&self) -> usize {
+        self.gdn_v_heads * self.gdn_head_dim
     }
 
     /// YaRN `mscale` logit correction: `0.1 * mscale_all_dim * ln(factor) + 1`.
@@ -193,6 +271,8 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            attn_output_gate: false,
+            zero_centered_norm: false,
             q_lora_rank: 0,
             kv_lora_rank: 0,
             qk_nope_head_dim: 0,
@@ -208,6 +288,12 @@ impl Config {
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
             rope_interleave: false,
+            rope_rotary_pct: 1.0,
+            full_attention_interval: 0,
+            gdn_k_heads: 0,
+            gdn_v_heads: 0,
+            gdn_head_dim: 0,
+            gdn_conv_kernel: 0,
             step_profile: false,
             moe_grouped: true,
         }
@@ -239,6 +325,8 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 1_000_000.0,
             qk_norm: true,
+            attn_output_gate: false,
+            zero_centered_norm: false,
             q_lora_rank: 0,
             kv_lora_rank: 0,
             qk_nope_head_dim: 0,
@@ -254,6 +342,12 @@ impl Config {
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
             rope_interleave: false,
+            rope_rotary_pct: 1.0,
+            full_attention_interval: 0,
+            gdn_k_heads: 0,
+            gdn_v_heads: 0,
+            gdn_head_dim: 0,
+            gdn_conv_kernel: 0,
             step_profile: false,
             moe_grouped: true,
         }
@@ -285,6 +379,8 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            attn_output_gate: false,
+            zero_centered_norm: false,
             q_lora_rank: 0,
             kv_lora_rank: 0,
             qk_nope_head_dim: 0,
@@ -300,6 +396,12 @@ impl Config {
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
             rope_interleave: false,
+            rope_rotary_pct: 1.0,
+            full_attention_interval: 0,
+            gdn_k_heads: 0,
+            gdn_v_heads: 0,
+            gdn_head_dim: 0,
+            gdn_conv_kernel: 0,
             step_profile: false,
             moe_grouped: true,
         }
@@ -324,6 +426,8 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            attn_output_gate: false,
+            zero_centered_norm: false,
             q_lora_rank: 0,
             kv_lora_rank: 0,
             qk_nope_head_dim: 0,
@@ -339,6 +443,12 @@ impl Config {
             rope_yarn_mscale: 1.0,
             rope_yarn_mscale_all_dim: 0.0,
             rope_interleave: false,
+            rope_rotary_pct: 1.0,
+            full_attention_interval: 0,
+            gdn_k_heads: 0,
+            gdn_v_heads: 0,
+            gdn_head_dim: 0,
+            gdn_conv_kernel: 0,
             step_profile: false,
             moe_grouped: true,
         }
@@ -375,6 +485,8 @@ impl Config {
             rms_eps: 1e-6,
             rope_theta: 10000.0,
             qk_norm: false,
+            attn_output_gate: false,
+            zero_centered_norm: false,
             q_lora_rank,
             kv_lora_rank,
             qk_nope_head_dim,
@@ -396,6 +508,84 @@ impl Config {
             // model-level coverage (parity tests compare both sides under the
             // same flag, so either default passes; only this one is truthful).
             rope_interleave: true,
+            rope_rotary_pct: 1.0,
+            full_attention_interval: 0,
+            gdn_k_heads: 0,
+            gdn_v_heads: 0,
+            gdn_head_dim: 0,
+            gdn_conv_kernel: 0,
+            step_profile: false,
+            moe_grouped: true,
+        }
+    }
+
+    /// Qwen3.5/Qwen3.8 hybrid config (gated-DeltaNet linear attention + every
+    /// `full_attention_interval`-th layer full attention, QK-norm, partial
+    /// rotary 0.25, theta=1e7). `gdn_*` describe the linear-attention layers;
+    /// pass zeros with `full_attention_interval = 0` for a pure full-attention
+    /// variant.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen3_5(
+        hidden_size: usize,
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+        gdn_k_heads: usize,
+        gdn_v_heads: usize,
+        gdn_head_dim: usize,
+        gdn_conv_kernel: usize,
+    ) -> Self {
+        let full_attention_interval = if gdn_v_heads > 0 { 4 } else { 0 };
+        Self {
+            dtype: ModelDType::F32,
+            vocab_size,
+            d_model: hidden_size,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            intermediate_size,
+            moe_intermediate_size: 0,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            max_seq_len,
+            rms_eps: 1e-6,
+            rope_theta: 10_000_000.0,
+            qk_norm: true,
+            // Family constants: full-attn layers carry the doubled q_proj
+            // with its sigmoid output gate, and RMSNorm weights ship
+            // zero-centered (`x * (1 + w)`).
+            attn_output_gate: true,
+            zero_centered_norm: true,
+            q_lora_rank: 0,
+            kv_lora_rank: 0,
+            qk_nope_head_dim: 0,
+            qk_rope_head_dim: 0,
+            v_head_dim: 0,
+            n_shared_experts: 0,
+            moe_norm_topk: true,
+            moe_routed_scale: 1.0,
+            rope_yarn_factor: 0.0,
+            rope_yarn_orig_len: 0,
+            rope_yarn_beta_fast: 0.0,
+            rope_yarn_beta_slow: 0.0,
+            rope_yarn_mscale: 1.0,
+            rope_yarn_mscale_all_dim: 0.0,
+            // Qwen3.5 rotates with plain rotate_half pairing (the M-RoPE
+            // machinery degenerates to standard sequential positions for
+            // text-only input), but only over the leading 25% of each head.
+            rope_interleave: false,
+            rope_rotary_pct: 0.25,
+            full_attention_interval,
+            gdn_k_heads,
+            gdn_v_heads,
+            gdn_head_dim,
+            gdn_conv_kernel,
             step_profile: false,
             moe_grouped: true,
         }

@@ -65,6 +65,29 @@ pub struct LayerWeights {
     pub shared_wg: Vec<f32>,
     pub shared_wu: Vec<f32>,
     pub shared_wd: Vec<f32>,
+    /// Gated DeltaNet (Qwen3.5 linear-attention layers): fused QKV projection
+    /// `[2*key_dim + value_dim, d_model]` — q rows `[0, key_dim)`, k rows
+    /// `[key_dim, 2*key_dim)`, v rows `[2*key_dim, 2*key_dim + value_dim)`.
+    /// Empty for full-attention layers.
+    pub gdn_in_qkv: Vec<f32>,
+    /// Output gate projection `[value_dim, d_model]`. Empty otherwise.
+    pub gdn_in_z: Vec<f32>,
+    /// Per v-head decay input `[gdn_v_heads, d_model]`. Empty otherwise.
+    pub gdn_in_a: Vec<f32>,
+    /// Per v-head beta input `[gdn_v_heads, d_model]`. Empty otherwise.
+    pub gdn_in_b: Vec<f32>,
+    /// Depthwise causal conv1d weight `[2*key_dim + value_dim, conv_kernel]`.
+    /// Empty otherwise.
+    pub gdn_conv_w: Vec<f32>,
+    /// Decay log-scale `[gdn_v_heads]` (gate = -exp(A_log)). Empty otherwise.
+    pub gdn_a_log: Vec<f32>,
+    /// Delta-rule time-step bias `[gdn_v_heads]`. Empty otherwise.
+    pub gdn_dt_bias: Vec<f32>,
+    /// Gated RMSNorm weight over v-head dim `[gdn_head_dim]`, shared across
+    /// v-heads. Empty otherwise.
+    pub gdn_norm: Vec<f32>,
+    /// Output projection `[d_model, value_dim]`. Empty otherwise.
+    pub gdn_out: Vec<f32>,
 }
 
 /// Q4 (storage-level int4) layer weights: GEMM tensors quantized, norms and
@@ -104,6 +127,19 @@ pub struct LayerWeightsQ4 {
     pub shared_wg: crate::q4::Q4Tensor,
     pub shared_wu: crate::q4::Q4Tensor,
     pub shared_wd: crate::q4::Q4Tensor,
+    // GDN (Qwen3.5 linear attention). The three big projections quantize; the
+    // a/b gate projections feed softplus/sigmoid (tiny — `[48, d_model]` — but
+    // error there shifts decay for a whole head), and conv_w/a_log/dt_bias/
+    // norm are structured or per-head small, so they stay f32.
+    pub gdn_in_qkv: crate::q4::Q4Tensor,
+    pub gdn_in_z: crate::q4::Q4Tensor,
+    pub gdn_in_a: Vec<f32>,
+    pub gdn_in_b: Vec<f32>,
+    pub gdn_conv_w: Vec<f32>,
+    pub gdn_a_log: Vec<f32>,
+    pub gdn_dt_bias: Vec<f32>,
+    pub gdn_norm: Vec<f32>,
+    pub gdn_out: crate::q4::Q4Tensor,
 }
 
 /// All model weights in storage-Q4 form (host memory ~4x smaller than f32 for
@@ -153,6 +189,17 @@ pub struct LayerWeightsFp8 {
     pub shared_wg: crate::fp8::Fp8Tensor,
     pub shared_wu: crate::fp8::Fp8Tensor,
     pub shared_wd: crate::fp8::Fp8Tensor,
+    // GDN (Qwen3.5 linear attention), same split as the Q4 mirror: the three
+    // big projections quantize, the gate/small tensors stay f32.
+    pub gdn_in_qkv: crate::fp8::Fp8Tensor,
+    pub gdn_in_z: crate::fp8::Fp8Tensor,
+    pub gdn_in_a: Vec<f32>,
+    pub gdn_in_b: Vec<f32>,
+    pub gdn_conv_w: Vec<f32>,
+    pub gdn_a_log: Vec<f32>,
+    pub gdn_dt_bias: Vec<f32>,
+    pub gdn_norm: Vec<f32>,
+    pub gdn_out: crate::fp8::Fp8Tensor,
 }
 
 /// All model weights in storage-FP8 form (host memory ~2x smaller than f16 /
@@ -208,7 +255,10 @@ impl Weights {
             d
         };
         let mut layers = Vec::with_capacity(cfg.n_layers);
-        for _ in 0..cfg.n_layers {
+        for li in 0..cfg.n_layers {
+            // Qwen3.5 hybrid: linear-attention (GDN) layers replace the
+            // standard q/k/v/o path entirely.
+            let gdn = cfg.gdn_enabled() && !cfg.layer_is_full_attn(li);
             // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
             // `n_shared_experts * expert_size`, present on every routed layer.
             let (shared_wg, shared_wu, shared_wd) =
@@ -231,24 +281,85 @@ impl Weights {
             } else {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
+            // GDN tensors, following the checkpoint's own init conventions:
+            // conv1d is the identity-like depthwise init (columns 1..=1, last
+            // column 2), A_log is log-uniform over U(0.01, 16) so decay spans
+            // fast/slow heads, dt_bias and the gated-norm weight start at one.
+            let (
+                gdn_in_qkv,
+                gdn_in_z,
+                gdn_in_a,
+                gdn_in_b,
+                gdn_conv_w,
+                gdn_a_log,
+                gdn_dt_bias,
+                gdn_norm,
+                gdn_out,
+            ) = if gdn {
+                let kd = cfg.gdn_key_dim();
+                let vd = cfg.gdn_value_dim();
+                let conv_dim = 2 * kd + vd;
+                let conv_k = cfg.gdn_conv_kernel;
+                let mut conv_w = vec![0.0f32; conv_dim * conv_k];
+                for c in 0..conv_dim {
+                    for k in 0..conv_k - 1 {
+                        conv_w[c * conv_k + k] = 1.0;
+                    }
+                    conv_w[c * conv_k + conv_k - 1] = 2.0;
+                }
+                (
+                    mat(&mut rng, conv_dim, d, scale),
+                    mat(&mut rng, vd, d, scale),
+                    mat(&mut rng, cfg.gdn_v_heads, d, scale),
+                    mat(&mut rng, cfg.gdn_v_heads, d, scale),
+                    conv_w,
+                    (0..cfg.gdn_v_heads)
+                        .map(|_| (0.01f32 * 1600.0f32.powf(rng.next_f32())).ln())
+                        .collect(),
+                    vec![1.0f32; cfg.gdn_v_heads],
+                    vec1(&mut rng, cfg.gdn_head_dim),
+                    mat(&mut rng, d, vd, scale),
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
             layers.push(LayerWeights {
-                // MLA replaces the standard q/k/v/o projections.
-                wq: if mla {
+                // MLA replaces the standard q/k/v/o projections; so do GDN
+                // linear-attention layers.
+                // Qwen3.5 `attn_output_gate`: q_proj carries a per-head
+                // sigmoid gate in the second half of each head's
+                // `2 * head_dim` block, doubling the projection width.
+                wq: if mla || gdn {
                     Vec::new()
                 } else {
-                    mat(&mut rng, d, cfg.n_heads * cfg.head_dim, scale)
+                    mat(
+                        &mut rng,
+                        d,
+                        cfg.n_heads * cfg.head_dim * if cfg.attn_output_gate { 2 } else { 1 },
+                        scale,
+                    )
                 },
-                wk: if mla {
+                wk: if mla || gdn {
                     Vec::new()
                 } else {
                     mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale)
                 },
-                wv: if mla {
+                wv: if mla || gdn {
                     Vec::new()
                 } else {
                     mat(&mut rng, d, cfg.n_kv_heads * cfg.head_dim, scale)
                 },
-                wo: if mla {
+                wo: if mla || gdn {
                     Vec::new()
                 } else {
                     mat(&mut rng, cfg.n_heads * cfg.head_dim, d, scale)
@@ -261,12 +372,12 @@ impl Weights {
                 bq: Vec::new(),
                 bk: Vec::new(),
                 bv: Vec::new(),
-                q_norm: if cfg.qk_norm {
+                q_norm: if cfg.qk_norm && !gdn {
                     vec1(&mut rng, cfg.n_heads * cfg.head_dim)
                 } else {
                     Vec::new()
                 },
-                k_norm: if cfg.qk_norm {
+                k_norm: if cfg.qk_norm && !gdn {
                     vec1(&mut rng, cfg.n_kv_heads * cfg.head_dim)
                 } else {
                     Vec::new()
@@ -336,6 +447,15 @@ impl Weights {
                 shared_wg,
                 shared_wu,
                 shared_wd,
+                gdn_in_qkv,
+                gdn_in_z,
+                gdn_in_a,
+                gdn_in_b,
+                gdn_conv_w,
+                gdn_a_log,
+                gdn_dt_bias,
+                gdn_norm,
+                gdn_out,
             });
         }
 
@@ -377,7 +497,16 @@ impl Weights {
                 + l.moe_wd.len()
                 + l.shared_wg.len()
                 + l.shared_wu.len()
-                + l.shared_wd.len();
+                + l.shared_wd.len()
+                + l.gdn_in_qkv.len()
+                + l.gdn_in_z.len()
+                + l.gdn_in_a.len()
+                + l.gdn_in_b.len()
+                + l.gdn_conv_w.len()
+                + l.gdn_a_log.len()
+                + l.gdn_dt_bias.len()
+                + l.gdn_norm.len()
+                + l.gdn_out.len();
         }
         n * 4
     }
@@ -443,6 +572,15 @@ impl WeightsQ4 {
                     shared_wg: q(&l.shared_wg),
                     shared_wu: q(&l.shared_wu),
                     shared_wd: q(&l.shared_wd),
+                    gdn_in_qkv: q(&l.gdn_in_qkv),
+                    gdn_in_z: q(&l.gdn_in_z),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: q(&l.gdn_out),
                 })
                 .collect(),
         }
@@ -508,6 +646,15 @@ impl WeightsFp8 {
                     shared_wg: qm(&l.shared_wg),
                     shared_wu: qm(&l.shared_wu),
                     shared_wd: qm(&l.shared_wd),
+                    gdn_in_qkv: q(&l.gdn_in_qkv),
+                    gdn_in_z: q(&l.gdn_in_z),
+                    gdn_in_a: l.gdn_in_a.clone(),
+                    gdn_in_b: l.gdn_in_b.clone(),
+                    gdn_conv_w: l.gdn_conv_w.clone(),
+                    gdn_a_log: l.gdn_a_log.clone(),
+                    gdn_dt_bias: l.gdn_dt_bias.clone(),
+                    gdn_norm: l.gdn_norm.clone(),
+                    gdn_out: q(&l.gdn_out),
                 })
                 .collect(),
         }

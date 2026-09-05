@@ -86,6 +86,17 @@ fn qwen3_moe_tiny_cfg() -> Config {
         rope_yarn_mscale: 1.0,
         rope_yarn_mscale_all_dim: 0.0,
         rope_interleave: false,
+        // Qwen3-MoE predates the Qwen3.5 additions: full rotary, no
+        // attention output gate, no GDN layers, plain (non-zero-centered)
+        // norm weights.
+        rope_rotary_pct: 1.0,
+        attn_output_gate: false,
+        zero_centered_norm: false,
+        full_attention_interval: 0,
+        gdn_k_heads: 0,
+        gdn_v_heads: 0,
+        gdn_head_dim: 0,
+        gdn_conv_kernel: 0,
         moe_grouped: true,
         step_profile: false,
     }

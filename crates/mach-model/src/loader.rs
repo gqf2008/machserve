@@ -85,8 +85,18 @@ fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>
                 data.len()
             )));
         }
+        // Qwen3.5 VLM checkpoints namespace the text stack under
+        // `model.language_model.*` (`Qwen3_5ForConditionalGeneration`);
+        // remap to the `model.*` layout every family (and this loader)
+        // expects. The `model.visual.*` and `mtp.*` stacks keep their
+        // prefixes and are skipped by the Q4/FP8 classifiers (the f32 loader
+        // simply never reads them).
+        let name = match name.strip_prefix("model.language_model.") {
+            Some(rest) => format!("model.{rest}"),
+            None => name.clone(),
+        };
         tensors.insert(
-            name.clone(),
+            name,
             RawTensor {
                 dtype,
                 shape,
@@ -397,6 +407,9 @@ fn build_weights(
 ) -> Result<Weights, Error> {
     let d = cfg.d_model;
     let nq = cfg.n_heads * cfg.head_dim;
+    // Qwen3.5 `attn_output_gate` doubles the q_proj width (per-head gate in
+    // the second half of each head's block).
+    let nq_load = if cfg.attn_output_gate { nq * 2 } else { nq };
     let nkv = cfg.n_kv_heads * cfg.head_dim;
 
     // Like `get`, but returns an empty vector when the tensor is absent
@@ -415,7 +428,7 @@ fn build_weights(
     };
 
     let tok_emb = get("model.embed_tokens.weight", cfg.vocab_size * d)?;
-    let rms_final = get("model.norm.weight", d)?;
+    let mut rms_final = get("model.norm.weight", d)?;
     let lm_head = match tensors.get("lm_head.weight") {
         Some(_) => get("lm_head.weight", cfg.vocab_size * d)?,
         None if tie_embeddings => tok_emb.clone(),
@@ -453,6 +466,52 @@ fn build_weights(
         // MLA (DeepSeek-V2 style): compressed KV + low-rank Q replace the
         // standard q/k/v/o projections when kv_lora_rank > 0.
         let mla = cfg.kv_lora_rank > 0;
+        // Qwen3.5 hybrid: linear-attention layers carry `linear_attn.*`
+        // tensors instead of `self_attn.*`. Which layers are linear is a pure
+        // config function (`layer_is_full_attn`); tensor emptiness doubles as
+        // the per-layer dispatch flag downstream.
+        let gdn = cfg.gdn_enabled() && !cfg.layer_is_full_attn(i);
+        let gdn_kd = cfg.gdn_key_dim();
+        let gdn_vd = cfg.gdn_value_dim();
+        let gdn_conv_dim = 2 * gdn_kd + gdn_vd;
+        let (
+            gdn_in_qkv,
+            gdn_in_z,
+            gdn_in_a,
+            gdn_in_b,
+            gdn_conv_w,
+            gdn_a_log,
+            gdn_dt_bias,
+            gdn_norm,
+            gdn_out,
+        ) = if gdn {
+            (
+                get(&p("linear_attn.in_proj_qkv.weight"), gdn_conv_dim * d)?,
+                get(&p("linear_attn.in_proj_z.weight"), gdn_vd * d)?,
+                get(&p("linear_attn.in_proj_a.weight"), cfg.gdn_v_heads * d)?,
+                get(&p("linear_attn.in_proj_b.weight"), cfg.gdn_v_heads * d)?,
+                get(
+                    &p("linear_attn.conv1d.weight"),
+                    gdn_conv_dim * cfg.gdn_conv_kernel,
+                )?,
+                get(&p("linear_attn.A_log"), cfg.gdn_v_heads)?,
+                get(&p("linear_attn.dt_bias"), cfg.gdn_v_heads)?,
+                get(&p("linear_attn.norm.weight"), cfg.gdn_head_dim)?,
+                get(&p("linear_attn.out_proj.weight"), d * gdn_vd)?,
+            )
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
         // Shared experts (DeepSeek-V2): a dense SwiGLU MLP of width
         // `n_shared_experts * expert_size` on routed layers, added to the
         // routed experts' output. Dense layers never have one.
@@ -535,22 +594,22 @@ fn build_weights(
                 )
             };
         let lw = LayerWeights {
-            wq: if mla {
+            wq: if mla || gdn {
                 Vec::new()
             } else {
-                get(&p("self_attn.q_proj.weight"), d * nq)?
+                get(&p("self_attn.q_proj.weight"), d * nq_load)?
             },
-            wk: if mla {
+            wk: if mla || gdn {
                 Vec::new()
             } else {
                 get(&p("self_attn.k_proj.weight"), d * nkv)?
             },
-            wv: if mla {
+            wv: if mla || gdn {
                 Vec::new()
             } else {
                 get(&p("self_attn.v_proj.weight"), d * nkv)?
             },
-            wo: if mla {
+            wo: if mla || gdn {
                 Vec::new()
             } else {
                 get(&p("self_attn.o_proj.weight"), nq * d)?
@@ -607,8 +666,40 @@ fn build_weights(
             shared_wg,
             shared_wu,
             shared_wd,
+            gdn_in_qkv,
+            gdn_in_z,
+            gdn_in_a,
+            gdn_in_b,
+            gdn_conv_w,
+            gdn_a_log,
+            gdn_dt_bias,
+            gdn_norm,
+            gdn_out,
         };
         layers.push(lw);
+    }
+
+    // Qwen3.5 zero-centered norms: the checkpoint stores `w` with forward
+    // `x * (1 + w)` (`Qwen3_5RMSNorm`); shift so the runtime's plain `x * w`
+    // matches. The GDN gated norm multiplies plainly and is NOT shifted.
+    if cfg.zero_centered_norm {
+        for l in &mut layers {
+            for v in &mut l.rms_attn {
+                *v += 1.0;
+            }
+            for v in &mut l.rms_mlp {
+                *v += 1.0;
+            }
+            for v in &mut l.q_norm {
+                *v += 1.0;
+            }
+            for v in &mut l.k_norm {
+                *v += 1.0;
+            }
+        }
+        for v in &mut rms_final {
+            *v += 1.0;
+        }
     }
 
     Ok(Weights {
@@ -671,6 +762,13 @@ pub fn load_safetensors_q4(
         // name maps to a known GEMM weight.
         let mut big_work: Vec<(String, usize)> = Vec::new();
         for (name, t) in &tensors {
+            // VLM auxiliary stacks (Qwen3.5 VLM): HF's own text-only class
+            // ignores `^mtp.*` / `^model.visual.*` on load. Skipping here
+            // also keeps `mtp.layers.*.self_attn.q_proj.weight` out of the
+            // classifiers' `contains()` patterns below.
+            if name.starts_with("mtp.") || name.starts_with("model.visual.") {
+                continue;
+            }
             let n: usize = t.shape.iter().product();
             let expected = if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
                 Some(cfg.vocab_size * d)
@@ -687,7 +785,10 @@ pub fn load_safetensors_q4(
                 } else {
                     e
                 };
-                small.insert(name.clone(), tensor_f32(&data, t, e, name)?);
+                small.insert(
+                    name.clone(),
+                    load_small_f32(&data, t, e, name, cfg.zero_centered_norm)?,
+                );
                 None
             } else {
                 // Unknown auxiliary tensors (e.g. shared_expert.*) are skipped,
@@ -771,6 +872,8 @@ pub fn load_safetensors_q4(
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
         let is_moe = ne > 0 && small.contains_key(&p("mlp.gate.weight"));
+        // Qwen3.5 hybrid: linear-attention layers carry `linear_attn.*`.
+        let gdn = cfg.gdn_enabled() && !cfg.layer_is_full_attn(i);
         // Shared experts (DeepSeek-V2): dense SwiGLU MLP of width
         // `n_shared_experts * expert_size`, added to the routed experts' sum.
         let shinter = cfg.shared_size();
@@ -789,22 +892,22 @@ pub fn load_safetensors_q4(
             )
         };
         let mut lw = LayerWeightsQ4 {
-            wq: if mla {
+            wq: if mla || gdn {
                 Q4Tensor::default()
             } else {
                 big.remove(&p("self_attn.q_proj.weight")).expect("q_proj")
             },
-            wk: if mla {
+            wk: if mla || gdn {
                 Q4Tensor::default()
             } else {
                 big.remove(&p("self_attn.k_proj.weight")).expect("k_proj")
             },
-            wv: if mla {
+            wv: if mla || gdn {
                 Q4Tensor::default()
             } else {
                 big.remove(&p("self_attn.v_proj.weight")).expect("v_proj")
             },
-            wo: if mla {
+            wo: if mla || gdn {
                 Q4Tensor::default()
             } else {
                 big.remove(&p("self_attn.o_proj.weight")).expect("o_proj")
@@ -893,6 +996,64 @@ pub fn load_safetensors_q4(
             shared_wg,
             shared_wu,
             shared_wd,
+            gdn_in_qkv: if gdn {
+                big.remove(&p("linear_attn.in_proj_qkv.weight"))
+                    .expect("gdn in_proj_qkv")
+            } else {
+                Q4Tensor::default()
+            },
+            gdn_in_z: if gdn {
+                big.remove(&p("linear_attn.in_proj_z.weight"))
+                    .expect("gdn in_proj_z")
+            } else {
+                Q4Tensor::default()
+            },
+            gdn_in_a: if gdn {
+                small
+                    .remove(&p("linear_attn.in_proj_a.weight"))
+                    .expect("gdn in_proj_a")
+            } else {
+                Vec::new()
+            },
+            gdn_in_b: if gdn {
+                small
+                    .remove(&p("linear_attn.in_proj_b.weight"))
+                    .expect("gdn in_proj_b")
+            } else {
+                Vec::new()
+            },
+            gdn_conv_w: if gdn {
+                small
+                    .remove(&p("linear_attn.conv1d.weight"))
+                    .expect("gdn conv1d")
+            } else {
+                Vec::new()
+            },
+            gdn_a_log: if gdn {
+                small.remove(&p("linear_attn.A_log")).expect("gdn A_log")
+            } else {
+                Vec::new()
+            },
+            gdn_dt_bias: if gdn {
+                small
+                    .remove(&p("linear_attn.dt_bias"))
+                    .expect("gdn dt_bias")
+            } else {
+                Vec::new()
+            },
+            gdn_norm: if gdn {
+                small
+                    .remove(&p("linear_attn.norm.weight"))
+                    .expect("gdn norm")
+            } else {
+                Vec::new()
+            },
+            gdn_out: if gdn {
+                big.remove(&p("linear_attn.out_proj.weight"))
+                    .expect("gdn out_proj")
+            } else {
+                Q4Tensor::default()
+            },
         };
         if mla {
             let fused = if cfg.q_lora_rank > 0 {
@@ -1002,6 +1163,10 @@ pub fn load_safetensors_fp8(
         // loader; only the quantization differs).
         let mut big_work: Vec<(String, usize)> = Vec::new();
         for (name, t) in &tensors {
+            // VLM auxiliary stacks (Qwen3.5 VLM): same skip as the Q4 loader.
+            if name.starts_with("mtp.") || name.starts_with("model.visual.") {
+                continue;
+            }
             let n: usize = t.shape.iter().product();
             let expected = if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
                 Some(cfg.vocab_size * d)
@@ -1018,7 +1183,10 @@ pub fn load_safetensors_fp8(
                 } else {
                     e
                 };
-                small.insert(name.clone(), tensor_f32(&data, t, e, name)?);
+                small.insert(
+                    name.clone(),
+                    load_small_f32(&data, t, e, name, cfg.zero_centered_norm)?,
+                );
                 None
             } else {
                 // Unknown auxiliary tensors (e.g. shared_expert.*) are skipped,
@@ -1102,6 +1270,7 @@ pub fn load_safetensors_fp8(
     for i in 0..cfg.n_layers {
         let p = |suffix: &str| format!("model.layers.{i}.{suffix}");
         let is_moe = ne > 0 && small.contains_key(&p("mlp.gate.weight"));
+        let gdn = cfg.gdn_enabled() && !cfg.layer_is_full_attn(i);
         // Shared experts (DeepSeek-V2): dense SwiGLU MLP of width
         // `n_shared_experts * expert_size`, added to the routed experts' sum.
         let shinter = cfg.shared_size();
@@ -1120,22 +1289,22 @@ pub fn load_safetensors_fp8(
             )
         };
         let mut lw = LayerWeightsFp8 {
-            wq: if mla {
+            wq: if mla || gdn {
                 Fp8Tensor::default()
             } else {
                 big.remove(&p("self_attn.q_proj.weight")).expect("q_proj")
             },
-            wk: if mla {
+            wk: if mla || gdn {
                 Fp8Tensor::default()
             } else {
                 big.remove(&p("self_attn.k_proj.weight")).expect("k_proj")
             },
-            wv: if mla {
+            wv: if mla || gdn {
                 Fp8Tensor::default()
             } else {
                 big.remove(&p("self_attn.v_proj.weight")).expect("v_proj")
             },
-            wo: if mla {
+            wo: if mla || gdn {
                 Fp8Tensor::default()
             } else {
                 big.remove(&p("self_attn.o_proj.weight")).expect("o_proj")
@@ -1224,6 +1393,64 @@ pub fn load_safetensors_fp8(
             shared_wg,
             shared_wu,
             shared_wd,
+            gdn_in_qkv: if gdn {
+                big.remove(&p("linear_attn.in_proj_qkv.weight"))
+                    .expect("gdn in_proj_qkv")
+            } else {
+                Fp8Tensor::default()
+            },
+            gdn_in_z: if gdn {
+                big.remove(&p("linear_attn.in_proj_z.weight"))
+                    .expect("gdn in_proj_z")
+            } else {
+                Fp8Tensor::default()
+            },
+            gdn_in_a: if gdn {
+                small
+                    .remove(&p("linear_attn.in_proj_a.weight"))
+                    .expect("gdn in_proj_a")
+            } else {
+                Vec::new()
+            },
+            gdn_in_b: if gdn {
+                small
+                    .remove(&p("linear_attn.in_proj_b.weight"))
+                    .expect("gdn in_proj_b")
+            } else {
+                Vec::new()
+            },
+            gdn_conv_w: if gdn {
+                small
+                    .remove(&p("linear_attn.conv1d.weight"))
+                    .expect("gdn conv1d")
+            } else {
+                Vec::new()
+            },
+            gdn_a_log: if gdn {
+                small.remove(&p("linear_attn.A_log")).expect("gdn A_log")
+            } else {
+                Vec::new()
+            },
+            gdn_dt_bias: if gdn {
+                small
+                    .remove(&p("linear_attn.dt_bias"))
+                    .expect("gdn dt_bias")
+            } else {
+                Vec::new()
+            },
+            gdn_norm: if gdn {
+                small
+                    .remove(&p("linear_attn.norm.weight"))
+                    .expect("gdn norm")
+            } else {
+                Vec::new()
+            },
+            gdn_out: if gdn {
+                big.remove(&p("linear_attn.out_proj.weight"))
+                    .expect("gdn out_proj")
+            } else {
+                Fp8Tensor::default()
+            },
         };
         if mla {
             let fused = if cfg.q_lora_rank > 0 {
@@ -1276,6 +1503,32 @@ pub fn load_safetensors_fp8(
     })
 }
 
+/// Loads a small (f32) tensor, applying the Qwen3.5 zero-centered-norm shift
+/// (`x * (1 + w)` checkpoints store `w`; the runtime multiplies plainly, so
+/// the loader adds 1 to the layer/final/q/k norm tensors). The GDN gated
+/// norm is ones-init and passes through untouched.
+fn load_small_f32(
+    data: &[u8],
+    t: &RawTensor,
+    expected: usize,
+    name: &str,
+    zero_centered: bool,
+) -> Result<Vec<f32>, Error> {
+    let mut v = tensor_f32(data, t, expected, name)?;
+    if zero_centered
+        && (name == "model.norm.weight"
+            || name.contains("input_layernorm.weight")
+            || name.contains("post_attention_layernorm.weight")
+            || name.contains("q_norm.weight")
+            || name.contains("k_norm.weight"))
+    {
+        for x in &mut v {
+            *x += 1.0;
+        }
+    }
+    Ok(v)
+}
+
 /// Expected element count for a quantized (GEMM) weight tensor by name.
 #[allow(clippy::too_many_arguments)]
 fn expected_q4_size(
@@ -1314,8 +1567,19 @@ fn expected_q4_size(
         // DeepSeek-V2 shared experts: one dense SwiGLU MLP of width
         // `n_shared_experts * expert_size` (not per-expert tensors).
         Some(cfg.shared_size() * d)
+    } else if name.contains("linear_attn.in_proj_qkv.weight") {
+        // Qwen3.5 gated DeltaNet: fused q/k/v projection.
+        Some((2 * cfg.gdn_key_dim() + cfg.gdn_value_dim()) * d)
+    } else if name.contains("linear_attn.in_proj_z.weight")
+        || name.contains("linear_attn.out_proj.weight")
+    {
+        // Qwen3.5 gated DeltaNet: z projection and output projection both
+        // span the value dim ([v, d] and [d, v]).
+        Some(cfg.gdn_value_dim() * d)
     } else if name.contains("self_attn.q_proj.weight") {
-        Some(d * nq)
+        // Qwen3.5 `attn_output_gate` doubles the width (per-head sigmoid gate
+        // rides along in q_proj).
+        Some(d * nq * if cfg.attn_output_gate { 2 } else { 1 })
     } else if name.contains("self_attn.k_proj.weight") || name.contains("self_attn.v_proj.weight") {
         Some(d * nkv)
     } else if name.contains("self_attn.o_proj.weight") {
@@ -1363,6 +1627,21 @@ fn expected_small_size(
         Some(cfg.q_lora_rank)
     } else if mla && name.contains("self_attn.kv_a_layernorm.weight") {
         Some(cfg.kv_lora_rank)
+    } else if name.contains("linear_attn.in_proj_a.weight")
+        || name.contains("linear_attn.in_proj_b.weight")
+    {
+        // GDN gate inputs: tiny `[gdn_v_heads, d]` GEMMs kept f32 (they feed
+        // softplus/sigmoid, where quantization error shifts a whole head's
+        // decay).
+        Some(cfg.gdn_v_heads * d)
+    } else if name.contains("linear_attn.conv1d.weight") {
+        Some((2 * cfg.gdn_key_dim() + cfg.gdn_value_dim()) * cfg.gdn_conv_kernel)
+    } else if name.contains("linear_attn.A_log") || name.contains("linear_attn.dt_bias") {
+        // Bare nn.Parameter names (no `.weight` suffix) — direct parameters,
+        // not submodules.
+        Some(cfg.gdn_v_heads)
+    } else if name.contains("linear_attn.norm.weight") {
+        Some(cfg.gdn_head_dim)
     } else {
         None
     }

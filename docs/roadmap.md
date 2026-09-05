@@ -1380,3 +1380,43 @@
   - **性能数据待重测**:修复让 MoE 层恢复了 shared 的三个 GEMM(此前
     被跳过),既有 25.73 tok/s 是"少干活"的数字,不再代表修复后路径。
 
+- **Qwen3.8-27B(Qwen3.5 家族)Stage A 地基(#112,2026-09-05)——
+  检查点语义对照 transformers 源码全部定案,CPU 参考实现全绿**:
+  - **架构**(对照 config.json + `modeling_qwen3_5.py` 全文):64 层混合,
+    `full_attention_interval=4` → 16 层 full-attn(3,7,…,63)+ 48 层
+    gated-DeltaNet;hidden 5120 / heads 24 / kv 4 / head_dim 256 /
+    vocab 248320;GDN:k_heads 16 × 128 / v_heads 48 × 128 / conv 4 /
+    theta 1e7 / partial_rotary 0.25(rotary_dim 64)/ 无偏置。
+  - **对照源码定案的三个语义**(此前凭猜测,全部修正):
+    1. `attn_output_gate=True` **不是无参门控** —— q_proj 宽度翻倍
+       (`heads·head_dim·2`),每 head 块内 `[query | gate]`(HF
+       `chunk(2, dim=-1)`),注意力输出 ×`sigmoid(gate)` 后才过 o_proj;
+       gate 不吃 QK-norm/RoPE。引擎侧:`attn_output_gate` 家族旗标 +
+       加倍尺寸贯穿 f32/Q4/FP8 三条加载路径 + ref 前向按 head 拆分。
+    2. **零中心 RMSNorm**:`Qwen3_5RMSNorm` 前向是 `x·(1+w)`(权重
+       zero-init)—— 加载时对 layer norm / q/k norm / final norm 统一
+       +1(`zero_centered_norm` 旗标);GDN 门控 norm 是 ones-init 的
+       `x·w`,**不**加。
+    3. **mrope_interleaved 纯文本下是恒等**:T/H/W 位置同为文本位置,
+       interleave 覆盖等于自身 —— 既有 partial rope(基频=rotary_dim、
+       半半配对)即最终语义,无需改动。
+  - **loader 对齐真实检查点**(index.json 权重表逐项核对):GDN 的
+    `A_log`/`dt_bias` 是裸 `nn.Parameter`(**无 `.weight` 后缀**);
+    VLM 前缀 `model.language_model.` → `model.` 在 parse 阶段重映射;
+    `mtp.*`/`model.visual.*` 在 Q4/FP8 分类器跳过(mtp 的
+    `self_attn.q_proj`/`input_layernorm` 名字会撞 `contains()` 模式,
+    且尺寸故意错位的 tripwire 张量证明跳过生效)。GDN l2norm 补上
+    HF 的 eps=1e-6(在 sqrt 内)。
+  - **测试**:GDN 递归手算 f64 对拍、门控注意力 pos-0 手算对拍
+    (softmax=1、RoPE=恒等,精确隔离拆分/σ/位置三个新事实)、VLM
+    前缀+辅助栈跳过、零中心 +1 端到端 roundtrip(f32/Q4/FP8)、
+    加倍 q_proj 尺寸贯穿。`cargo test --workspace` / clippy
+    (±hip)/ check(±hip)/ fmt 全绿;GPU 门禁与本批内核另行推进。
+  - **下载**:huggingface.co 直连中断(WinError 10060 持续数日),
+    切 `HF_ENDPOINT=https://hf-mirror.com` 续传完成(55.6GB/18 分片)。
+  - **下一步(Stage A 余量)**:HIP 内核(partial rope、GDN decode:
+    conv 更新+状态更新+q·S+门控 norm)、BatchedModel 逐层分发与
+    递归状态缓冲、server 端 qwen3_5 `config_from_json` 映射、真实
+    checkpoint Q4 量化与逐层对拍;Stage B = GDN chunked prefill,
+    Stage C = 视觉塔。
+
