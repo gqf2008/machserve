@@ -4341,8 +4341,18 @@ impl BatchedModel {
             num_runs,
             num_gdn_runs,
         )?;
-        self.sampler
-            .sample_batched_after_stage(self.logits, params, vocab)
+        let out = self
+            .sampler
+            .sample_batched_after_stage(self.logits, params, vocab);
+        // Step profiler (also reached via decode_step): the sampling sync above
+        // drained the stream, so all event records have executed. Without this
+        // call the continuous engine (which enters here directly) would print
+        // nothing under MACH_STEP_PROFILE — the #89 wiring only covered
+        // decode_step.
+        if let Some(pf_state) = self.prof.as_mut() {
+            pf_state.report();
+        }
+        out
     }
 
     /// Saves a lightweight token-boundary anchor for `slot`: the per-layer KV

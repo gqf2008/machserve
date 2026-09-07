@@ -624,9 +624,22 @@ extern "C" __global__ void gdn_step(
     const float* __restrict__ a_in,     // [batch, vh]
     const float* __restrict__ b_in,     // [batch, vh]
     int batch, int vh, int kh, int hd, int conv_dim) {
-    int i = blockIdx.x;   // v-head
-    int b = blockIdx.y;   // batch row
-    int rep = vh / kh;
+    // Column-tiled decode step: blockIdx.x = (v-head, column tile of 32).
+    // The head's matrix work is column-separable — every phase (kmem, the
+    // outer-product update, and o) touches complete columns — so tiles run
+    // with NO cross-block dependency. The old one-block-per-head grid put
+    // only `vh` blocks on the whole GPU with three barrier-separated phases
+    // (half the block idle in the dot phases); tiling gives vh*hd/32 blocks
+    // that stream their column strip twice. Semantics are identical to the
+    // sequential contract (decay, then kmem over the decayed S, then the
+    // update, then o over the updated S) except that o comes from the
+    // algebraic regrouping o = decay*(S_old^T q) + beta*(k.q)*(v - kmem)
+    // — a summation-order-only change.
+    const int tiles_per_head = (hd + 31) / 32;
+    const int i = blockIdx.x / tiles_per_head;   // v-head
+    const int b = blockIdx.y;                    // batch row
+    const int c0 = (blockIdx.x % tiles_per_head) * 32;
+    const int rep = vh / kh;
     float* S = state + ((long long)slots[b] * vh + i) * hd * hd;
     float sp = a_in[(long long)b * vh + i] + dt_bias[i];
     float softplus = (sp > 20.0f) ? sp : __logf(1.0f + __expf(sp));
@@ -638,29 +651,42 @@ extern "C" __global__ void gdn_step(
     const float* vv = qkv + (long long)b * conv_dim + (long long)2 * kh * hd
                     + (long long)i * hd;
     float* oh = o + ((long long)b * vh + i) * hd;
-    int n = hd * hd;
-    // 1) S <- S * decay
-    for (int t = threadIdx.x; t < n; t += blockDim.x) S[t] *= decay;
-    __syncthreads();
-    // 2) kv_mem = S^T k
-    extern __shared__ float kmem[];   // [hd]
-    for (int m = threadIdx.x; m < hd; m += blockDim.x) {
-        float acc = 0.0f;
-        for (int kk = 0; kk < hd; kk++) acc += kv[kk] * S[kk * hd + m];
-        kmem[m] = acc;
+    const int lane = threadIdx.x & 31;
+    const bool active = (c0 + lane) < hd;
+    const int nw = blockDim.x >> 5;     // warps; rows kk = warp, +nw, ...
+    const int warp = threadIdx.x >> 5;
+    // kdot = k.q, computed redundantly per thread (L1-broadcast reads).
+    float kdot = 0.0f;
+    for (int kk = 0; kk < hd; kk++) kdot += qh[kk] * kv[kk];
+    // Pass 1: stream the strip once, accumulating kmem and oq over the
+    // DECAYED old state (per-warp partials along the row axis).
+    float kmem = 0.0f, oq = 0.0f;
+    for (int kk = warp; kk < hd; kk += nw) {
+        float s = active ? S[(long long)kk * hd + c0 + lane] * decay : 0.0f;
+        kmem += kv[kk] * s;
+        oq += qh[kk] * s;
     }
+    // Cross-warp reduce of the two per-column accumulators.
+    __shared__ float red[2][32][8];
+    red[0][lane][warp] = kmem;
+    red[1][lane][warp] = oq;
     __syncthreads();
-    // 3) S <- S + k (x) (v - kv_mem) * beta
-    for (int t = threadIdx.x; t < n; t += blockDim.x) {
-        int kk = t / hd, m = t % hd;
-        S[t] += kv[kk] * (vv[m] - kmem[m]) * beta;
+    kmem = 0.0f;
+    oq = 0.0f;
+    for (int w = 0; w < nw; w++) {
+        kmem += red[0][lane][w];
+        oq += red[1][lane][w];
     }
-    __syncthreads();
-    // 4) o = S^T q on the UPDATED S
-    for (int m = threadIdx.x; m < hd; m += blockDim.x) {
-        float acc = 0.0f;
-        for (int kk = 0; kk < hd; kk++) acc += qh[kk] * S[kk * hd + m];
-        oh[m] = acc;
+    // Pass 2: re-read the strip and write the updated state.
+    if (active) {
+        const float vm = vv[c0 + lane];
+        for (int kk = warp; kk < hd; kk += nw) {
+            float* sp2 = S + (long long)kk * hd + c0 + lane;
+            *sp2 = *sp2 * decay + kv[kk] * (vm - kmem) * beta;
+        }
+        // oq already accumulates over the DECAYED state (pass 1 scales s by
+        // decay), so o = oq + beta*kdot*(v - kmem) — no second decay here.
+        oh[c0 + lane] = oq + beta * kdot * (vm - kmem);
     }
 }
 "#;
@@ -2027,13 +2053,14 @@ extern "C" __global__ void embed_gather_f16(const int* tok, const unsigned short
 /// (group = 32 elements of the flat index — a row whose length is not a
 /// multiple of 32 starts mid-group, so scale indices come from the flat
 /// element index, never a per-row restart). Warp-per-(row, batch) like
-/// GEMV_F16; each lane loads u32 = 8 consecutive elements, and an 8-aligned
-/// flat span can never straddle a 32-element group (8 | 32), so ONE scale
-/// serves the whole u32. When `d*4 > 48KB` the x staging is skipped and x
-/// is read straight from global/L2 — the 27B dense down-proj contracts
-/// over 17408, over the shared limit that forces GEMV_F16 onto hipBLAS.
-/// Odd `d` (test configs) takes a portable byte path; rows of a
-/// `d % 8 != 0` tensor are not u32-aligned.
+/// GEMV_F16; each lane loads u32 pairs (two 8-element groups per round, the
+/// second 32 groups along to keep per-lane accumulation order — and thus
+/// results — bit-identical to the single-u32 loop), and an 8-aligned flat
+/// span can never straddle a 32-element group (8 | 32), so ONE scale serves
+/// a whole u32. x is read straight from global as float4 pairs (no shared
+/// staging: the staging buffer's strided reads bank-conflicted 8-way and its
+/// size capped occupancy). Odd `d` (test configs) takes a portable byte
+/// path; rows of a `d % 8 != 0` tensor are not u32-aligned.
 const GEMV_Q4: &str = r#"
 extern "C" __global__ void gemv_q4(
     const float* __restrict__ x,
@@ -2043,12 +2070,12 @@ extern "C" __global__ void gemv_q4(
     int n, int d, int batch) {
     const int b = blockIdx.y;
     const float* xb = x + (long long)b * d;
-    extern __shared__ float sx[];
-    if ((long long)d * 4 <= 48 * 1024) {
-        for (int j = threadIdx.x; j < d; j += blockDim.x) sx[j] = xb[j];
-        __syncthreads();
-        xb = sx;
-    }
+    // x is read straight from global with float4 pairs per 8-element group.
+    // The former shared-memory staging bought nothing: the strided scalar
+    // reads it served (8 floats at 32-byte stride per lane) hit an 8-way
+    // bank conflict on every access, and the d*4-byte buffer capped
+    // occupancy at ~3 blocks/CU. Global x stays L1/L2-resident (every block
+    // reads the same rows), so the float4 loads coalesce cleanly.
     const int warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (warp >= n) return;
@@ -2057,9 +2084,49 @@ extern "C" __global__ void gemv_q4(
     float acc = 0.f;
     if (d % 8 == 0) {
         const int nq = d / 8;
-        for (int j4 = lane; j4 < nq; j4 += 32) {
+        // Double-group iterations: one lane services j4 and j4+32 per round,
+        // doubling the weight bytes in flight per warp (the single-u32 loop
+        // left the memory pipe under-subscribed — the GEMV measured ~1/4 of
+        // achievable bandwidth). Accumulation order per lane is unchanged
+        // (strictly ascending j4), so results are bit-identical to the
+        // single-group loop.
+        int j4 = lane;
+        for (; j4 + 32 < nq; j4 += 64) {
+            const int j4b = j4 + 32;
+            unsigned int w8a = *(const unsigned int*)(wrow + 4 * (long long)j4);
+            unsigned int w8b = *(const unsigned int*)(wrow + 4 * (long long)j4b);
+            const float sa = ws[(base + 8 * j4) >> 5];
+            const float sb = ws[(base + 8 * j4b) >> 5];
+            const float4 xa0 = *(const float4*)(xb + 8 * j4);
+            const float4 xa1 = *(const float4*)(xb + 8 * j4 + 4);
+            const float4 xb0 = *(const float4*)(xb + 8 * j4b);
+            const float4 xb1 = *(const float4*)(xb + 8 * j4b + 4);
+            float pa = 0.f, pb = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 4; t++) {
+                const unsigned int ba = (w8a >> (8 * t)) & 0xFFu;
+                const unsigned int bb = (w8b >> (8 * t)) & 0xFFu;
+                int la = (int)(ba & 0xFu), ha = (int)((ba >> 4) & 0xFu);
+                int lb = (int)(bb & 0xFu), hb = (int)((bb >> 4) & 0xFu);
+                la = la < 8 ? la : la - 16;
+                ha = ha < 8 ? ha : ha - 16;
+                lb = lb < 8 ? lb : lb - 16;
+                hb = hb < 8 ? hb : hb - 16;
+                // group element pairs (2t, 2t+1): x0 holds 0..3, x1 holds 4..7
+                const float* xr = (t < 2) ? &xa0.x : &xa1.x;
+                const int xi = (t < 2) ? 2 * t : 2 * t - 4;
+                pa += (float)la * xr[xi] + (float)ha * xr[xi + 1];
+                const float* yr = (t < 2) ? &xb0.x : &xb1.x;
+                pb += (float)lb * yr[xi] + (float)hb * yr[xi + 1];
+            }
+            acc += pa * sa;
+            acc += pb * sb;
+        }
+        for (; j4 < nq; j4 += 32) {
             unsigned int w8 = *(const unsigned int*)(wrow + 4 * (long long)j4);
             const float s = ws[(base + 8 * j4) >> 5];
+            const float4 x0 = *(const float4*)(xb + 8 * j4);
+            const float4 x1 = *(const float4*)(xb + 8 * j4 + 4);
             float p = 0.f;
             #pragma unroll
             for (int t = 0; t < 4; t++) {
@@ -2068,8 +2135,10 @@ extern "C" __global__ void gemv_q4(
                 int hi = (int)((byte >> 4) & 0xFu);
                 lo = lo < 8 ? lo : lo - 16;
                 hi = hi < 8 ? hi : hi - 16;
-                p += (float)lo * xb[8 * j4 + 2 * t]
-                   + (float)hi * xb[8 * j4 + 2 * t + 1];
+                // group element pair (2t, 2t+1): x0 holds 0..3, x1 holds 4..7
+                const float* xr = (t < 2) ? &x0.x : &x1.x;
+                const int xi = (t < 2) ? 2 * t : 2 * t - 4;
+                p += (float)lo * xr[xi] + (float)hi * xr[xi + 1];
             }
             acc += p * s;
         }
@@ -3758,13 +3827,15 @@ impl HipKernels {
             &hd as *const i32 as *mut core::ffi::c_void,
             &conv_dim as *const i32 as *mut core::ffi::c_void,
         ];
-        // shared: [hd] floats for kv_mem.
-        Ok(self.gdn_step.launch_shmem(
-            [vh as u32, batch as u32, 1],
-            [256, 1, 1],
+        // Column-tiled grid (see the kernel): x = v-head x column-tile of 32
+        // (ceil for non-multiple head dims), y = batch row. Shared memory is
+        // the kernel's static 2 KB reduction buffer — no dynamic allocation.
+        let tiles = ((hd + 31) / 32) as u32;
+        Ok(self.gdn_step.launch(
+            [vh as u32 * tiles, batch as u32, 1],
+            [128, 1, 1],
             &mut p,
             self.stream,
-            hd as u32 * 4,
         )?)
     }
 
@@ -4288,9 +4359,9 @@ impl HipKernels {
 
     /// Q4-on-device GEMV (see the [`GEMV_Q4`] contract): `wq`/`ws` are the
     /// packed nibbles and per-group scales of an `[n, d]` weight kept raw on
-    /// device. `d % 8 != 0` takes the kernel's portable byte path; `d*4`
-    /// over 48 KB skips the x staging (kernel reads x from global/L2) so the
-    /// shared limit that GEMV_F16 asserts against does not apply here.
+    /// device. `d % 8 != 0` takes the kernel's portable byte path. x is read
+    /// from global in float4 pairs (no shared staging, no 48 KB limit — the
+    /// shared cap that GEMV_F16 asserts against does not apply here).
     #[allow(clippy::too_many_arguments)]
     pub fn launch_gemv_q4(
         &self,
@@ -4320,18 +4391,11 @@ impl HipKernels {
         ];
         let warps_per_block = 256 / 32;
         let blocks = (n as u32).div_ceil(warps_per_block);
-        let shmem = if (d as u64) * 4 <= 48 * 1024 {
-            (d as u32) * 4
-        } else {
-            0
-        };
-        Ok(self.gemv_q4.launch_shmem(
-            [blocks, batch as u32, 1],
-            [256, 1, 1],
-            &mut p,
-            self.stream,
-            shmem,
-        )?)
+        // No dynamic shared memory: x is read from global (float4 pairs), so
+        // the kernel has no staging buffer and no occupancy cap from it.
+        Ok(self
+            .gemv_q4
+            .launch([blocks, batch as u32, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
     /// Q4 embedding gather (see the [`EMBED_GATHER_Q4`] contract): token rows
@@ -7225,11 +7289,96 @@ mod gpu_tests {
         }
     }
 
+    /// TEMP probe (remove before commit): isolated gemv_q4 bandwidth on the
+    /// shapes the 27B decode actually issues (timed with events, no oracle).
+    #[test]
+    #[ignore = "manual perf probe"]
+    fn gemv_q4_bandwidth_probe() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let mut rng = lcg(71);
+        for (n, d, batch, label) in [
+            (13824usize, 5120usize, 1usize, "ffn-gate-like"),
+            (5120, 5120, 1, "square"),
+            (8192, 5120, 1, "qkv-like"),
+            (13824, 5120, 12, "ffn m=12"),
+        ] {
+            let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
+            let w: Vec<f32> = (0..n * d).map(|_| rng()).collect();
+            let wq4 = crate::q4::Q4Tensor::quantize(&w);
+            let dx = hip::malloc(&h, bytes(x.len())).unwrap();
+            let dwq = hip::malloc(&h, wq4.q_bytes().len()).unwrap();
+            let dws = hip::malloc(&h, bytes(wq4.scales().len())).unwrap();
+            let dout = hip::malloc(&h, bytes(n * batch)).unwrap();
+            for (dst, src, len) in [
+                (dx, x.as_ptr() as *const std::ffi::c_void, bytes(x.len())),
+                (
+                    dwq,
+                    wq4.q_bytes().as_ptr() as *const std::ffi::c_void,
+                    wq4.q_bytes().len(),
+                ),
+                (
+                    dws,
+                    wq4.scales().as_ptr() as *const std::ffi::c_void,
+                    bytes(wq4.scales().len()),
+                ),
+            ] {
+                hip::memcpy(&h, dst, src, len, hip::HIP_MEMCPY_HOST_TO_DEVICE).unwrap();
+            }
+            let mut run = || {
+                k.launch_gemv_q4(
+                    dx as *const f32,
+                    dwq as *const u8,
+                    dws as *const f32,
+                    dout as *mut f32,
+                    n as i32,
+                    d as i32,
+                    batch as i32,
+                )
+                .unwrap();
+            };
+            for _ in 0..3 {
+                run();
+            }
+            let (e0, e1) = {
+                let mk = || {
+                    let mut e = std::ptr::null_mut();
+                    unsafe { (h.api.hip_event_create)(&mut e) };
+                    e
+                };
+                (mk(), mk())
+            };
+            unsafe {
+                (h.api.hip_event_record)(e0, k.stream);
+                for _ in 0..20 {
+                    run();
+                }
+                (h.api.hip_event_record)(e1, k.stream);
+                (h.api.hip_event_synchronize)(e1);
+            }
+            let mut ms = 0f32;
+            unsafe { (h.api.hip_event_elapsed_time)(&mut ms, e0, e1) };
+            let wbytes = (wq4.q_bytes().len() + bytes(wq4.scales().len())) as f64;
+            let gbs = wbytes * 20.0 / (ms as f64 / 1000.0) / 1e9;
+            eprintln!(
+                "probe {label:<14} n={n} d={d} b={batch}: {ms:.2} ms/20 -> weights {gbs:.0} GB/s"
+            );
+        }
+    }
+
     /// `gemv_q4` vs the CPU dequantized dot: multiple shapes covering both
-    /// kernel paths — u32 loads with x staged in shared (d % 8 == 0, d*4 <=
-    /// 48 KB), the portable byte path (d % 8 != 0, odd nibble tail), u32
-    /// loads with x read straight from global (d*4 > 48 KB — the 27B dense
-    /// down-proj shape class, d=16384), and a batch > 1 (blockIdx.y rows).
+    /// kernel paths — the u32/float4 path with x read straight from global
+    /// (d % 8 == 0, including the 27B dense down-proj shape class,
+    /// d=16384), the portable byte path (d % 8 != 0, odd nibble tail),
+    /// and a batch > 1 (blockIdx.y rows).
     #[test]
     fn gemv_q4_matches_dequantized_cpu() {
         let Ok(h) = hip::hip() else {
