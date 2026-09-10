@@ -253,6 +253,345 @@ impl Int8Kv {
     }
 }
 
+/// Contiguous INT8 KV cache layout:
+/// payload `[slots, max_seq, kv_heads, head_dim]`, scales
+/// `[slots, max_seq, kv_heads]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContiguousInt8KvLayout {
+    slots: usize,
+    max_seq: usize,
+    heads: usize,
+    head_dim: usize,
+    payload_len: usize,
+    scale_len: usize,
+    scale_bytes: usize,
+    total_bytes: usize,
+}
+
+impl ContiguousInt8KvLayout {
+    pub fn new(slots: usize, max_seq: usize, heads: usize, head_dim: usize) -> Result<Self, Error> {
+        if slots == 0 || max_seq == 0 || heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "INT8 contiguous KV layout requires non-zero slots/max_seq/heads/head_dim".into(),
+            ));
+        }
+        let head_block = heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV head block overflow".into()))?;
+        let per_slot = max_seq
+            .checked_mul(head_block)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV per-slot payload overflow".into()))?;
+        let payload_len = slots
+            .checked_mul(per_slot)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV payload overflow".into()))?;
+        let scale_len = slots
+            .checked_mul(max_seq)
+            .and_then(|v| v.checked_mul(heads))
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV scale overflow".into()))?;
+        let scale_bytes = scale_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV scale bytes overflow".into()))?;
+        let total_bytes = payload_len
+            .checked_add(scale_bytes)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV total bytes overflow".into()))?;
+        Ok(Self {
+            slots,
+            max_seq,
+            heads,
+            head_dim,
+            payload_len,
+            scale_len,
+            scale_bytes,
+            total_bytes,
+        })
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn scale_len(&self) -> usize {
+        self.scale_len
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn scale_bytes(&self) -> usize {
+        self.scale_bytes
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn payload_index(&self, slot: usize, pos: usize, head: usize, dim: usize) -> Option<usize> {
+        if slot >= self.slots || pos >= self.max_seq || head >= self.heads || dim >= self.head_dim {
+            return None;
+        }
+        ((slot * self.max_seq + pos) * self.heads + head)
+            .checked_mul(self.head_dim)
+            .and_then(|v| v.checked_add(dim))
+    }
+
+    pub fn scale_index(&self, slot: usize, pos: usize, head: usize) -> Option<usize> {
+        if slot >= self.slots || pos >= self.max_seq || head >= self.heads {
+            return None;
+        }
+        (slot * self.max_seq + pos)
+            .checked_mul(self.heads)
+            .and_then(|v| v.checked_add(head))
+    }
+}
+
+/// Paged INT8 KV pool layout:
+/// payload `[pages, tokens_per_page, kv_heads, head_dim]`, scales
+/// `[pages, tokens_per_page, kv_heads]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedInt8KvLayout {
+    pages: usize,
+    tokens_per_page: usize,
+    heads: usize,
+    head_dim: usize,
+    payload_len: usize,
+    scale_len: usize,
+    scale_bytes: usize,
+    total_bytes: usize,
+}
+
+impl PagedInt8KvLayout {
+    pub fn new(
+        pages: usize,
+        tokens_per_page: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, Error> {
+        if pages == 0 || tokens_per_page == 0 || heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "INT8 paged KV layout requires non-zero pages/tokens_per_page/heads/head_dim"
+                    .into(),
+            ));
+        }
+        let head_block = heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV head block overflow".into()))?;
+        let per_page = tokens_per_page
+            .checked_mul(head_block)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV per-page payload overflow".into()))?;
+        let payload_len = pages
+            .checked_mul(per_page)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV paged payload overflow".into()))?;
+        let scale_len = pages
+            .checked_mul(tokens_per_page)
+            .and_then(|v| v.checked_mul(heads))
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV paged scale overflow".into()))?;
+        let scale_bytes = scale_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV paged scale bytes overflow".into()))?;
+        let total_bytes = payload_len
+            .checked_add(scale_bytes)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV paged total bytes overflow".into()))?;
+        Ok(Self {
+            pages,
+            tokens_per_page,
+            heads,
+            head_dim,
+            payload_len,
+            scale_len,
+            scale_bytes,
+            total_bytes,
+        })
+    }
+
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
+    pub fn tokens_per_page(&self) -> usize {
+        self.tokens_per_page
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn scale_len(&self) -> usize {
+        self.scale_len
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn scale_bytes(&self) -> usize {
+        self.scale_bytes
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn payload_index(
+        &self,
+        page: usize,
+        offset: usize,
+        head: usize,
+        dim: usize,
+    ) -> Option<usize> {
+        if page >= self.pages
+            || offset >= self.tokens_per_page
+            || head >= self.heads
+            || dim >= self.head_dim
+        {
+            return None;
+        }
+        ((page * self.tokens_per_page + offset) * self.heads + head)
+            .checked_mul(self.head_dim)
+            .and_then(|v| v.checked_add(dim))
+    }
+
+    pub fn scale_index(&self, page: usize, offset: usize, head: usize) -> Option<usize> {
+        if page >= self.pages || offset >= self.tokens_per_page || head >= self.heads {
+            return None;
+        }
+        (page * self.tokens_per_page + offset)
+            .checked_mul(self.heads)
+            .and_then(|v| v.checked_add(head))
+    }
+}
+
+fn checked_layout_len(values: usize, expected: usize, what: &str) -> Result<(), Error> {
+    if values != expected {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 KV {what} length {values} != expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_min_len(values: usize, needed: usize, what: &str) -> Result<(), Error> {
+    if values < needed {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 KV {what} length {values} < needed {needed}"
+        )));
+    }
+    Ok(())
+}
+
+/// Scatter one contiguous `Int8Kv` into a paged payload+scale pool using
+/// `page_table[logical_page] = physical_page`. Unused page slots are left
+/// untouched.
+pub fn scatter_paged_int8(
+    src: &Int8Kv,
+    layout: &PagedInt8KvLayout,
+    page_table: &[usize],
+    payload: &mut [i8],
+    scales: &mut [f32],
+) -> Result<(), Error> {
+    if src.heads != layout.heads || src.head_dim != layout.head_dim {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 KV scatter shape mismatch: src heads/head_dim={}/{} layout={}/{}",
+            src.heads, src.head_dim, layout.heads, layout.head_dim
+        )));
+    }
+    checked_layout_len(payload.len(), layout.payload_len, "payload")?;
+    checked_layout_len(scales.len(), layout.scale_len, "scale")?;
+    let tokens = src.tokens();
+    let logical_pages = tokens.div_ceil(layout.tokens_per_page);
+    checked_min_len(page_table.len(), logical_pages, "page table")?;
+    for &page in &page_table[..logical_pages] {
+        if page >= layout.pages {
+            return Err(Error::InvalidArgument(format!(
+                "INT8 KV page table entry {page} >= pages {}",
+                layout.pages
+            )));
+        }
+    }
+
+    for token in 0..tokens {
+        let logical = token / layout.tokens_per_page;
+        let off = token % layout.tokens_per_page;
+        let page = page_table[logical];
+        for head in 0..layout.heads {
+            if let Some(idx) = layout.payload_index(page, off, head, 0) {
+                let src_row = src.head_row(token, head).unwrap();
+                payload[idx..idx + layout.head_dim].copy_from_slice(src_row);
+            }
+            if let Some(idx) = layout.scale_index(page, off, head) {
+                scales[idx] = src.scale(token, head).unwrap();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Gather `tokens` from a paged INT8 pool back into the contiguous oracle
+/// representation. This is the CPU reference for paged decode/store parity.
+pub fn gather_paged_int8(
+    layout: &PagedInt8KvLayout,
+    page_table: &[usize],
+    payload: &[i8],
+    scales: &[f32],
+    tokens: usize,
+) -> Result<Int8Kv, Error> {
+    checked_layout_len(payload.len(), layout.payload_len, "payload")?;
+    checked_layout_len(scales.len(), layout.scale_len, "scale")?;
+    let logical_pages = tokens.div_ceil(layout.tokens_per_page);
+    checked_min_len(page_table.len(), logical_pages, "page table")?;
+    for &page in &page_table[..logical_pages] {
+        if page >= layout.pages {
+            return Err(Error::InvalidArgument(format!(
+                "INT8 KV page table entry {page} >= pages {}",
+                layout.pages
+            )));
+        }
+    }
+
+    let mut q = Vec::with_capacity(tokens * layout.heads * layout.head_dim);
+    let mut out_scales = Vec::with_capacity(tokens * layout.heads);
+    for token in 0..tokens {
+        let logical = token / layout.tokens_per_page;
+        let off = token % layout.tokens_per_page;
+        let page = page_table[logical];
+        for head in 0..layout.heads {
+            let idx = layout.payload_index(page, off, head, 0).unwrap();
+            q.extend_from_slice(&payload[idx..idx + layout.head_dim]);
+            out_scales.push(scales[layout.scale_index(page, off, head).unwrap()]);
+        }
+    }
+    Ok(Int8Kv {
+        q,
+        scales: out_scales,
+        heads: layout.heads,
+        head_dim: layout.head_dim,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +601,88 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((*seed >> 33) as f32 / (1u32 << 31) as f32) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn layout_offsets_and_bytes_match_contract() {
+        let contiguous = ContiguousInt8KvLayout::new(3, 5, 2, 4).unwrap();
+        assert_eq!(contiguous.slots(), 3);
+        assert_eq!(contiguous.max_seq(), 5);
+        assert_eq!(contiguous.heads(), 2);
+        assert_eq!(contiguous.head_dim(), 4);
+        assert_eq!(contiguous.payload_len(), 3 * 5 * 2 * 4);
+        assert_eq!(contiguous.scale_len(), 3 * 5 * 2);
+        assert_eq!(contiguous.payload_bytes(), 120);
+        assert_eq!(contiguous.scale_bytes(), 30 * 4);
+        assert_eq!(contiguous.total_bytes(), 120 + 30 * 4);
+        assert_eq!(contiguous.payload_index(1, 2, 0, 3), Some(59));
+        assert_eq!(contiguous.payload_index(1, 2, 1, 0), Some(60));
+        assert_eq!(contiguous.payload_index(2, 4, 1, 3), Some(119));
+        assert_eq!(contiguous.scale_index(1, 2, 1), Some(15));
+        assert_eq!(contiguous.scale_index(2, 4, 1), Some(29));
+        assert_eq!(contiguous.payload_index(3, 0, 0, 0), None);
+        assert_eq!(contiguous.scale_index(0, 5, 0), None);
+
+        let paged = PagedInt8KvLayout::new(3, 5, 2, 4).unwrap();
+        assert_eq!(paged.pages(), 3);
+        assert_eq!(paged.tokens_per_page(), 5);
+        assert_eq!(paged.heads(), 2);
+        assert_eq!(paged.head_dim(), 4);
+        assert_eq!(paged.payload_len(), 120);
+        assert_eq!(paged.scale_len(), 30);
+        assert_eq!(paged.total_bytes(), 120 + 30 * 4);
+        assert_eq!(paged.payload_index(2, 1, 0, 3), Some(91));
+        assert_eq!(paged.payload_index(2, 1, 1, 0), Some(92));
+        assert_eq!(paged.payload_index(2, 4, 1, 3), Some(119));
+        assert_eq!(paged.scale_index(2, 1, 1), Some(23));
+        assert_eq!(paged.scale_index(2, 4, 1), Some(29));
+        assert_eq!(paged.payload_index(0, 5, 0, 0), None);
+    }
+
+    #[test]
+    fn layout_rejects_scale_byte_overflow() {
+        assert!(
+            ContiguousInt8KvLayout::new(usize::MAX / 2, 2, 1, 1).is_err(),
+            "scale byte overflow must be rejected at construction"
+        );
+        assert!(
+            PagedInt8KvLayout::new(usize::MAX / 2, 2, 1, 1).is_err(),
+            "paged scale byte overflow must be rejected at construction"
+        );
+    }
+
+    #[test]
+    fn paged_scatter_gather_roundtrips_payload_and_scales() {
+        let mut seed = 23u64;
+        let values: Vec<f32> = (0..7 * 2 * 4).map(|_| lcg(&mut seed) * 4.0).collect();
+        let src = Int8Kv::quantize(&values, 2, 4).unwrap();
+        let layout = PagedInt8KvLayout::new(3, 4, 2, 4).unwrap();
+        // Existing runtime tables are padded with unused tail entries.
+        let page_table = [2usize, 0usize, 99usize];
+        let mut payload = vec![0i8; layout.payload_len()];
+        let mut scales = vec![0.0f32; layout.scale_len()];
+
+        scatter_paged_int8(&src, &layout, &page_table, &mut payload, &mut scales).unwrap();
+        let gathered = gather_paged_int8(&layout, &page_table, &payload, &scales, 7).unwrap();
+        assert_eq!(gathered.quantized(), src.quantized());
+        assert_eq!(gathered.scales(), src.scales());
+        assert_eq!(gathered.tokens(), 7);
+    }
+
+    #[test]
+    fn paged_scatter_rejects_bad_page_table() {
+        let src = Int8Kv::quantize(&[0.0f32; 4], 1, 4).unwrap();
+        let layout = PagedInt8KvLayout::new(1, 4, 1, 4).unwrap();
+        let mut payload = vec![0i8; layout.payload_len()];
+        let mut scales = vec![0.0f32; layout.scale_len()];
+        assert!(
+            scatter_paged_int8(&src, &layout, &[1], &mut payload, &mut scales).is_err(),
+            "physical page must be in range"
+        );
+        assert!(
+            scatter_paged_int8(&src, &layout, &[], &mut payload, &mut scales).is_err(),
+            "one logical page is required"
+        );
     }
 
     #[test]
