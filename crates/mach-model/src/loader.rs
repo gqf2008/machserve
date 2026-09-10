@@ -9,6 +9,8 @@ use crate::fp8::Fp8Tensor;
 use crate::q4::Q4Tensor;
 use crate::weights::{LayerWeightsFp8, LayerWeightsQ4, WeightsFp8, WeightsQ4};
 use crate::{Config, Error, LayerWeights, Weights};
+#[cfg(windows)]
+use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
@@ -166,8 +168,108 @@ fn read_safetensors_header(path: &Path) -> Result<(HashMap<String, RawTensor>, u
     Ok((tensors, data_bytes))
 }
 
-/// Reads a safetensors file and returns `(name -> raw tensor, data_bytes)`.
-fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>), Error> {
+/// Open a checkpoint file without granting concurrent writers on Windows.
+/// `FILE_SHARE_READ` denies write/delete sharing for this handle, matching the
+/// immutability precondition of the read-only memory map.
+#[cfg(windows)]
+fn open_safetensors_readonly(path: &Path) -> Result<File, Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| Error::Model(format!("open {path:?} without write sharing: {e}")))
+}
+
+/// Parsed safetensors shard storage. On Windows payload is memory-mapped and
+/// faulted on demand; on other platforms it falls back to an owned `Vec<u8>`
+/// because safe, mandatory no-writer file locking is not portable.
+#[cfg(windows)]
+type ParsedStorage = Mmap;
+#[cfg(not(windows))]
+type ParsedStorage = Vec<u8>;
+
+struct ParsedSafetensors {
+    tensors: HashMap<String, RawTensor>,
+    storage: ParsedStorage,
+    data_start: usize,
+}
+
+impl ParsedSafetensors {
+    fn data(&self) -> &[u8] {
+        &self.storage[self.data_start..]
+    }
+}
+
+/// Open and parse a safetensors file. Windows uses a read-only mmap with
+/// write/delete sharing denied; other platforms fall back to an owned buffer.
+/// Callers only borrow tensor ranges while encoding/quantizing weights.
+fn parse_safetensors(path: &Path) -> Result<ParsedSafetensors, Error> {
+    #[cfg(windows)]
+    {
+        let file = open_safetensors_readonly(path)?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| Error::Model(format!("metadata {path:?}: {e}")))?
+            .len();
+        if file_len < 8 {
+            return Err(Error::Model(format!("{path:?}: file too short")));
+        }
+        // SAFETY: the Windows handle denies write/delete sharing for the
+        // mapping lifetime; the mapping itself is read-only and never exposed
+        // mutably.
+        let map =
+            unsafe { Mmap::map(&file) }.map_err(|e| Error::Model(format!("mmap {path:?}: {e}")))?;
+        let map_len = map.len();
+        if map_len < 8 {
+            return Err(Error::Model(format!(
+                "{path:?}: file shrank below the safetensors prefix while mapping"
+            )));
+        }
+        let header_len = u64::from_le_bytes(map[0..8].try_into().unwrap());
+        if header_len > MAX_HEADER_BYTES {
+            return Err(Error::Model(format!(
+                "{path:?}: header length {header_len} exceeds the {MAX_HEADER_BYTES}-byte cap"
+            )));
+        }
+        let data_start = 8u64
+            .checked_add(header_len)
+            .ok_or_else(|| Error::Model(format!("{path:?}: header length overflow")))?;
+        if data_start > map_len as u64 {
+            return Err(Error::Model(format!(
+                "{path:?}: header length out of range for mapped length {map_len}"
+            )));
+        }
+        let data_start = usize::try_from(data_start)
+            .map_err(|_| Error::Model(format!("{path:?}: header too large")))?;
+        let header: serde_json::Value = serde_json::from_slice(&map[8..data_start])
+            .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
+        let data_len = map_len
+            .checked_sub(data_start)
+            .ok_or_else(|| Error::Model(format!("{path:?}: mapped data length underflow")))?;
+        let tensors = parse_safetensors_header(&header, data_len)?;
+        Ok(ParsedSafetensors {
+            tensors,
+            storage: map,
+            data_start,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let (tensors, data) = parse_safetensors_owned(path)?;
+        Ok(ParsedSafetensors {
+            tensors,
+            storage: data,
+            data_start: 0,
+        })
+    }
+}
+
+/// Owned-buffer parser used by the f32/f16 multi-shard concatenation path and
+/// as the non-Windows fallback for the single-file/Q4/FP8 parser. On Windows
+/// those non-sharded paths use a read-only mmap instead.
+fn parse_safetensors_owned(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>), Error> {
     let mut bytes = std::fs::read(path).map_err(|e| Error::Model(format!("read {path:?}: {e}")))?;
     if bytes.len() < 8 {
         return Err(Error::Model(format!("{path:?}: file too short")));
@@ -190,9 +292,6 @@ fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>
         .map_err(|_| Error::Model(format!("{path:?}: header too large")))?;
     let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])
         .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
-    // Move the data segment out of the file buffer instead of copying it:
-    // `bytes` keeps only the small header, so the whole file never lives twice
-    // during the tensor loop (multi-GB shards would double host RAM).
     let data = bytes.split_off(8 + header_len);
     let tensors = parse_safetensors_header(&header, data.len())?;
     Ok((tensors, data))
@@ -552,8 +651,8 @@ fn bf16_to_f32(b: u16) -> f32 {
 
 /// Loads a single safetensors checkpoint into [`Weights`].
 pub fn load_safetensors(path: &Path, cfg: &Config, tie_embeddings: bool) -> Result<Weights, Error> {
-    let (tensors, data) = parse_safetensors(path)?;
-    build_weights(&tensors, &data, cfg, tie_embeddings)
+    let parsed = parse_safetensors(path)?;
+    build_weights(&parsed.tensors, parsed.data(), cfg, tie_embeddings)
 }
 
 /// Loads every `*.safetensors` shard in `path` and merges them into one
@@ -582,14 +681,14 @@ pub fn load_safetensors_dir(
     let mut tensors = HashMap::new();
     let mut data = Vec::new();
     for f in &files {
-        let (mut t, d) = parse_safetensors(f)?;
+        let (mut shard_tensors, shard_data) = parse_safetensors_owned(f)?;
         let base = data.len();
-        for rt in t.values_mut() {
+        for rt in shard_tensors.values_mut() {
             rt.start += base;
             rt.end += base;
         }
-        tensors.extend(t);
-        data.extend(d);
+        tensors.extend(shard_tensors);
+        data.extend(shard_data);
     }
     build_weights(&tensors, &data, cfg, tie_embeddings)
 }
@@ -988,12 +1087,15 @@ fn build_weights(
     })
 }
 
-/// Loads a checkpoint into storage-Q4 form, streaming shards one at a time so
-/// host memory stays ~= the packed Q4 weights + one shard of raw bytes (8B
-/// model: ~5GB instead of ~48GB for the f32 path).
+/// Loads a checkpoint into storage-Q4 form, streaming shards one at a time.
+/// On Windows shard payload is mmap-backed (no private whole-shard copy); on
+/// other platforms it retains one owned raw-shard buffer at a time. Host
+/// private memory is ~= packed Q4 weights plus that platform-dependent scratch
+/// (8B model: ~5GB instead of ~48GB for the f32 path).
 ///
-/// Every GEMM weight is quantized to int4 as it is read and the raw shard
-/// bytes are dropped before the next shard. Norms and biases stay f32.
+/// Every GEMM weight is quantized to int4 as it is read: Windows uses a
+/// read-only mmap; other platforms use the owned-buffer fallback. Norms and
+/// biases stay f32.
 pub fn load_safetensors_q4(
     path: &Path,
     cfg: &Config,
@@ -1033,13 +1135,15 @@ pub fn load_safetensors_q4(
         .min(16);
 
     for file in &files {
-        let (tensors, data) = parse_safetensors(file)?;
+        let parsed = parse_safetensors(file)?;
+        let tensors = &parsed.tensors;
+        let data = parsed.data();
 
         // Classify this shard's tensors: GEMM weights are quantized (parallel),
         // norms/biases stay f32 (inline). Big-vs-small is decided by whether the
         // name maps to a known GEMM weight.
         let mut big_work: Vec<(String, usize)> = Vec::new();
-        for (name, t) in &tensors {
+        for (name, t) in tensors {
             // VLM auxiliary stacks (Qwen3.5 VLM): HF's own text-only class
             // ignores `^mtp.*` / `^model.visual.*` on load. Skipping here
             // also keeps `mtp.layers.*.self_attn.q_proj.weight` out of the
@@ -1065,7 +1169,7 @@ pub fn load_safetensors_q4(
                 };
                 small.insert(
                     name.clone(),
-                    load_small_f32(&data, t, e, name, cfg.zero_centered_norm)?,
+                    load_small_f32(data, t, e, name, cfg.zero_centered_norm)?,
                 );
                 None
             } else {
@@ -1082,7 +1186,7 @@ pub fn load_safetensors_q4(
         // Decode + quantize the GEMM tensors in parallel: per-element CPU work
         // dominates Q4 load, so the shard's tensors are split across threads
         // (peak host RAM is one shard's decoded f32 tensors, then the shard's
-        // raw bytes are dropped before the next shard).
+        // mmap window or owned shard buffer is dropped before the next shard).
         let next = std::sync::atomic::AtomicUsize::new(0);
         let results: std::sync::Mutex<Vec<(String, Q4Tensor)>> =
             std::sync::Mutex::new(Vec::with_capacity(big_work.len()));
@@ -1098,7 +1202,7 @@ pub fn load_safetensors_q4(
                         let Some((name, expected)) = big_work.get(i) else {
                             break;
                         };
-                        match tensor_f32_par(&data, &tensors[name], *expected, name) {
+                        match tensor_f32_par(data, &tensors[name], *expected, name) {
                             Ok(f) => {
                                 let q = Q4Tensor::quantize_par(&f);
                                 results.lock().unwrap().push((name.clone(), q));
@@ -1121,8 +1225,7 @@ pub fn load_safetensors_q4(
         for (name, q) in results.into_inner().unwrap() {
             big.insert(name, q);
         }
-        // Drop this shard's raw bytes before reading the next.
-        drop(data);
+        // `parsed` (and its mmap) is dropped before the next shard.
     }
 
     // Assemble per-layer Q4 weights.
@@ -1386,14 +1489,16 @@ pub fn load_safetensors_q4(
     })
 }
 
-/// Loads a checkpoint into storage-FP8 form, streaming shards one at a time so
-/// host memory stays ~= the packed FP8 weights + one shard of raw bytes
-/// (8B model: ~8GB instead of ~48GB for the f32 path / ~16GB for f16).
+/// Loads a checkpoint into storage-FP8 form, streaming shards one at a time.
+/// On Windows shard payload is mmap-backed (no private whole-shard copy); on
+/// other platforms it retains one owned raw-shard buffer at a time. Host
+/// private memory is ~= packed FP8 weights plus that platform-dependent
+/// scratch (8B model: ~8GB instead of ~48GB f32 / ~16GB f16).
 ///
 /// Every GEMM weight is quantized to E4M3 (one byte/element + one f32 scale
 /// per tensor; MoE experts keep per-expert scales and concatenate by appending
-/// packed bytes + scales) as it is read, and the raw shard bytes are dropped
-/// before the next shard. Norms and biases stay f32.
+/// packed bytes + scales) as it is read. Windows uses a read-only mmap; other
+/// platforms retain the previous owned-shard fallback. Norms and biases stay f32.
 pub fn load_safetensors_fp8(
     path: &Path,
     cfg: &Config,
@@ -1433,14 +1538,16 @@ pub fn load_safetensors_fp8(
         .min(16);
 
     for file in &files {
-        let (tensors, data) = parse_safetensors(file)?;
+        let parsed = parse_safetensors(file)?;
+        let tensors = &parsed.tensors;
+        let data = parsed.data();
 
         // Classify this shard's tensors: GEMM weights are quantized (parallel),
         // norms/biases stay f32 (inline). Big-vs-small is decided by whether the
         // name maps to a known GEMM weight (same shape matcher as the Q4
         // loader; only the quantization differs).
         let mut big_work: Vec<(String, usize)> = Vec::new();
-        for (name, t) in &tensors {
+        for (name, t) in tensors {
             // VLM auxiliary stacks (Qwen3.5 VLM): same skip as the Q4 loader.
             if name.starts_with("mtp.") || name.starts_with("model.visual.") {
                 continue;
@@ -1463,7 +1570,7 @@ pub fn load_safetensors_fp8(
                 };
                 small.insert(
                     name.clone(),
-                    load_small_f32(&data, t, e, name, cfg.zero_centered_norm)?,
+                    load_small_f32(data, t, e, name, cfg.zero_centered_norm)?,
                 );
                 None
             } else {
@@ -1480,7 +1587,7 @@ pub fn load_safetensors_fp8(
         // Decode + quantize the GEMM tensors in parallel: per-element CPU work
         // dominates FP8 load, so the shard's tensors are split across threads
         // (peak host RAM is one shard's decoded f32 tensors, then the shard's
-        // raw bytes are dropped before the next shard).
+        // mmap window or owned shard buffer is dropped before the next shard).
         let next = std::sync::atomic::AtomicUsize::new(0);
         let results: std::sync::Mutex<Vec<(String, Fp8Tensor)>> =
             std::sync::Mutex::new(Vec::with_capacity(big_work.len()));
@@ -1496,7 +1603,7 @@ pub fn load_safetensors_fp8(
                         let Some((name, expected)) = big_work.get(i) else {
                             break;
                         };
-                        match tensor_f32(&data, &tensors[name], *expected, name) {
+                        match tensor_f32(data, &tensors[name], *expected, name) {
                             Ok(f) => {
                                 let q = Fp8Tensor::quantize_par(&f);
                                 results.lock().unwrap().push((name.clone(), q));
@@ -1519,8 +1626,7 @@ pub fn load_safetensors_fp8(
         for (name, q) in results.into_inner().unwrap() {
             big.insert(name, q);
         }
-        // Drop this shard's raw bytes before reading the next.
-        drop(data);
+        // `parsed` (and its mmap) is dropped before the next shard.
     }
 
     // Assemble per-layer FP8 weights.
@@ -1960,6 +2066,33 @@ mod tests {
             end: n * elem,
         };
         (t, data)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mmap_denies_concurrent_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "machserve-mmap-share-{}.safetensors",
+            std::process::id()
+        ));
+        let header = r#"{"x":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let parsed = parse_safetensors(&path).unwrap();
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&path).is_err(),
+            "a writer must not open the file while the mmap is live"
+        );
+        drop(parsed);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("writer becomes available after the mmap is dropped");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

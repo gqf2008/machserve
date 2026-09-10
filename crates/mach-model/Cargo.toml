@@ -34,3 +34,6 @@ tinyvec = ">=1.12, <1.13"
 [lints]
 workspace = true
 
+
+[target.'cfg(windows)'.dependencies]
+memmap2 = "0.9"
