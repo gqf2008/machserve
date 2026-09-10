@@ -19,6 +19,7 @@ pub mod fp16;
 pub mod fp64_ref;
 pub mod fp8;
 pub mod kv_block_pool;
+pub mod kv_quant;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
