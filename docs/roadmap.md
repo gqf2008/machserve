@@ -1665,3 +1665,16 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
   首版 Phase-A 用 scalar i8 load 保正确性，向量化留到 GPU 对拍后再做。
 - wrapper 层拒绝零形状、非法 GQA geometry、非有限/非正 softmax scale 和
   `256 % head_dim != 0`；内核源码进入 `ALL_KERNELS` 离线 hiprtc 编译。
+
+## INT8 KV Stage 5：paged store/attention HIP 内核（compile-only，#134，2026-09-11）
+
+连续 INT8 kernel（#133）之后补齐 paged 路径，内核计数 64→66，仍不接 runtime。
+
+- `kv_store_paged_int8`：block-per-(sequence, kv_head)，经 block table 定位
+  `[pages,tokens_per_page,kv_heads,head_dim]` 的 payload/scale 位置，量化规则与
+  连续 store 一致。
+- `attn_decode_paged_int8_gqa`：block-per-(sequence, query head)，double
+  score/softmax/V 累加，经 page table 逐 token 读取 INT8 K/V 与 per-token/head
+  scale，最终饱和回 f32。
+- wrapper 校验正形状、GQA geometry、`256 % head_dim == 0` 与 `i32::MAX` grid 上限；
+  GPU 数值 parity 仍留真机窗口。
