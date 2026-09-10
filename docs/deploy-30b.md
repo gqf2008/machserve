@@ -32,7 +32,7 @@ MACH_CONFIG=config.json MACH_Q4=1 MACH_MOE_SLOTS=2 MACH_CAPACITY=8 MACH_PREFILL_
 curl http://127.0.0.1:8080/v1/completions -d '{"model":"x","prompt":"你好","max_tokens":16}'
 ```
 
-> 注意：MACH_MODEL 只需指向任一 shard 文件名（loader 按目录发现全部 shard）；Q4 要求 f16 计算路径（默认）。
+> 注意：MACH_MODEL 只需指向任一 shard 文件名（server 会解析到该目录，loader 发现全部 shard）；同目录的 `config.json` / `tokenizer.json` 自动发现，`MACH_CONFIG` / `MACH_TOKENIZER` 可显式覆盖。Q4 要求 f16 计算路径（默认）。
 
 ## 4. 现状结论（2026-08-25）
 

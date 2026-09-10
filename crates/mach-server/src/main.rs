@@ -5,7 +5,9 @@
 //!   cargo run -p mach-server --release --features hip
 //!
 //! Env: MACH_MODELS (default ".models"), MACH_MODEL (default
-//! "qwen-0.5b.safetensors"), MACH_CONFIG (default "qwen-config.json"),
+//! "qwen-0.5b.safetensors"; an HF shard filename resolves to its directory),
+//! MACH_CONFIG (optional; defaults to `config.json` beside the checkpoint,
+//! then the legacy `qwen-config.json`),
 //! MACH_CAPACITY (default 64), MACH_PREFILL_ROWS (default 512),
 //! MACH_ADDR (default "127.0.0.1:8080"), MACH_Q4 / MACH_FP8 (storage-quantized
 //! host weights: int4 or E4M3, dequantized to f16 on the device),
@@ -47,8 +49,10 @@ use mach_model::tokenizer::Tokenizer;
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ChatFormat, ServerEngine, router};
-#[cfg(feature = "hip")]
-use std::path::PathBuf;
+#[cfg(any(feature = "hip", test))]
+use std::ffi::OsStr;
+#[cfg(any(feature = "hip", test))]
+use std::path::{Path, PathBuf};
 
 /// Collapse a model-family name to a lowercase alphanumeric key so the two
 /// places it can come from agree: `model_type` is snake_case (`deepseek_v2`)
@@ -330,6 +334,90 @@ fn chat_format_from_json(path: &std::path::Path) -> ChatFormat {
     }
 }
 
+/// True when `name` follows the Hugging Face multi-shard convention
+/// (`model-00001-of-00018.safetensors`, also used with a `pytorch_model`
+/// prefix). Such a file is only one piece of a checkpoint; the loader must be
+/// given its containing directory or it will report unrelated tensors missing.
+#[cfg(any(feature = "hip", test))]
+fn is_hf_shard_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".safetensors") else {
+        return false;
+    };
+    let Some((prefix, total)) = stem.rsplit_once("-of-") else {
+        return false;
+    };
+    let Some((stem, index)) = prefix.rsplit_once('-') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !index.is_empty()
+        && !total.is_empty()
+        && index.chars().all(|c| c.is_ascii_digit())
+        && total.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Resolve a checkpoint input to the path the loaders actually need.
+///
+/// A directory stays a directory. A shard file is promoted to its parent so
+/// `MACH_MODEL=model-00001-of-00018.safetensors` follows the documented HF
+/// workflow instead of loading one shard in isolation. Standalone files stay
+/// files, which keeps `.models/qwen-0.5b.safetensors` from absorbing every
+/// unrelated checkpoint in the models root.
+#[cfg(any(feature = "hip", test))]
+fn resolve_checkpoint_path(root: &Path, model: &str) -> PathBuf {
+    let path = root.join(model);
+    if path.is_file() && is_hf_shard_file(&path) {
+        return path.parent().unwrap_or(root).to_path_buf();
+    }
+    path
+}
+
+/// Resolve the checkpoint config. An explicit `MACH_CONFIG` always wins.
+/// Otherwise use `config.json` next to the model (directory or shard parent),
+/// falling back to the legacy models-root `qwen-config.json`.
+#[cfg(any(feature = "hip", test))]
+fn resolve_config_path(root: &Path, model: &str, explicit: Option<&OsStr>) -> PathBuf {
+    if let Some(name) = explicit {
+        return root.join(name);
+    }
+    let checkpoint = resolve_checkpoint_path(root, model);
+    let dir = if checkpoint.is_dir() {
+        checkpoint.as_path()
+    } else {
+        checkpoint.parent().unwrap_or(root)
+    };
+    let local = dir.join("config.json");
+    if local.is_file() {
+        local
+    } else {
+        root.join("qwen-config.json")
+    }
+}
+
+/// Resolve the tokenizer beside a checkpoint directory/shard parent, with an
+/// explicit `MACH_TOKENIZER` override and the legacy models-root fallback.
+#[cfg(any(feature = "hip", test))]
+fn resolve_tokenizer_path(root: &Path, model: &str, explicit: Option<&OsStr>) -> PathBuf {
+    if let Some(name) = explicit {
+        return root.join(name);
+    }
+    let checkpoint = resolve_checkpoint_path(root, model);
+    let dir = if checkpoint.is_dir() {
+        checkpoint.as_path()
+    } else {
+        checkpoint.parent().unwrap_or(root)
+    };
+    let local = dir.join("tokenizer.json");
+    if local.is_file() {
+        local
+    } else {
+        root.join("tokenizer.json")
+    }
+}
+
 /// Total weight-payload size for the VRAM preflight: a single checkpoint file,
 /// or the sum of every `*.safetensors` shard when `path` is a directory of
 /// shards (Qwen-8B+ checkpoints ship as 5..65 files). A bare directory's
@@ -337,7 +425,7 @@ fn chat_format_from_json(path: &std::path::Path) -> ChatFormat {
 /// preflight pass while the actual upload OOMs. Best-effort: unreadable shard
 /// entries are skipped, and a directory with no shards sums to 0.
 #[cfg(feature = "hip")]
-fn model_file_bytes(path: &std::path::Path) -> u64 {
+fn model_file_bytes(path: &Path) -> u64 {
     if let Ok(entries) = std::fs::read_dir(path) {
         // Directory of shards: sum every `*.safetensors`; non-shard files and
         // unreadable entries are skipped (best-effort preflight estimate).
@@ -544,23 +632,35 @@ fn run_doctor() {
 
     let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
     let model_name = std::env::var("MACH_MODEL").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
-    let config_name = std::env::var("MACH_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
+    let explicit_config = std::env::var_os("MACH_CONFIG");
+    let explicit_tokenizer = std::env::var_os("MACH_TOKENIZER");
     println!("models dir: {root}");
     let root = std::path::PathBuf::from(root);
-    for (label, f) in [("model", &model_name), ("config", &config_name)] {
-        let path = root.join(f);
-        match std::fs::metadata(&path) {
-            Ok(m) => println!("  {label} {f}: {} bytes", m.len()),
-            Err(e) => println!("  {label} {f}: MISSING ({e})"),
+    let checkpoint_path = resolve_checkpoint_path(&root, &model_name);
+    let config_path = resolve_config_path(&root, &model_name, explicit_config.as_deref());
+    let tokenizer_path = resolve_tokenizer_path(&root, &model_name, explicit_tokenizer.as_deref());
+    for (label, path) in [
+        ("model", &checkpoint_path),
+        ("config", &config_path),
+        ("tokenizer", &tokenizer_path),
+    ] {
+        let size = if label == "model" {
+            model_file_bytes(path)
+        } else {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        };
+        match std::fs::metadata(path) {
+            Ok(_) => println!("  {label} {}: {size} bytes", path.display()),
+            Err(e) => println!("  {label} {}: MISSING ({e})", path.display()),
         }
     }
     // Best-effort VRAM estimate; the server preflight is authoritative.
     let cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        config_from_json(&root.join(&config_name))
+        config_from_json(&config_path)
     }))
     .ok();
     if let Some(cfg) = cfg {
-        let fb = model_file_bytes(&root.join(&model_name));
+        let fb = model_file_bytes(&checkpoint_path);
         let cap = std::env::var("MACH_CAPACITY")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -593,9 +693,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let root = std::env::var("MACH_MODELS").unwrap_or_else(|_| ".models".into());
     let model_name = std::env::var("MACH_MODEL").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
-    let config_name = std::env::var("MACH_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
-    let tokenizer_name =
-        std::env::var("MACH_TOKENIZER").unwrap_or_else(|_| "tokenizer.json".into());
+    let explicit_config = std::env::var_os("MACH_CONFIG");
+    let explicit_tokenizer = std::env::var_os("MACH_TOKENIZER");
     let capacity = std::env::var("MACH_CAPACITY")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -636,7 +735,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
 
     let root = PathBuf::from(root);
-    let mut cfg = config_from_json(&root.join(&config_name));
+    let checkpoint_path = resolve_checkpoint_path(&root, &model_name);
+    let config_path = resolve_config_path(&root, &model_name, explicit_config.as_deref());
+    let tokenizer_path = resolve_tokenizer_path(&root, &model_name, explicit_tokenizer.as_deref());
+    let mut cfg = config_from_json(&config_path);
     match dtype.as_str() {
         "f32" => cfg.dtype = ModelDType::F32,
         "f16" => cfg.dtype = ModelDType::F16,
@@ -730,7 +832,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // NOTE: hipBLAS workspace and compiled kernels are not counted; the 256MiB
     // margin covers today's tiny/1.5B scenarios.
-    let file_bytes = model_file_bytes(&root.join(&model_name));
+    let file_bytes = model_file_bytes(&checkpoint_path);
     let draft_est = if spec {
         let dfb = model_file_bytes(&root.join(&draft_name));
         let mut dcfg = config_from_json(&root.join(&draft_config));
@@ -792,17 +894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // look there first: pointing MACH_MODEL at a directory must not silently
     // pick up some other model's vocabulary from the models root (a
     // DeepSeek checkpoint would then be served with Qwen's 151k vocab).
-    let tok_path = match std::env::var_os("MACH_TOKENIZER") {
-        Some(t) => root.join(t),
-        None => {
-            let in_model = root.join(&model_name).join("tokenizer.json");
-            if in_model.is_file() {
-                in_model
-            } else {
-                root.join(&tokenizer_name)
-            }
-        }
-    };
+    let tok_path = tokenizer_path;
     let tok = if tok_path.exists() {
         let t = Tokenizer::from_path(&tok_path).expect("load tokenizer");
         println!(
@@ -858,7 +950,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (engine, engine_handle) = if q4 {
         let wq4: WeightsQ4 =
-            load_safetensors_q4(&root.join(&model_name), &cfg, true).expect("load q4 weights");
+            load_safetensors_q4(&checkpoint_path, &cfg, true).expect("load q4 weights");
         println!(
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage Q4; host weights stay packed int4, device dequantizes to f16)",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
@@ -875,7 +967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (eng, handle)
     } else if fp8 {
         let wfp8: WeightsFp8 =
-            load_safetensors_fp8(&root.join(&model_name), &cfg, true).expect("load fp8 weights");
+            load_safetensors_fp8(&checkpoint_path, &cfg, true).expect("load fp8 weights");
         println!(
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?} (storage FP8; host weights stay packed E4M3, device dequantizes to f16)",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
@@ -893,7 +985,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         let w: Weights =
-            load_safetensors(&root.join(&model_name), &cfg, true).expect("load target weights");
+            load_safetensors(&checkpoint_path, &cfg, true).expect("load target weights");
         println!(
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
@@ -919,8 +1011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
         (eng, handle)
     } else {
-        let w: Weights =
-            load_safetensors(&root.join(&model_name), &cfg, true).expect("load weights");
+        let w: Weights = load_safetensors(&checkpoint_path, &cfg, true).expect("load weights");
         println!(
             "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
             cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
@@ -944,7 +1035,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: engine.clone(),
         model: model_name,
         tok,
-        chat_format: chat_format_from_json(&root.join(&config_name)),
+        chat_format: chat_format_from_json(&config_path),
     };
     let app = router(state);
     println!(
@@ -995,6 +1086,102 @@ fn main() {
         _ => eprintln!(
             "mach-server requires the `hip` feature: cargo run -p mach-server --features hip"
         ),
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_path_tests {
+    use super::*;
+
+    #[test]
+    fn hf_shard_and_local_metadata_resolution() {
+        let root =
+            std::env::temp_dir().join(format!("mach_checkpoint_paths_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("qwen3.8-27b");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("config.json"), b"{}").unwrap();
+        std::fs::write(repo.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(repo.join("model-00001-of-00002.safetensors"), b"one").unwrap();
+        std::fs::write(repo.join("model-00002-of-00002.safetensors"), b"two").unwrap();
+
+        assert!(is_hf_shard_file(
+            &repo.join("model-00001-of-00002.safetensors")
+        ));
+        assert!(!is_hf_shard_file(&repo.join("model.safetensors")));
+        assert_eq!(
+            resolve_checkpoint_path(&root, "qwen3.8-27b"),
+            repo,
+            "directory input stays a directory"
+        );
+        assert_eq!(
+            resolve_checkpoint_path(&root, "qwen3.8-27b/model-00001-of-00002.safetensors"),
+            repo,
+            "any HF shard resolves to the shard directory"
+        );
+        assert_eq!(
+            resolve_config_path(&root, "qwen3.8-27b/model-00001-of-00002.safetensors", None),
+            repo.join("config.json"),
+            "model-local config is discovered from a shard path"
+        );
+        assert_eq!(
+            resolve_tokenizer_path(&root, "qwen3.8-27b/model-00001-of-00002.safetensors", None),
+            repo.join("tokenizer.json"),
+            "model-local tokenizer is discovered from a shard path"
+        );
+        assert_eq!(
+            resolve_config_path(
+                &root,
+                "qwen3.8-27b/model-00001-of-00002.safetensors",
+                Some(OsStr::new("custom.json"))
+            ),
+            root.join("custom.json"),
+            "explicit MACH_CONFIG wins"
+        );
+        assert_eq!(
+            resolve_tokenizer_path(
+                &root,
+                "qwen3.8-27b/model-00001-of-00002.safetensors",
+                Some(OsStr::new("custom-tokenizer.json"))
+            ),
+            root.join("custom-tokenizer.json"),
+            "explicit MACH_TOKENIZER wins"
+        );
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            // WTF-16 permits an unpaired surrogate; this is the Windows form of
+            // a non-Unicode OsString and must survive path resolution intact.
+            let non_unicode = std::ffi::OsString::from_wide(&[0xD800, b'x' as u16]);
+            assert_eq!(
+                resolve_config_path(&root, "qwen3.8-27b", Some(non_unicode.as_os_str())),
+                root.join(&non_unicode),
+                "non-Unicode explicit config path must not be converted to UTF-8"
+            );
+        }
+
+        let standalone = root.join("qwen-0.5b.safetensors");
+        std::fs::write(&standalone, b"single").unwrap();
+        assert_eq!(
+            resolve_checkpoint_path(&root, "qwen-0.5b.safetensors"),
+            standalone,
+            "standalone checkpoints do not absorb their parent directory"
+        );
+        assert_eq!(
+            resolve_config_path(&root, "qwen-0.5b.safetensors", None),
+            root.join("qwen-config.json"),
+            "standalone files keep the legacy root fallback"
+        );
+
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            resolve_config_path(&root, "bare", None),
+            root.join("qwen-config.json"),
+            "a directory without config.json keeps the legacy fallback"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
