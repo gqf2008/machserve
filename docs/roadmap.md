@@ -1651,3 +1651,17 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
   decode ≈6-7 tok/s(Stage A 顺序期 ~4-5),chunk 步 wall ≈0.6-1.1s
   /12 行——投影按行批摊销后 prefill 每 token 成本降至 decode 量级,
   长 prompt TTFT 相应大幅缩短(顺序期 130 步 → 11 步)。
+
+## INT8 KV Stage 4：连续 store/attention HIP 内核（compile-only，#132，2026-09-11）
+
+在 #127/#129/#131 的 INT8 KV oracle、连续/分页布局和 CPU decode 之后，
+本批补齐连续路径的两枚 HIP 内核并接入离线 hiprtc 门禁（内核计数 62→64），
+但**不接运行时**；没有真机 GPU parity 前 `MACH_KV=int8` 不暴露。
+
+- `kv_store_int8`：每 `(sequence, kv_head)` 一个 block，shared max 归约得到
+  per-token/head scale，写 `[slots,max_seq,kv_heads,head_dim]` 的 signed-byte payload。
+- `attn_decode_batched_int8_gqa`：f32 Q + INT8 K/V + K/V scales；GQA 映射、
+  逐 token K scale、per-token/head V scale 与 CPU `attention_decode_int8` 同契约。
+  首版 Phase-A 用 scalar i8 load 保正确性，向量化留到 GPU 对拍后再做。
+- wrapper 层拒绝零形状、非法 GQA geometry、非有限/非正 softmax scale 和
+  `256 % head_dim != 0`；内核源码进入 `ALL_KERNELS` 离线 hiprtc 编译。
