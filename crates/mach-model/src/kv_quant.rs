@@ -48,6 +48,36 @@ pub struct Int8Kv {
 }
 
 impl Int8Kv {
+    /// Create an empty cache for later [`Self::append_rows`] calls.
+    pub fn empty(heads: usize, head_dim: usize) -> Result<Self, Error> {
+        if heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "INT8 KV requires non-zero heads and head_dim".into(),
+            ));
+        }
+        heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::InvalidArgument("INT8 KV head block overflow".into()))?;
+        Ok(Self {
+            q: Vec::new(),
+            scales: Vec::new(),
+            heads,
+            head_dim,
+        })
+    }
+
+    /// Append one or more `[tokens, heads, head_dim]` rows, preserving the
+    /// existing per-token/head scales.
+    pub fn append_rows(&mut self, values: &[f32]) -> Result<(), Error> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let add = Self::quantize(values, self.heads, self.head_dim)?;
+        self.q.extend_from_slice(&add.q);
+        self.scales.extend_from_slice(&add.scales);
+        Ok(())
+    }
+
     /// Quantize `values` shaped `[tokens, heads, head_dim]` with one symmetric
     /// scale per `(token, head)`. The quantized range is `[-127, 127]`; `-128`
     /// is deliberately unused so dequantization stays exactly symmetric.
@@ -927,6 +957,26 @@ mod tests {
             scatter_paged_int8(&src, &layout, &[], &mut payload, &mut scales).is_err(),
             "one logical page is required"
         );
+    }
+
+    #[test]
+    fn empty_rejects_head_block_overflow() {
+        assert!(Int8Kv::empty(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn append_rows_matches_one_shot_quantization() {
+        let mut seed = 31u64;
+        let first: Vec<f32> = (0..3 * 2 * 4).map(|_| lcg(&mut seed) * 2.0).collect();
+        let second: Vec<f32> = (0..2 * 2 * 4).map(|_| lcg(&mut seed) * 2.0).collect();
+        let mut appended = Int8Kv::empty(2, 4).unwrap();
+        appended.append_rows(&first).unwrap();
+        appended.append_rows(&second).unwrap();
+        let mut all = first;
+        all.extend_from_slice(&second);
+        let one_shot = Int8Kv::quantize(&all, 2, 4).unwrap();
+        assert_eq!(appended.quantized(), one_shot.quantized());
+        assert_eq!(appended.scales(), one_shot.scales());
     }
 
     #[test]

@@ -3,7 +3,11 @@
 //! Used as the golden reference for the GPU path: identical math, naive
 //! loops, no SIMD. The GPU tests compare against this within tolerance.
 
+use crate::kv_quant::{Int8Kv, attention_decode_int8};
 use crate::{Config, LayerWeights, Weights};
+
+/// Per-layer KV bytes in the host framing used by anchors/page snapshots.
+pub type KvSliceBytes = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// CPU reference model with an explicit KV cache.
 #[derive(Debug)]
@@ -12,6 +16,9 @@ pub struct RefModel {
     w: Weights,
     /// Per layer: (k, v), each `[n_kv_heads, max_seq_len, head_dim]`.
     kv: Vec<(Vec<f32>, Vec<f32>)>,
+    /// Optional INT8 KV mode for full-attention layers. GDN/MLA layers keep
+    /// their original paths.
+    kv_int8: Option<Vec<(Int8Kv, Int8Kv)>>,
     /// Per layer MLA (kv_lora_rank > 0): expanded per-head k `[n_heads,
     /// max_seq_len, qk_nope+qk_rope]` and v `[n_heads, max_seq_len, v_head_dim]`.
     mla_kv: Vec<(Vec<f32>, Vec<f32>)>,
@@ -79,12 +86,30 @@ impl RefModel {
             cfg,
             w,
             kv,
+            kv_int8: None,
             mla_kv,
             gdn_state,
             gdn_conv,
             pos: 0,
             last_hidden: Vec::new(),
         }
+    }
+
+    /// Build a reference model whose full-attention layers keep K/V as INT8
+    /// (per-token/head scale). MLA and GDN state remain unchanged.
+    #[must_use]
+    pub fn new_int8_kv(cfg: Config, w: Weights) -> Self {
+        let mut model = Self::new(cfg, w);
+        let caches = (0..cfg.n_layers)
+            .map(|_| {
+                (
+                    Int8Kv::empty(cfg.n_kv_heads, cfg.head_dim).unwrap(),
+                    Int8Kv::empty(cfg.n_kv_heads, cfg.head_dim).unwrap(),
+                )
+            })
+            .collect();
+        model.kv_int8 = Some(caches);
+        model
     }
 
     /// Processes `tokens` one by one and returns logits of the final token.
@@ -167,12 +192,18 @@ impl RefModel {
                 apply_rope(&mut q, cfg.n_heads, cfg.head_dim, rot, pos, cfg);
                 apply_rope(&mut k, cfg.n_kv_heads, cfg.head_dim, rot, pos, cfg);
 
-                // Store into KV cache.
-                store_row(&mut self.kv[li].0, &k, pos, cfg);
-                store_row(&mut self.kv[li].1, &v, pos, cfg);
-
-                // Attention over positions 0..=pos.
-                let mut attn = attention_decode(&q, &self.kv[li].0, &self.kv[li].1, pos, cfg);
+                // Store into the selected KV representation and attend.
+                let mut attn = if let Some(caches) = &mut self.kv_int8 {
+                    let (kc, vc) = &mut caches[li];
+                    kc.append_rows(&k).expect("append INT8 K");
+                    vc.append_rows(&v).expect("append INT8 V");
+                    attention_decode_int8(&q, cfg.n_heads, kc, vc, cfg.attn_scale(hd))
+                        .expect("INT8 KV attention")
+                } else {
+                    store_row(&mut self.kv[li].0, &k, pos, cfg);
+                    store_row(&mut self.kv[li].1, &v, pos, cfg);
+                    attention_decode(&q, &self.kv[li].0, &self.kv[li].1, pos, cfg)
+                };
                 if cfg.attn_output_gate {
                     for (a, g) in attn.iter_mut().zip(&gate) {
                         *a *= 1.0 / (1.0 + (-g).exp());
@@ -295,6 +326,11 @@ impl RefModel {
         token_idx: usize,
     ) -> Result<crate::state_reuse::Anchor, crate::Error> {
         use crate::state_reuse::{Anchor, KvSnapshot};
+        if self.kv_int8.is_some() {
+            return Err(crate::Error::InvalidArgument(
+                "state anchors do not support INT8 KV RefModel yet".into(),
+            ));
+        }
         if tokens.len() != token_idx + 1 {
             return Err(crate::Error::InvalidArgument(format!(
                 "anchor token_idx {token_idx} does not match {} prefix tokens",
@@ -346,6 +382,11 @@ impl RefModel {
         &mut self,
         anchor: &crate::state_reuse::Anchor,
     ) -> Result<(), crate::Error> {
+        if self.kv_int8.is_some() {
+            return Err(crate::Error::InvalidArgument(
+                "state anchors do not support INT8 KV RefModel yet".into(),
+            ));
+        }
         let cfg = self.cfg;
         if anchor.kv.layers.len() != cfg.n_layers {
             return Err(crate::Error::InvalidArgument(format!(
@@ -413,21 +454,28 @@ impl RefModel {
     /// Extracts per-layer KV bytes for positions `[start, end)` (same host
     /// framing as [`Self::save_anchor`]). Used by the page-prefix cache to
     /// store one page's KV independently of the rest of the prefix.
-    #[must_use]
-    pub fn kv_slice_bytes(&self, start: usize, end: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-        assert!(
-            start < end && end <= self.pos,
-            "kv slice must be within processed positions"
-        );
+    pub fn kv_slice_bytes(&self, start: usize, end: usize) -> Result<KvSliceBytes, crate::Error> {
+        if self.kv_int8.is_some() {
+            return Err(crate::Error::InvalidArgument(
+                "kv_slice_bytes does not support INT8 KV RefModel yet".into(),
+            ));
+        }
+        if start >= end || end > self.pos {
+            return Err(crate::Error::InvalidArgument(format!(
+                "kv slice [{start}, {end}) must be within processed positions 0..{}",
+                self.pos
+            )));
+        }
         let cfg = self.cfg;
         if cfg.kv_lora_rank == 0 {
             let row = cfg.n_kv_heads * cfg.head_dim;
             let n0 = start * row;
             let n1 = end * row;
-            self.kv
+            Ok(self
+                .kv
                 .iter()
                 .map(|(k, v)| (f32s_to_bytes(&k[n0..n1]), f32s_to_bytes(&v[n0..n1])))
-                .collect()
+                .collect())
         } else {
             let heads = cfg.n_heads;
             let hd = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
@@ -435,10 +483,11 @@ impl RefModel {
             let kn1 = end * heads * hd;
             let vn0 = start * heads * cfg.v_head_dim;
             let vn1 = end * heads * cfg.v_head_dim;
-            self.mla_kv
+            Ok(self
+                .mla_kv
                 .iter()
                 .map(|(k, v)| (f32s_to_bytes(&k[kn0..kn1]), f32s_to_bytes(&v[vn0..vn1])))
-                .collect()
+                .collect())
         }
     }
 
@@ -1145,6 +1194,64 @@ pub(crate) fn silu(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn int8_kv_refmodel_tracks_f32_over_multiple_tokens() {
+        let cfg = Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 64, 2, 4, 8, 4);
+        let w = Weights::random(&cfg, 77).unwrap();
+        let tokens = [3u32, 17, 42, 5, 11, 29, 7, 13];
+        let mut f32_model = RefModel::new(cfg, w.clone());
+        let mut int8_model = RefModel::new_int8_kv(cfg, w);
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let mut full_attn_layers = 0usize;
+        let mut max_diff = 0.0f32;
+        for (step, &token) in tokens.iter().enumerate() {
+            let a = f32_model.decode_step(token);
+            let b = int8_model.decode_step(token);
+            assert_eq!(a.len(), b.len());
+            assert_eq!(argmax(&a), argmax(&b), "greedy diverged at step {step}");
+            for (x, y) in a.iter().zip(&b) {
+                assert!(
+                    x.is_finite() && y.is_finite(),
+                    "step {step}: non-finite logits"
+                );
+                max_diff = max_diff.max((x - y).abs());
+            }
+            let caches = int8_model.kv_int8.as_ref().unwrap();
+            for (li, lw) in int8_model.w.layers.iter().enumerate() {
+                if !lw.wq.is_empty() {
+                    full_attn_layers += usize::from(step == 0);
+                    assert_eq!(caches[li].0.tokens(), step + 1);
+                    assert_eq!(caches[li].1.tokens(), step + 1);
+                } else {
+                    assert_eq!(caches[li].0.tokens(), 0);
+                    assert_eq!(caches[li].1.tokens(), 0);
+                }
+            }
+        }
+        assert!(
+            full_attn_layers > 0,
+            "test config must contain full attention"
+        );
+        eprintln!("Qwen3.5-small INT8 KV vs f32 max logit diff: {max_diff}");
+        assert!(max_diff < 0.02, "INT8 KV logit drift too large: {max_diff}");
+    }
+
+    #[test]
+    fn int8_kv_refmodel_allows_mla_but_rejects_kv_slice() {
+        let cfg = Config::mla(64, 2, 4, 128, 16, 8, 16, 16, 8, 16);
+        let w = Weights::random(&cfg, 91).unwrap();
+        let mut model = RefModel::new_int8_kv(cfg, w);
+        let logits = model.decode_step(3);
+        assert!(logits.iter().all(|x| x.is_finite()));
+        assert!(model.kv_slice_bytes(0, 1).is_err());
+    }
 
     /// Independent transcription of HF's YaRN rotary
     /// (`modeling_deepseek.DeepseekV2YarnRotaryEmbedding` plus the three
