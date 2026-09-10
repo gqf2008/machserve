@@ -2035,6 +2035,163 @@ extern "C" __global__ void attn_decode_batched_int8_gqa(
 }
 "#;
 
+/// Paged INT8 KV store: page-table addressing over the INT8 pool layout,
+/// with the same per-token/kv-head symmetric scale as the contiguous kernel.
+const KV_STORE_PAGED_INT8: &str = r#"
+extern "C" __global__ void kv_store_paged_int8(const float* __restrict__ kv,
+                                               signed char* __restrict__ payload,
+                                               float* __restrict__ scales,
+                                               const int* __restrict__ pos_buf,
+                                               const int* __restrict__ table_offsets,
+                                               const int* __restrict__ block_tables,
+                                               int batch, int kv_heads, int head_dim,
+                                               int tokens_per_page) {
+    int row = blockIdx.x;
+    if ((long long)row >= (long long)batch * kv_heads) return;
+    int s = row / kv_heads;
+    int kh = row % kv_heads;
+    int p = pos_buf[s];
+    int logical = p / tokens_per_page;
+    int off = p % tokens_per_page;
+    int page = block_tables[table_offsets[s] + logical];
+    const float* src = kv + ((long long)s * kv_heads + kh) * head_dim;
+    extern __shared__ float red[];
+    float mx = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        mx = fmaxf(mx, fabsf(src[d]));
+    }
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+        __syncthreads();
+    }
+    float scale = red[0] == 0.0f ? 1.0f : red[0] / 127.0f;
+    if (scale == 0.0f) scale = red[0];
+    const long long row_base = ((long long)page * tokens_per_page + off) * kv_heads;
+    if (threadIdx.x == 0) scales[row_base + kh] = scale;
+    const long long base = (row_base + kh) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float q = roundf(src[d] / scale);
+        if (q > 127.0f) q = 127.0f;
+        else if (q < -127.0f) q = -127.0f;
+        payload[base + d] = (signed char)q;
+    }
+}
+"#;
+
+/// Paged INT8 GQA decode attention. Correctness-first block-per-(sequence,
+/// query head), double score/softmax/V math, page-table K/V reads.
+const ATTN_DECODE_PAGED_INT8_GQA: &str = r#"
+__device__ inline float sat_f32_from_double(double v) {
+    const double maxf = 3.4028234663852886e38;
+    if (v > maxf) return (float)maxf;
+    if (v < -maxf) return (float)-maxf;
+    return (float)v;
+}
+
+extern "C" __global__ void attn_decode_paged_int8_gqa(
+    const float* __restrict__ q,
+    const signed char* __restrict__ kc,
+    const float* __restrict__ ksc,
+    const signed char* __restrict__ vc,
+    const float* __restrict__ vsc,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page) {
+    const int s = blockIdx.x / n_heads;
+    const int h = blockIdx.x % n_heads;
+    const int groups = n_heads / n_kv_heads;
+    const int kv = h / groups;
+    const int pos = pos_buf[s];
+    const int* table = block_tables + table_offsets[s];
+    const int T = blockDim.x;
+    const int tid = threadIdx.x;
+    const int per = T / head_dim;
+    const int tile = T;
+    const int np = pos + 1;
+
+    extern __shared__ double sm[];
+    double* scores = sm;
+    double* sm_m = scores + tile;
+    double* sm_l = sm_m + T;
+    double* sm_a = sm_l + T;
+
+    double m = -1.0e300;
+    double l = 0.0;
+    double acc = 0.0;
+    const int dd = tid % head_dim;
+    const int c = tid / head_dim;
+    const float* qh = q + ((long long)s * n_heads + h) * head_dim;
+
+    for (int tile0 = 0; tile0 < np; tile0 += tile) {
+        const int n_t = (np - tile0 < tile) ? (np - tile0) : tile;
+        if (tid < n_t) {
+            const int p = tile0 + tid;
+            const int logical = p / tokens_per_page;
+            const int off = p % tokens_per_page;
+            const int page = table[logical];
+            const signed char* krow =
+                kc + (((long long)page * tokens_per_page + off) * n_kv_heads + kv) * head_dim;
+            double dot = 0.0;
+            for (int j = 0; j < head_dim; j++) {
+                dot += (double)qh[j] * (double)((int)krow[j]);
+            }
+            const double kscale =
+                (double)ksc[((long long)page * tokens_per_page + off) * n_kv_heads + kv];
+            scores[tid] = dot * kscale * (double)scale;
+        }
+        __syncthreads();
+
+        for (int pp = c; pp < n_t; pp += per) {
+            const int p = tile0 + pp;
+            const int logical = p / tokens_per_page;
+            const int off = p % tokens_per_page;
+            const int page = table[logical];
+            const signed char* vrow =
+                vc + (((long long)page * tokens_per_page + off) * n_kv_heads + kv) * head_dim + dd;
+            const double vscale =
+                (double)vsc[((long long)page * tokens_per_page + off) * n_kv_heads + kv];
+            const double vv = (double)((int)vrow[0]) * vscale;
+            const double sc = scores[pp];
+            const double mnew = fmax(m, sc);
+            const double alpha = exp(m - mnew);
+            const double beta = exp(sc - mnew);
+            l = l * alpha + beta;
+            acc = acc * alpha + beta * vv;
+            m = mnew;
+        }
+        __syncthreads();
+    }
+
+    sm_m[tid] = m;
+    sm_l[tid] = l;
+    sm_a[tid] = acc;
+    __syncthreads();
+    if (c == 0) {
+        double m2 = -1.0e300;
+        double l2 = 0.0;
+        double a2 = 0.0;
+        for (int cc = 0; cc < per; cc++) {
+            const long long j = (long long)cc * head_dim + dd;
+            const double mi = sm_m[j];
+            const double li = sm_l[j];
+            const double ai = sm_a[j];
+            const double mnew = fmax(m2, mi);
+            const double alpha = exp(m2 - mnew);
+            const double beta = exp(mi - mnew);
+            l2 = l2 * alpha + li * beta;
+            a2 = a2 * alpha + ai * beta;
+            m2 = mnew;
+        }
+        out[((long long)s * n_heads + h) * head_dim + dd] = sat_f32_from_double(a2 / l2);
+    }
+}
+"#;
+
 /// Prefill attention with shared K/V reads (one block per (run, head)).
 ///
 /// A "run" is C consecutive query rows of one sequence at positions
@@ -3020,6 +3177,8 @@ pub struct HipKernels {
     attn_f16_gqa: HipKernelModule,
     kv_store_int8: HipKernelModule,
     attn_int8_gqa: HipKernelModule,
+    kv_store_paged_int8: HipKernelModule,
+    attn_paged_int8_gqa: HipKernelModule,
     attn_prefill_f16: HipKernelModule,
     moe_router: HipKernelModule,
     moe_gather: HipKernelModule,
@@ -3180,6 +3339,12 @@ impl HipKernels {
                 &arch,
                 ATTN_DECODE_BATCHED_INT8_GQA,
                 "attn_decode_batched_int8_gqa",
+            )?,
+            kv_store_paged_int8: compile_cached(&arch, KV_STORE_PAGED_INT8, "kv_store_paged_int8")?,
+            attn_paged_int8_gqa: compile_cached(
+                &arch,
+                ATTN_DECODE_PAGED_INT8_GQA,
+                "attn_decode_paged_int8_gqa",
             )?,
             attn_f16_gqa: compile_cached(
                 &arch,
@@ -5189,6 +5354,138 @@ impl HipKernels {
         )?)
     }
 
+    /// Paged INT8 KV store: page-table addressing over the same packed layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_store_paged_int8(
+        &self,
+        kv: *const f32,
+        payload: *mut i8,
+        scales: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        block_tables: *const i32,
+        batch: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        if batch <= 0 || kv_heads <= 0 || head_dim <= 0 || tokens_per_page <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "kv_store_paged_int8 requires positive dims, got batch={batch} kv_heads={kv_heads} head_dim={head_dim} tokens_per_page={tokens_per_page}"
+            )));
+        }
+        let grid64 = (batch as u64)
+            .checked_mul(kv_heads as u64)
+            .ok_or_else(|| Error::InvalidArgument("kv_store_paged_int8 grid overflow".into()))?;
+        let grid = i32::try_from(grid64)
+            .map_err(|_| Error::InvalidArgument("kv_store_paged_int8 grid exceeds i32".into()))?;
+        let kvp = kv;
+        let pp = payload;
+        let sp = scales;
+        let posp = pos;
+        let top = table_offsets;
+        let btp = block_tables;
+        let mut p = vec![
+            &kvp as *const *const f32 as *mut core::ffi::c_void,
+            &pp as *const *mut i8 as *mut core::ffi::c_void,
+            &sp as *const *mut f32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &top as *const *const i32 as *mut core::ffi::c_void,
+            &btp as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.kv_store_paged_int8.launch_shmem(
+            [grid as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            256 * 4,
+        )?)
+    }
+
+    /// Paged INT8 GQA decode attention. Correctness-first double math; the
+    /// runtime remains disabled until GPU parity is recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_decode_paged_int8_gqa(
+        &self,
+        q: *const f32,
+        kc: *const i8,
+        kscales: *const f32,
+        vc: *const i8,
+        vscales: *const f32,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        if batch <= 0
+            || n_heads <= 0
+            || n_kv_heads <= 0
+            || head_dim <= 0
+            || tokens_per_page <= 0
+            || !softmax_scale.is_finite()
+            || softmax_scale <= 0.0
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attn_decode_paged_int8_gqa invalid dims: batch={batch} n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} tpp={tokens_per_page} scale={softmax_scale}"
+            )));
+        }
+        if n_heads % n_kv_heads != 0 || 256 % head_dim != 0 || head_dim > 256 {
+            return Err(Error::InvalidArgument(format!(
+                "attn_decode_paged_int8_gqa unsupported geometry: n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} (require 256 % head_dim == 0, head_dim <= 256, n_heads % n_kv_heads == 0)"
+            )));
+        }
+        let grid64 = (batch as u64).checked_mul(n_heads as u64).ok_or_else(|| {
+            Error::InvalidArgument("attn_decode_paged_int8_gqa grid overflow".into())
+        })?;
+        let grid = i32::try_from(grid64).map_err(|_| {
+            Error::InvalidArgument("attn_decode_paged_int8_gqa grid exceeds i32".into())
+        })?;
+        let qp = q;
+        let kp = kc;
+        let ksp = kscales;
+        let vp = vc;
+        let vsp = vscales;
+        let btp = block_tables;
+        let op = out;
+        let posp = pos;
+        let top = table_offsets;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const i8 as *mut core::ffi::c_void,
+            &ksp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const i8 as *mut core::ffi::c_void,
+            &vsp as *const *const f32 as *mut core::ffi::c_void,
+            &btp as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &top as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &softmax_scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+        ];
+        let shared = (4 * 256 * std::mem::size_of::<f64>()) as u32;
+        Ok(self.attn_paged_int8_gqa.launch_shmem(
+            [grid as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
     /// Synchronizes the execution stream.
     /// MoE router for a single token: softmax over `ne` logits + top-k
     /// selection; writes `out_ids[topk]` and `out_w[topk]`. `norm_topk` picks
@@ -5828,7 +6125,9 @@ mod offline_tests {
         KV_STORE_PAGED,
         ATTN_DECODE_PAGED,
         KV_STORE_PAGED_F16,
+        KV_STORE_PAGED_INT8,
         ATTN_DECODE_PAGED_F16_GQA,
+        ATTN_DECODE_PAGED_INT8_GQA,
         KV_STORE_PAGED_MLA,
         ATTN_DECODE_PAGED_MLA,
         ATTN_DECODE_PAGED_MLA_BATCHED,
@@ -5843,7 +6142,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            64,
+            66,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
