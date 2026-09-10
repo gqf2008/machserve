@@ -9,8 +9,26 @@ use crate::fp8::Fp8Tensor;
 use crate::q4::Q4Tensor;
 use crate::weights::{LayerWeightsFp8, LayerWeightsQ4, WeightsFp8, WeightsQ4};
 use crate::{Config, Error, LayerWeights, Weights};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// Safetensors headers contain tensor names/shapes/offsets only; 64 MiB is
+/// already orders of magnitude larger than real checkpoints. The cap prevents
+/// a corrupt length prefix from driving a multi-GB allocation before JSON
+/// parsing can reject it.
+const MAX_HEADER_BYTES: u64 = 64 << 20;
+
+/// Summary returned by [`validate_checkpoint`] after reading only safetensors
+/// headers. `payload_bytes` is the sum of tensor data spans, excluding file
+/// headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointLayout {
+    pub shards: usize,
+    pub tensors: usize,
+    pub payload_bytes: u64,
+}
 
 /// A decoded tensor from a safetensors file.
 struct RawTensor {
@@ -21,23 +39,22 @@ struct RawTensor {
     end: usize,
 }
 
-/// Reads a safetensors file and returns `(name -> raw tensor, data_bytes)`.
-fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>), Error> {
-    let mut bytes = std::fs::read(path).map_err(|e| Error::Model(format!("read {path:?}: {e}")))?;
-    if bytes.len() < 8 {
-        return Err(Error::Model("file too short".into()));
+/// Qwen3.5 VLM checkpoints namespace the text stack under
+/// `model.language_model.*` (`Qwen3_5ForConditionalGeneration`); the loaders
+/// and validation share this remap to the `model.*` layout.
+fn normalize_tensor_name(name: &str) -> String {
+    match name.strip_prefix("model.language_model.") {
+        Some(rest) => format!("model.{rest}"),
+        None => name.to_string(),
     }
-    let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-    if 8 + header_len > bytes.len() {
-        return Err(Error::Model("header length out of range".into()));
-    }
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])
-        .map_err(|e| Error::Model(format!("bad JSON header: {e}")))?;
-    // Move the data segment out of the file buffer instead of copying it:
-    // `bytes` keeps only the small header, so the whole file never lives twice
-    // during the tensor loop (multi-GB shards would double host RAM).
-    let data = bytes.split_off(8 + header_len);
+}
 
+/// Parse a safetensors header and validate every tensor range against the
+/// shard's data-section length. No tensor payload is read.
+fn parse_safetensors_header(
+    header: &serde_json::Value,
+    data_len: usize,
+) -> Result<HashMap<String, RawTensor>, Error> {
     let mut tensors = HashMap::new();
     let obj = header
         .as_object()
@@ -57,15 +74,23 @@ fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>
         let shape = o
             .get("shape")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::Model(format!("tensor {name}: missing shape")))?
-            .iter()
-            .map(|v| v.as_u64().unwrap_or(0) as usize)
-            .collect();
+            .ok_or_else(|| Error::Model(format!("tensor {name}: missing shape")))?;
+        let mut shape_usize = Vec::with_capacity(shape.len());
+        for dim in shape {
+            let d = dim
+                .as_u64()
+                .ok_or_else(|| Error::Model(format!("tensor {name}: shape entry not a u64")))?;
+            shape_usize.push(
+                usize::try_from(d).map_err(|_| {
+                    Error::Model(format!("tensor {name}: shape dimension too large"))
+                })?,
+            );
+        }
         let off = o
             .get("data_offsets")
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Model(format!("tensor {name}: missing data_offsets")))?;
-        if off.len() < 2 {
+        if off.len() != 2 {
             return Err(Error::Model(format!(
                 "tensor {name}: data_offsets must have 2 entries, got {}",
                 off.len()
@@ -73,39 +98,292 @@ fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>
         }
         let start = off[0]
             .as_u64()
-            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[0] not a u64")))?
-            as usize;
+            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[0] not a u64")))?;
         let end = off[1]
             .as_u64()
-            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[1] not a u64")))?
-            as usize;
-        if start > end || end > data.len() {
+            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[1] not a u64")))?;
+        if start > end || end > data_len as u64 {
             return Err(Error::Model(format!(
-                "tensor {name}: data_offsets [{start}, {end}) out of bounds (data len {})",
-                data.len()
+                "tensor {name}: data_offsets [{start}, {end}) out of bounds (data len {data_len})"
             )));
         }
-        // Qwen3.5 VLM checkpoints namespace the text stack under
-        // `model.language_model.*` (`Qwen3_5ForConditionalGeneration`);
-        // remap to the `model.*` layout every family (and this loader)
-        // expects. The `model.visual.*` and `mtp.*` stacks keep their
-        // prefixes and are skipped by the Q4/FP8 classifiers (the f32 loader
-        // simply never reads them).
-        let name = match name.strip_prefix("model.language_model.") {
-            Some(rest) => format!("model.{rest}"),
-            None => name.clone(),
-        };
+        let name = normalize_tensor_name(name);
+        if tensors.contains_key(&name) {
+            return Err(Error::Model(format!(
+                "duplicate tensor {name} after namespace normalization"
+            )));
+        }
         tensors.insert(
-            name,
+            name.clone(),
             RawTensor {
                 dtype,
-                shape,
-                start,
-                end,
+                shape: shape_usize,
+                start: usize::try_from(start)
+                    .map_err(|_| Error::Model(format!("tensor {name}: offset too large")))?,
+                end: usize::try_from(end)
+                    .map_err(|_| Error::Model(format!("tensor {name}: offset too large")))?,
             },
         );
     }
+    Ok(tensors)
+}
+
+/// Reads and parses only the 8-byte length prefix + JSON header of one shard.
+fn read_safetensors_header(path: &Path) -> Result<(HashMap<String, RawTensor>, u64), Error> {
+    let mut file = File::open(path).map_err(|e| Error::Model(format!("open {path:?}: {e}")))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| Error::Model(format!("metadata {path:?}: {e}")))?
+        .len();
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|e| Error::Model(format!("read {path:?} header prefix: {e}")))?;
+    let header_len = u64::from_le_bytes(prefix);
+    if header_len > MAX_HEADER_BYTES {
+        return Err(Error::Model(format!(
+            "{path:?}: header length {header_len} exceeds the {MAX_HEADER_BYTES}-byte cap"
+        )));
+    }
+    let data_start = 8u64
+        .checked_add(header_len)
+        .ok_or_else(|| Error::Model(format!("{path:?}: header length overflow")))?;
+    if data_start > file_len {
+        return Err(Error::Model(format!(
+            "{path:?}: header length {header_len} exceeds file size {file_len}"
+        )));
+    }
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| Error::Model(format!("{path:?}: header too large")))?;
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| Error::Model(format!("read {path:?} header: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
+    let data_bytes = file_len - data_start;
+    let data_len = usize::try_from(data_bytes)
+        .map_err(|_| Error::Model(format!("{path:?}: data section too large")))?;
+    let tensors = parse_safetensors_header(&header, data_len)?;
+    Ok((tensors, data_bytes))
+}
+
+/// Reads a safetensors file and returns `(name -> raw tensor, data_bytes)`.
+fn parse_safetensors(path: &Path) -> Result<(HashMap<String, RawTensor>, Vec<u8>), Error> {
+    let mut bytes = std::fs::read(path).map_err(|e| Error::Model(format!("read {path:?}: {e}")))?;
+    if bytes.len() < 8 {
+        return Err(Error::Model(format!("{path:?}: file too short")));
+    }
+    let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    if header_len > MAX_HEADER_BYTES {
+        return Err(Error::Model(format!(
+            "{path:?}: header length {header_len} exceeds the {MAX_HEADER_BYTES}-byte cap"
+        )));
+    }
+    let data_start = 8u64
+        .checked_add(header_len)
+        .ok_or_else(|| Error::Model(format!("{path:?}: header length overflow")))?;
+    if data_start > bytes.len() as u64 {
+        return Err(Error::Model(format!(
+            "{path:?}: header length out of range"
+        )));
+    }
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| Error::Model(format!("{path:?}: header too large")))?;
+    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])
+        .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
+    // Move the data segment out of the file buffer instead of copying it:
+    // `bytes` keeps only the small header, so the whole file never lives twice
+    // during the tensor loop (multi-GB shards would double host RAM).
+    let data = bytes.split_off(8 + header_len);
+    let tensors = parse_safetensors_header(&header, data.len())?;
     Ok((tensors, data))
+}
+
+/// Parsed HF shard index used by [`validate_checkpoint`].
+struct CheckpointIndex {
+    tensors: HashMap<String, String>,
+    total_size: Option<u64>,
+}
+
+/// Read a Hugging Face `model.safetensors.index.json`, if present.
+///
+/// Returns `(tensor -> basename, metadata.total_size?)`. Paths in the index are
+/// deliberately restricted to a single sibling filename: a malformed index
+/// must not make validation escape the checkpoint directory.
+fn read_checkpoint_index(dir: &Path) -> Result<Option<CheckpointIndex>, Error> {
+    let path = dir.join("model.safetensors.index.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| Error::Model(format!("read {path:?}: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| Error::Model(format!("parse {path:?}: {e}")))?;
+    let map = value["weight_map"]
+        .as_object()
+        .ok_or_else(|| Error::Model(format!("{path:?}: weight_map missing or not an object")))?;
+    let mut out = HashMap::with_capacity(map.len());
+    for (name, file) in map {
+        let file = file
+            .as_str()
+            .ok_or_else(|| Error::Model(format!("{path:?}: weight_map[{name}] not a string")))?;
+        let rel = Path::new(file);
+        if rel.is_absolute() || rel.components().count() != 1 {
+            return Err(Error::Model(format!(
+                "{path:?}: weight_map[{name}] must name a sibling shard, got {file:?}"
+            )));
+        }
+        if rel.extension().is_none_or(|x| x != "safetensors") {
+            return Err(Error::Model(format!(
+                "{path:?}: weight_map[{name}] is not a .safetensors file: {file:?}"
+            )));
+        }
+        let shard = dir.join(rel);
+        if !shard.is_file() {
+            return Err(Error::Model(format!(
+                "{path:?}: indexed shard {file:?} is missing"
+            )));
+        }
+        let name = normalize_tensor_name(name);
+        if out.insert(name.clone(), file.to_string()).is_some() {
+            return Err(Error::Model(format!(
+                "{path:?}: duplicate tensor {name} after namespace normalization"
+            )));
+        }
+    }
+    let total = value["metadata"]["total_size"]
+        .as_f64()
+        .map(|n| {
+            if n.fract() == 0.0 && n >= 0.0 {
+                Ok(n as u64)
+            } else {
+                Err(Error::Model(format!(
+                    "{path:?}: metadata.total_size is not a non-negative integer"
+                )))
+            }
+        })
+        .transpose()?;
+    Ok(Some(CheckpointIndex {
+        tensors: out,
+        total_size: total,
+    }))
+}
+
+/// Validate a checkpoint using only safetensors headers and the optional HF
+/// shard index. This catches missing shards, truncated payloads, out-of-range
+/// tensor offsets, duplicate tensors, stale index entries and index/tensor
+/// placement mismatches before any weight allocation or GPU upload.
+pub fn validate_checkpoint(path: &Path) -> Result<CheckpointLayout, Error> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
+    // A standalone file can share a models root with an unrelated or even
+    // malformed HF index. The index only governs directory checkpoints; file
+    // inputs are validated on their own.
+    let index = if path.is_dir() {
+        read_checkpoint_index(&dir)?
+    } else {
+        None
+    };
+    if let Some(index) = &index {
+        let expected: HashSet<&str> = index.tensors.values().map(String::as_str).collect();
+        let actual: HashSet<String> = std::fs::read_dir(&dir)
+            .map_err(|e| Error::Model(format!("read dir {dir:?}: {e}")))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .filter_map(|p| p.file_name().and_then(|x| x.to_str()).map(str::to_string))
+            .collect();
+        let mut extra: Vec<&str> = actual
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !expected.contains(name))
+            .collect();
+        if !extra.is_empty() {
+            extra.sort_unstable();
+            return Err(Error::Model(format!(
+                "{dir:?}: unindexed .safetensors files present: {}",
+                extra.join(", ")
+            )));
+        }
+    }
+    let files: Vec<PathBuf> = if let Some(index) = &index {
+        let mut names: Vec<&str> = index.tensors.values().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        names.into_iter().map(|name| dir.join(name)).collect()
+    } else if path.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        files.sort();
+        files
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if files.is_empty() {
+        return Err(Error::Model(format!("no .safetensors files in {path:?}")));
+    }
+
+    let expected = index.as_ref().map(|index| &index.tensors);
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut tensors = 0usize;
+    let mut payload_bytes = 0u64;
+    for file in &files {
+        let (shard_tensors, _) = read_safetensors_header(file)?;
+        let file_name = file
+            .file_name()
+            .and_then(|x| x.to_str())
+            .ok_or_else(|| Error::Model(format!("{file:?}: non-Unicode shard filename")))?;
+        for (name, tensor) in shard_tensors {
+            if let Some(map) = expected {
+                let want = map.get(&name).ok_or_else(|| {
+                    Error::Model(format!("{file:?}: tensor {name} is absent from the index"))
+                })?;
+                if want != file_name {
+                    return Err(Error::Model(format!(
+                        "{file:?}: tensor {name} is indexed in {want:?}"
+                    )));
+                }
+            }
+            if let Some(previous) = seen.insert(name.clone(), file_name.to_string()) {
+                return Err(Error::Model(format!(
+                    "tensor {name} appears in both {previous} and {file_name}"
+                )));
+            }
+            tensors = tensors
+                .checked_add(1)
+                .ok_or_else(|| Error::Model("tensor count overflow".into()))?;
+            payload_bytes = payload_bytes
+                .checked_add((tensor.end - tensor.start) as u64)
+                .ok_or_else(|| Error::Model("payload byte count overflow".into()))?;
+        }
+    }
+    if let Some(index) = index {
+        if let Some(missing) = index.tensors.keys().find(|name| !seen.contains_key(*name)) {
+            return Err(Error::Model(format!(
+                "indexed tensor {missing} was not found in any shard"
+            )));
+        }
+        if let Some(total) = index.total_size
+            && payload_bytes != total
+        {
+            return Err(Error::Model(format!(
+                "index metadata.total_size={total}, but shard headers describe {payload_bytes} bytes"
+            )));
+        }
+    }
+    Ok(CheckpointLayout {
+        shards: files.len(),
+        tensors,
+        payload_bytes,
+    })
 }
 
 /// Loads a tensor and converts it to f32 `[out, in]` row-major.

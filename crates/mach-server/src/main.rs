@@ -42,7 +42,9 @@ use mach_model::batched::BatchedModel;
 #[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
-use mach_model::loader::{load_safetensors, load_safetensors_fp8, load_safetensors_q4};
+use mach_model::loader::{
+    load_safetensors, load_safetensors_fp8, load_safetensors_q4, validate_checkpoint,
+};
 #[cfg(feature = "hip")]
 use mach_model::tokenizer::Tokenizer;
 #[cfg(feature = "hip")]
@@ -654,6 +656,13 @@ fn run_doctor() {
             Err(e) => println!("  {label} {}: MISSING ({e})", path.display()),
         }
     }
+    match validate_checkpoint(&checkpoint_path) {
+        Ok(layout) => println!(
+            "  checkpoint layout: {} shards, {} tensors, {} payload bytes",
+            layout.shards, layout.tensors, layout.payload_bytes
+        ),
+        Err(e) => println!("  checkpoint layout: ERROR ({e})"),
+    }
     // Best-effort VRAM estimate; the server preflight is authoritative.
     let cfg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         config_from_json(&config_path)
@@ -799,6 +808,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Header/index validation is a few MB of I/O and happens before HIP
+    // preflight or any multi-GB weight allocation, so a missing/truncated
+    // 18-shard Qwen3.8 checkpoint fails fast instead of after a full load.
+    let layout = validate_checkpoint(&checkpoint_path).unwrap_or_else(|e| {
+        eprintln!("invalid checkpoint {}: {e}", checkpoint_path.display());
+        std::process::exit(1);
+    });
+    println!(
+        "checkpoint: {} shards, {} tensors, {:.2} GiB payload",
+        layout.shards,
+        layout.tensors,
+        layout.payload_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     // Preflight (before any heavy loading): HIP runtime + device + VRAM. A
     // missing/busy device or grossly insufficient memory should fail fast with
     // a readable error, not hang the host during the ~36 serial hiprtc kernel

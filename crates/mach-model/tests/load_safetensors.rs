@@ -9,9 +9,10 @@
 use mach_model::config::ModelDType;
 use mach_model::loader::{
     load_safetensors, load_safetensors_dir, load_safetensors_fp8, load_safetensors_q4,
+    validate_checkpoint,
 };
 use mach_model::{Config, Weights};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("machserve-{name}.safetensors"))
@@ -592,6 +593,133 @@ fn sharded_load_matches_single_file() {
         assert_eq!(max_abs_diff(&a.rms_attn, &b.rms_attn), 0.0);
         assert_eq!(max_abs_diff(&a.rms_mlp, &b.rms_mlp), 0.0);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Opt-in real-checkpoint header/index validation. Set `MACH_TEST_MODEL` to a
+/// `.safetensors` file or an HF model directory; no tensor payload is loaded.
+#[test]
+fn validate_real_checkpoint_when_requested() {
+    let Ok(path) = std::env::var("MACH_TEST_MODEL") else {
+        eprintln!("skipping real checkpoint validation: MACH_TEST_MODEL not set");
+        return;
+    };
+    let layout = validate_checkpoint(std::path::Path::new(&path)).unwrap();
+    eprintln!(
+        "validated {path}: {} shards, {} tensors, {} payload bytes",
+        layout.shards, layout.tensors, layout.payload_bytes
+    );
+}
+
+/// Header-only checkpoint validation: a healthy HF shard/index pair passes
+/// without reading tensor payload; a missing shard, truncated payload, or
+/// index/placement mismatch fails before any weight allocation.
+#[test]
+fn validate_checkpoint_headers_and_index() {
+    fn write_index(dir: &Path, map: &[(&str, &str)], total: usize) {
+        let entries = map
+            .iter()
+            .map(|(name, file)| format!(r#""{name}": "{file}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json = format!(r#"{{"metadata":{{"total_size":{total}}},"weight_map":{{{entries}}}}}"#);
+        std::fs::write(dir.join("model.safetensors.index.json"), json).unwrap();
+    }
+
+    let cfg = Config::tiny();
+    let tensors = tensor_names(&cfg);
+    let mid = tensors.len() / 2;
+    let (first, second) = tensors.split_at(mid);
+    let dir = std::env::temp_dir().join(format!("machserve-validate-{}", std::process::id()));
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("model-00001-of-00002.safetensors");
+    let p2 = dir.join("model-00002-of-00002.safetensors");
+    let flat1: Vec<(&str, &[f32], &[usize])> = first
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    let flat2: Vec<(&str, &[f32], &[usize])> = second
+        .iter()
+        .map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice()))
+        .collect();
+    write_safetensors(&p1, &flat1);
+    write_safetensors(&p2, &flat2);
+    let index: Vec<(&str, &str)> = first
+        .iter()
+        .map(|(n, _, _)| (n.as_str(), "model-00001-of-00002.safetensors"))
+        .chain(
+            second
+                .iter()
+                .map(|(n, _, _)| (n.as_str(), "model-00002-of-00002.safetensors")),
+        )
+        .collect();
+    let payload = tensors.iter().map(|(_, d, _)| d.len() * 4).sum::<usize>();
+    write_index(&dir, &index, payload);
+
+    let layout = validate_checkpoint(&dir).unwrap();
+    assert_eq!(layout.shards, 2);
+    assert_eq!(layout.tensors, tensors.len());
+    assert_eq!(layout.payload_bytes, payload as u64);
+
+    let extra = dir.join("unindexed-extra.safetensors");
+    let extra_data = [1.0f32];
+    write_safetensors(&extra, &[("extra", &extra_data, &[1])]);
+    let err = validate_checkpoint(&dir).unwrap_err().to_string();
+    assert!(err.contains("unindexed"), "unexpected error: {err}");
+    std::fs::remove_file(&extra).unwrap();
+
+    std::fs::remove_file(&p2).unwrap();
+    let err = validate_checkpoint(&dir).unwrap_err().to_string();
+    assert!(err.contains("missing"), "unexpected error: {err}");
+    write_safetensors(&p2, &flat2);
+
+    let len = std::fs::metadata(&p2).unwrap().len();
+    let f = std::fs::OpenOptions::new().write(true).open(&p2).unwrap();
+    f.set_len(len - 4).unwrap();
+    drop(f);
+    let err = validate_checkpoint(&dir).unwrap_err().to_string();
+    assert!(err.contains("out of bounds"), "unexpected error: {err}");
+    write_safetensors(&p2, &flat2);
+
+    let mut bad_index = index.clone();
+    bad_index[0].1 = "model-00002-of-00002.safetensors";
+    write_index(&dir, &bad_index, payload);
+    let err = validate_checkpoint(&dir).unwrap_err().to_string();
+    assert!(err.contains("indexed in"), "unexpected error: {err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A standalone checkpoint in a shared models root must not be captured by an
+/// unrelated sibling HF index; only an index that references the file applies.
+#[test]
+fn validate_standalone_ignores_unrelated_sibling_index() {
+    let dir =
+        std::env::temp_dir().join(format!("machserve-validate-single-{}", std::process::id()));
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let single = dir.join("qwen-0.5b.safetensors");
+    let other = dir.join("model-00001-of-00001.safetensors");
+    let data = vec![1.0f32, 2.0, 3.0];
+    write_safetensors(&single, &[("weight", &data, &[3])]);
+    write_safetensors(&other, &[("other", &data, &[3])]);
+    // Deliberately malformed/unrelated: a file-path validation must not even
+    // parse this sibling index, otherwise a valid standalone checkpoint dies.
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        r#"{"metadata":{"total_size":12},"weight_map":{"other":"../escape.safetensors"}}"#,
+    )
+    .unwrap();
+
+    let layout = validate_checkpoint(&single).unwrap();
+    assert_eq!(layout.shards, 1);
+    assert_eq!(layout.tensors, 1);
+    assert_eq!(layout.payload_bytes, 12);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
