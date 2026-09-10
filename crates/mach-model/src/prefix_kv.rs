@@ -167,7 +167,7 @@ impl PrefixKvCache {
                 computed_tokens += end - start;
                 let key = &plan.page_keys[i];
                 let page_kv = PageKv {
-                    layers: model.kv_slice_bytes(start, end),
+                    layers: model.kv_slice_bytes(start, end)?,
                     boundary_hidden: model.hidden().to_vec(),
                     len: end - start,
                 };
