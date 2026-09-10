@@ -253,6 +253,128 @@ impl Int8Kv {
     }
 }
 
+/// Single-token full-attention decode oracle for INT8 K/V.
+///
+/// `q` is `[n_heads, head_dim]`; `k`/`v` are `[tokens, n_kv_heads, head_dim]`
+/// and must share heads/head_dim/token count. GQA maps query head `h` to
+/// `kv_head = h / (n_heads / n_kv_heads)`, matching the existing GPU kernels.
+pub fn attention_decode_int8(
+    q: &[f32],
+    n_heads: usize,
+    k: &Int8Kv,
+    v: &Int8Kv,
+    softmax_scale: f32,
+) -> Result<Vec<f32>, Error> {
+    if n_heads == 0 || k.heads == 0 || k.head_dim == 0 {
+        return Err(Error::InvalidArgument(
+            "INT8 attention requires non-zero n_heads/kv_heads/head_dim".into(),
+        ));
+    }
+    if k.heads != v.heads || k.head_dim != v.head_dim || k.tokens() != v.tokens() {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 attention K/V shape mismatch: k={}/{}/{}, v={}/{}/{}",
+            k.tokens(),
+            k.heads,
+            k.head_dim,
+            v.tokens(),
+            v.heads,
+            v.head_dim
+        )));
+    }
+    let tokens = k.tokens();
+    if tokens == 0 {
+        return Err(Error::InvalidArgument(
+            "INT8 attention requires at least one token".into(),
+        ));
+    }
+    if !n_heads.is_multiple_of(k.heads) {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 attention n_heads={n_heads} is not a multiple of kv_heads={}",
+            k.heads
+        )));
+    }
+    let q_len = n_heads
+        .checked_mul(k.head_dim)
+        .ok_or_else(|| Error::InvalidArgument("INT8 attention q size overflow".into()))?;
+    if q.len() != q_len {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 attention q length {} != n_heads*head_dim {q_len}",
+            q.len()
+        )));
+    }
+    if let Some((i, value)) = q
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 attention q has non-finite value at index {i}: {value}"
+        )));
+    }
+    if !softmax_scale.is_finite() || softmax_scale <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "INT8 attention softmax_scale must be finite and positive, got {softmax_scale}"
+        )));
+    }
+
+    let groups = n_heads / k.heads;
+    let mut out = vec![0.0f32; q_len];
+    for h in 0..n_heads {
+        let kv = h / groups;
+        let qh = &q[h * k.head_dim..(h + 1) * k.head_dim];
+        let mut scores = Vec::with_capacity(tokens);
+        for token in 0..tokens {
+            scores.push(k.dot_q(qh, token, kv)? * softmax_scale);
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs = Vec::with_capacity(tokens);
+        let mut denom = 0.0f32;
+        for &score in &scores {
+            let p = (score - max_score).exp();
+            if !p.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "INT8 attention softmax produced non-finite probability for head {h}"
+                )));
+            }
+            probs.push(p);
+            denom += p;
+        }
+        if !denom.is_finite() || denom <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "INT8 attention softmax denominator invalid for head {h}: {denom}"
+            )));
+        }
+        let inv = 1.0f64 / denom as f64;
+        for dim in 0..k.head_dim {
+            let mut acc = 0.0f64;
+            for (token, &p) in probs.iter().enumerate() {
+                let vs = v.scale(token, kv).unwrap();
+                if !vs.is_finite() {
+                    return Err(Error::InvalidArgument(format!(
+                        "INT8 attention V scale non-finite for token {token} head {kv}: {vs}"
+                    )));
+                }
+                let value = dequant_value(v.head_row(token, kv).unwrap()[dim], vs) as f64;
+                acc += p as f64 * inv * value;
+            }
+            if !acc.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "INT8 attention V accumulation non-finite for head {h} dim {dim}: {acc}"
+                )));
+            }
+            out[h * k.head_dim + dim] = if acc > f32::MAX as f64 {
+                f32::MAX
+            } else if acc < f32::MIN as f64 {
+                f32::MIN
+            } else {
+                acc as f32
+            };
+        }
+    }
+    Ok(out)
+}
+
 /// Contiguous INT8 KV cache layout:
 /// payload `[slots, max_seq, kv_heads, head_dim]`, scales
 /// `[slots, max_seq, kv_heads]`.
@@ -581,7 +703,13 @@ pub fn gather_paged_int8(
         for head in 0..layout.heads {
             let idx = layout.payload_index(page, off, head, 0).unwrap();
             q.extend_from_slice(&payload[idx..idx + layout.head_dim]);
-            out_scales.push(scales[layout.scale_index(page, off, head).unwrap()]);
+            let scale = scales[layout.scale_index(page, off, head).unwrap()];
+            if !scale.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "INT8 paged KV has non-finite scale at token {token} head {head}: {scale}"
+                )));
+            }
+            out_scales.push(scale);
         }
     }
     Ok(Int8Kv {
@@ -601,6 +729,122 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((*seed >> 33) as f32 / (1u32 << 31) as f32) * 2.0 - 1.0
+    }
+
+    fn attention_f32_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        kv_heads: usize,
+        head_dim: usize,
+        softmax_scale: f32,
+        head_map: &[usize],
+    ) -> Vec<f32> {
+        let tokens = k.len() / (kv_heads * head_dim);
+        let n_heads = head_map.len();
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kv = head_map[h];
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::with_capacity(tokens);
+            for token in 0..tokens {
+                let krow =
+                    &k[(token * kv_heads + kv) * head_dim..(token * kv_heads + kv + 1) * head_dim];
+                scores.push(qh.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * softmax_scale);
+            }
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let probs: Vec<f32> = scores.iter().map(|s| (s - max_score).exp()).collect();
+            let denom: f32 = probs.iter().sum();
+            for dim in 0..head_dim {
+                let mut acc = 0.0f32;
+                for token in 0..tokens {
+                    let vrow = &v[(token * kv_heads + kv) * head_dim
+                        ..(token * kv_heads + kv + 1) * head_dim];
+                    acc += probs[token] / denom * vrow[dim];
+                }
+                out[h * head_dim + dim] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn paged_gather_rejects_non_finite_scale() {
+        let layout = PagedInt8KvLayout::new(2, 2, 1, 2).unwrap();
+        let payload = vec![0i8; layout.payload_len()];
+        let mut scales = vec![1.0f32; layout.scale_len()];
+        scales[layout.scale_index(1, 0, 0).unwrap()] = f32::INFINITY;
+        assert!(
+            gather_paged_int8(&layout, &[1], &payload, &scales, 1).is_err(),
+            "non-finite paged scale must be rejected"
+        );
+        scales[layout.scale_index(1, 0, 0).unwrap()] = f32::NAN;
+        assert!(
+            gather_paged_int8(&layout, &[1], &payload, &scales, 1).is_err(),
+            "NaN paged scale must be rejected"
+        );
+    }
+
+    #[test]
+    fn attention_decode_matches_f32_reference() {
+        let (n_heads, kv_heads, dim, tokens) = (6usize, 2usize, 32usize, 17usize);
+        let mut seed = 29u64;
+        let q: Vec<f32> = (0..n_heads * dim).map(|_| lcg(&mut seed)).collect();
+        let k: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let v: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let kq = Int8Kv::quantize(&k, kv_heads, dim).unwrap();
+        let vq = Int8Kv::quantize(&v, kv_heads, dim).unwrap();
+        let scale = 1.0 / (dim as f32).sqrt();
+        let got = attention_decode_int8(&q, n_heads, &kq, &vq, scale).unwrap();
+        let want = attention_f32_reference(&q, &k, &v, kv_heads, dim, scale, &[0, 0, 0, 1, 1, 1]);
+        assert_eq!(got.len(), want.len());
+        let mut max_err = 0.0f32;
+        for (a, b) in got.iter().zip(&want) {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "non-finite attention output"
+            );
+            let diff = (a - b).abs();
+            assert!(diff.is_finite(), "non-finite attention diff");
+            max_err = max_err.max(diff);
+        }
+        assert!(max_err < 0.02, "INT8 attention max error {max_err}");
+    }
+
+    #[test]
+    fn attention_decode_rejects_bad_shapes_and_non_finite_query() {
+        let k = Int8Kv::quantize(&[0.0f32; 8], 2, 4).unwrap();
+        let v = Int8Kv::quantize(&[0.0f32; 8], 2, 4).unwrap();
+        assert!(attention_decode_int8(&[0.0f32; 8], 3, &k, &v, 0.5).is_err());
+        let mut bad_q = [0.0f32; 8];
+        bad_q[1] = f32::NAN;
+        assert!(attention_decode_int8(&bad_q, 2, &k, &v, 0.5).is_err());
+        assert!(attention_decode_int8(&[0.0f32; 8], 2, &k, &v, 0.0).is_err());
+    }
+
+    #[test]
+    fn attention_v_extreme_scale_stays_finite() {
+        let k = Int8Kv::quantize(&[0.0f32], 1, 1).unwrap();
+        let v = Int8Kv::quantize(&[f32::MAX], 1, 1).unwrap();
+        let out = attention_decode_int8(&[0.0f32], 1, &k, &v, 1.0).unwrap();
+        assert!(out[0].is_finite());
+        assert_eq!(out[0], f32::MAX);
+    }
+
+    #[test]
+    fn attention_v_scale_is_applied_per_token() {
+        let k = Int8Kv::quantize(&[0.0f32; 3], 1, 1).unwrap();
+        let v = Int8Kv::quantize(&[1.0f32, 2.0, 3.0], 1, 1).unwrap();
+        let out = attention_decode_int8(&[0.0f32], 1, &k, &v, 1.0).unwrap();
+        assert!(
+            (out[0] - 2.0).abs() < 1e-6,
+            "uniform V average got {}",
+            out[0]
+        );
     }
 
     #[test]
