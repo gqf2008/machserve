@@ -647,4 +647,33 @@ mod step_tests {
             .to_string();
         assert!(err.contains("does not match"), "{err}");
     }
+
+    #[test]
+    fn step_overrides_decode_multiple_rows_advance_positions() {
+        let (cfg, vision, prompt) = single_image_prompt();
+        let seqs = [StepSeq {
+            offset: 7,
+            count: 2,
+            prefill: false,
+            prompt: Some(&prompt),
+        }];
+        let out = step_overrides(&seqs, &cfg, vision.mrope_section).unwrap();
+        assert_eq!(out.rows, 2);
+        assert_eq!(out.row_mask, [0, 0]);
+        let dim = out.rotary_dim;
+        let (want0, _) = MropePositions {
+            pos: vec![[5, 5, 5]],
+            delta: 0,
+        }
+        .cos_sin(&cfg, vision.mrope_section)
+        .unwrap();
+        let (want1, _) = MropePositions {
+            pos: vec![[6, 6, 6]],
+            delta: 0,
+        }
+        .cos_sin(&cfg, vision.mrope_section)
+        .unwrap();
+        assert_eq!(&out.cos[0..dim], &want0);
+        assert_eq!(&out.cos[dim..2 * dim], &want1);
+    }
 }

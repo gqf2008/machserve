@@ -635,6 +635,8 @@ impl ContinuousModel {
     }
 
     /// Sets the M-RoPE section used to build per-step tables for multimodal
+    /// prompts. Must be set before the first [`Self::add_multimodal`] and
+    /// must not change while multimodal sequences are active.
     /// prompts. Required before [`Self::add_multimodal`].
     pub fn set_mrope_section(&mut self, section: [usize; 3]) {
         self.mrope_section = Some(section);
