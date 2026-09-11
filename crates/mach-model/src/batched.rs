@@ -1384,8 +1384,15 @@ impl BatchedModel {
         let rope_dim = c.attn_rotary_dim();
         self.mrope_cos_dev = self.dalloc(b * rope_dim * 4)?;
         self.mrope_sin_dev = self.dalloc(b * rope_dim * 4)?;
-        self.row_embed_dev = self.dalloc(b * d * 4)?;
-        self.row_embed_mask_dev = self.dalloc(b * 4)? as *mut i32;
+        let row_embed_bytes = b
+            .checked_mul(d)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| Error::InvalidArgument("row embedding buffer overflow".into()))?;
+        let row_embed_mask_bytes = b
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidArgument("row embedding mask overflow".into()))?;
+        self.row_embed_dev = self.dalloc(row_embed_bytes)?;
+        self.row_embed_mask_dev = self.dalloc(row_embed_mask_bytes)? as *mut i32;
         self.slots_dev = self.dalloc(b * 4)? as *mut i32;
         let max_runs = b.div_ceil(2);
         self.runs_dev = self.dalloc(max_runs * 4 * 4)? as *mut i32;
@@ -2576,11 +2583,17 @@ impl BatchedModel {
                 features.len()
             )));
         }
+        let feature_bytes = want
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidArgument("row embedding byte size overflow".into()))?;
+        let mask_bytes = rows.checked_mul(4).ok_or_else(|| {
+            Error::InvalidArgument("row embedding mask byte size overflow".into())
+        })?;
         hip::memcpy_async(
             self.k.hip(),
             self.row_embed_dev as *mut core::ffi::c_void,
             features.as_ptr() as *const core::ffi::c_void,
-            want * 4,
+            feature_bytes,
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.k.stream,
         )?;
@@ -2588,7 +2601,7 @@ impl BatchedModel {
             self.k.hip(),
             self.row_embed_mask_dev as *mut core::ffi::c_void,
             mask.as_ptr() as *const core::ffi::c_void,
-            rows * 4,
+            mask_bytes,
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.k.stream,
         )?;
@@ -3092,6 +3105,11 @@ impl BatchedModel {
             }
         };
 
+        if self.row_embed_active && b as usize > self.row_embed_rows {
+            return Err(Error::InvalidArgument(
+                "row embeddings do not cover this step".into(),
+            ));
+        }
         if !self.emb_q4.is_null() {
             // Dense Q4-on-device: embedding rows dequantize in the gather.
             k.launch_embed_gather_q4(self.tokens_dev, self.emb_q4.q, self.emb_q4.s, self.x, d, b)?;
@@ -3101,11 +3119,6 @@ impl BatchedModel {
             k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
         }
         if self.row_embed_active {
-            if b as usize > self.row_embed_rows {
-                return Err(Error::InvalidArgument(
-                    "row embeddings do not cover this step".into(),
-                ));
-            }
             k.launch_embed_scatter_rows(self.x, self.row_embed_dev, self.row_embed_mask_dev, b, d)?;
         }
         // Debug (issue #107): pre-layer-0 embedding snapshot (row 0 of the

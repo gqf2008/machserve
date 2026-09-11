@@ -4680,6 +4680,11 @@ impl HipKernels {
         let total = (rows as i64)
             .checked_mul(cols as i64)
             .ok_or_else(|| Error::InvalidArgument("embed_scatter_rows size overflow".into()))?;
+        if total > i32::MAX as i64 {
+            return Err(Error::InvalidArgument(
+                "embed_scatter_rows total exceeds i32".into(),
+            ));
+        }
         let total = u32::try_from(total)
             .map_err(|_| Error::InvalidArgument("embed_scatter_rows grid overflow".into()))?;
         let xp = x;
