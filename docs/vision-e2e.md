@@ -87,9 +87,20 @@ python tools/vision_c4_e2e.py --dry-run `
 ```powershell
 python tools/vision_c4_e2e.py --binary target/release/mach-server.exe `
   --model-dir .models/qwen3.8-27b --image artifacts/vision-c4/input.png `
-  --out-dir artifacts/vision-c4 --extra-env MACH_Q4=1 --extra-env MACH_CAPACITY=1 `
+  --out-dir artifacts/vision-c4 --max-patches 2048 `
+  --extra-env MACH_Q4=1 --extra-env MACH_Q4_DEVICE=2 --extra-env MACH_CAPACITY=1 `
   --extra-env MACH_VISION_DUMP=artifacts/vision-c4/ms_features
 ```
+
+注意 **`MACH_Q4_DEVICE=2` 不能省**：27B 是 dense，`MACH_Q4=1` 只让 host 权重保持
+int4，设备上仍会把 dense 权重解量化成 f16（`doctor` 估算 ~53 GiB，超出 24GB 卡）；
+只有 `MACH_Q4_DEVICE=2` 会把 dense 张量也按原始 int4 常驻设备（本次服务 preflight
+实测 `estimated need 16.42GiB`）。`estimate_vram` 对 `=1`/`=2` 用同一个系数，所以
+这条结论来自 Q4-on-device 的运行时语义与实测 preflight，而不是估算差值。
+
+`--max-patches 2048` 覆盖 `MACH_VISION_MAX_TOKENS`：128x128 图会先按 `min_pixels`
+放大到 256x256，得 grid `[1,16,16]` = **256 patch（merge 后 64 个视觉 token）**，
+2048 足够且把 vision scratch 压到最小；不设时默认 8192。
 
 5) 数值对拍（HF `hf_golden_features.npy` vs MachServe `ms_features.bin/json`；compare 同时校验 grid 与输入 SHA-256 绑定）：
 
@@ -100,29 +111,72 @@ python tools/vision_c4_compare.py `
   --e2e-summary artifacts/vision-c4/summary.json --require-hash --atol 1e-3 --rtol 1e-3
 ```
 
-6) 负例（重启服务后）：
+6) 负例与确定性（脚本会起停服务两次；需真机）：
 
-- 不设 `MACH_VISION` 时图片请求应返回 501 `multimodal_not_implemented`；
-- 超 `MACH_VISION_MAX_TOKENS` 的图片应返回 400，不得空完成；
-- 纯文本请求行为与开启 vision 前一致。
+```powershell
+python tools/vision_c4_negative.py --binary target/release/mach-server.exe `
+  --model-dir .models/qwen3.8-27b --image artifacts/vision-c4/input.png `
+  --out artifacts/vision-c4/negatives.json `
+  --extra-env MACH_Q4=1 --extra-env MACH_Q4_DEVICE=2 --extra-env MACH_CAPACITY=1
+```
+
+检查项：图片 200、同图两次 `temperature=0` 逐字一致、超 patch 预算 400、纯文本 200、
+不带 `MACH_VISION` 时图片 501 `multimodal_not_implemented`；报告写入
+`artifacts/vision-c4/negatives.json`，任一不符退出码非 0。
 
 ## 验收
 
 - 服务启动日志出现 vision 配置与权重加载；`/healthz` 200；
 - E2E 每次只发一个 vision 请求；`MACH_VISION_DUMP` 会被覆盖，summary 校验 dump 非空且 mtime 新于请求开始，SSE `data: {"error": ...}` 会让脚本返回非 0；
 - 图片问答请求 200，回答能描述图片内容；`summary.json` 含 `ttft_seconds`、VRAM 采样（`vram_ok=true`）、输入 SHA-256；
-- `vision_c4_compare.py` 的 `max_abs_diff`/`max_rel_diff` 在约定容差内、`nonfinite == 0`（HF 侧必须是 transformer 视觉塔真实输出；PIL 回退只用于 processor 参考）；
+- `vision_c4_compare.py` 的 `pass` 采用 numpy 混合容差（`|d| <= atol + rtol*|ref|`）：`max_abs_diff` 与 `mean_abs_diff` 应远小于 atol，`max_rel_diff` 在近零特征上天然很大，必须结合混合容差与 `nonfinite == 0` 一起读（HF 侧必须是 transformer 视觉塔真实输出；PIL 回退只用于 processor 参考）；
 - temperature=0 多次运行输出一致；HF 整模型 greedy token/logits 参考由操作员按现有 HF 环境补充并记录；
 - 文本-only 回归、501/400 负例通过；VRAM/TTFT/耗时写入 `artifacts/vision-c4/summary.json` 并回填 Issue #146。
 
+## C4 真机实测（2026-09-11，7900 XTX / ROCm 6.2 / Windows）
+
+本次完成的是**HTTP 端到端多模态链路**与**视觉塔 GPU↔HF 特征对拍**；issue #146 验收里
+的「整模型 HF token/logits 对齐」仍未做（见文末待办）。
+
+输入 `artifacts/vision-c4/input.png`（128x128，SHA-256 `4550d45d…`），模型
+`.models/qwen3.8-27b`，`MACH_Q4=1 MACH_Q4_DEVICE=2 MACH_CAPACITY=1
+MACH_VISION_MAX_TOKENS=2048`（release 二进制）：
+
+- 启动/加载：从进程启动到**首个请求开始**共 **123.3s**（`summary.json` 的
+  `load_plus_wait_seconds`，含 healthz 等待与一次 VRAM 采样；纯 healthz 时刻未单独记录）；日志
+  `GPU preflight: device_count=2, VRAM free 23.84GiB / 23.98GiB, estimated need 16.42GiB`、
+  `vision: depth=27 hidden=1152 merge=2 image_token=248056 max_patches=2048`。
+- 图片问答：HTTP **200**，SSE 流式回答
+  “A red circle, a white square, and a yellow triangle are arranged on a dark blue
+  background.”，**TTFT 3.15s**（含 prefill+vision 前向）；`temperature=0` 连发两次
+  输出逐字一致。
+- GPU↔HF 对拍（`vision_c4_compare.py --atol 1e-3 --rtol 1e-3 --require-hash`）：
+  **pass=true**，`grid_match=true`、`image_hash_match=true`、`nonfinite=0`、
+  **max_abs_diff 7.362e-4**、mean_abs 1.626e-6。`pass` 用的是混合容差，所以同一份
+  输出里的 `max_rel_diff 22.6`（出现在近零特征上）与 pass 不矛盾；这里主要看
+  `max_abs_diff`。
+- 负例与确定性（`tools/vision_c4_negative.py`，报告
+  `artifacts/vision-c4/negatives.json`）：超过 patch 预算的 2048x2048 图
+  （grid 128x128 = 16384 patch）返回 **400**
+  `image grid 128x128 = 16384 patches exceeds limit 2048`；不带 `MACH_VISION` 时
+  图片请求返回 **501** `multimodal_not_implemented`；同服务纯文本请求 **200**；
+  同一张图两次 `temperature=0` 输出逐字一致。
+- Fast/PIL 漂移：装上 torchvision 0.29.0+cpu 后用 `AutoProcessor` 走 Fast 路径与
+  PIL 路径对比同一张图，grid 相同、`max_abs_diff 5.9e-8`、mean 3.3e-9（ULP 级）；
+  且 **PIL 参考与 Rust 生产预处理逐位相同**（`pil vs rust max_abs 0.0`）。
+- VRAM 采样注意：`mach-server doctor` 是**另一个进程**，Windows 驱动只报该进程的
+  空闲值（服务运行中仍报 23.84 GiB free），所以 `summary.json` 的 `vram_*` 只能当
+  背景参考；服务日志的 preflight 行（`VRAM free 23.84GiB … estimated need
+  16.42GiB`）也只是**加载前的预算**。本次**没有采到实际占用**——要采需在服务进程内
+  前后采样，或使用可用的 `rocm-smi`。
+
 ## C4 仍待处理
 
-真机窗口项（必须 7900 XTX）：
+待办：
 
-- 步骤 1–5：golden/compare、图片问答 E2E、TTFT/VRAM 回填 Issue #146；
-- HF 整模型 greedy token/logits 参考（本机 31GB 内存装不下 BF16 27B，只能在
-  真机或另一台机器上生成）；
-- Fast/torchvision 与 PIL 归一路径的数值漂移复核（当前 golden 明确是 PIL 回退）。
+- HF 整模型 greedy token/logits 参考：本机 31GB 内存装不下 BF16 27B、且 PyTorch
+  没有 Windows ROCm 轮子，必须在 ≥64GB 内存的机器（或 Linux+ROCm torch）上生成
+  后再与本实现的输出对比。其余真机项见上面「C4 实测结果」。
 
 纯离线 P3（不阻塞真机）：
 
