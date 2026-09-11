@@ -52,7 +52,7 @@ python tools/vision_c4_e2e.py --binary target/release/mach-server.exe `
 python tools/vision_c4_compare.py `
   --hf-npy artifacts/vision-c4/hf_golden_features.npy `
   --ms-prefix artifacts/vision-c4/ms_features --hf-json artifacts/vision-c4/hf_golden.json `
-  --atol 1e-3 --rtol 1e-3
+  --e2e-summary artifacts/vision-c4/summary.json --require-hash --atol 1e-3 --rtol 1e-3
 ```
 
 5) 负例（重启服务后）：

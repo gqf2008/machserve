@@ -136,6 +136,19 @@ def selftest():
     empty = ["data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n"]
     ttft, error = parse_sse_data(empty, time.time())
     assert ttft is None and error is None, (ttft, error)
+    import tempfile
+
+    prefix = os.path.join(tempfile.gettempdir(), "vision_c4_dump_selftest")
+    for suffix in (".bin", ".json"):
+        with open(prefix + suffix, "wb") as handle:
+            handle.write(b"x")
+    status = dump_status(prefix, {})
+    assert all("error" not in entry for entry in status.values()), status
+    stale = {suffix: os.path.getmtime(prefix + suffix) + 1 for suffix in (".bin", ".json")}
+    status = dump_status(prefix, stale)
+    assert any(entry.get("error") == "stale" for entry in status.values()), status
+    for suffix in (".bin", ".json"):
+        os.remove(prefix + suffix)
     print("vision_c4_e2e selftest ok")
 
 

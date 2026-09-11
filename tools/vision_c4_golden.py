@@ -136,7 +136,7 @@ def tower_smoke():
         out = model(hidden_states=hidden, grid_thw=grid)
     features = out.pooler_output
     assert features is not None, "tower smoke: no pooler_output"
-    assert features.shape[-1] == cfg.out_hidden_size
+    assert tuple(features.shape) == (4, cfg.out_hidden_size), tuple(features.shape)
     print("tower smoke ok:", tuple(features.shape))
 
 def main():
@@ -154,8 +154,10 @@ def main():
     if not args.model_dir or not args.image or not args.out:
         parser.error("--model-dir/--image/--out are required unless --smoke")
 
-    image_sha256 = hashlib.sha256(open(args.image, "rb").read()).hexdigest()
-    img = np.asarray(Image.open(args.image).convert("RGB"), dtype=np.uint8)
+    with open(args.image, "rb") as handle:
+        image_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    with Image.open(args.image) as handle:
+        img = np.asarray(handle.convert("RGB"), dtype=np.uint8)
     proc, kind = load_processor(args.model_dir, args.allow_pil_fallback)
     hidden_states, grid = process(proc, img)
     flat = np.asarray(hidden_states, dtype=np.float64).flatten()
