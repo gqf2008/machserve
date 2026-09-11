@@ -151,6 +151,16 @@ impl Q4TensorDev {
     }
 }
 
+/// INT8 KV buffers for one full-attention layer: packed signed-byte payload
+/// plus per-token/head f32 scales, contiguous `[slots,max_seq,kv_heads,dim]`.
+#[derive(Clone, Copy)]
+struct Int8KvDev {
+    kp: *mut i8,
+    ks: *mut f32,
+    vp: *mut i8,
+    vs: *mut f32,
+}
+
 /// Dense (non-expert) Q4 weights per layer (dense Q4-on-device mode,
 /// `MACH_Q4_DEVICE=2`): every big GEMM tensor stays raw Q4 on device — the
 /// memory path for DENSE 27B-class checkpoints, where the dequantized f16
@@ -383,6 +393,10 @@ pub struct BatchedModel {
     /// KV caches as opaque pointers (f32 or fp16 per dtype), layout
     /// `[batch, max_seq, kv_heads, head_dim]`.
     kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
+    /// Optional contiguous INT8 KV buffers, index-aligned with layers; only
+    /// full-attention layers carry Some.
+    int8_kv: bool,
+    int8_kv_cache: Vec<Option<Int8KvDev>>,
     /// MLA KV caches (kv_lora_rank > 0): expanded per-head k/v, layout
     /// `[batch, max_seq, heads, hd]` / `[batch, max_seq, heads, v_hd]`.
     mla_kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
@@ -837,6 +851,29 @@ impl BatchedModel {
 
     /// Q4 variant of [`with_rows`]: `slots` KV slots and `rows` row capacity
     /// (prefill can pack more prompt positions per step).
+    /// Dense Q4-on-device + contiguous INT8 KV (experimental, full-attention
+    /// layers only). MLA and paged modes are rejected until their INT8 paths
+    /// are wired and parity-validated.
+    pub fn with_rows_q4_all_int8_kv(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+    ) -> Result<Self, Error> {
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model("INT8 KV requires dtype F16".into()));
+        }
+        if cfg.kv_lora_rank > 0 {
+            return Err(Error::Model(
+                "INT8 KV does not support MLA yet (kv_lora_rank > 0)".into(),
+            ));
+        }
+        Self::build_common_with(hip, cfg, slots, rows, usize::MAX, true, |m| {
+            m.upload_weights_q4(w, true, true)
+        })
+    }
+
     pub fn with_rows_q4(
         hip: Arc<Hip>,
         cfg: Config,
@@ -1018,6 +1055,18 @@ impl BatchedModel {
         expert_slots: usize,
         upload: impl FnOnce(&mut Self) -> Result<(), Error>,
     ) -> Result<Self, Error> {
+        Self::build_common_with(hip, cfg, slots, rows, expert_slots, false, upload)
+    }
+
+    fn build_common_with(
+        hip: Arc<Hip>,
+        cfg: Config,
+        slots: usize,
+        rows: usize,
+        expert_slots: usize,
+        int8_kv: bool,
+        upload: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
         assert!(slots >= 1, "slots must be >= 1");
         assert!(rows >= slots, "rows must be >= slots");
         let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
@@ -1104,6 +1153,8 @@ impl BatchedModel {
             emb_q4: Q4TensorDev::EMPTY,
             lm_head_q4: Q4TensorDev::EMPTY,
             kv_cache: Vec::new(),
+            int8_kv,
+            int8_kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
             last_row_by_slot: vec![0; slots],
@@ -1369,13 +1420,29 @@ impl BatchedModel {
         // Dense KV cache: skipped on the MLA path (kv_lora_rank > 0), which
         // keeps its expanded per-head KV in `mla_kv_cache`; allocating it here
         // would waste VRAM (n_kv_heads = n_heads, head_dim = nope+rope).
-        if c.kv_lora_rank == 0 {
+        if c.kv_lora_rank == 0 && !self.int8_kv {
             let kv_bytes = self.batch * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
             for _ in 0..c.n_layers {
                 let kk = self.dalloc(kv_bytes)?;
                 let vv = self.dalloc(kv_bytes)?;
                 self.kv_cache
                     .push((kk as *mut core::ffi::c_void, vv as *mut core::ffi::c_void));
+            }
+        }
+        if self.int8_kv {
+            let payload_bytes = self.batch * c.max_seq_len * c.n_kv_heads * c.head_dim;
+            let scale_bytes = self.batch * c.max_seq_len * c.n_kv_heads * 4;
+            self.kv_cache = vec![(std::ptr::null_mut(), std::ptr::null_mut()); c.n_layers];
+            self.int8_kv_cache = vec![None; c.n_layers];
+            for li in 0..c.n_layers {
+                if c.gdn_enabled() && !c.layer_is_full_attn(li) {
+                    continue;
+                }
+                let kp = self.dalloc(payload_bytes)? as *mut i8;
+                let ks = self.dalloc(scale_bytes)?;
+                let vp = self.dalloc(payload_bytes)? as *mut i8;
+                let vs = self.dalloc(scale_bytes)?;
+                self.int8_kv_cache[li] = Some(Int8KvDev { kp, ks, vp, vs });
             }
         }
         if c.kv_lora_rank > 0 {
@@ -2217,6 +2284,9 @@ impl BatchedModel {
         let kv_bytes =
             self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * kv_elem;
         for (kc, vc) in &self.kv_cache {
+            if kc.is_null() {
+                continue;
+            }
             unsafe {
                 hip::check(
                     self.k.hip(),
@@ -2226,6 +2296,32 @@ impl BatchedModel {
                     self.k.hip(),
                     (self.k.hip().api.hip_memset)(*vc as *mut _, 0, kv_bytes),
                 )?;
+            }
+        }
+        if !self.int8_kv_cache.is_empty() {
+            let payload_bytes =
+                self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim;
+            let scale_bytes = self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * 4;
+            for entry in &self.int8_kv_cache {
+                let Some(iv) = entry else { continue };
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(iv.kp as *mut _, 0, payload_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(iv.ks as *mut _, 0, scale_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(iv.vp as *mut _, 0, payload_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(iv.vs as *mut _, 0, scale_bytes),
+                    )?;
+                }
             }
         }
         if !self.mla_kv_cache.is_empty() {
@@ -2336,6 +2432,21 @@ impl BatchedModel {
             }
         }
         Ok(())
+    }
+
+    /// Whether this model keeps full-attention KV in the contiguous INT8 path.
+    #[must_use]
+    pub const fn int8_kv_enabled(&self) -> bool {
+        self.int8_kv
+    }
+
+    /// Number of layers with allocated INT8 K/V buffers.
+    #[must_use]
+    pub fn int8_kv_layer_count(&self) -> usize {
+        self.int8_kv_cache
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
     }
 
     /// Runs a batched decode step for `tokens` (one per sequence), returning the
@@ -3331,7 +3442,48 @@ impl BatchedModel {
                     RopeParams::from(c),
                 )?;
                 let (kc, vc) = self.kv_cache[li];
-                if f16 && self.paged {
+                if self.int8_kv {
+                    let iv = self.int8_kv_cache[li].expect("full-attention INT8 KV cache");
+                    k.launch_kv_store_int8(
+                        self.k_buf,
+                        iv.kp,
+                        iv.ks,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.max_seq_len as i32,
+                    )?;
+                    k.launch_kv_store_int8(
+                        self.v_buf,
+                        iv.vp,
+                        iv.vs,
+                        self.pos_dev,
+                        slots,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        c.max_seq_len as i32,
+                    )?;
+                    k.launch_attn_decode_batched_int8_gqa(
+                        self.q,
+                        iv.kp as *const i8,
+                        iv.ks as *const f32,
+                        iv.vp as *const i8,
+                        iv.vs as *const f32,
+                        self.attn,
+                        self.pos_dev,
+                        slots,
+                        run_mask,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        c.max_seq_len as i32,
+                    )?;
+                } else if f16 && self.paged {
                     // Paged decode (F16 KV): store + attention through the
                     // block tables; same addressing as the F32 paged branch.
                     let tpp = self.tokens_per_page as i32;
@@ -4365,6 +4517,11 @@ impl BatchedModel {
                 self.batch
             )));
         }
+        if self.int8_kv {
+            return Err(Error::InvalidArgument(
+                "state anchors do not support INT8 KV yet".into(),
+            ));
+        }
         if tokens.len() != token_idx + 1 {
             return Err(Error::InvalidArgument(format!(
                 "anchor token_idx {token_idx} does not match {} prefix tokens",
@@ -4471,6 +4628,11 @@ impl BatchedModel {
                 self.batch
             )));
         }
+        if self.int8_kv {
+            return Err(Error::InvalidArgument(
+                "state anchors do not support INT8 KV yet".into(),
+            ));
+        }
         let c = self.cfg;
         if anchor.kv.layers.len() != c.n_layers {
             return Err(Error::InvalidArgument(format!(
@@ -4567,6 +4729,46 @@ impl BatchedModel {
     /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the
     /// first `len` positions are copied.
     pub fn copy_seq_kv(&self, from: usize, to: usize, len: usize) -> Result<(), Error> {
+        if self.int8_kv {
+            let c = self.cfg;
+            if len == 0 {
+                return Ok(());
+            }
+            let payload_stride = c.max_seq_len * c.n_kv_heads * c.head_dim;
+            let scale_stride = c.max_seq_len * c.n_kv_heads * 4;
+            let copy_payload = len * c.n_kv_heads * c.head_dim;
+            let copy_scale = len * c.n_kv_heads * 4;
+            for entry in &self.int8_kv_cache {
+                let Some(iv) = entry else { continue };
+                for (src, dst, stride, bytes) in [
+                    (
+                        iv.kp as *const _,
+                        iv.kp as *mut _,
+                        payload_stride,
+                        copy_payload,
+                    ),
+                    (
+                        iv.vp as *const _,
+                        iv.vp as *mut _,
+                        payload_stride,
+                        copy_payload,
+                    ),
+                    (iv.ks as *const _, iv.ks as *mut _, scale_stride, copy_scale),
+                    (iv.vs as *const _, iv.vs as *mut _, scale_stride, copy_scale),
+                ] {
+                    let src = (src as usize + from * stride) as *const core::ffi::c_void;
+                    let dst = (dst as usize + to * stride) as *mut core::ffi::c_void;
+                    hip::memcpy(
+                        self.k.hip(),
+                        dst,
+                        src,
+                        bytes,
+                        hip::HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         let kv_elem = if self.cfg.dtype == ModelDType::F16 {
             2
         } else {

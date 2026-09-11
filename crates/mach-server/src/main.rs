@@ -730,6 +730,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage-FP8 mode: weights stay E4M3 on the host (dequantized to f16
     // per tensor on the device), cutting host RAM ~2x vs f16 / ~4x vs f32.
     let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
+    let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
+    let kv_int8 = match std::env::var("MACH_KV").as_deref() {
+        Err(_) | Ok("") | Ok("0") | Ok("f16") => false,
+        Ok("int8") => true,
+        Ok(other) => {
+            eprintln!("MACH_KV must be f16 or int8, got {other:?}");
+            std::process::exit(1);
+        }
+    };
+    if kv_int8 && (!q4 || q4_device != 2) {
+        eprintln!("MACH_KV=int8 currently requires MACH_Q4=1 MACH_Q4_DEVICE=2");
+        std::process::exit(1);
+    }
+    if kv_int8 && paged_requested {
+        eprintln!("MACH_KV=int8 is not wired for MACH_PAGED yet; unset MACH_PAGED");
+        std::process::exit(1);
+    }
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -755,6 +772,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("MACH_DTYPE must be f32 or f16, got {other:?}");
             std::process::exit(1);
         }
+    }
+    if kv_int8 && cfg.kv_lora_rank > 0 {
+        eprintln!("MACH_KV=int8 does not support MLA checkpoints yet (kv_lora_rank > 0)");
+        std::process::exit(1);
     }
     if q4 {
         if cfg.dtype != ModelDType::F16 {
@@ -935,7 +956,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Paged mode is wired for the plain-Weights and storage-quantized paths
     // (device f16 served by the f16 paged kernels); MACH_SPEC remains
     // contiguous-only (warned).
-    let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
     // Resolve paged engagement BEFORE any weight load: a stale/invalid
     // MACH_TPP or a paged-incompatible checkpoint must fail fast (or degrade
     // with a warning) up front, not abort after the multi-minute load.
@@ -982,7 +1002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
         };
         let handle = match q4_device {
-            2 => eng.clone().spawn_q4_all(hip, cfg, wq4)?,
+            2 => eng.clone().spawn_q4_all(hip, cfg, wq4, kv_int8)?,
             1 => eng.clone().spawn_q4_device(hip, cfg, wq4)?,
             _ => eng.clone().spawn_q4(hip, cfg, wq4)?,
         };

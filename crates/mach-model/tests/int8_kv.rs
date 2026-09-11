@@ -8,8 +8,12 @@
 #![cfg(feature = "hip")]
 
 use mach_kernel_sys::hip;
+use mach_model::batched::BatchedModel;
+use mach_model::config::ModelDType;
 use mach_model::kernels::HipKernels;
 use mach_model::kv_quant::{Int8Kv, PagedInt8KvLayout, attention_decode_int8, scatter_paged_int8};
+use mach_model::sampling::SamplingParams;
+use mach_model::{Config, Weights, WeightsQ4};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -360,5 +364,91 @@ fn paged_int8_kv_store_and_attention_match_cpu_oracle() {
             assert_eq!(got_ks[si], ck.scales()[head]);
             assert_eq!(got_vs[si], cv.scales()[head]);
         }
+    }
+}
+
+#[test]
+#[ignore = "GPU runtime parity; run explicitly with MACH_TEST_INT8_KV=1"]
+fn batched_model_q4_int8_kv_matches_f16_greedy() {
+    let Some((h, _)) = gpu_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 123).unwrap();
+    let wq = WeightsQ4::from_weights(&w, &cfg);
+    let mut f16 = BatchedModel::with_rows_q4_all(Arc::clone(&h), cfg, &wq, 1, 1).unwrap();
+    let mut int8 = BatchedModel::with_rows_q4_all_int8_kv(Arc::clone(&h), cfg, &wq, 1, 1).unwrap();
+    assert!(int8.int8_kv_enabled());
+    assert!(int8.int8_kv_layer_count() > 0);
+
+    let prompt = [3u32, 17, 42, 5, 11, 29, 7, 13];
+    let mut f16_tokens = Vec::with_capacity(prompt.len());
+    let mut int8_tokens = Vec::with_capacity(prompt.len());
+    for &token in &prompt {
+        f16_tokens.push(f16.decode_step(&[token]).unwrap()[0]);
+        int8_tokens.push(int8.decode_step(&[token]).unwrap()[0]);
+    }
+    assert_eq!(
+        int8_tokens, f16_tokens,
+        "Q4 dense INT8 KV greedy chain diverged"
+    );
+}
+
+#[test]
+#[ignore = "GPU runtime prefill parity; run explicitly with MACH_TEST_INT8_KV=1"]
+fn batched_model_q4_int8_kv_prefill_matches_f16() {
+    let Some((h, _)) = gpu_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let w = Weights::random(&cfg, 321).unwrap();
+    let wq = WeightsQ4::from_weights(&w, &cfg);
+    let mut f16 = BatchedModel::with_rows_q4_all(Arc::clone(&h), cfg, &wq, 1, 4).unwrap();
+    let mut int8 = BatchedModel::with_rows_q4_all_int8_kv(Arc::clone(&h), cfg, &wq, 1, 4).unwrap();
+    let tokens = [3u32, 17, 42, 5];
+    let lens = [0u32, 1, 2, 3];
+    let slots = [0u32, 0, 0, 0];
+    let mut params_a: Vec<SamplingParams> = (0..tokens.len())
+        .map(|_| SamplingParams::default())
+        .collect();
+    let mut params_b = params_a.clone();
+    let counts_a: Vec<Vec<(u32, u32)>> = vec![Vec::new(); tokens.len()];
+    let counts_b = counts_a.clone();
+    let bias_a: Vec<Vec<(u32, f32)>> = vec![Vec::new(); tokens.len()];
+    let bias_b = bias_a.clone();
+    f16.decode_step_explicit(
+        &tokens,
+        &lens,
+        &slots,
+        &mut params_a,
+        &counts_a,
+        &bias_a,
+        false,
+    )
+    .unwrap();
+    int8.decode_step_explicit(
+        &tokens,
+        &lens,
+        &slots,
+        &mut params_b,
+        &counts_b,
+        &bias_b,
+        false,
+    )
+    .unwrap();
+    let a = f16.read_logits_rows(tokens.len()).unwrap();
+    let b = int8.read_logits_rows(tokens.len()).unwrap();
+    let vocab = cfg.vocab_size;
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    for row in 0..tokens.len() {
+        let ar = &a[row * vocab..(row + 1) * vocab];
+        let br = &b[row * vocab..(row + 1) * vocab];
+        assert_eq!(argmax(ar), argmax(br), "prefill row {row} greedy diverged");
+        let diff = max_abs_diff(ar, br);
+        assert!(diff < 0.02, "prefill row {row} logit diff {diff}");
     }
 }

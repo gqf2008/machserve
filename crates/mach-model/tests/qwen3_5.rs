@@ -463,6 +463,68 @@ mod gpu {
         );
     }
 
+    /// Same compaction scenario on the INT8 KV runtime: both control and
+    /// compacted engines use Q4 dense + INT8 KV, so any divergence isolates
+    /// the INT8 slot-copy path rather than Q4 precision.
+    #[test]
+    fn gdn_compaction_moves_state_int8_kv() {
+        let Some(hip) = hip_ctx() else { return };
+        let cfg = small_cfg(ModelDType::F16);
+        let w = Weights::random(&cfg, 61).unwrap();
+        let wq = mach_model::WeightsQ4::from_weights(&w, &cfg);
+        let prompt_b = vec![90u32, 7, 42, 5];
+        let max_new_b = 5usize;
+
+        let control = {
+            let mut eng =
+                ContinuousModel::with_prefill_rows_q4_all_int8_kv(Arc::clone(&hip), cfg, &wq, 2, 4)
+                    .unwrap();
+            let id = eng
+                .add(
+                    &prompt_b,
+                    max_new_b,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    SamplingParams::default(),
+                )
+                .unwrap();
+            while !eng.all_done() {
+                eng.step().unwrap();
+            }
+            eng.generated(id)
+        };
+
+        let mut eng =
+            ContinuousModel::with_prefill_rows_q4_all_int8_kv(Arc::clone(&hip), cfg, &wq, 2, 4)
+                .unwrap();
+        let a = eng
+            .add(
+                &[3u32, 17],
+                1,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        let b = eng
+            .add(
+                &prompt_b,
+                max_new_b,
+                None,
+                Vec::new(),
+                Vec::new(),
+                SamplingParams::default(),
+            )
+            .unwrap();
+        while !eng.all_done() {
+            eng.step().unwrap();
+        }
+        assert_eq!(eng.generated(a).len(), 1);
+        assert_eq!(eng.generated(b), control, "INT8 compaction lost state");
+    }
+
     /// Batched decode of two interleaved sequences: each row's logits vs its
     /// own single-sequence reference — pins that the SLOT-indexed GDN state
     /// keeps the sequences isolated while they share steps.
