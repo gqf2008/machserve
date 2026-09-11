@@ -3586,6 +3586,11 @@ impl HipKernels {
         cols: i32,
         eps: f32,
     ) -> Result<(), Error> {
+        if rows <= 0 || cols <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "layer_norm requires positive rows/cols, got {rows}x{cols}"
+            )));
+        }
         let xp = x;
         let wp = w;
         let yp = y;
@@ -3709,6 +3714,11 @@ impl HipKernels {
         cols: i32,
         eps: f32,
     ) -> Result<(), Error> {
+        if rows <= 0 || cols <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "layer_norm requires positive rows/cols, got {rows}x{cols}"
+            )));
+        }
         let xp = x;
         let wp = w;
         let bp = b;
@@ -3728,6 +3738,14 @@ impl HipKernels {
 
     /// In-place GELU for the vision MLP (`tanh`) or merger (`erf`).
     pub fn launch_gelu(&self, x: *mut f32, n: i32, tanh: bool) -> Result<(), Error> {
+        if n < 0 {
+            return Err(Error::InvalidArgument(format!(
+                "gelu requires a non-negative element count, got {n}"
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
         let xp = x;
         let mut p = vec![
             &xp as *const *mut f32 as *mut core::ffi::c_void,
@@ -3752,6 +3770,11 @@ impl HipKernels {
         heads: i32,
         hd: i32,
     ) -> Result<(), Error> {
+        if tokens <= 0 || heads <= 0 || hd <= 0 || hd % 2 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "vision_rope_apply requires positive tokens/heads and an even hd, got tokens={tokens} heads={heads} hd={hd}"
+            )));
+        }
         let qp = qkv;
         let cp = cos;
         let sp = sin;
@@ -3787,6 +3810,11 @@ impl HipKernels {
         scale: f32,
         max_seg: i32,
     ) -> Result<(), Error> {
+        if tokens <= 0 || heads <= 0 || hd <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "vision_attn requires positive tokens/heads/hd, got tokens={tokens} heads={heads} hd={hd}"
+            )));
+        }
         if max_seg <= 0 {
             return Err(Error::InvalidArgument(
                 "vision_attn max_seg must be positive".into(),

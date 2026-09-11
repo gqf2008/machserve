@@ -27,9 +27,9 @@ fn linear(name: &str, out_dim: usize, in_dim: usize) -> VisionLinear {
 fn tiny_cfg() -> VisionConfig {
     VisionConfig {
         depth: 1,
-        hidden_size: 4,
-        intermediate_size: 8,
-        num_heads: 1,
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_heads: 2,
         in_channels: 1,
         patch_size: 2,
         temporal_patch_size: 2,
@@ -48,31 +48,31 @@ fn tiny_cfg() -> VisionConfig {
 
 fn tiny_weights() -> VisionWeights {
     let layer = VisionLayerWeights {
-        norm1_weight: fill("blocks.0.norm1.weight", 4),
-        norm1_bias: fill("blocks.0.norm1.bias", 4),
-        qkv: linear("blocks.0.attn.qkv", 12, 4),
-        attn_proj: linear("blocks.0.attn.proj", 4, 4),
-        norm2_weight: fill("blocks.0.norm2.weight", 4),
-        norm2_bias: fill("blocks.0.norm2.bias", 4),
-        mlp_fc1: linear("blocks.0.mlp.linear_fc1", 8, 4),
-        mlp_fc2: linear("blocks.0.mlp.linear_fc2", 4, 8),
+        norm1_weight: fill("blocks.0.norm1.weight", 8),
+        norm1_bias: fill("blocks.0.norm1.bias", 8),
+        qkv: linear("blocks.0.attn.qkv", 24, 8),
+        attn_proj: linear("blocks.0.attn.proj", 8, 8),
+        norm2_weight: fill("blocks.0.norm2.weight", 8),
+        norm2_bias: fill("blocks.0.norm2.bias", 8),
+        mlp_fc1: linear("blocks.0.mlp.linear_fc1", 16, 8),
+        mlp_fc2: linear("blocks.0.mlp.linear_fc2", 8, 16),
     };
     VisionWeights {
-        patch_embed_weight: fill("patch_embed.proj.weight", 4 * 8),
-        patch_embed_bias: fill("patch_embed.proj.bias", 4),
-        pos_embed_weight: fill("pos_embed.weight", 4 * 4),
+        patch_embed_weight: fill("patch_embed.proj.weight", 8 * 8),
+        patch_embed_bias: fill("patch_embed.proj.bias", 8),
+        pos_embed_weight: fill("pos_embed.weight", 4 * 8),
         layers: vec![layer],
-        merger_norm_weight: fill("merger.norm.weight", 4),
-        merger_norm_bias: fill("merger.norm.bias", 4),
-        merger_fc1: linear("merger.linear_fc1", 16, 16),
-        merger_fc2: linear("merger.linear_fc2", 6, 16),
+        merger_norm_weight: fill("merger.norm.weight", 8),
+        merger_norm_bias: fill("merger.norm.bias", 8),
+        merger_fc1: linear("merger.linear_fc1", 32, 32),
+        merger_fc2: linear("merger.linear_fc2", 6, 32),
     }
 }
-
 #[test]
 #[ignore = "GPU vision parity; set MACH_TEST_VISION_GPU=1 and run explicitly"]
 fn gpu_vision_forward_matches_cpu() {
     if std::env::var("MACH_TEST_VISION_GPU").as_deref() != Ok("1") {
+        eprintln!("skipping GPU vision parity: MACH_TEST_VISION_GPU is not 1");
         return;
     }
     let hip = hip::hip().expect("HIP runtime");
@@ -86,9 +86,14 @@ fn gpu_vision_forward_matches_cpu() {
     let got = gpu.forward(&pixel, &prep).unwrap();
     assert_eq!(cpu.len(), got.len());
     let mut max_diff = 0.0f32;
-    for (a, b) in cpu.iter().zip(&got) {
-        max_diff = max_diff.max((a - b).abs());
+    for (i, (a, b)) in cpu.iter().zip(&got).enumerate() {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "non-finite vision output at {i}: {a} vs {b}"
+        );
+        let diff = (a - b).abs();
+        assert!(diff <= 5e-7, "vision GPU mismatch at {i}: {a} vs {b}");
+        max_diff = max_diff.max(diff);
     }
     eprintln!("vision GPU max_diff={max_diff}");
-    assert!(max_diff < 2e-4, "vision GPU mismatch: {max_diff}");
 }

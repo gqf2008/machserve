@@ -337,6 +337,7 @@ pub fn vision_forward(
     grids: &[VisionGrid],
 ) -> Result<Vec<f32>, Error> {
     cfg.validate()?;
+    validate_vision_weights(cfg, w)?;
     if grids.is_empty() {
         return Err(Error::InvalidArgument(
             "vision grids must not be empty".into(),
@@ -877,4 +878,141 @@ pub fn prepare_vision_inputs(
         merged_tokens,
         max_seg,
     })
+}
+
+/// Validate all vision weight tensor lengths against the configured shapes.
+///
+/// `VisionGpu::new` uploads raw pointers derived from these vectors, so this
+/// must run before any allocation/upload: a mismatched weight vector would
+/// otherwise turn a host-side shape bug into device OOB reads.
+pub fn validate_vision_weights(cfg: &VisionConfig, w: &VisionWeights) -> Result<(), Error> {
+    cfg.validate()?;
+    let h = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let patch_dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let merger = cfg.merger_input_dim();
+    let check = |name: &str, got: usize, want: usize| -> Result<(), Error> {
+        if got != want {
+            return Err(Error::Model(format!(
+                "vision weight {name} has {got} elements, expected {want}"
+            )));
+        }
+        Ok(())
+    };
+    check(
+        "patch_embed.weight",
+        w.patch_embed_weight.len(),
+        h * patch_dim,
+    )?;
+    check("patch_embed.bias", w.patch_embed_bias.len(), h)?;
+    check(
+        "pos_embed.weight",
+        w.pos_embed_weight.len(),
+        cfg.num_position_embeddings * h,
+    )?;
+    check("merger.norm.weight", w.merger_norm_weight.len(), h)?;
+    check("merger.norm.bias", w.merger_norm_bias.len(), h)?;
+    check(
+        "merger.fc1.weight",
+        w.merger_fc1.weight.len(),
+        merger * merger,
+    )?;
+    check("merger.fc1.bias", w.merger_fc1.bias.len(), merger)?;
+    check(
+        "merger.fc2.weight",
+        w.merger_fc2.weight.len(),
+        cfg.out_hidden_size * merger,
+    )?;
+    check(
+        "merger.fc2.bias",
+        w.merger_fc2.bias.len(),
+        cfg.out_hidden_size,
+    )?;
+    if w.layers.len() != cfg.depth {
+        return Err(Error::Model(format!(
+            "vision has {} layers, expected {}",
+            w.layers.len(),
+            cfg.depth
+        )));
+    }
+    for (i, layer) in w.layers.iter().enumerate() {
+        let p = |name: &str| format!("layers.{i}.{name}");
+        check(&p("norm1.weight"), layer.norm1_weight.len(), h)?;
+        check(&p("norm1.bias"), layer.norm1_bias.len(), h)?;
+        check(&p("qkv.weight"), layer.qkv.weight.len(), 3 * h * h)?;
+        check(&p("qkv.bias"), layer.qkv.bias.len(), 3 * h)?;
+        check(&p("attn.proj.weight"), layer.attn_proj.weight.len(), h * h)?;
+        check(&p("attn.proj.bias"), layer.attn_proj.bias.len(), h)?;
+        check(&p("norm2.weight"), layer.norm2_weight.len(), h)?;
+        check(&p("norm2.bias"), layer.norm2_bias.len(), h)?;
+        check(&p("mlp.fc1.weight"), layer.mlp_fc1.weight.len(), inter * h)?;
+        check(&p("mlp.fc1.bias"), layer.mlp_fc1.bias.len(), inter)?;
+        check(&p("mlp.fc2.weight"), layer.mlp_fc2.weight.len(), h * inter)?;
+        check(&p("mlp.fc2.bias"), layer.mlp_fc2.bias.len(), h)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn linear(out_dim: usize, in_dim: usize) -> VisionLinear {
+        VisionLinear {
+            weight: vec![0.0; out_dim * in_dim],
+            bias: vec![0.0; out_dim],
+        }
+    }
+
+    fn tiny_weights() -> (VisionConfig, VisionWeights) {
+        let cfg = VisionConfig {
+            depth: 1,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_heads: 1,
+            in_channels: 1,
+            patch_size: 2,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            num_position_embeddings: 4,
+            out_hidden_size: 6,
+            image_token_id: 1,
+            video_token_id: 2,
+            vision_start_token_id: 3,
+            vision_end_token_id: 4,
+            mrope_section: [1, 1, 1],
+            mrope_interleaved: true,
+            hidden_act: VisionActivation::GeluPytorchTanh,
+        };
+        let w = VisionWeights {
+            patch_embed_weight: vec![0.0; cfg.hidden_size * 8],
+            patch_embed_bias: vec![0.0; cfg.hidden_size],
+            pos_embed_weight: vec![0.0; cfg.num_position_embeddings * cfg.hidden_size],
+            layers: vec![VisionLayerWeights {
+                norm1_weight: vec![0.0; cfg.hidden_size],
+                norm1_bias: vec![0.0; cfg.hidden_size],
+                qkv: linear(3 * cfg.hidden_size, cfg.hidden_size),
+                attn_proj: linear(cfg.hidden_size, cfg.hidden_size),
+                norm2_weight: vec![0.0; cfg.hidden_size],
+                norm2_bias: vec![0.0; cfg.hidden_size],
+                mlp_fc1: linear(cfg.intermediate_size, cfg.hidden_size),
+                mlp_fc2: linear(cfg.hidden_size, cfg.intermediate_size),
+            }],
+            merger_norm_weight: vec![0.0; cfg.hidden_size],
+            merger_norm_bias: vec![0.0; cfg.hidden_size],
+            merger_fc1: linear(cfg.merger_input_dim(), cfg.merger_input_dim()),
+            merger_fc2: linear(cfg.out_hidden_size, cfg.merger_input_dim()),
+        };
+        (cfg, w)
+    }
+
+    #[test]
+    fn vision_weight_validation_rejects_short_tensor() {
+        let (cfg, w) = tiny_weights();
+        validate_vision_weights(&cfg, &w).unwrap();
+        let mut bad = w;
+        bad.layers[0].qkv.weight.pop();
+        let err = validate_vision_weights(&cfg, &bad).unwrap_err().to_string();
+        assert!(err.contains("qkv.weight"), "{err}");
+    }
 }

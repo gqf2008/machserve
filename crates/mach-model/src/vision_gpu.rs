@@ -10,6 +10,7 @@ use crate::Error;
 use crate::kernels::HipKernels;
 use crate::vision::{
     VisionConfig, VisionGrid, VisionPrepared, VisionWeights, prepare_vision_inputs,
+    validate_vision_weights,
 };
 use mach_kernel_sys::hip;
 use std::sync::Arc;
@@ -69,6 +70,7 @@ impl VisionGpu {
         max_tokens: usize,
     ) -> Result<Self, Error> {
         cfg.validate()?;
+        validate_vision_weights(&cfg, w)?;
         if max_tokens == 0 {
             return Err(Error::InvalidArgument(
                 "vision max_tokens must be positive".into(),
@@ -195,7 +197,9 @@ impl VisionGpu {
                 tokens * patch_dim
             )));
         }
-        if prep.pos_embeddings.len() != tokens * hidden
+        if !tokens.is_multiple_of(merge_unit)
+            || merged != tokens / merge_unit
+            || prep.pos_embeddings.len() != tokens * hidden
             || prep.cos.len() != tokens * hd
             || prep.sin.len() != tokens * hd
             || prep.seg_start.len() != tokens
@@ -204,6 +208,31 @@ impl VisionGpu {
             return Err(Error::InvalidArgument(
                 "vision prepared tensor shape mismatch".into(),
             ));
+        }
+        let mut actual_max = 0usize;
+        for i in 0..tokens {
+            let start = prep.seg_start[i];
+            let len = prep.seg_len[i];
+            if start < 0 || len <= 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "vision segment {i} has invalid start/len ({start}, {len})"
+                )));
+            }
+            let end = (start as usize)
+                .checked_add(len as usize)
+                .ok_or_else(|| Error::InvalidArgument("vision segment end overflow".into()))?;
+            if end > tokens {
+                return Err(Error::InvalidArgument(format!(
+                    "vision segment {i} [{start}, {end}) exceeds {tokens} tokens"
+                )));
+            }
+            actual_max = actual_max.max(len as usize);
+        }
+        if prep.max_seg != actual_max {
+            return Err(Error::InvalidArgument(format!(
+                "vision prepared max_seg={} but descriptors imply {actual_max}",
+                prep.max_seg
+            )));
         }
         if prep.max_seg > 8192 {
             return Err(Error::InvalidArgument(format!(
@@ -219,7 +248,8 @@ impl VisionGpu {
         self.copy_h2d(self.seg_start_dev, &prep.seg_start)?;
         self.copy_h2d(self.seg_len_dev, &prep.seg_len)?;
 
-        let t = tokens as i32;
+        let t = i32::try_from(tokens)
+            .map_err(|_| Error::InvalidArgument("vision token count exceeds i32".into()))?;
         self.k.gemm_batched(
             self.x,
             self.pixel_dev,
@@ -336,14 +366,18 @@ impl VisionGpu {
             self.proj,
             self.x,
             self.merger_fc1_w,
-            merged as i32,
+            i32::try_from(merged).map_err(|_| {
+                Error::InvalidArgument("vision merged token count exceeds i32".into())
+            })?,
             merger_dim as i32,
             merger_dim as i32,
         )?;
         self.k.launch_add_bias(
             self.proj,
             self.merger_fc1_b,
-            merged as i32,
+            i32::try_from(merged).map_err(|_| {
+                Error::InvalidArgument("vision merged token count exceeds i32".into())
+            })?,
             merger_dim as i32,
         )?;
         self.k
@@ -352,18 +386,25 @@ impl VisionGpu {
             self.out,
             self.proj,
             self.merger_fc2_w,
-            merged as i32,
+            i32::try_from(merged).map_err(|_| {
+                Error::InvalidArgument("vision merged token count exceeds i32".into())
+            })?,
             self.cfg.out_hidden_size as i32,
             merger_dim as i32,
         )?;
         self.k.launch_add_bias(
             self.out,
             self.merger_fc2_b,
-            merged as i32,
+            i32::try_from(merged).map_err(|_| {
+                Error::InvalidArgument("vision merged token count exceeds i32".into())
+            })?,
             self.cfg.out_hidden_size as i32,
         )?;
 
         let mut host = vec![0.0f32; merged * self.cfg.out_hidden_size];
+        // SAFETY: self.k.stream is owned by this VisionGpu and was created
+        // by HipKernels::new; no other thread can destroy it while self is
+        // mutably borrowed for this synchronous forward.
         unsafe {
             hip::check(
                 &self.hip,
