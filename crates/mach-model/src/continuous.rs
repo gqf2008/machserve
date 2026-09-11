@@ -339,6 +339,29 @@ impl ContinuousModel {
         ))
     }
 
+    /// Dense Q4-on-device + contiguous INT8 KV (`MACH_KV=int8` initial scope).
+    pub fn with_prefill_rows_q4_all_int8_kv(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_rows_q4_all_int8_kv(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+        )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            None,
+        ))
+    }
+
     /// Builds a continuous-batching engine from storage-FP8 weights: each GEMM
     /// tensor is dequantized to f16 during upload, so host RAM stays ~= the
     /// packed FP8 weights (experts stay fully GPU-resident).

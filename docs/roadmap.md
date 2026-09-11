@@ -1678,3 +1678,22 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
   scale，最终饱和回 f32。
 - wrapper 校验正形状、GQA geometry、`256 % head_dim == 0` 与 `i32::MAX` grid 上限；
   GPU 数值 parity 仍留真机窗口。
+
+## INT8 KV Stage 9：runtime 接线与 Qwen3.8 真机短请求（#142，2026-09-11）
+
+在连续/paged attention parity 和各类 CPU oracle 通过后，接入 runtime 首版：
+`MACH_Q4=1 MACH_Q4_DEVICE=2 MACH_KV=int8`，仅连续、非 MLA、非 paged。
+
+- `BatchedModel`：full-attention 层单独分配 packed i8 payload + per-token/head
+  f32 scales；Q4 dense 构造变体启用；reset/compaction 同步清零/搬移。
+- server：`MACH_KV=int8` 只允许 `MACH_Q4_DEVICE=2` 且 `MACH_PAGED` 未开；
+  其他组合 fail fast。
+- GPU 验证：
+  - tiny Q4 dense：INT8 KV vs f16 KV 单 token greedy 8 步一致；
+  - chunked prefill 4 行 argmax/logits 对拍通过；
+  - capacity=2 compaction 回归通过；
+  - 真机 Qwen3.8-27B：18 shards / 1199 tensors / Q4 all-device + INT8 KV，
+    `capacity=1, max_seq=128, prefill_rows=4`，短 completion 8 tokens，
+    0.42s，正常返回。
+- 当前限制：paged INT8 KV 尚未接 runtime；MLA 不支持；显存估算仍按 f16 KV
+  保守计数；长 context / 多序列性能 A/B 待下一批真机窗口。

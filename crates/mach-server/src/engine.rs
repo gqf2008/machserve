@@ -382,11 +382,17 @@ impl ServerEngine {
         hip: Arc<Hip>,
         cfg: Config,
         w: WeightsQ4,
+        int8_kv: bool,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
         if self.offload_slots.is_some() {
             return Err(EngineError::InvalidRequest(
                 "Q4 mode does not support MACH_MOE_SLOTS (cpu-backend offload needs f32 Weights)"
                     .into(),
+            ));
+        }
+        if int8_kv && self.paged_tpp.is_some() {
+            return Err(EngineError::InvalidRequest(
+                "MACH_KV=int8 is not wired for paged KV yet; unset MACH_PAGED".into(),
             ));
         }
         let mut model = if let Some(tpp) = self.paged_tpp {
@@ -397,6 +403,14 @@ impl ServerEngine {
                 self.capacity,
                 self.prefill_rows,
                 tpp,
+            )?
+        } else if int8_kv {
+            ContinuousModel::with_prefill_rows_q4_all_int8_kv(
+                hip,
+                cfg,
+                &w,
+                self.capacity,
+                self.prefill_rows,
             )?
         } else {
             ContinuousModel::with_prefill_rows_q4_all(

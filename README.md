@@ -132,7 +132,8 @@ cargo run -p mach-server --release --features hip
 #   环境变量:MACH_MODELS(默认 .models)、MACH_MODEL、MACH_CONFIG、
 #   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)、
 #   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)、
-#   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64)
+#   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64)、
+#   MACH_KV=int8(实验:Q4_DEVICE=2 的连续 full-attention K/V 用 INT8)
 
 # 调用示例
 curl -s http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/json" \
