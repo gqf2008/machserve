@@ -6,6 +6,7 @@
 //! support OpenAI-shaped `stream: true` -> SSE with per-token deltas.
 
 use crate::engine::{EngineError, ServerEngine};
+use crate::multimodal::{ChatContent, render_content};
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -112,7 +113,7 @@ pub struct CompletionRequest {
 #[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatContent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,16 +349,16 @@ fn decode_text(tok: &Option<Arc<Tokenizer>>, tokens: &[u32]) -> String {
 
 /// Formats chat messages with the Qwen chat template
 /// (`<|im_start|>role\ncontent<|im_end|>\n...<|im_start|>assistant\n`).
-fn qwen_chat_text(messages: &[ChatMessage]) -> String {
+fn qwen_chat_text(messages: &[ChatMessage]) -> (String, Vec<String>) {
     let mut out = String::new();
+    let mut images = Vec::new();
     for m in messages {
-        out.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            m.role, m.content
-        ));
+        out.push_str(&format!("<|im_start|>{}\n", m.role));
+        render_content(&m.content, &mut out, &mut images);
+        out.push_str("<|im_end|>\n");
     }
     out.push_str("<|im_start|>assistant\n");
-    out
+    (out, images)
 }
 
 /// DeepSeek-V2 special tokens. The delimiters are U+FF5C FULLWIDTH VERTICAL
@@ -368,27 +369,30 @@ const DS_BOS: &str = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
 const DS_EOS: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
 
 /// Formats chat messages with the DeepSeek-V2 chat template, transcribed from
-/// the checkpoint's `tokenizer_config.json`:
+/// the checkpoint `tokenizer_config.json`:
 /// `{{ bos_token }}` then, per message, `system` -> `{content}\n\n`, `user` ->
 /// `User: {content}\n\n`, `assistant` -> `Assistant: {content}{eos}`, closing
 /// with the `Assistant:` generation prompt.
-fn deepseek_chat_text(messages: &[ChatMessage]) -> String {
+fn deepseek_chat_text(messages: &[ChatMessage]) -> (String, Vec<String>) {
     let mut out = String::from(DS_BOS);
+    let mut images = Vec::new();
     for m in messages {
+        let mut content = String::new();
+        render_content(&m.content, &mut content, &mut images);
         match m.role.as_str() {
-            "user" => out.push_str(&format!("User: {}\n\n", m.content)),
-            "assistant" => out.push_str(&format!("Assistant: {}{}", m.content, DS_EOS)),
+            "user" => out.push_str(&format!("User: {content}\n\n")),
+            "assistant" => out.push_str(&format!("Assistant: {content}{DS_EOS}")),
             // The template falls through to the system spelling for any other
             // role (e.g. `system`, `tool`), as the Jinja source does.
-            _ => out.push_str(&format!("{}\n\n", m.content)),
+            _ => out.push_str(&format!("{content}\n\n")),
         }
     }
     out.push_str("Assistant:");
-    out
+    (out, images)
 }
 
-/// The end-of-turn token string for `format`, used to derive the request's
-/// stop token id from the tokenizer's specials.
+/// The end-of-turn token string for `format`, used to derive the request
+/// stop token id from the tokenizer specials.
 fn chat_eos_text(format: ChatFormat) -> &'static str {
     match format {
         ChatFormat::Qwen => "<|im_end|>",
@@ -396,8 +400,9 @@ fn chat_eos_text(format: ChatFormat) -> &'static str {
     }
 }
 
-/// Renders `messages` in the server's configured chat format.
-fn chat_text(format: ChatFormat, messages: &[ChatMessage]) -> String {
+/// Renders `messages` in the server configured chat format, returning the
+/// text and the image URLs in message order.
+fn chat_text(format: ChatFormat, messages: &[ChatMessage]) -> (String, Vec<String>) {
     match format {
         ChatFormat::Qwen => qwen_chat_text(messages),
         ChatFormat::DeepSeek => deepseek_chat_text(messages),
@@ -651,7 +656,15 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let text = chat_text(state.chat_format, &req.messages);
+    let (text, image_urls) = chat_text(state.chat_format, &req.messages);
+    if !image_urls.is_empty() {
+        return err_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "multimodal image requests are not yet wired to the continuous engine",
+            "invalid_request_error",
+            "multimodal_not_implemented",
+        );
+    }
     let tokens = match &state.tok {
         Some(t) => t.encode(&text),
         None => naive_encode(&text),
@@ -814,13 +827,15 @@ mod tests {
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.into(),
-            content: content.into(),
+            content: ChatContent::Text(content.into()),
         }
     }
 
     #[test]
     fn qwen_chat_template_format() {
-        let text = qwen_chat_text(&[msg("system", "You are helpful."), msg("user", "hi")]);
+        let (text, images) =
+            qwen_chat_text(&[msg("system", "You are helpful."), msg("user", "hi")]);
+        assert!(images.is_empty());
         assert_eq!(
             text,
             "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
@@ -829,7 +844,8 @@ mod tests {
 
     #[test]
     fn qwen_chat_template_no_system() {
-        let text = qwen_chat_text(&[msg("user", "hello")]);
+        let (text, images) = qwen_chat_text(&[msg("user", "hello")]);
+        assert!(images.is_empty());
         assert_eq!(
             text,
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
@@ -840,18 +856,20 @@ mod tests {
     /// `User: …\n\n`, then a bare `Assistant:` prompt with no trailing space.
     #[test]
     fn deepseek_chat_template_user_only() {
-        let text = deepseek_chat_text(&[msg("user", "hello")]);
+        let (text, images) = deepseek_chat_text(&[msg("user", "hello")]);
+        assert!(images.is_empty());
         assert_eq!(text, format!("{DS_BOS}User: hello\n\nAssistant:"));
     }
 
     #[test]
     fn deepseek_chat_template_with_system_and_history() {
-        let text = deepseek_chat_text(&[
+        let (text, images) = deepseek_chat_text(&[
             msg("system", "You are helpful."),
             msg("user", "hi"),
             msg("assistant", "Hello!"),
             msg("user", "again"),
         ]);
+        assert!(images.is_empty());
         assert_eq!(
             text,
             format!(
@@ -892,5 +910,48 @@ mod tests {
     #[test]
     fn chat_format_defaults_to_qwen() {
         assert_eq!(ChatFormat::default(), ChatFormat::Qwen);
+    }
+
+    #[test]
+    fn chat_request_parses_multimodal_parts() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"user","content":[
+                {"type":"text","text":"what is this? "},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+            ]}]}"#,
+        )
+        .unwrap();
+        match &req.messages[0].content {
+            ChatContent::Parts(parts) => assert_eq!(parts.len(), 2),
+            other => panic!("expected parts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen_chat_template_renders_image_placeholder() {
+        use crate::multimodal::{ContentPart, ImageUrl};
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: ChatContent::Parts(vec![
+                ContentPart::Text {
+                    text: "look ".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AA==".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text {
+                    text: " now".into(),
+                },
+            ]),
+        }];
+        let (text, images) = qwen_chat_text(&msgs);
+        assert_eq!(images, vec!["data:image/png;base64,AA==".to_string()]);
+        assert_eq!(
+            text,
+            "<|im_start|>user\nlook <|vision_start|><|image_pad|><|vision_end|> now<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }

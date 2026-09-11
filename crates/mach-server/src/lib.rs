@@ -3,6 +3,8 @@
 #[cfg(feature = "hip")]
 pub mod engine;
 #[cfg(feature = "hip")]
+pub mod multimodal;
+#[cfg(feature = "hip")]
 pub mod routes;
 
 #[cfg(feature = "hip")]
