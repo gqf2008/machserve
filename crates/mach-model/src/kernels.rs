@@ -564,6 +564,17 @@ extern "C" __global__ void mla_attn_decode(
 "#;
 
 /// Batched embedding: `x[s, :] = emb[tok[s], :]`.
+/// Replace selected rows of an already-gathered embedding batch with explicit
+/// vision/audio features. This composes with all embedding table formats
+/// (f32/f16/Q4): the gather runs first, then masked rows are overwritten.
+const EMBED_SCATTER_ROWS: &str = r#"
+extern "C" __global__ void embed_scatter_rows(float* x, const float* features,
+                                              const int* mask, int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (i < total && mask[i / cols]) x[i] = features[i];
+}
+"#;
 const EMBED_BATCHED: &str = r#"
 extern "C" __global__ void embed_batched(const int* tok, const float* emb, float* x,
                                          int cols, int batch) {
@@ -3340,6 +3351,7 @@ pub struct HipKernels {
     mla_attn_decode_batched: HipKernelModule,
     rope: HipKernelModule,
     embed_batched: HipKernelModule,
+    embed_scatter_rows: HipKernelModule,
     rope_batched: HipKernelModule,
     rope_batched_tables: HipKernelModule,
     qg_split: HipKernelModule,
@@ -3498,6 +3510,7 @@ impl HipKernels {
             )?,
             rope: compile_cached(&arch, ROPE, "rope")?,
             embed_batched: compile_cached(&arch, EMBED_BATCHED, "embed_batched")?,
+            embed_scatter_rows: compile_cached(&arch, EMBED_SCATTER_ROWS, "embed_scatter_rows")?,
             rope_batched: compile_cached(&arch, ROPE_BATCHED, "rope_batched")?,
             rope_batched_tables: compile_cached(&arch, ROPE_BATCHED_TABLES, "rope_batched_tables")?,
             qg_split: compile_cached(&arch, QG_SPLIT, "qg_split")?,
@@ -4648,6 +4661,49 @@ impl HipKernels {
         )?)
     }
 
+    /// Overwrite selected rows of `x` with explicit features: row `r` is
+    /// replaced when `mask[r] != 0`. Used for image/video embeddings after
+    /// the normal token gather (works for f32/f16/Q4 gather paths).
+    pub fn launch_embed_scatter_rows(
+        &self,
+        x: *mut f32,
+        features: *const f32,
+        mask: *const i32,
+        rows: i32,
+        cols: i32,
+    ) -> Result<(), Error> {
+        if rows <= 0 || cols <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "embed_scatter_rows requires positive rows/cols, got {rows}x{cols}"
+            )));
+        }
+        let total = (rows as i64)
+            .checked_mul(cols as i64)
+            .ok_or_else(|| Error::InvalidArgument("embed_scatter_rows size overflow".into()))?;
+        if total > i32::MAX as i64 {
+            return Err(Error::InvalidArgument(
+                "embed_scatter_rows total exceeds i32".into(),
+            ));
+        }
+        let total = u32::try_from(total)
+            .map_err(|_| Error::InvalidArgument("embed_scatter_rows grid overflow".into()))?;
+        let xp = x;
+        let fp = features;
+        let mp = mask;
+        let mut p = vec![
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &fp as *const *const f32 as *mut core::ffi::c_void,
+            &mp as *const *const i32 as *mut core::ffi::c_void,
+            &rows as *const i32 as *mut core::ffi::c_void,
+            &cols as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.embed_scatter_rows.launch(
+            [total.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn launch_rope_batched(
         &self,
@@ -6494,6 +6550,7 @@ mod offline_tests {
         MLA_ASSEMBLE_KV,
         MLA_ATTN_DECODE,
         EMBED_BATCHED,
+        EMBED_SCATTER_ROWS,
         ROPE_BATCHED,
         ROPE_BATCHED_TABLES,
         QG_SPLIT,
@@ -6559,7 +6616,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            72,
+            73,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }

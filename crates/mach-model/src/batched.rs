@@ -306,6 +306,12 @@ pub struct BatchedModel {
     mrope_rows: usize,
     /// Added to the scalar RoPE position after a multimodal prompt (HF rope_deltas).
     rope_delta: i32,
+    /// Optional row-level embedding overrides (vision/video features); row
+    /// `r` replaces the normal token gather when its mask is nonzero.
+    row_embed_dev: *mut f32,
+    row_embed_mask_dev: *mut i32,
+    row_embed_active: bool,
+    row_embed_rows: usize,
     // pinned host inputs
     tokens_host: *mut i32,
     pos_host: *mut i32,
@@ -1091,6 +1097,10 @@ impl BatchedModel {
             mrope_active: false,
             mrope_rows: 0,
             rope_delta: 0,
+            row_embed_dev: std::ptr::null_mut(),
+            row_embed_mask_dev: std::ptr::null_mut(),
+            row_embed_active: false,
+            row_embed_rows: 0,
             tokens_host: std::ptr::null_mut(),
             pos_host: std::ptr::null_mut(),
             slots_host: std::ptr::null_mut(),
@@ -1374,6 +1384,15 @@ impl BatchedModel {
         let rope_dim = c.attn_rotary_dim();
         self.mrope_cos_dev = self.dalloc(b * rope_dim * 4)?;
         self.mrope_sin_dev = self.dalloc(b * rope_dim * 4)?;
+        let row_embed_bytes = b
+            .checked_mul(d)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| Error::InvalidArgument("row embedding buffer overflow".into()))?;
+        let row_embed_mask_bytes = b
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidArgument("row embedding mask overflow".into()))?;
+        self.row_embed_dev = self.dalloc(row_embed_bytes)?;
+        self.row_embed_mask_dev = self.dalloc(row_embed_mask_bytes)? as *mut i32;
         self.slots_dev = self.dalloc(b * 4)? as *mut i32;
         let max_runs = b.div_ceil(2);
         self.runs_dev = self.dalloc(max_runs * 4 * 4)? as *mut i32;
@@ -2316,6 +2335,8 @@ impl BatchedModel {
         self.mrope_active = false;
         self.mrope_rows = 0;
         self.rope_delta = 0;
+        self.row_embed_active = false;
+        self.row_embed_rows = 0;
         self.decode_graphs.clear();
         self.greedy_graph = None;
         if !self.int8_kv_cache.is_empty() {
@@ -2530,6 +2551,69 @@ impl BatchedModel {
     /// the RoPE angle is shifted by this delta.
     pub fn set_rope_delta(&mut self, delta: i32) {
         self.rope_delta = delta;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
+    }
+    /// Upload row-level embedding overrides for the next step. `features` is
+    /// `[rows, d_model]`; row `r` overrides the normal token embedding when
+    /// `mask[r] != 0`. The override is cleared after the multimodal prompt.
+    pub fn set_row_embeddings(
+        &mut self,
+        features: &[f32],
+        mask: &[i32],
+        rows: usize,
+    ) -> Result<(), Error> {
+        self.row_embed_active = false;
+        self.row_embed_rows = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
+        if rows == 0 || rows > self.rows || mask.len() != rows {
+            return Err(Error::InvalidArgument(format!(
+                "row embedding rows/mask mismatch: rows={rows} mask={} capacity={}",
+                mask.len(),
+                self.rows
+            )));
+        }
+        let want = rows
+            .checked_mul(self.cfg.d_model)
+            .ok_or_else(|| Error::InvalidArgument("row embedding size overflow".into()))?;
+        if features.len() != want {
+            return Err(Error::InvalidArgument(format!(
+                "row embeddings have {} elements, expected {want}",
+                features.len()
+            )));
+        }
+        let feature_bytes = want
+            .checked_mul(4)
+            .ok_or_else(|| Error::InvalidArgument("row embedding byte size overflow".into()))?;
+        let mask_bytes = rows.checked_mul(4).ok_or_else(|| {
+            Error::InvalidArgument("row embedding mask byte size overflow".into())
+        })?;
+        hip::memcpy_async(
+            self.k.hip(),
+            self.row_embed_dev as *mut core::ffi::c_void,
+            features.as_ptr() as *const core::ffi::c_void,
+            feature_bytes,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        hip::memcpy_async(
+            self.k.hip(),
+            self.row_embed_mask_dev as *mut core::ffi::c_void,
+            mask.as_ptr() as *const core::ffi::c_void,
+            mask_bytes,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        self.row_embed_rows = rows;
+        self.row_embed_active = true;
+        Ok(())
+    }
+
+    /// Return to the normal token-embedding gather for subsequent steps.
+    pub fn clear_row_embeddings(&mut self) {
+        self.row_embed_active = false;
+        self.row_embed_rows = 0;
         self.decode_graphs.clear();
         self.greedy_graph = None;
     }
@@ -3021,6 +3105,11 @@ impl BatchedModel {
             }
         };
 
+        if self.row_embed_active && b as usize > self.row_embed_rows {
+            return Err(Error::InvalidArgument(
+                "row embeddings do not cover this step".into(),
+            ));
+        }
         if !self.emb_q4.is_null() {
             // Dense Q4-on-device: embedding rows dequantize in the gather.
             k.launch_embed_gather_q4(self.tokens_dev, self.emb_q4.q, self.emb_q4.s, self.x, d, b)?;
@@ -3028,6 +3117,9 @@ impl BatchedModel {
             k.launch_embed_f16(self.tokens_dev, self.emb_f16, self.x, d, b)?;
         } else {
             k.launch_embed_batched(self.tokens_dev, self.emb_dev, self.x, d, b)?;
+        }
+        if self.row_embed_active {
+            k.launch_embed_scatter_rows(self.x, self.row_embed_dev, self.row_embed_mask_dev, b, d)?;
         }
         // Debug (issue #107): pre-layer-0 embedding snapshot (row 0 of the
         // diff chain — if this is off, nothing downstream matters).
