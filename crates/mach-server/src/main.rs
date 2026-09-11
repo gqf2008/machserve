@@ -458,6 +458,7 @@ fn estimate_vram(
     draft: Option<(&Config, u64)>,
     fp8: bool,
     q4_device: bool,
+    kv_int8: bool,
 ) -> u64 {
     let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
     let kv = if cfg.kv_lora_rank > 0 {
@@ -466,6 +467,12 @@ fn estimate_vram(
             * cfg.n_heads
             * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
             * 4
+    } else if kv_int8 {
+        // Contiguous INT8 KV stores K and V as i8 payloads plus one f32 scale
+        // per token/head for each of K and V: 2*head_dim + 2*4 bytes per
+        // token/head. MLA and paged combinations are not wired for INT8 and
+        // retain their existing estimates above/below.
+        capacity * cfg.max_seq_len * cfg.n_kv_heads * (cfg.head_dim * 2 + 8)
     } else {
         capacity * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * kv_elem * 2
     };
@@ -676,7 +683,15 @@ fn run_doctor() {
             .unwrap_or(64);
         let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
         let q4_device = std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v != "0");
-        let need = estimate_vram(&cfg, cap, fb, None, fp8, q4_device);
+        // Doctor is diagnostic-only: mirror the runtime's reachable INT8-KV
+        // constraints, but fall back to the conservative f16 estimate for an
+        // invalid combination instead of aborting the whole doctor run.
+        let kv_int8 = std::env::var("MACH_KV").is_ok_and(|v| v == "int8")
+            && std::env::var("MACH_Q4").is_ok_and(|v| v != "0")
+            && std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v == "2")
+            && !std::env::var("MACH_PAGED").is_ok_and(|v| v != "0")
+            && cfg.kv_lora_rank == 0;
+        let need = estimate_vram(&cfg, cap, fb, None, fp8, q4_device, kv_int8);
         let gib = need as f64 / (1024.0 * 1024.0 * 1024.0);
         println!(
             "estimate: d_model={} layers={} experts={} need ~{:.2} GiB (capacity {cap})",
@@ -897,6 +912,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         draft_est.as_ref().map(|(c, b)| (c, *b)),
         fp8,
         q4_device != 0,
+        kv_int8,
     );
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     println!(
@@ -917,6 +933,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "storage Q4: host weights stay packed int4 (~4x smaller than f32); device still holds dequantized f16 weights"
             ),
         }
+    }
+    if kv_int8 {
+        println!(
+            "INT8 KV: contiguous full-attention payload i8 + per-token/head f32 scales (exact preflight estimate)"
+        );
     }
     if estimate > free as u64 {
         eprintln!(
@@ -1242,7 +1263,7 @@ mod tests {
     #[test]
     fn dense_estimate_includes_weights_kv_and_margin() {
         let cfg = dense_cfg();
-        let est = estimate_vram(&cfg, 8, 1_000_000, None, false, false);
+        let est = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
         // KV (f32) = capacity*max_seq*kv_heads*head_dim*4 per layer.
         let kv =
             (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * 2 * cfg.n_layers) as u64;
@@ -1253,9 +1274,9 @@ mod tests {
     fn f16_dense_uses_two_byte_kv() {
         let mut cfg = dense_cfg();
         cfg.dtype = ModelDType::F16;
-        let f16 = estimate_vram(&cfg, 8, 0, None, false, false);
+        let f16 = estimate_vram(&cfg, 8, 0, None, false, false, false);
         cfg.dtype = ModelDType::F32;
-        let f32 = estimate_vram(&cfg, 8, 0, None, false, false);
+        let f32 = estimate_vram(&cfg, 8, 0, None, false, false, false);
         // KV diff = layers * capacity*max_seq*kv_heads*head_dim*(4-2).
         let kv_diff =
             (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
@@ -1267,6 +1288,23 @@ mod tests {
     }
 
     #[test]
+    fn int8_dense_accounts_payload_and_scales() {
+        let mut cfg = dense_cfg();
+        cfg.dtype = ModelDType::F16;
+        for cap in [1usize, 8] {
+            for max_seq in [64usize, 128] {
+                cfg.max_seq_len = max_seq;
+                let f16 = estimate_vram(&cfg, cap, 0, None, false, false, false);
+                let int8 = estimate_vram(&cfg, cap, 0, None, false, false, true);
+                let f16_kv =
+                    (cfg.n_layers * cap * max_seq * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
+                let int8_kv =
+                    (cfg.n_layers * cap * max_seq * cfg.n_kv_heads * (cfg.head_dim * 2 + 8)) as u64;
+                assert_eq!(int8, f16 - f16_kv + int8_kv, "cap={cap} max_seq={max_seq}");
+            }
+        }
+    }
+    #[test]
     fn mla_estimate_uses_expanded_per_head_kv() {
         let cfg = mla_cfg();
         // MLA KV/layer is f32: capacity*max_seq*heads*(nope+rope+v_hd)*4.
@@ -1277,7 +1315,7 @@ mod tests {
             * 4
             * cfg.n_layers) as u64;
         assert_eq!(
-            estimate_vram(&cfg, 8, 0, None, false, false),
+            estimate_vram(&cfg, 8, 0, None, false, false, false),
             kv + (256 << 20)
         );
     }
@@ -1286,8 +1324,8 @@ mod tests {
     fn spec_adds_draft_weights_and_kv() {
         let tcfg = dense_cfg();
         let dcfg = dense_cfg();
-        let base = estimate_vram(&tcfg, 8, 1_000, None, false, false);
-        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)), false, false);
+        let base = estimate_vram(&tcfg, 8, 1_000, None, false, false, false);
+        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)), false, false, false);
         let dkv =
             (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4 * 2) as u64;
         assert_eq!(spec - base, 500 + dkv);
@@ -1618,15 +1656,15 @@ mod tests {
     #[test]
     fn q4_and_q4_device_weight_terms() {
         let cfg = dense_cfg();
-        let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false);
+        let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
         // MACH_Q4 loads standard BF16/F16 files and quantizes at load: the
         // device holds f16 = the same bytes as the file, so the weight term
         // is unchanged vs dense.
-        let q4 = estimate_vram(&cfg, 8, 1_000_000, None, false, false);
+        let q4 = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
         assert_eq!(q4, base);
         // MACH_Q4_DEVICE keeps the expert pool packed on the device: the
         // weight term is 0.3x the file bytes.
-        let q4d = estimate_vram(&cfg, 8, 1_000_000, None, false, true);
+        let q4d = estimate_vram(&cfg, 8, 1_000_000, None, false, true, false);
         assert_eq!(q4d, base - 700_000);
     }
 
@@ -1640,7 +1678,7 @@ mod tests {
         let mut cfg = mach_model::Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 4096, 2, 4, 8, 4);
         cfg.dtype = ModelDType::F32;
         let cap = 8usize;
-        let got = estimate_vram(&cfg, cap, 0, None, false, false);
+        let got = estimate_vram(&cfg, cap, 0, None, false, false, false);
         // qwen35_small shape: interval 4 over 5 layers -> full-attn ONLY
         // layer 3 (li where (li+1)%4==0); layers 0,1,2,4 are GDN.
         let full_layers = (0..cfg.n_layers)
@@ -1654,13 +1692,23 @@ mod tests {
             + cap * (cfg.n_layers - full_layers) * per_gdn_layer * 4
             + (256 << 20)) as u64;
         assert_eq!(got, want);
+
+        let int8 = estimate_vram(&cfg, cap, 0, None, false, false, true);
+        let int8_kv_per_layer = cap * cfg.max_seq_len * cfg.n_kv_heads * (cfg.head_dim * 2 + 8);
+        let want_int8 = (int8_kv_per_layer * full_layers
+            + cap * (cfg.n_layers - full_layers) * per_gdn_layer * 4
+            + (256 << 20)) as u64;
+        assert_eq!(
+            int8, want_int8,
+            "INT8 KV accounting must cover only full-attention layers"
+        );
     }
 
     #[test]
     fn fp8_scales_weight_term_by_two() {
         let cfg = dense_cfg();
-        let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false);
-        let fp8 = estimate_vram(&cfg, 8, 1_000_000, None, true, false);
+        let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
+        let fp8 = estimate_vram(&cfg, 8, 1_000_000, None, true, false, false);
         // FP8 stores E4M3 (1 byte/weight) but the device holds dequantized f16
         // (2 bytes/weight): the weight term must be x2, or the preflight can
         // pass while the upload OOMs (regression).

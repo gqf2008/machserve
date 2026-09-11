@@ -1697,3 +1697,12 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
     0.42s，正常返回。
 - 当前限制：paged INT8 KV 尚未接 runtime；MLA 不支持；显存估算仍按 f16 KV
   保守计数；长 context / 多序列性能 A/B 待下一批真机窗口。
+
+## INT8 KV Stage 10：连续路径精确显存预检（#144，2026-09-11）
+
+Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
+
+- dense/非 MLA 路径按实际布局统计 `payload i8 + per-token/head f32 scales`；
+- GDN/hybrid 只对 full-attention 层统计 KV，GDD 递归状态沿用 per-head 公式；
+- `doctor` 与启动 preflight 都读取 `MACH_KV` 并传入同一估算函数；
+- MLA/paged/spec 未接组合保持既有语义；纯 CPU/HIP-feature 测试钉住 dense 与 hybrid 公式。
