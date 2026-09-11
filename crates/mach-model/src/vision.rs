@@ -2,19 +2,17 @@
 //!
 //! Stage C is intentionally split from the text `Config`: the vision stack has
 //! its own dimensions, token ids and M-RoPE metadata, while the text runtime
-//! keeps its existing shape. This module currently owns parsing and
-//! header-only checkpoint validation; tensor loading and the CPU/GPU forward
-//! live in follow-up increments.
+//! keeps its existing shape. This module owns parsing, checkpoint loading and
+//! the CPU reference forward; GPU execution and M-RoPE text injection live in
+//! follow-up increments.
 
 use crate::Error;
 
 /// MLP activation used by the vision tower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionActivation {
-    /// PyTorch gelu_pytorch_tanh: the Qwen3.5 vision MLP default.
+    /// PyTorch `gelu_pytorch_tanh`: the Qwen3.5 vision MLP default.
     GeluPytorchTanh,
-    /// Exact erf GELU (used by the footprint merger, not the vision MLP).
-    Gelu,
 }
 
 /// Qwen3.5/Qwen3.8 vision-tower configuration.
@@ -52,7 +50,7 @@ pub struct VisionConfig {
     pub mrope_section: [usize; 3],
     /// Whether M-RoPE uses the interleaved layout.
     pub mrope_interleaved: bool,
-    /// Vision MLP activation from ision_config.hidden_act.
+    /// Vision MLP activation from `vision_config.hidden_act`.
     pub hidden_act: VisionActivation,
 }
 
@@ -153,7 +151,6 @@ impl VisionConfig {
         if let Some(act) = vc.get("hidden_act").and_then(|x| x.as_str()) {
             cfg.hidden_act = match act {
                 "gelu_pytorch_tanh" => VisionActivation::GeluPytorchTanh,
-                "gelu" => VisionActivation::Gelu,
                 other => {
                     return Err(Error::Model(format!(
                         "unsupported vision hidden_act {other:?}"
@@ -434,7 +431,6 @@ pub fn vision_forward(
         let mut gelu = fc1;
         match cfg.hidden_act {
             VisionActivation::GeluPytorchTanh => gelu_tanh_inplace(&mut gelu),
-            VisionActivation::Gelu => gelu_erf_inplace(&mut gelu),
         }
         let fc2 = linear_forward(&gelu, total_patches, cfg.intermediate_size, &layer.mlp_fc2)?;
         for (v, p) in x.iter_mut().zip(fc2) {
