@@ -1971,3 +1971,20 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   跨进程读不到服务占用、本次未采到实际 VRAM 占用。
 - 剩余唯一验收项：HF 整模型 greedy token/logits 参考（本机 31GB 内存装不下 BF16 27B、
   PyTorch 无 Windows ROCm 轮子），需在 ≥64GB 内存机器或 Linux+ROCm 环境生成后对比。
+
+## Qwen3.8-27B Stage C4：Q4-on-device prefill 行复用（#146，2026-09-11）
+
+- `gemv_q4` 是 decode 形状：一个 warp 只算"一行权重 × 一行输入"，batch 维在
+  `blockIdx.y`，prefill 每个 token 都把整份 Q4 权重重读一遍 —— 实测 prefill
+  ≈49 tok/s 且与 prompt 长度无关（4.8k token 用 98.2s）。
+- 新增 `GEMV_Q4_ROWBATCH`（内核 73→74）：一个 warp 持有一行权重、对 8 行输入同时
+  累加，权重行每 tile 只读一次，x 直接从 global 读；`batched.rs` 在
+  `batch > 1 && d % 8 == 0` 时走它，其余形状仍走 `gemv_q4`。
+- 真机 A/B（7900 XTX / Qwen3.8-27B Q4-all / 同一 prompt，release）：
+  - 4.8k-token prompt + 8 token 输出：**98.24s → 55.17s（1.78×）**；
+  - decode TPOT 37.8ms → 35.0ms（噪声内不变，decode 不走新 kernel）；
+  - 加载到 `/healthz` ~114s（同量级）。
+- 正确性：`gemv_q4_rowbatch_matches_dequantized_cpu`（GPU 对拍 CPU dequant，4 组
+  形状含非整 tile 尾部）通过；`offline_tests` 74 内核离线编译门禁通过。
+- 剩余优化点：x 行目前被每个输出行重复读取（未走 shared），更高 tile 会放大 x
+  读；下一步做 x 分级 staging 后再调 tile 大小。

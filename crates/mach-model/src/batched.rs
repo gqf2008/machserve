@@ -3092,6 +3092,12 @@ impl BatchedModel {
                     kk: i32|
          -> Result<(), Error> {
             if !t.is_null() {
+                // Prefill rows: reuse each packed weight row across a tile of
+                // input rows instead of re-reading it once per row (the plain
+                // GEMV is decode-shaped).
+                if b > 1 && kk > 0 && kk % 8 == 0 {
+                    return k.launch_gemv_q4_rowbatch(x, t.q, t.s, out, n, kk, b);
+                }
                 return k.launch_gemv_q4(x, t.q, t.s, out, n, kk, b);
             }
             if f16 {
