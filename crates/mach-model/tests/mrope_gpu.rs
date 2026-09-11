@@ -178,10 +178,18 @@ fn batched_model_mrope_tables_match_scalar_text_only() {
     let a = scalar.read_logits_rows(tokens.len()).unwrap();
     let b = tabled.read_logits_rows(tokens.len()).unwrap();
     let mut max_diff = 0.0f32;
-    for (x, y) in a.iter().zip(&b) {
-        max_diff = max_diff.max((x - y).abs());
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "non-finite logit at {i}: {x} vs {y}"
+        );
+        let diff = (x - y).abs();
+        assert!(
+            diff <= 1e-5,
+            "M-RoPE table model mismatch at {i}: {x} vs {y}"
+        );
+        max_diff = max_diff.max(diff);
     }
-    assert!(max_diff < 1e-5, "M-RoPE table model mismatch: {max_diff}");
 }
 #[test]
 #[ignore = "GPU M-RoPE lifecycle; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
@@ -221,16 +229,17 @@ fn rope_batched_tables_matches_cpu() {
     }
     let h = hip::hip().expect("HIP runtime");
     let k = HipKernels::new(Arc::clone(&h)).unwrap();
-    let cfg = Config::llama(8, 4, 1, 1, 32, 32);
+    let mut cfg = Config::llama(32, 4, 2, 1, 64, 64);
+    cfg.rope_rotary_pct = 0.5;
     let positions = MropePositions {
-        pos: vec![[2, 3, 4], [3, 4, 2], [4, 2, 3]],
+        pos: vec![[2, 3, 4], [4, 2, 3]],
         delta: 0,
     };
-    let (cos, sin) = positions.cos_sin(&cfg, [11, 11, 10]).unwrap();
-    let batch = 3usize;
-    let heads = 1usize;
+    let (cos, sin) = positions.cos_sin(&cfg, [1, 1, 1]).unwrap();
+    let batch = 2usize;
+    let heads = 2usize;
     let kv_heads = 1usize;
-    let hd = 8usize;
+    let hd = 16usize;
     let rot = cfg.attn_rotary_dim();
     assert_eq!(rot, 8);
     let mut seed = 7u64;
@@ -283,14 +292,15 @@ fn rope_batched_delta_matches_cpu() {
     }
     let h = hip::hip().expect("HIP runtime");
     let k = HipKernels::new(Arc::clone(&h)).unwrap();
-    let cfg = Config::llama(8, 4, 1, 1, 32, 32);
-    let batch = 3usize;
-    let heads = 1usize;
+    let mut cfg = Config::llama(32, 4, 2, 1, 64, 64);
+    cfg.rope_rotary_pct = 0.5;
+    let batch = 2usize;
+    let heads = 2usize;
     let kv_heads = 1usize;
-    let hd = 8usize;
+    let hd = 16usize;
     let rot = cfg.attn_rotary_dim();
-    let pos = [0i32, 1, 2];
-    let delta = -2i32;
+    let pos = [0i32, 1];
+    let delta = 3i32;
     let mut seed = 11u64;
     let q: Vec<f32> = (0..batch * heads * hd).map(|_| lcg(&mut seed)).collect();
     let kv: Vec<f32> = (0..batch * kv_heads * hd).map(|_| lcg(&mut seed)).collect();

@@ -4684,10 +4684,13 @@ impl HipKernels {
             &pos_delta as *const i32 as *mut core::ffi::c_void,
             &rp.interleave as *const i32 as *mut core::ffi::c_void,
         ];
-        let total = (batch as i64) * (n_heads.max(n_kv_heads) as i64) * (head_dim as i64);
-        let total = u32::try_from(total)
-            .map_err(|_| Error::InvalidArgument("rope_batched grid overflow".into()))?;
-        let blocks = total.div_ceil(256);
+        let total = (batch as i64)
+            .checked_mul(n_heads.max(n_kv_heads) as i64)
+            .and_then(|v| v.checked_mul(head_dim as i64))
+            .ok_or_else(|| Error::InvalidArgument("rope grid overflow".into()))?;
+        let total = i32::try_from(total)
+            .map_err(|_| Error::InvalidArgument("rope grid exceeds i32".into()))?;
+        let blocks = (total as u32).div_ceil(256);
         Ok(self
             .rope_batched
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
@@ -4718,11 +4721,6 @@ impl HipKernels {
                 "rope_batched_tables invalid dims: batch={batch} n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} rot_dim={rot_dim}"
             )));
         }
-        if n_kv_heads <= 0 {
-            return Err(Error::InvalidArgument(format!(
-                "rope_batched_tables requires positive n_kv_heads, got {n_kv_heads}"
-            )));
-        }
         let qp = q;
         let kp = k;
         let cp = cos;
@@ -4738,10 +4736,13 @@ impl HipKernels {
             &head_dim as *const i32 as *mut core::ffi::c_void,
             &rot_dim as *const i32 as *mut core::ffi::c_void,
         ];
-        let total = (batch as i64) * (n_heads.max(n_kv_heads) as i64) * (head_dim as i64);
-        let total = u32::try_from(total)
-            .map_err(|_| Error::InvalidArgument("rope_batched grid overflow".into()))?;
-        let blocks = total.div_ceil(256);
+        let total = (batch as i64)
+            .checked_mul(n_heads.max(n_kv_heads) as i64)
+            .and_then(|v| v.checked_mul(head_dim as i64))
+            .ok_or_else(|| Error::InvalidArgument("rope grid overflow".into()))?;
+        let total = i32::try_from(total)
+            .map_err(|_| Error::InvalidArgument("rope grid exceeds i32".into()))?;
+        let blocks = (total as u32).div_ceil(256);
         Ok(self
             .rope_batched_tables
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)

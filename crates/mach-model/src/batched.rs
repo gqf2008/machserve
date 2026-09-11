@@ -2475,6 +2475,8 @@ impl BatchedModel {
     pub fn set_mrope_tables(&mut self, cos: &[f32], sin: &[f32], rows: usize) -> Result<(), Error> {
         self.mrope_active = false;
         self.mrope_rows = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
         let rot = self.cfg.attn_rotary_dim();
         if rows == 0 || rows > self.rows {
             return Err(Error::InvalidArgument(format!(
