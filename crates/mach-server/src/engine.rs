@@ -761,8 +761,8 @@ impl ServerEngine {
                     }
                     // Admission failure (e.g. paged page-pool exhaustion):
                     // reject the request instead of panicking the engine
-                    // thread. The oneshot delivers an empty completion; the
-                    // caller sees an empty generation rather than a hang.
+                    // thread. The oneshot carries the engine error; the caller
+                    // sees a structured failure rather than a hang.
                     Err(e) => {
                         eprintln!("engine: rejecting request: {e}");
                         let _ = r.done.send(Err(e));

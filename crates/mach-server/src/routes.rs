@@ -1082,4 +1082,27 @@ mod tests {
         assert_eq!(remaining_patch_budget(8192, 8192), None);
         assert_eq!(remaining_patch_budget(9000, 8192), None);
     }
+
+    #[tokio::test]
+    async fn chat_body_limit_rejects_oversized_text_request() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let state = AppState {
+            engine: ServerEngine::new(1),
+            model: "test".into(),
+            tok: None,
+            chat_format: ChatFormat::Qwen,
+        };
+        let app = router(state);
+        let text = "a".repeat((2 << 20) + 1024);
+        let body = serde_json::json!({"messages": [{"role": "user", "content": text}]});
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
