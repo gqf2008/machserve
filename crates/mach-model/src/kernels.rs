@@ -348,7 +348,7 @@ extern "C" __global__ void rope(float* q, float* k, const int* pos_buf,
                                 int n_heads, int n_kv_heads, int head_dim,
                                 int rot_dim, float theta,
                                 int yarn, float factor, float beta_fast, float beta_slow,
-                                float orig_len, float attn_factor, int interleave) {
+                                float orig_len, float attn_factor, int pos_delta, int interleave) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int pos = *pos_buf;
     // Partial rotary (Qwen3.5 full-attn layers): only the first `rot_dim`
@@ -600,7 +600,7 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
                                         int head_dim, int rot_dim, float theta,
                                         int yarn, float factor, float beta_fast,
                                         float beta_slow, float orig_len,
-                                        float attn_factor, int interleave) {
+                                        float attn_factor, int pos_delta, int interleave) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // Partial rotary: same contract as the single-row `rope` kernel — the
     // frequency basis is `rot_dim` and coordinates beyond it pass through.
@@ -613,7 +613,7 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
         int h = rem / head_dim;
         int d = rem % head_dim;
         if (d < half) {
-            int pos = pos_buf[s];
+            int pos = pos_buf[s] + pos_delta;
             float freq = yarn_freq(d, rot_dim, theta, yarn, factor, beta_fast,
                                     beta_slow, orig_len);
             float ang = (float)pos * freq;
@@ -632,7 +632,7 @@ extern "C" __global__ void rope_batched(float* q, float* k, const int* pos_buf,
         int h = rem / head_dim;
         int d = rem % head_dim;
         if (d < half) {
-            int pos = pos_buf[s];
+            int pos = pos_buf[s] + pos_delta;
             float freq = yarn_freq(d, rot_dim, theta, yarn, factor, beta_fast,
                                     beta_slow, orig_len);
             float ang = (float)pos * freq;
@@ -667,6 +667,49 @@ extern "C" __global__ void qg_split(const float* __restrict__ qg,
     const float* src = qg + (b * heads * 2 + h * 2) * hd + j;
     q[i] = src[0];
     gate[i] = src[hd];
+}
+"#;
+/// Apply precomputed per-row M-RoPE cos/sin tables to q/k in place. The
+/// tables are token-major `[batch, rot_dim]`; the pairing is the standard
+/// HF rotate_half (`d` with `d+half`) because Qwen3.5 uses non-interleaved
+/// pairing with already-interleaved frequency inputs.
+const ROPE_BATCHED_TABLES: &str = r#"
+extern "C" __global__ void rope_batched_tables(float* q, float* k,
+                                               const float* cos_tab, const float* sin_tab,
+                                               int batch, int n_heads, int n_kv_heads,
+                                               int head_dim, int rot_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = rot_dim / 2;
+    int total_q = batch * n_heads * head_dim;
+    int total_k = batch * n_kv_heads * head_dim;
+    if (idx < total_q) {
+        int s = idx / (n_heads * head_dim);
+        int rem = idx % (n_heads * head_dim);
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+        if (d < half) {
+            float c = cos_tab[s * rot_dim + d];
+            float sn = sin_tab[s * rot_dim + d];
+            float* p = q + (long long)s * n_heads * head_dim + h * head_dim;
+            float a = p[d], b = p[d + half];
+            p[d] = a * c - b * sn;
+            p[d + half] = a * sn + b * c;
+        }
+    }
+    if (idx < total_k) {
+        int s = idx / (n_kv_heads * head_dim);
+        int rem = idx % (n_kv_heads * head_dim);
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+        if (d < half) {
+            float c = cos_tab[s * rot_dim + d];
+            float sn = sin_tab[s * rot_dim + d];
+            float* p = k + (long long)s * n_kv_heads * head_dim + h * head_dim;
+            float a = p[d], b = p[d + half];
+            p[d] = a * c - b * sn;
+            p[d + half] = a * sn + b * c;
+        }
+    }
 }
 "#;
 
@@ -3298,6 +3341,7 @@ pub struct HipKernels {
     rope: HipKernelModule,
     embed_batched: HipKernelModule,
     rope_batched: HipKernelModule,
+    rope_batched_tables: HipKernelModule,
     qg_split: HipKernelModule,
     attn_gate_apply: HipKernelModule,
     gdn_conv_update: HipKernelModule,
@@ -3455,6 +3499,7 @@ impl HipKernels {
             rope: compile_cached(&arch, ROPE, "rope")?,
             embed_batched: compile_cached(&arch, EMBED_BATCHED, "embed_batched")?,
             rope_batched: compile_cached(&arch, ROPE_BATCHED, "rope_batched")?,
+            rope_batched_tables: compile_cached(&arch, ROPE_BATCHED_TABLES, "rope_batched_tables")?,
             qg_split: compile_cached(&arch, QG_SPLIT, "qg_split")?,
             attn_gate_apply: compile_cached(&arch, ATTN_GATE_APPLY, "attn_gate_apply")?,
             gdn_conv_update: compile_cached(&arch, GDN_CONV_UPDATE, "gdn_conv_update")?,
@@ -4612,6 +4657,7 @@ impl HipKernels {
         head_dim: i32,
         rot_dim: i32,
         rp: RopeParams,
+        pos_delta: i32,
     ) -> Result<(), Error> {
         let qp = q;
         let kp = k;
@@ -4632,6 +4678,7 @@ impl HipKernels {
             &rp.beta_slow as *const f32 as *mut core::ffi::c_void,
             &rp.orig_len as *const i32 as *mut core::ffi::c_void,
             &rp.attn_factor as *const f32 as *mut core::ffi::c_void,
+            &pos_delta as *const i32 as *mut core::ffi::c_void,
             &rp.interleave as *const i32 as *mut core::ffi::c_void,
         ];
         let total = (batch * n_heads.max(n_kv_heads) * head_dim) as u32;
@@ -4641,6 +4688,51 @@ impl HipKernels {
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_rope_batched_tables(
+        &self,
+        q: *mut f32,
+        k: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rot_dim: i32,
+    ) -> Result<(), Error> {
+        if batch <= 0 || n_heads <= 0 || head_dim <= 0 || rot_dim <= 0 || rot_dim % 2 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "rope_batched_tables invalid dims: batch={batch} n_heads={n_heads} head_dim={head_dim} rot_dim={rot_dim}"
+            )));
+        }
+        if n_kv_heads <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "rope_batched_tables requires positive n_kv_heads, got {n_kv_heads}"
+            )));
+        }
+        let qp = q;
+        let kp = k;
+        let cp = cos;
+        let sp = sin;
+        let mut p = vec![
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &kp as *const *mut f32 as *mut core::ffi::c_void,
+            &cp as *const *const f32 as *mut core::ffi::c_void,
+            &sp as *const *const f32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &rot_dim as *const i32 as *mut core::ffi::c_void,
+        ];
+        let total = (batch * n_heads.max(n_kv_heads) * head_dim) as u32;
+        let blocks = total.div_ceil(256);
+        Ok(self
+            .rope_batched_tables
+            .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn launch_kv_store_batched(
         &self,
@@ -6389,6 +6481,7 @@ mod offline_tests {
         MLA_ATTN_DECODE,
         EMBED_BATCHED,
         ROPE_BATCHED,
+        ROPE_BATCHED_TABLES,
         QG_SPLIT,
         ATTN_GATE_APPLY,
         GDN_CONV_UPDATE,
@@ -6452,7 +6545,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            71,
+            72,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
