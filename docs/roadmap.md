@@ -1765,3 +1765,19 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   精确覆盖），以及「部分行、每行不同 features」的注入模型与替换 token 参考模型
   logits 逐元素对拍（finite + 1e-5）；负例覆盖 total>i32::MAX 与行数不足
   fail-fast。
+
+## Qwen3.8-27B Stage C3d：HF 兼容图像预处理（#146，2026-09-11）
+
+- 新增 `mach_model::image_processor`：`ImageProcessorConfig`（解析
+  `preprocessor_config.json` 的 size/patch/temporal/merge/mean/std）、
+  `smart_resize`、`preprocess_image`，输出与 HF 相同的 `pixel_values` 与
+  `image_grid_thw`（本实现为 `ProcessedImage { pixel_values, grid }`）。
+- 参考锁死 transformers 5.16.1 `Qwen2VLImageProcessorPil` + Pillow 12.3.0
+  `Resampling.BICUBIC`：22-bit 定点 bicubic、`smart_resize` 的
+  round/floor/ceil 语义逐位复刻；48x64 实配置图 → grid `[1,14,20]`、
+  430080 个 f32 对 HF golden 采样逐位一致，全量和/加权和/平方和对拍。
+- 对拍测试：smart_resize 5 组边界（含 200:1 拒绝）、4x5→8x6 的 144 像素
+  bicubic 逐位一致、tiny/small/real 三组 preprocessing golden。
+- 说明：checkpoint 声明 `Qwen2VLImageProcessorFast`（torchvision）；本模块与
+  框架无关的 PIL 参考逐位一致，fast 后端仅 bicubic 核细节不同，grid/token
+  布局一致。图像解码/base64/HTTP content parts 留待 C3e。
