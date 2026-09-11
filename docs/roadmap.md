@@ -1907,3 +1907,26 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   `cargo clippy --workspace --all-targets --features hip -- -D warnings` 全绿。
 - 说明：`spawn_blocking` 作业不可取消，`FETCH_TIMEOUT` 触发后 CPU 作业仍会跑完
   （此时它仍占着一个许可）；此前内联执行时超时同样中断不了它。
+
+## Qwen3.8-27B Stage C4：CPU 真权重视觉塔与 HF 对拍（#146，2026-09-11）
+
+- 原有 `cpu_vision_forward_matches_hf_golden` 只用 `depth=1/hidden=4` 合成配置，
+  抓不到真 27 层塔（hidden 1152/intermediate 4304/out 5120）的形状与量级错误。
+- 新增 opt-in 集成测试 `crates/mach-model/tests/vision_real_weights.rs`：读
+  `MACH_VISION_GOLDEN` 下的 raw f32 输入/参考与 `MACH_VISION_MODEL` 真权重，
+  跑 `vision_forward` 后逐元素对拍；两个变量都不设时打印 SKIP 并返回（须用
+  `--nocapture` 确认），只设一个直接失败；meta 的 dtype/shape/grid/image_sha256
+  都做契约校验。
+- `tools/vision_c4_golden.py --parity-export`：`--tower` 时额外导出 raw f32
+  文件与 meta（显式 `<f4`、先写临时文件再 `os.replace`，避免混合批次），
+  导出已验证确定性。
+- 容差 `|got-ref| <= 1e-3 * max(1, |ref|)`，另有毫秒级阳性对照
+  `tolerance_flags_a_perturbed_feature`（近零特征 +1e-2 必须被拒）。
+- 实测（128x128 → grid `[1,16,16]`、64x5120 features）：`worst_ratio=0.4488`
+  （index 320103：`-1.2215794` vs `-1.2210314`，允许 `1.22e-3`）、`nonfinite=0`、
+  单线程 687s。
+- runbook 同步：新增 CPU 对拍小节、把已完成的 C4 项移出待办、标注 graph capture
+  已暂停；`.gitignore` 忽略 `/artifacts`。
+
+**C4 至此只剩真机窗口项**：golden/compare E2E、HF 整模型 greedy token/logits
+（本机 31GB 内存装不下 BF16 27B）、Fast/PIL 漂移复核、VRAM/TTFT 回填。

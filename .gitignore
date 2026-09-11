@@ -16,3 +16,6 @@ __pycache__/
 
 # local scratch: A/B scripts, server logs, one-off inspection tools
 /.scratch
+
+# C4 vision runbook outputs (golden/e2e dumps, never committed)
+/artifacts
