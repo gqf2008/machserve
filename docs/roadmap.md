@@ -1845,7 +1845,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - fail-fast：spawn 前做 vision readiness handshake，VisionGpu 初始化失败直接让启动失败；
   engine admission 错误改为 Result 透传（非流式 400/500/503，流式发 SSE error frame），
   不再伪装成空 completion。
-- 内存预算：新增 `preprocess_image_limited` / `fetch_image_url_limited`，route 对单图与
-  多图总 patch 数按 `MACH_VISION_MAX_TOKENS` 在分配 patch buffer 前拒绝（400）。
+- 内存预算：新增 `preprocess_image_limited` / `preprocess_data_url_limited` /
+  `fetch_image_url_limited`；route 对每张图使用剩余预算（`total` 累加），data URL 与 HTTP
+  路径都在分配 patch buffer 前按 `MACH_VISION_MAX_TOKENS` 拒绝（400）。
 - 离线测试：engine image_runtime 往返、router 两种状态、engine error → HTTP 状态映射、
   preprocessor 路径解析、fetch/patch 上限；真机视觉前向与图片问答 E2E 属 C4。

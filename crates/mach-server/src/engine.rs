@@ -256,12 +256,6 @@ impl ServerEngine {
         *self.vision.lock().unwrap() = Some((hip, setup));
     }
 
-    /// True when a vision tower was installed before spawn.
-    #[must_use]
-    pub fn vision_enabled(&self) -> bool {
-        self.vision.lock().unwrap().is_some()
-    }
-
     /// Installs the image preprocessing/token config used by the handler.
     pub fn set_image_runtime(&self, cfg: ImageRuntimeConfig) {
         *self.image.lock().unwrap() = Some(cfg);
@@ -887,7 +881,6 @@ mod tests {
     fn image_runtime_round_trip() {
         let engine = ServerEngine::new(1);
         assert!(engine.image_runtime().is_none());
-        assert!(!engine.vision_enabled());
         let cfg = ImageRuntimeConfig {
             processor: mach_model::image_processor::ImageProcessorConfig::default(),
             image_token_id: 7,

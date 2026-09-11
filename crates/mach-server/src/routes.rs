@@ -234,6 +234,11 @@ const MAX_TOP_LOGPROBS: usize = 20;
 
 /// Validates request parameters; returns a 400 response for the first invalid
 /// one (OpenAI `invalid_request_error`).
+/// Remaining vision patch budget for the next image, or None when exhausted.
+fn remaining_patch_budget(total: usize, max: usize) -> Option<usize> {
+    (max > total).then(|| max - total)
+}
+
 fn validate_request(
     max_tokens: usize,
     top_logprobs: Option<usize>,
@@ -257,7 +262,7 @@ fn validate_request(
     None
 }
 
-/// Maps an engine submission error to an OpenAI-shaped 503 response.
+/// Maps engine errors to OpenAI-shaped responses (400 invalid, 503 busy/model, 500 startup).
 fn busy_response(e: EngineError) -> Response {
     let status = StatusCode::SERVICE_UNAVAILABLE;
     match e {
@@ -691,18 +696,21 @@ pub async fn chat_completions(
         let mut images = Vec::with_capacity(image_urls.len());
         let mut total_patches = 0usize;
         for url in &image_urls {
-            match crate::multimodal::fetch_image_url_limited(
-                url,
-                &image_cfg.processor,
-                image_cfg.max_patches,
-            )
-            .await
+            let Some(remaining) = remaining_patch_budget(total_patches, image_cfg.max_patches)
+            else {
+                return bad_request(&format!(
+                    "images exceed the {} vision patch budget",
+                    image_cfg.max_patches
+                ));
+            };
+            match crate::multimodal::fetch_image_url_limited(url, &image_cfg.processor, remaining)
+                .await
             {
                 Ok(image) => {
                     let patches = image.grid[0] * image.grid[1] * image.grid[2];
                     total_patches = match total_patches.checked_add(patches) {
-                        Some(total) if total <= image_cfg.max_patches => total,
-                        _ => {
+                        Some(total) => total,
+                        None => {
                             return bad_request(&format!(
                                 "images exceed the {} vision patch budget",
                                 image_cfg.max_patches
@@ -749,10 +757,6 @@ pub async fn chat_completions(
     );
     let id = format!("chatcmpl-{}", now());
     let created = now();
-
-    if let Some(resp) = validate_request(req.max_tokens, req.top_logprobs, req.n) {
-        return resp;
-    }
 
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
@@ -874,7 +878,8 @@ pub async fn healthz() -> &'static str {
 
 /// Builds the axum router.
 /// Largest accepted chat body when multimodal serving is enabled: one
-/// 64MiB encoded base64 payload plus JSON overhead. Text-only keeps the\n/// axum default.
+/// 64MiB encoded base64 payload plus JSON overhead. Text-only keeps the
+/// axum default.
 pub const MAX_CHAT_BODY_BYTES: usize = 96 << 20;
 
 pub fn router(state: AppState) -> axum::Router {
@@ -1068,5 +1073,13 @@ mod tests {
             chat_format: ChatFormat::Qwen,
         };
         let _ = router(vision);
+    }
+
+    #[test]
+    fn remaining_patch_budget_shrinks_per_image() {
+        assert_eq!(remaining_patch_budget(0, 8192), Some(8192));
+        assert_eq!(remaining_patch_budget(5000, 8192), Some(3192));
+        assert_eq!(remaining_patch_budget(8192, 8192), None);
+        assert_eq!(remaining_patch_budget(9000, 8192), None);
     }
 }

@@ -8,9 +8,7 @@
 
 use base64::Engine as _;
 use image::GenericImageView as _;
-use mach_model::image_processor::{
-    ImageProcessorConfig, ProcessedImage, preprocess_image, preprocess_image_limited,
-};
+use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image_limited};
 use mach_model::vision::VisionGrid;
 use serde::Deserialize;
 
@@ -181,12 +179,23 @@ pub fn preprocess_data_url(
     url: &str,
     cfg: &ImageProcessorConfig,
 ) -> Result<ProcessedImage, MultimodalError> {
+    preprocess_data_url_limited(url, cfg, usize::MAX)
+}
+
+/// Like preprocess_data_url but applies the patch budget before the
+/// patch buffer is allocated.
+pub fn preprocess_data_url_limited(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
     let image = decode_data_url(url)?;
-    Ok(preprocess_image(
+    Ok(preprocess_image_limited(
         cfg,
         &image.rgb8,
         image.height,
         image.width,
+        max_patches,
     )?)
 }
 
@@ -233,7 +242,7 @@ async fn fetch_impl_limited(
     max_patches: usize,
 ) -> Result<ProcessedImage, MultimodalError> {
     if url.starts_with("data:") {
-        return preprocess_data_url(url, cfg);
+        return preprocess_data_url_limited(url, cfg, max_patches);
     }
     let mut current = parse_http_url(url)?;
     let mut hops = 0usize;
@@ -834,5 +843,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn preprocess_data_url_limit_rejects_oversized_grid() {
+        let err = preprocess_data_url_limited(&png_data_url(4, 4), &small_cfg(), 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_data_url_limit_rejects_oversized_grid() {
+        let err = fetch_image_url_limited(&png_data_url(4, 4), &small_cfg(), 8)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds limit"), "{err}");
     }
 }
