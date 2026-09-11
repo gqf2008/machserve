@@ -7,7 +7,6 @@
 //! wrong direction moves a colour by >180 per channel. The image crate decodes
 //! JPEG with zune-jpeg instead of libjpeg, which measures <=2 per channel on
 //! these fixtures; the tolerance keeps headroom for decoder-version drift.
-#![cfg(feature = "hip")]
 
 use mach_server::multimodal::{DecodedImage, decode_rgb8};
 

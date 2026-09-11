@@ -126,9 +126,6 @@ python tools/vision_c4_compare.py `
 
 纯离线 P3（不阻塞真机）：
 
-- `crates/mach-server/tests/vision_decode.rs` 仍带 `#![cfg(feature = "hip")]`：
-  漏带 `--features hip` 时该测试目标编译成 0 测试即"通过"；标准门禁命令已带该
-  feature，是否把纯解码逻辑移进 CPU 可编译面留待真机验证后再定；
 - 高分辨率图片 tiling（当前 vision attention 段上限 `max_seg <= 8192`）；
 - 多图/并发请求的总显存预算（连接池复用与 CPU 预处理已由 PR #159 覆盖）。
 
@@ -136,4 +133,7 @@ python tools/vision_c4_compare.py `
 30B 在 ROCm 6.2/Windows 上有驱动腐化，方向已停）。
 
 已完成（无需在此重复）：EXIF orientation（PR #158）、HTTP client 连接池复用与
-CPU 预处理移出 async worker（PR #159）、CPU 真权重视觉塔对拍（PR #160）。
+CPU 预处理移出 async worker（PR #159）、CPU 真权重视觉塔对拍（PR #160）、
+图像解码/预处理/SSRF 用例进入 CPU 测试面（PR #162，`mach-server --lib` 的 CPU
+面从 0 个测试变为 29 个）。注意这只覆盖这些用例；仓库其它 hip-only 测试面的同类
+假绿已另开批次 issue 跟踪，不在本 runbook 范围。
