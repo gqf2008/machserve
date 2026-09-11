@@ -1818,10 +1818,11 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 ## Qwen3.8-27B Stage C3f（二·1）：HTTP(S) 图像抓取（#146，2026-09-11）
 
 - `mach_server::multimodal::fetch_image_url`：data URL 复用 C3e 解析；http(s)
-  用 reqwest(native-tls)：30s 超时、手动逐跳重定向 ≤5（https→http 拒绝）、
-  响应体 64MiB 上限（Content-Length 预检 + 流式累计）、Content-Type 校验
-  （缺省时交给解码器猜）；DNS 解析后仅允许公网 IP（拒绝 loopback/私有/
-  链路本地/CGNAT/ULA 等）并用 `resolve` 固定地址防 rebinding，再走 C3d 预处理。
+  用 reqwest(native-tls)：整个抓取总 30s 超时、手动逐跳重定向 ≤5（https→
+  http 拒绝）、响应体 64MiB 上限（Content-Length 预检 + 流式累计）、Content-
+  Type 校验（缺省时交给解码器猜）；仅直连（忽略环境代理）；DNS 解析后仅
+  允许公网 IP（拒绝 loopback/私有/链路本地/CGNAT/ULA/保留段等）并用
+  `resolve` 固定地址防 rebinding，再走 C3d 预处理。
 - 测试：本地 TCP HTTP server 覆盖 PNG 200、Content-Type 带参数、404、
   text/html、超长 Content-Length、chunked 流式超限、5 跳重定向成功/6 跳
   拒绝、非 http scheme、data URL；另有私网/特殊 IP 拒绝与 DNS 解析校验单测。

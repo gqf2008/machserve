@@ -22,6 +22,8 @@ pub const MAX_ENCODED_IMAGE_BYTES: usize = 64 << 20;
 const MAX_DECODE_BYTES: u64 = 512 << 20;
 /// Largest accepted HTTP(S) image response body.
 pub const MAX_FETCH_BYTES: usize = 64 << 20;
+/// Overall wall-clock limit for one image fetch (all redirect hops).
+pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Largest accepted RGB8 buffer after channel expansion. 256 MiB covers
 /// an ~89 MP RGB photo while bounding grayscale/CMYK decode bombs.
 pub const MAX_RGB8_BYTES: usize = 256 << 20;
@@ -192,7 +194,9 @@ pub async fn fetch_image_url(
     url: &str,
     cfg: &ImageProcessorConfig,
 ) -> Result<ProcessedImage, MultimodalError> {
-    fetch_impl(url, cfg, false).await
+    tokio::time::timeout(FETCH_TIMEOUT, fetch_impl(url, cfg, false))
+        .await
+        .map_err(|_| MultimodalError::Fetch("image fetch timed out".into()))?
 }
 
 /// Max redirect hops followed manually (each hop is re-validated).
@@ -324,16 +328,15 @@ fn build_fetch_client(
     allow_private: bool,
 ) -> Result<reqwest::Client, MultimodalError> {
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
     if let Some(host) = url.host_str()
         && host.parse::<std::net::IpAddr>().is_err()
     {
         builder = builder.resolve(host, addr);
     }
-    if allow_private {
-        builder = builder.no_proxy();
-    }
+    let _ = allow_private;
+    builder = builder.no_proxy();
     builder
         .build()
         .map_err(|e| MultimodalError::Fetch(e.to_string()))
@@ -377,6 +380,10 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || o[0] == 0
+                || o[0] == 0
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+                || (o[0] & 0xf0) == 240
                 || (o[0] == 100 && (o[1] & 0xc0) == 64))
         }
         IpAddr::V6(v6) => {
@@ -384,6 +391,10 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
             let is_ula = (seg[0] & 0xfe00) == 0xfc00;
             let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
             let is_doc = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            let is_nat64 = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0];
+            let is_6to4 = seg[0] == 0x2002;
+            let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
+            let is_benchmark = seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0x0000;
             let embedded_public = v6
                 .to_ipv4_mapped()
                 .is_none_or(|v4| is_public_ip(IpAddr::V4(v4)));
@@ -393,6 +404,10 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 || is_ula
                 || is_link_local
                 || is_doc
+                || is_nat64
+                || is_6to4
+                || is_teredo
+                || is_benchmark
                 || !embedded_public)
         }
     }
@@ -664,6 +679,13 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "2001:0:0:0:0:0:0:1",
+            "2001:2::1",
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(!is_public_ip(ip), "{ip} must be rejected");
