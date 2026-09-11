@@ -159,6 +159,150 @@ extern "C" __global__ void add_bias(float* x, const float* bias, int rows, int c
 }
 "#;
 
+/// LayerNorm over `rows` rows of `cols` columns, one block per row.
+const LAYER_NORM: &str = r#"
+extern "C" __global__ void layer_norm(const float* x, const float* w, const float* b,
+                                      float* y, int cols, float eps) {
+    int row = blockIdx.x;
+    const float* xr = x + (long long)row * cols;
+    float* yr = y + (long long)row * cols;
+    __shared__ float red[256];
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = xr[i];
+        sum += v;
+        sumsq += v * v;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = red[0] / (float)cols;
+    __syncthreads();
+    red[threadIdx.x] = sumsq;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float var = red[0] / (float)cols - mean * mean;
+    float inv = rsqrtf(var + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+    }
+}
+"#;
+
+/// Elementwise GELU variants used by the vision MLP and merger.
+const GELU_TANH: &str = r#"
+extern "C" __global__ void gelu_tanh(float* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+    }
+}
+"#;
+const GELU_ERF: &str = r#"
+extern "C" __global__ void gelu_erf(float* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = 0.5f * v * (1.0f + erff(v * 0.7071067811865476f));
+    }
+}
+"#;
+
+/// Qwen3.5 vision RoPE over the packed `[token, 3, head, head_dim]` qkv
+/// layout: apply the h/w rotary tables to q and k, leave v untouched.
+const VISION_ROPE_APPLY: &str = r#"
+extern "C" __global__ void vision_rope_apply(float* qkv, const float* cos, const float* sin,
+                                             int tokens, int heads, int hd) {
+    int token = blockIdx.x;
+    int head = blockIdx.y;
+    int half = hd / 2;
+    for (int part = 0; part < 2; ++part) {
+        float* row = qkv + (((long long)token * 3 + part) * heads + head) * hd;
+        for (int i = threadIdx.x; i < half; i += blockDim.x) {
+            float a = row[i];
+            float b = row[half + i];
+            float c = cos[token * hd + i];
+            float s = sin[token * hd + i];
+            row[i] = a * c - b * s;
+            row[half + i] = b * c + a * s;
+        }
+    }
+}
+"#;
+
+/// Packed bidirectional vision attention. Each block handles one
+/// (query token, head); `seg_start`/`seg_len` describe the frame-local
+/// attention segment. The score scratch is dynamic shared memory sized to the
+/// largest segment (`max_seg * 4` bytes).
+const VISION_ATTN: &str = r#"
+extern "C" __global__ void vision_attn(const float* qkv, float* out,
+                                       const int* seg_start, const int* seg_len,
+                                       int tokens, int heads, int hd, float scale,
+                                       int max_seg) {
+    extern __shared__ float scores[];
+    __shared__ float red[256];
+    int token = blockIdx.x;
+    int head = blockIdx.y;
+    int start = seg_start[token];
+    int len = seg_len[token];
+    if (len <= 0 || len > max_seg) {
+        if (threadIdx.x == 0 && token < tokens) {
+            for (int d = 0; d < hd; ++d) out[(long long)token * heads * hd + head * hd + d] = 0.0f;
+        }
+        return;
+    }
+    const float* q = qkv + (((long long)token * 3) * heads + head) * hd;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        int key = start + i;
+        const float* k = qkv + (((long long)key * 3 + 1) * heads + head) * hd;
+        float dot = 0.0f;
+        for (int d = 0; d < hd; ++d) dot += q[d] * k[d];
+        scores[i] = dot * scale;
+    }
+    __syncthreads();
+    float m = -3.402823466e38f;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) m = fmaxf(m, scores[i]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float maxv = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        float e = expf(scores[i] - maxv);
+        scores[i] = e;
+        sum += e;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / red[0];
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < len; ++i) {
+            int key = start + i;
+            float v = qkv[(((long long)key * 3 + 2) * heads + head) * hd + d];
+            acc += scores[i] * v;
+        }
+        out[((long long)token * heads + head) * hd + d] = acc * inv_sum;
+    }
+}
+"#;
+
 /// Store a K/V row into the cache at position `*pos`.
 const KV_STORE: &str = r#" 
 extern "C" __global__ void kv_store(const float* kv, float* cache, const int* pos_buf,
@@ -3136,6 +3280,11 @@ pub struct HipKernels {
     silu_mul: HipKernelModule,
     add: HipKernelModule,
     add_bias: HipKernelModule,
+    layer_norm: HipKernelModule,
+    gelu_tanh: HipKernelModule,
+    gelu_erf: HipKernelModule,
+    vision_rope_apply: HipKernelModule,
+    vision_attn: HipKernelModule,
     kv_store: HipKernelModule,
     attn_decode: HipKernelModule,
     mla_assemble_q: HipKernelModule,
@@ -3276,6 +3425,11 @@ impl HipKernels {
             silu_mul: compile_cached(&arch, SILU_MUL, "silu_mul")?,
             add: compile_cached(&arch, ADD, "add")?,
             add_bias: compile_cached(&arch, ADD_BIAS, "add_bias")?,
+            layer_norm: compile_cached(&arch, LAYER_NORM, "layer_norm")?,
+            gelu_tanh: compile_cached(&arch, GELU_TANH, "gelu_tanh")?,
+            gelu_erf: compile_cached(&arch, GELU_ERF, "gelu_erf")?,
+            vision_rope_apply: compile_cached(&arch, VISION_ROPE_APPLY, "vision_rope_apply")?,
+            vision_attn: compile_cached(&arch, VISION_ATTN, "vision_attn")?,
             kv_store: compile_cached(&arch, KV_STORE, "kv_store")?,
             attn_decode: compile_cached(&arch, ATTN_DECODE, "attn_decode")?,
             mla_assemble_q: compile_cached(&arch, MLA_ASSEMBLE_Q, "mla_assemble_q")?,
@@ -3432,6 +3586,11 @@ impl HipKernels {
         cols: i32,
         eps: f32,
     ) -> Result<(), Error> {
+        if rows <= 0 || cols <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm requires positive rows/cols, got {rows}x{cols}"
+            )));
+        }
         let xp = x;
         let wp = w;
         let yp = y;
@@ -3543,6 +3702,152 @@ impl HipKernels {
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    /// LayerNorm over rows: `y = ln(x) * w + b`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_layer_norm(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        y: *mut f32,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+    ) -> Result<(), Error> {
+        if rows <= 0 || cols <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm requires positive rows/cols, got {rows}x{cols}"
+            )));
+        }
+        let xp = x;
+        let wp = w;
+        let bp = b;
+        let yp = y;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &wp as *const *const f32 as *mut core::ffi::c_void,
+            &bp as *const *const f32 as *mut core::ffi::c_void,
+            &yp as *const *mut f32 as *mut core::ffi::c_void,
+            &cols as *const i32 as *mut core::ffi::c_void,
+            &eps as *const f32 as *mut core::ffi::c_void,
+        ];
+        Ok(self
+            .layer_norm
+            .launch([rows as u32, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// In-place GELU for the vision MLP (`tanh`) or merger (`erf`).
+    pub fn launch_gelu(&self, x: *mut f32, n: i32, tanh: bool) -> Result<(), Error> {
+        if n < 0 {
+            return Err(Error::InvalidArgument(format!(
+                "gelu requires a non-negative element count, got {n}"
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let xp = x;
+        let mut p = vec![
+            &xp as *const *mut f32 as *mut core::ffi::c_void,
+            &n as *const i32 as *mut core::ffi::c_void,
+        ];
+        let blocks = (n as u32).div_ceil(256);
+        let module = if tanh {
+            &self.gelu_tanh
+        } else {
+            &self.gelu_erf
+        };
+        Ok(module.launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
+    /// Apply Qwen3.5 vision RoPE to q/k in the packed qkv layout, in place.
+    pub fn launch_vision_rope_apply(
+        &self,
+        qkv: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        tokens: i32,
+        heads: i32,
+        hd: i32,
+    ) -> Result<(), Error> {
+        if tokens <= 0 || heads <= 0 || hd <= 0 || hd % 2 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "vision_rope_apply requires positive tokens/heads and an even hd, got tokens={tokens} heads={heads} hd={hd}"
+            )));
+        }
+        let qp = qkv;
+        let cp = cos;
+        let sp = sin;
+        let mut p = vec![
+            &qp as *const *mut f32 as *mut core::ffi::c_void,
+            &cp as *const *const f32 as *mut core::ffi::c_void,
+            &sp as *const *const f32 as *mut core::ffi::c_void,
+            &tokens as *const i32 as *mut core::ffi::c_void,
+            &heads as *const i32 as *mut core::ffi::c_void,
+            &hd as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.vision_rope_apply.launch(
+            [tokens as u32, heads as u32, 1],
+            [128, 1, 1],
+            &mut p,
+            self.stream,
+        )?)
+    }
+
+    /// Packed bidirectional vision attention. `seg_start`/`seg_len` are
+    /// per-token segment descriptors; dynamic shared memory is `max_seg * 4`
+    /// bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_vision_attn(
+        &self,
+        qkv: *const f32,
+        out: *mut f32,
+        seg_start: *const i32,
+        seg_len: *const i32,
+        tokens: i32,
+        heads: i32,
+        hd: i32,
+        scale: f32,
+        max_seg: i32,
+    ) -> Result<(), Error> {
+        if tokens <= 0 || heads <= 0 || hd <= 0 {
+            return Err(Error::InvalidArgument(format!(
+                "vision_attn requires positive tokens/heads/hd, got tokens={tokens} heads={heads} hd={hd}"
+            )));
+        }
+        if max_seg <= 0 {
+            return Err(Error::InvalidArgument(
+                "vision_attn max_seg must be positive".into(),
+            ));
+        }
+        if max_seg > 8192 {
+            return Err(Error::InvalidArgument(format!(
+                "vision_attn max_seg {max_seg} exceeds the 8192-token shared-memory limit"
+            )));
+        }
+        let qp = qkv;
+        let op = out;
+        let sp = seg_start;
+        let lp = seg_len;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &sp as *const *const i32 as *mut core::ffi::c_void,
+            &lp as *const *const i32 as *mut core::ffi::c_void,
+            &tokens as *const i32 as *mut core::ffi::c_void,
+            &heads as *const i32 as *mut core::ffi::c_void,
+            &hd as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &max_seg as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.vision_attn.launch_shmem(
+            [tokens as u32, heads as u32, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            (max_seg as u32) * 4,
+        )?)
+    }
     pub fn launch_kv_store(
         &self,
         kv: *const f32,
@@ -6071,6 +6376,11 @@ mod offline_tests {
         SILU_MUL,
         ADD,
         ADD_BIAS,
+        LAYER_NORM,
+        GELU_TANH,
+        GELU_ERF,
+        VISION_ROPE_APPLY,
+        VISION_ATTN,
         KV_STORE,
         ROPE,
         ATTN_DECODE,
@@ -6142,7 +6452,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            66,
+            71,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }

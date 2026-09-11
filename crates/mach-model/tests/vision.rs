@@ -182,6 +182,89 @@ fn cpu_vision_forward_matches_hf_golden() {
         assert!((a - b).abs() < 5e-7, "token {i}: {a} vs {b}");
     }
 }
+fn multi_head_cfg() -> VisionConfig {
+    VisionConfig {
+        depth: 1,
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_heads: 2,
+        in_channels: 1,
+        patch_size: 2,
+        temporal_patch_size: 2,
+        spatial_merge_size: 2,
+        num_position_embeddings: 4,
+        out_hidden_size: 6,
+        image_token_id: 101,
+        video_token_id: 102,
+        vision_start_token_id: 103,
+        vision_end_token_id: 104,
+        mrope_section: [1, 1, 1],
+        mrope_interleaved: true,
+        hidden_act: VisionActivation::GeluPytorchTanh,
+    }
+}
+
+fn multi_head_weights() -> VisionWeights {
+    let layer = VisionLayerWeights {
+        norm1_weight: fill("blocks.0.norm1.weight", 8),
+        norm1_bias: fill("blocks.0.norm1.bias", 8),
+        qkv: linear("blocks.0.attn.qkv", 24, 8),
+        attn_proj: linear("blocks.0.attn.proj", 8, 8),
+        norm2_weight: fill("blocks.0.norm2.weight", 8),
+        norm2_bias: fill("blocks.0.norm2.bias", 8),
+        mlp_fc1: linear("blocks.0.mlp.linear_fc1", 16, 8),
+        mlp_fc2: linear("blocks.0.mlp.linear_fc2", 8, 16),
+    };
+    VisionWeights {
+        patch_embed_weight: fill("patch_embed.proj.weight", 8 * 8),
+        patch_embed_bias: fill("patch_embed.proj.bias", 8),
+        pos_embed_weight: fill("pos_embed.weight", 4 * 8),
+        layers: vec![layer],
+        merger_norm_weight: fill("merger.norm.weight", 8),
+        merger_norm_bias: fill("merger.norm.bias", 8),
+        merger_fc1: linear("merger.linear_fc1", 32, 32),
+        merger_fc2: linear("merger.linear_fc2", 6, 32),
+    }
+}
+
+#[test]
+#[allow(clippy::excessive_precision)]
+fn cpu_vision_forward_matches_hf_golden_multi_head() {
+    let cfg = multi_head_cfg();
+    let w = multi_head_weights();
+    let pixel = fill("pixel", 16 * 8);
+    let got = vision_forward(&cfg, &w, &pixel, &[[1, 2, 4], [2, 2, 2]]).unwrap();
+    let want = [
+        0.12758752703666687f32,
+        -0.3536241948604584,
+        0.7869868278503418,
+        -0.21890529990196228,
+        -0.9496842622756958,
+        1.3021525144577026,
+        0.09965535253286362,
+        -0.3464723527431488,
+        0.7794058322906494,
+        0.1719481498003006,
+        -0.8959850072860718,
+        1.328220009803772,
+        0.8674502372741699,
+        0.0795118510723114,
+        0.8524913191795349,
+        0.9201756715774536,
+        -0.4743712246417999,
+        1.4105879068374634,
+        0.39053773880004883,
+        -0.18814316391944885,
+        0.8579662442207336,
+        -0.008011549711227417,
+        -0.8432198762893677,
+        1.3198504447937012,
+    ];
+    assert_eq!(got.len(), want.len());
+    for (i, (a, b)) in got.iter().zip(want).enumerate() {
+        assert!((a - b).abs() < 5e-7, "token {i}: {a} vs {b}");
+    }
+}
 #[test]
 fn validates_complete_vision_header() {
     let cfg = tiny_cfg();
