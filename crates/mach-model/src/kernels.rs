@@ -2597,6 +2597,69 @@ extern "C" __global__ void gemv_q4(
 }
 "#;
 
+/// Q4 GEMV for prefill rows: each warp owns one weight row and multiplies it
+/// against up to `GEMV_Q4_ROW_TILE` input rows, so the packed weight row is
+/// read **once per tile** instead of once per row (the decode-shaped `gemv_q4`
+/// re-reads it per row, which is why chunked prefill used to run at decode
+/// speed). Only the `d % 8 == 0` fast path is implemented; callers fall back to
+/// `gemv_q4` for other shapes.
+const GEMV_Q4_ROWBATCH: &str = r#"
+extern "C" __global__ void gemv_q4_rowbatch(
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ wq,
+    const float* __restrict__ ws,
+    float* __restrict__ out,
+    int n, int d, int batch, int tile) {
+    const int warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (warp >= n || (d & 7) != 0) return;
+    const int b0 = blockIdx.y * tile;
+    const int bend = b0 + tile < batch ? b0 + tile : batch;
+    const long long base = (long long)warp * d;
+    const unsigned char* wrow = wq + base / 2;
+    const int nq = d / 8;
+    float acc[8];
+    #pragma unroll
+    for (int t = 0; t < 8; t++) acc[t] = 0.f;
+    for (int j4 = lane; j4 < nq; j4 += 32) {
+        const unsigned int w8 = *(const unsigned int*)(wrow + 4 * (long long)j4);
+        const float s = ws[(base + 8 * j4) >> 5];
+        int v[8];
+        #pragma unroll
+        for (int t = 0; t < 4; t++) {
+            const unsigned int byte = (w8 >> (8 * t)) & 0xFFu;
+            int lo = (int)(byte & 0xFu);
+            int hi = (int)((byte >> 4) & 0xFu);
+            v[2 * t] = lo < 8 ? lo : lo - 16;
+            v[2 * t + 1] = hi < 8 ? hi : hi - 16;
+        }
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            const int b = b0 + t;
+            if (b < bend) {
+                const float* xb = x + (long long)b * d + 8 * j4;
+                float p = 0.f;
+                #pragma unroll
+                for (int q = 0; q < 8; q++) p += (float)v[q] * xb[q];
+                acc[t] += p * s;
+            }
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        if (b0 + t < bend) {
+            float a = acc[t];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_down(a, off);
+            if (lane == 0) out[(long long)(b0 + t) * n + warp] = a;
+        }
+    }
+}
+"#;
+
+/// Input rows per weight-row read in [`GEMV_Q4_ROWBATCH`] (the kernel body
+/// hardcodes the same tile).
+const GEMV_Q4_ROW_TILE: i32 = 8;
+
 /// Q4 embedding gather: token rows of a Q4-on-device embedding table,
 /// dequantized (nibble * group scale) straight to f32 activations. Scales
 /// are FLAT over the tensor (see [`GEMV_Q4`]) — the group index comes from
@@ -3376,6 +3439,7 @@ pub struct HipKernels {
     gemv_f16: HipKernelModule,
     gemv_f16_qkv: HipKernelModule,
     gemv_q4: HipKernelModule,
+    gemv_q4_rowbatch: HipKernelModule,
     embed_f16: HipKernelModule,
     embed_gather_q4: HipKernelModule,
     kv_store_f16: HipKernelModule,
@@ -3543,6 +3607,7 @@ impl HipKernels {
             gemv_f16: compile_cached(&arch, GEMV_F16, "gemv_f16")?,
             gemv_f16_qkv: compile_cached(&arch, GEMV_F16_QKV, "gemv_f16_qkv")?,
             gemv_q4: compile_cached(&arch, GEMV_Q4, "gemv_q4")?,
+            gemv_q4_rowbatch: compile_cached(&arch, GEMV_Q4_ROWBATCH, "gemv_q4_rowbatch")?,
             embed_f16: compile_cached(&arch, EMBED_GATHER_F16, "embed_gather_f16")?,
             embed_gather_q4: compile_cached(&arch, EMBED_GATHER_Q4, "embed_gather_q4")?,
             kv_store_f16: compile_cached(&arch, KV_F16, "kv_store_batched_f16")?,
@@ -5124,6 +5189,55 @@ impl HipKernels {
         )?)
     }
 
+    /// Prefill-shaped Q4 GEMV: one weight row read serves
+    /// [`GEMV_Q4_ROW_TILE`] input rows. Only `d % 8 == 0` is supported;
+    /// callers must fall back to [`Self::launch_gemv_q4`] otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gemv_q4_rowbatch(
+        &self,
+        x: *const f32,
+        wq: *const u8,
+        ws: *const f32,
+        out: *mut f32,
+        n: i32,
+        d: i32,
+        batch: i32,
+    ) -> Result<(), Error> {
+        // The kernel requires `d % 8 == 0` and otherwise returns without
+        // writing `out`; reject illegal shapes loudly so a future caller never
+        // silently consumes a stale output buffer.
+        if n <= 0 || d <= 0 || batch <= 0 || d % GEMV_Q4_ROW_TILE != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "gemv_q4_rowbatch requires n>0, batch>0 and d>0 divisible by {}, got n={n}, d={d}, batch={batch}",
+                GEMV_Q4_ROW_TILE
+            )));
+        }
+        let xp = x;
+        let wqp = wq;
+        let wsp = ws;
+        let op = out;
+        let ni = n;
+        let di = d;
+        let bi = batch;
+        let ti = GEMV_Q4_ROW_TILE;
+        let mut p = vec![
+            &xp as *const *const f32 as *mut core::ffi::c_void,
+            &wqp as *const *const u8 as *mut core::ffi::c_void,
+            &wsp as *const *const f32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &ni as *const i32 as *mut core::ffi::c_void,
+            &di as *const i32 as *mut core::ffi::c_void,
+            &bi as *const i32 as *mut core::ffi::c_void,
+            &ti as *const i32 as *mut core::ffi::c_void,
+        ];
+        let warps_per_block = 256 / 32;
+        let blocks = (n as u32).div_ceil(warps_per_block);
+        let bblocks = (batch as u32).div_ceil(GEMV_Q4_ROW_TILE as u32);
+        Ok(self
+            .gemv_q4_rowbatch
+            .launch([blocks, bblocks, 1], [256, 1, 1], &mut p, self.stream)?)
+    }
+
     /// Q4 embedding gather (see the [`EMBED_GATHER_Q4`] contract): token rows
     /// of a Q4-on-device embedding table, dequantized straight to f32.
     pub fn launch_embed_gather_q4(
@@ -6578,6 +6692,7 @@ mod offline_tests {
         ATTN_PREFILL_F16,
         EMBED_GATHER_F16,
         GEMV_Q4,
+        GEMV_Q4_ROWBATCH,
         EMBED_GATHER_Q4,
         GDN_CONV_CHUNK,
         GDN_CHUNK,
@@ -6616,7 +6731,7 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            73,
+            74,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
@@ -8395,6 +8510,145 @@ mod gpu_tests {
         }
     }
 
+    /// `gemv_q4_rowbatch` vs the same CPU dequantized reference: the row-tiled
+    /// kernel must match `gemv_q4` numerically while reading each weight row
+    /// once per tile (batch tails that are not a multiple of the tile are
+    /// covered too).
+    #[test]
+    fn gemv_q4_rowbatch_matches_dequantized_cpu() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        let bytes = |n: usize| n * std::mem::size_of::<f32>();
+        let mut rng = lcg(73);
+
+        // (n, d, batch) — d % 8 == 0 is required by the row-tiled kernel; the
+        // batches cover a full tile, a partial tile and multiple tiles.
+        for (n, d, batch) in [
+            (33usize, 64usize, 8usize),
+            (24, 96, 3),
+            (21, 128, 17),
+            (17, 512, 9),
+            // d % 8 == 0 but not a multiple of the 32-element scale group:
+            // exercises the scale tail across a partial group.
+            (19, 40, 9),
+            // Large reduction dim close to a real contraction: the rowbatch
+            // kernel has no shared staging, so this also guards against a
+            // regression that reintroduces a shared-memory limit.
+            (3, 16384, 9),
+        ] {
+            let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
+            let w: Vec<f32> = (0..n * d).map(|_| rng()).collect();
+            let wq4 = crate::q4::Q4Tensor::quantize(&w);
+            let wdeq = wq4.dequantize();
+
+            let dx = hip::malloc(&h, bytes(x.len())).unwrap();
+            let dwq = hip::malloc(&h, wq4.q_bytes().len()).unwrap();
+            let dws = hip::malloc(&h, bytes(wq4.scales().len())).unwrap();
+            let dout = hip::malloc(&h, bytes(n * batch)).unwrap();
+            hip::memcpy(
+                &h,
+                dx,
+                x.as_ptr() as *const std::ffi::c_void,
+                bytes(x.len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dwq,
+                wq4.q_bytes().as_ptr() as *const std::ffi::c_void,
+                wq4.q_bytes().len(),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            hip::memcpy(
+                &h,
+                dws,
+                wq4.scales().as_ptr() as *const std::ffi::c_void,
+                bytes(wq4.scales().len()),
+                hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+            .unwrap();
+            k.launch_gemv_q4_rowbatch(
+                dx as *const f32,
+                dwq as *const u8,
+                dws as *const f32,
+                dout as *mut f32,
+                n as i32,
+                d as i32,
+                batch as i32,
+            )
+            .unwrap();
+            k.sync().unwrap();
+            let mut got = vec![0f32; batch * n];
+            hip::memcpy(
+                &h,
+                got.as_mut_ptr() as *mut std::ffi::c_void,
+                dout,
+                bytes(got.len()),
+                hip::HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+            .unwrap();
+            for b in 0..batch {
+                for row in 0..n {
+                    let mut acc = 0f32;
+                    for i in 0..d {
+                        acc += x[b * d + i] * wdeq[row * d + i];
+                    }
+                    let g = got[b * n + row];
+                    let want_scale = acc.abs().max(1.0);
+                    assert!(
+                        (g - acc).abs() <= 1e-3 * want_scale,
+                        "gemv_q4_rowbatch (n={n}, d={d}, batch={batch}) row {row}: got {g}, want {acc}"
+                    );
+                }
+            }
+            for p in [dx, dwq, dws, dout] {
+                hip::free(&h, p).unwrap();
+            }
+        }
+    }
+
+    /// The rowbatch wrapper must reject shapes the kernel cannot serve
+    /// instead of launching it and leaving `out` untouched. The guard runs
+    /// before any pointer is dereferenced, so null buffers are safe here.
+    #[test]
+    fn gemv_q4_rowbatch_rejects_illegal_shapes() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        // (n, d, batch) — each violates exactly one precondition.
+        for (n, d, batch) in [(4i32, 8i32, 0i32), (4, 12, 8), (0, 16, 8), (4, 0, 8)] {
+            let err = k
+                .launch_gemv_q4_rowbatch(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    n,
+                    d,
+                    batch,
+                )
+                .expect_err("illegal shape must be rejected");
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "n={n} d={d} batch={batch}: {err}"
+            );
+        }
+    }
     /// `embed_gather_q4` vs the CPU dequantized row gather (batch of token
     /// ids, duplicate ids included to pin the read-only row reuse).
     #[test]
