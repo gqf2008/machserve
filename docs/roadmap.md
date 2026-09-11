@@ -1930,3 +1930,17 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 
 **C4 至此只剩真机窗口项**：golden/compare E2E、HF 整模型 greedy token/logits
 （本机 31GB 内存装不下 BF16 27B）、Fast/PIL 漂移复核、VRAM/TTFT 回填。
+
+## Qwen3.8-27B Stage C4：图像解码测试进入 CPU 测试面（#146，2026-09-11）
+
+- `crates/mach-server/src/lib.rs` 里 `multimodal` 原先与 `engine`/`routes` 一起被
+  `#[cfg(feature = "hip")]` 门控：不带 `--features hip` 时整个模块（29 个纯 CPU
+  的图像解码/预处理/SSRF/连接复用/并发上限测试）编译成 0 个测试即"通过"。
+- 该模块本身不依赖 hip（只用 image/base64/reqwest/mach-model 的 CPU 面），改为
+  无条件编译；`crates/mach-server/tests/vision_decode.rs` 同步去掉
+  `#![cfg(feature = "hip")]`。
+- 结果：`cargo test -p mach-server --lib` 的 CPU 面现在真实执行 29 个（此前 0）、
+  `--test vision_decode` 执行 1 个（此前 0）；hip 面保持 44 + 1 不变。
+- 门禁：双面 `cargo clippy --workspace --all-targets -- -D warnings`、
+  `cargo test -p mach-server --lib`（CPU 29 / hip 44）、
+  `--test vision_decode`（CPU 1 / hip 1）、`cargo fmt --all --check` 全绿。
