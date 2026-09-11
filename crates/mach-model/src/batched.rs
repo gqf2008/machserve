@@ -537,6 +537,28 @@ fn write_npy_f32(path: &std::path::Path, v: &[f32]) -> Result<(), Error> {
         .map_err(|e| Error::Model(format!("layer dump write {}: {e}", path.display())))
 }
 
+/// Dense Q4-on-device dispatch shared by the layer GEMMs and the LM head.
+///
+/// Prefill rows (`b > 1`) reuse each packed weight row across a tile of input
+/// rows via `gemv_q4_rowbatch`; decode and contractions whose reduction dim is
+/// not a multiple of the kernel tile (`d % 8 != 0`) fall back to the
+/// batch-general plain `gemv_q4`. `launch_gemv_q4_rowbatch` only supports
+/// `d % 8 == 0`, so the guard must stay in sync with that wrapper.
+fn launch_q4_dense(
+    k: &HipKernels,
+    out: *mut f32,
+    x: *const f32,
+    t: Q4TensorDev,
+    n: i32,
+    kk: i32,
+    b: i32,
+) -> Result<(), Error> {
+    if b > 1 && kk > 0 && kk % 8 == 0 {
+        return k.launch_gemv_q4_rowbatch(x, t.q, t.s, out, n, kk, b);
+    }
+    k.launch_gemv_q4(x, t.q, t.s, out, n, kk, b)
+}
+
 impl BatchedModel {
     /// Builds a batched model for `batch` sequences and uploads `w`.
     pub fn new(hip: Arc<Hip>, cfg: Config, w: &Weights, batch: usize) -> Result<Self, Error> {
@@ -3078,11 +3100,13 @@ impl BatchedModel {
         // runs the 30B-class decode 60x over the memory bound; large m keeps
         // hipBLAS (weight reuse across rows pays on tensor cores).
         // `t` is the dense Q4-on-device pair for this tensor (null in every
-        // other mode): when present, the raw packed tensor + scales go to
-        // `gemv_q4` for EVERY step — no f16/f32 copy exists to fall back on
-        // (same contract as the Q4 expert pool), and that kernel is
-        // batch-general (prefill rows included) with no 48 KB staging limit
-        // (oversize contractions read x straight from global).
+        // other mode): when present the raw packed tensor + scales go to a Q4
+        // kernel for EVERY step - no f16/f32 copy exists to fall back on (same
+        // contract as the Q4 expert pool). Decode rows take the batch-general
+        // `gemv_q4`; prefill rows go through `launch_q4_dense` to
+        // `gemv_q4_rowbatch`, which reuses each packed weight row across a tile
+        // of input rows. Neither has a 48 KB staging limit (oversize
+        // contractions read x straight from global).
         let gemm = |out: *mut f32,
                     x: *const f32,
                     w32: *mut f32,
@@ -3092,13 +3116,7 @@ impl BatchedModel {
                     kk: i32|
          -> Result<(), Error> {
             if !t.is_null() {
-                // Prefill rows: reuse each packed weight row across a tile of
-                // input rows instead of re-reading it once per row (the plain
-                // GEMV is decode-shaped).
-                if b > 1 && kk > 0 && kk % 8 == 0 {
-                    return k.launch_gemv_q4_rowbatch(x, t.q, t.s, out, n, kk, b);
-                }
-                return k.launch_gemv_q4(x, t.q, t.s, out, n, kk, b);
+                return launch_q4_dense(k, out, x, t, n, kk, b);
             }
             if f16 {
                 if b <= GEMV_MAX_M && kk <= GEMV_MAX_D {
@@ -4437,13 +4455,14 @@ impl BatchedModel {
         // the `other` bucket).
         k.launch_rms_norm(self.x, self.rms_final_dev, self.xn, b, d, c.rms_eps)?;
         if !self.lm_head_q4.is_null() {
-            // Dense Q4-on-device: every step, any row count — the kernel is
-            // batch-general and vocab-sized n is just more blocks.
-            k.launch_gemv_q4(
-                self.xn,
-                self.lm_head_q4.q,
-                self.lm_head_q4.s,
+            // Dense Q4-on-device: same dispatch as the layer GEMMs, so the
+            // LM head prefill rows also reuse each packed weight row instead
+            // of re-reading the whole vocab-sized matrix once per row.
+            launch_q4_dense(
+                k,
                 self.logits,
+                self.xn,
+                self.lm_head_q4,
                 c.vocab_size as i32,
                 d,
                 b,

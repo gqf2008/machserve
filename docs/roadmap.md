@@ -1976,15 +1976,20 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 
 - `gemv_q4` 是 decode 形状：一个 warp 只算"一行权重 × 一行输入"，batch 维在
   `blockIdx.y`，prefill 每个 token 都把整份 Q4 权重重读一遍 —— 实测 prefill
-  ≈49 tok/s 且与 prompt 长度无关（4.8k token 用 98.2s）。
+  ≈41 tok/s 且与 prompt 长度无关（4020-token prompt 用 98.2s）。
 - 新增 `GEMV_Q4_ROWBATCH`（内核 73→74）：一个 warp 持有一行权重、对 8 行输入同时
-  累加，权重行每 tile 只读一次，x 直接从 global 读；`batched.rs` 在
-  `batch > 1 && d % 8 == 0` 时走它，其余形状仍走 `gemv_q4`。
+  累加，权重行每 tile 只读一次，x 直接从 global 读。层 GEMM 与 LM head 统一走
+  `batched.rs::launch_q4_dense`：`b > 1 && d % 8 == 0` 时走 rowbatch，其余（decode、d % 8 != 0）仍走 `gemv_q4`；`launch_gemv_q4_rowbatch` 对非法形状显式报 `InvalidArgument`，不再静默不写 out。
 - 真机 A/B（7900 XTX / Qwen3.8-27B Q4-all / 同一 prompt，release）：
-  - 4.8k-token prompt + 8 token 输出：**98.24s → 55.17s（1.78×）**；
+  - 4020-token prompt + 8 token 输出：**98.24s → 55.17s（1.78×）**（单次观测：perf_decode.py 用 split() 估的长度实为词数，按 checkpoint tokenizer 准确计数为 4020 token；扣掉 8 个 decode token 后 before ≈41 tok/s、after ≈73 tok/s）；
   - decode TPOT 37.8ms → 35.0ms（噪声内不变，decode 不走新 kernel）；
   - 加载到 `/healthz` ~114s（同量级）。
-- 正确性：`gemv_q4_rowbatch_matches_dequantized_cpu`（GPU 对拍 CPU dequant，4 组
-  形状含非整 tile 尾部）通过；`offline_tests` 74 内核离线编译门禁通过。
+- 正确性：`gemv_q4_rowbatch_matches_dequantized_cpu`（GPU 对拍 CPU dequant，6 组
+  形状含非整 tile 尾部、`d=40` 跨 scale group 尾、`d=16384` 大收缩维）通过；
+  `offline_tests` 74 内核离线编译门禁通过。
+- 为什么只有 1.78×（不是 ~8×）：rowbatch 只降低了 Q4 GEMM 的**权重**读量；x 仍被
+  每个输出行从 global 重复读，attention/GDN/norm/采样等 kernel 完全没变，且 LM head
+  虽已并入同一分派但在本轮 A/B 里占比很小。1.78× 与 batch=8 tile 的理论权重读量下降
+  吻合（每 tile 权重行读一次 vs 每行一次），剩余部分靠 x staging 再压。
 - 剩余优化点：x 行目前被每个输出行重复读取（未走 shared），更高 tile 会放大 x
   读；下一步做 x 分级 staging 后再调 tile 大小。

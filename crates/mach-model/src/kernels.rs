@@ -5203,6 +5203,15 @@ impl HipKernels {
         d: i32,
         batch: i32,
     ) -> Result<(), Error> {
+        // The kernel requires `d % 8 == 0` and otherwise returns without
+        // writing `out`; reject illegal shapes loudly so a future caller never
+        // silently consumes a stale output buffer.
+        if n <= 0 || d <= 0 || batch <= 0 || d % GEMV_Q4_ROW_TILE != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "gemv_q4_rowbatch requires n>0, batch>0 and d>0 divisible by {}, got n={n}, d={d}, batch={batch}",
+                GEMV_Q4_ROW_TILE
+            )));
+        }
         let xp = x;
         let wqp = wq;
         let wsp = ws;
@@ -8526,6 +8535,13 @@ mod gpu_tests {
             (24, 96, 3),
             (21, 128, 17),
             (17, 512, 9),
+            // d % 8 == 0 but not a multiple of the 32-element scale group:
+            // exercises the scale tail across a partial group.
+            (19, 40, 9),
+            // Large reduction dim close to a real contraction: the rowbatch
+            // kernel has no shared staging, so this also guards against a
+            // regression that reintroduces a shared-memory limit.
+            (3, 16384, 9),
         ] {
             let x: Vec<f32> = (0..batch * d).map(|_| rng()).collect();
             let w: Vec<f32> = (0..n * d).map(|_| rng()).collect();
