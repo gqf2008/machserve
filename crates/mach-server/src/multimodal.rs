@@ -8,7 +8,9 @@
 
 use base64::Engine as _;
 use image::GenericImageView as _;
-use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image};
+use mach_model::image_processor::{
+    ImageProcessorConfig, ProcessedImage, preprocess_image, preprocess_image_limited,
+};
 use mach_model::vision::VisionGrid;
 use serde::Deserialize;
 
@@ -194,18 +196,41 @@ pub async fn fetch_image_url(
     url: &str,
     cfg: &ImageProcessorConfig,
 ) -> Result<ProcessedImage, MultimodalError> {
-    tokio::time::timeout(FETCH_TIMEOUT, fetch_impl(url, cfg, false))
-        .await
-        .map_err(|_| MultimodalError::Fetch("image fetch timed out".into()))?
+    fetch_image_url_limited(url, cfg, usize::MAX).await
+}
+
+/// Like [`fetch_image_url`] but rejects images above `max_patches` before
+/// allocating the patch buffer.
+pub async fn fetch_image_url_limited(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
+    tokio::time::timeout(
+        FETCH_TIMEOUT,
+        fetch_impl_limited(url, cfg, false, max_patches),
+    )
+    .await
+    .map_err(|_| MultimodalError::Fetch("image fetch timed out".into()))?
 }
 
 /// Max redirect hops followed manually (each hop is re-validated).
 const MAX_REDIRECTS: usize = 5;
 
+#[cfg(test)]
 async fn fetch_impl(
     url: &str,
     cfg: &ImageProcessorConfig,
     allow_private: bool,
+) -> Result<ProcessedImage, MultimodalError> {
+    fetch_impl_limited(url, cfg, allow_private, usize::MAX).await
+}
+
+async fn fetch_impl_limited(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    allow_private: bool,
+    max_patches: usize,
 ) -> Result<ProcessedImage, MultimodalError> {
     if url.starts_with("data:") {
         return preprocess_data_url(url, cfg);
@@ -272,11 +297,12 @@ async fn fetch_impl(
         }
         let bytes = read_body_limited(resp, MAX_FETCH_BYTES).await?;
         let image = decode_rgb8(&bytes)?;
-        return Ok(preprocess_image(
+        return Ok(preprocess_image_limited(
             cfg,
             &image.rgb8,
             image.height,
             image.width,
+            max_patches,
         )?);
     }
 }
@@ -799,5 +825,14 @@ mod tests {
         .await;
         let out = fetch_impl(&url, &small_cfg(), true).await.unwrap();
         assert_eq!(out.grid, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn fetch_limit_rejects_oversized_grid() {
+        let url = spawn_raw(http_response("200 OK", "image/png", &png_bytes(4, 4))).await;
+        let err = fetch_impl_limited(&url, &small_cfg(), true, 8)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "{err}");
     }
 }

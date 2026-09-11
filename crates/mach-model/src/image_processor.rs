@@ -217,6 +217,18 @@ pub fn preprocess_image(
     height: usize,
     width: usize,
 ) -> Result<ProcessedImage, Error> {
+    preprocess_image_limited(cfg, rgb8, height, width, usize::MAX)
+}
+
+/// Like [`preprocess_image`] but rejects grids above `max_patches` before
+/// allocating the patch buffer.
+pub fn preprocess_image_limited(
+    cfg: &ImageProcessorConfig,
+    rgb8: &[u8],
+    height: usize,
+    width: usize,
+    max_patches: usize,
+) -> Result<ProcessedImage, Error> {
     cfg.validate()?;
     if height == 0 || width == 0 {
         return Err(Error::InvalidArgument(
@@ -251,6 +263,11 @@ pub fn preprocess_image(
     let patches = grid_h
         .checked_mul(grid_w)
         .ok_or_else(|| Error::InvalidArgument("image patch count overflow".into()))?;
+    if patches > max_patches {
+        return Err(Error::InvalidArgument(format!(
+            "image grid {grid_h}x{grid_w} = {patches} patches exceeds limit {max_patches}"
+        )));
+    }
     let mut pixel_values = Vec::with_capacity(
         patches
             .checked_mul(patch_dim)

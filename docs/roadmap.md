@@ -1842,4 +1842,10 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - routes：图片 part → `fetch_image_url`（data/http(s)）→ `expand_image_pads` →
   `submit_multimodal`；vision 未启用仍 501。vision 启用时 chat body limit 96MiB，
   否则保持 axum 默认 2MiB。
-- 本批仅编译 + CPU 门禁验证；真机视觉前向与图片问答 E2E 属 C4。
+- fail-fast：spawn 前做 vision readiness handshake，VisionGpu 初始化失败直接让启动失败；
+  engine admission 错误改为 Result 透传（非流式 400/500/503，流式发 SSE error frame），
+  不再伪装成空 completion。
+- 内存预算：新增 `preprocess_image_limited` / `fetch_image_url_limited`，route 对单图与
+  多图总 patch 数按 `MACH_VISION_MAX_TOKENS` 在分配 patch buffer 前拒绝（400）。
+- 离线测试：engine image_runtime 往返、router 两种状态、engine error → HTTP 状态映射、
+  preprocessor 路径解析、fetch/patch 上限；真机视觉前向与图片问答 E2E 属 C4。

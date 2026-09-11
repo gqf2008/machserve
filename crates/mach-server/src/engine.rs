@@ -46,6 +46,8 @@ pub struct ImageRuntimeConfig {
     pub processor: mach_model::image_processor::ImageProcessorConfig,
     pub image_token_id: u32,
     pub spatial_merge_size: usize,
+    /// Maximum total vision patches accepted per request.
+    pub max_patches: usize,
 }
 
 /// GPU vision runtime owned by (and created on) the engine thread.
@@ -84,8 +86,12 @@ impl VisionRuntime {
         let mut patches = 0usize;
         for image in images {
             pixel_values.extend_from_slice(&image.pixel_values);
+            let grid_patches = image.grid[0]
+                .checked_mul(image.grid[1])
+                .and_then(|v| v.checked_mul(image.grid[2]))
+                .ok_or_else(|| EngineError::InvalidRequest("vision grid overflow".into()))?;
             patches = patches
-                .checked_add(image.grid[0] * image.grid[1] * image.grid[2])
+                .checked_add(grid_patches)
                 .ok_or_else(|| EngineError::InvalidRequest("vision patch count overflow".into()))?;
         }
         if patches > self.max_tokens {
@@ -106,8 +112,17 @@ impl VisionRuntime {
         let mut offset = 0usize;
         let mut vision_images = Vec::with_capacity(images.len());
         for image in images {
-            let rows = (image.grid[0] * image.grid[1] * image.grid[2]) / merge_unit;
-            let end = offset + rows * hidden;
+            let grid_patches = image.grid[0]
+                .checked_mul(image.grid[1])
+                .and_then(|v| v.checked_mul(image.grid[2]))
+                .ok_or_else(|| EngineError::InvalidRequest("vision grid overflow".into()))?;
+            let rows = grid_patches / merge_unit;
+            let end = rows
+                .checked_mul(hidden)
+                .and_then(|v| offset.checked_add(v))
+                .ok_or_else(|| {
+                    EngineError::InvalidRequest("vision feature offset overflow".into())
+                })?;
             if end > features.len() {
                 return Err(EngineError::InvalidRequest(
                     "vision feature buffer shorter than expected".into(),
@@ -131,9 +146,10 @@ impl VisionRuntime {
 
 /// Completion delivery: generated tokens, per-token log-probs, per-token
 /// top-`k` log-probs (OpenAI `top_logprobs`), and the OpenAI finish reason.
-type DoneSender = oneshot::Sender<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str)>;
-/// Completion delivery receiver (the `submit`/`submit_stream` resolution).
-type DoneReceiver = oneshot::Receiver<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str)>;
+type DonePayload = (Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str);
+/// Completion delivery: `Err` carries the engine error for the caller.
+type DoneSender = oneshot::Sender<Result<DonePayload, EngineError>>;
+type DoneReceiver = oneshot::Receiver<Result<DonePayload, EngineError>>;
 
 /// Shared engine handle (channel side only; the model stays on the engine
 /// thread).
@@ -177,6 +193,8 @@ pub enum EngineError {
     InvalidRequest(String),
     #[error("model error: {0}")]
     Model(#[from] mach_model::Error),
+    #[error("engine startup failed: {0}")]
+    Startup(String),
 }
 
 impl ServerEngine {
@@ -373,7 +391,7 @@ impl ServerEngine {
             });
         }
         self.cond.notify_one();
-        rx.await.map_err(|_| EngineError::Busy)
+        rx.await.map_err(|_| EngineError::Busy)?
     }
 
     /// Submits a streaming generation request. The returned `Receiver<u32>`
@@ -474,7 +492,7 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
-        Ok(self.spawn_engine_thread(model))
+        self.spawn_engine_thread(model)
     }
 
     /// Spawns a storage-Q4 engine thread: weights are dequantized to f16 per
@@ -505,7 +523,7 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
-        Ok(self.spawn_engine_thread(model))
+        self.spawn_engine_thread(model)
     }
 
     /// Spawns a storage-Q4 engine with the expert pool kept in Q4 ON DEVICE
@@ -542,7 +560,7 @@ impl ServerEngine {
                 self.prefill_rows,
             )?
         };
-        Ok(self.spawn_engine_thread(model))
+        self.spawn_engine_thread(model)
     }
 
     /// Spawns a dense Q4-on-device engine (`MACH_Q4_DEVICE=2`): the expert
@@ -593,7 +611,7 @@ impl ServerEngine {
                 self.prefill_rows,
             )?
         };
-        Ok(self.spawn_engine_thread(model))
+        self.spawn_engine_thread(model)
     }
 
     /// Spawns a storage-FP8 engine thread: weights are dequantized to f16 per
@@ -624,7 +642,7 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows_fp8(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
-        Ok(self.spawn_engine_thread(model))
+        self.spawn_engine_thread(model)
     }
 
     /// Spawns a speculative-decoding engine thread (greedy-only).
@@ -657,10 +675,11 @@ impl ServerEngine {
     fn spawn_engine_thread(
         self: &Arc<Self>,
         mut model: ContinuousModel,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> Result<std::thread::JoinHandle<()>, EngineError> {
         let engine = Arc::clone(self);
         let setup = self.vision.lock().unwrap().take();
-        std::thread::Builder::new()
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
             .name("mach-engine".into())
             .spawn(move || {
                 let mut vision = match setup {
@@ -670,15 +689,23 @@ impl ServerEngine {
                             Some(runtime)
                         }
                         Err(e) => {
-                            eprintln!("engine: vision runtime disabled: {e}");
-                            None
+                            let _ = ready_tx.send(Err(e));
+                            return;
                         }
                     },
                     None => None,
                 };
+                let _ = ready_tx.send(Ok(()));
                 engine.run(&mut model, vision.as_mut());
             })
-            .expect("spawn engine thread")
+            .expect("spawn engine thread");
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(handle),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(EngineError::Startup(
+                "engine thread exited before signalling readiness".into(),
+            )),
+        }
     }
 
     fn run(self: &Arc<Self>, model: &mut ContinuousModel, mut vision: Option<&mut VisionRuntime>) {
@@ -744,7 +771,7 @@ impl ServerEngine {
                     // caller sees an empty generation rather than a hang.
                     Err(e) => {
                         eprintln!("engine: rejecting request: {e}");
-                        let _ = r.done.send((Vec::new(), Vec::new(), Vec::new(), "error"));
+                        let _ = r.done.send(Err(e));
                         drop(r.tokens_tx);
                     }
                 }
@@ -769,7 +796,7 @@ impl ServerEngine {
                         let reason = model.finish_reason(id);
                         model.ack(id);
                         if let Some(tx) = txs.remove(&id) {
-                            let _ = tx.send((output, lps, tlps, reason));
+                            let _ = tx.send(Ok((output, lps, tlps, reason)));
                         }
                         // Closing the stream sender signals end-of-stream.
                         streams.remove(&id);
@@ -830,7 +857,7 @@ impl ServerEngine {
                         let reason = engine.finish_reason(id as usize);
                         if let Some(tx) = txs.remove(&id) {
                             // Spec mode is greedy-only: no logprobs tracked.
-                            let _ = tx.send((output, Vec::new(), Vec::new(), reason));
+                            let _ = tx.send(Ok((output, Vec::new(), Vec::new(), reason)));
                         }
                         streams.remove(&id);
                     } else if let Some(stx) = streams.get(&id) {
@@ -849,5 +876,28 @@ impl ServerEngine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_runtime_round_trip() {
+        let engine = ServerEngine::new(1);
+        assert!(engine.image_runtime().is_none());
+        assert!(!engine.vision_enabled());
+        let cfg = ImageRuntimeConfig {
+            processor: mach_model::image_processor::ImageProcessorConfig::default(),
+            image_token_id: 7,
+            spatial_merge_size: 2,
+            max_patches: 128,
+        };
+        engine.set_image_runtime(cfg);
+        let got = engine.image_runtime().unwrap();
+        assert_eq!(got.image_token_id, 7);
+        assert_eq!(got.spatial_merge_size, 2);
+        assert_eq!(got.max_patches, 128);
     }
 }

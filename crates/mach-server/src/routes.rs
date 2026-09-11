@@ -285,9 +285,21 @@ fn busy_response(e: EngineError) -> Response {
             "server_error",
             "model_error",
         ),
+        EngineError::Startup(m) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("engine startup failed: {m}"),
+            "server_error",
+            "engine_startup",
+        ),
     }
 }
 
+/// Emits an OpenAI-style SSE error frame followed by `[DONE]`.
+async fn stream_error(tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>, message: &str) {
+    let body = serde_json::json!({"error": {"message": message, "type": "server_error"}});
+    let frame = format!("data: {body}\n\ndata: [DONE]\n\n");
+    let _ = tx.send(Ok(Bytes::from(frame))).await;
+}
 /// Naive fallback: token id -> byte (lossy UTF-8, no tokenizer configured).
 /// Kept consistent with the streaming path (byte-level + `from_utf8_lossy`).
 fn naive_decode(tokens: &[u32]) -> String {
@@ -547,10 +559,6 @@ pub async fn completions(
     let id = format!("cmpl-{}", now());
     let created = now();
 
-    if let Some(resp) = validate_request(req.max_tokens, req.top_logprobs, req.n) {
-        return resp;
-    }
-
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
@@ -564,8 +572,13 @@ pub async fn completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let reason = rx_final.await.map(|(_, _, _, r)| r).unwrap_or("length");
-            stream_tokens(st, id2, "text_completion", created, reason, rx_tokens, tx).await;
+            match rx_final.await {
+                Ok(Ok((_, _, _, reason))) => {
+                    stream_tokens(st, id2, "text_completion", created, reason, rx_tokens, tx).await;
+                }
+                Ok(Err(e)) => stream_error(tx, &e.to_string()).await,
+                Err(_) => stream_error(tx, "engine stopped before completion").await,
+            }
         });
         return sse_response(rx);
     }
@@ -661,6 +674,9 @@ pub async fn chat_completions(
         Some(t) => t.encode(&text),
         None => naive_encode(&text),
     };
+    if let Some(resp) = validate_request(req.max_tokens, req.top_logprobs, req.n) {
+        return resp;
+    }
     let (tokens, images) = if image_urls.is_empty() {
         (tokens, Vec::new())
     } else {
@@ -673,9 +689,28 @@ pub async fn chat_completions(
             );
         };
         let mut images = Vec::with_capacity(image_urls.len());
+        let mut total_patches = 0usize;
         for url in &image_urls {
-            match crate::multimodal::fetch_image_url(url, &image_cfg.processor).await {
-                Ok(image) => images.push(image),
+            match crate::multimodal::fetch_image_url_limited(
+                url,
+                &image_cfg.processor,
+                image_cfg.max_patches,
+            )
+            .await
+            {
+                Ok(image) => {
+                    let patches = image.grid[0] * image.grid[1] * image.grid[2];
+                    total_patches = match total_patches.checked_add(patches) {
+                        Some(total) if total <= image_cfg.max_patches => total,
+                        _ => {
+                            return bad_request(&format!(
+                                "images exceed the {} vision patch budget",
+                                image_cfg.max_patches
+                            ));
+                        }
+                    };
+                    images.push(image)
+                }
                 Err(e) => return bad_request(&format!("image: {e}")),
             }
         }
@@ -732,17 +767,22 @@ pub async fn chat_completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            let reason = rx_final.await.map(|(_, _, _, r)| r).unwrap_or("length");
-            stream_tokens(
-                st,
-                id2,
-                "chat.completion.chunk",
-                created,
-                reason,
-                rx_tokens,
-                tx,
-            )
-            .await;
+            match rx_final.await {
+                Ok(Ok((_, _, _, reason))) => {
+                    stream_tokens(
+                        st,
+                        id2,
+                        "chat.completion.chunk",
+                        created,
+                        reason,
+                        rx_tokens,
+                        tx,
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => stream_error(tx, &e.to_string()).await,
+                Err(_) => stream_error(tx, "engine stopped before completion").await,
+            }
         });
         return sse_response(rx);
     }
@@ -834,7 +874,7 @@ pub async fn healthz() -> &'static str {
 
 /// Builds the axum router.
 /// Largest accepted chat body when multimodal serving is enabled: one
-/// 64MiB base64 image plus JSON overhead. Text-only keeps the axum default.
+/// 64MiB encoded base64 payload plus JSON overhead. Text-only keeps the\n/// axum default.
 pub const MAX_CHAT_BODY_BYTES: usize = 96 << 20;
 
 pub fn router(state: AppState) -> axum::Router {
@@ -987,5 +1027,46 @@ mod tests {
             text,
             "<|im_start|>user\nlook <|vision_start|><|image_pad|><|vision_end|> now<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn engine_errors_map_to_http_status() {
+        assert_eq!(
+            busy_response(EngineError::InvalidRequest("bad".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            busy_response(EngineError::Model(mach_model::Error::Model("m".into()))).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            busy_response(EngineError::Startup("s".into())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn router_builds_for_text_and_vision_states() {
+        let text = AppState {
+            engine: ServerEngine::new(1),
+            model: "test".into(),
+            tok: None,
+            chat_format: ChatFormat::Qwen,
+        };
+        let _ = router(text);
+        let engine = ServerEngine::new(1);
+        engine.set_image_runtime(crate::engine::ImageRuntimeConfig {
+            processor: mach_model::image_processor::ImageProcessorConfig::default(),
+            image_token_id: 1,
+            spatial_merge_size: 2,
+            max_patches: 16,
+        });
+        let vision = AppState {
+            engine,
+            model: "test".into(),
+            tok: None,
+            chat_format: ChatFormat::Qwen,
+        };
+        let _ = router(vision);
     }
 }
