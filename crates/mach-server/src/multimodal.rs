@@ -20,6 +20,8 @@ pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>
 pub const MAX_ENCODED_IMAGE_BYTES: usize = 64 << 20;
 /// Largest decoded RGBA/RGB allocation accepted from the image decoder.
 const MAX_DECODE_BYTES: u64 = 512 << 20;
+/// Largest accepted HTTP(S) image response body.
+pub const MAX_FETCH_BYTES: usize = 64 << 20;
 /// Largest accepted RGB8 buffer after channel expansion. 256 MiB covers
 /// an ~89 MP RGB photo while bounding grayscale/CMYK decode bombs.
 pub const MAX_RGB8_BYTES: usize = 256 << 20;
@@ -51,7 +53,7 @@ pub struct ImageUrl {
 /// Errors from parsing/decoding/preprocessing multimodal content.
 #[derive(Debug, thiserror::Error)]
 pub enum MultimodalError {
-    #[error("image_url must be a data URL (http fetch is C3f)")]
+    #[error("image_url must be a data URL or http(s) URL")]
     UnsupportedUrl,
     #[error("invalid image data URL: {0}")]
     BadDataUrl(String),
@@ -61,6 +63,8 @@ pub enum MultimodalError {
     TooLarge(usize),
     #[error("image base64 decode failed: {0}")]
     Base64(String),
+    #[error("image fetch failed: {0}")]
+    Fetch(String),
     #[error("image decode failed: {0}")]
     Decode(String),
     #[error(transparent)]
@@ -182,6 +186,83 @@ pub fn preprocess_data_url(
     )?)
 }
 
+/// Fetch an `http(s)://` image (bounded) or decode a data URL, then run the
+/// C3d image processor.
+pub async fn fetch_image_url(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+) -> Result<ProcessedImage, MultimodalError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| MultimodalError::Fetch(e.to_string()))?;
+    fetch_with_client(&client, url, cfg).await
+}
+
+async fn fetch_with_client(
+    client: &reqwest::Client,
+    url: &str,
+    cfg: &ImageProcessorConfig,
+) -> Result<ProcessedImage, MultimodalError> {
+    if url.starts_with("data:") {
+        return preprocess_data_url(url, cfg);
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(MultimodalError::UnsupportedUrl);
+    }
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| MultimodalError::Fetch(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(MultimodalError::Fetch(format!("HTTP {}", resp.status())));
+    }
+    if let Some(len) = resp.content_length()
+        && len > MAX_FETCH_BYTES as u64
+    {
+        return Err(MultimodalError::TooLarge(len as usize));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !content_type.is_empty()
+        && !matches!(
+            content_type.as_str(),
+            "image/png" | "image/jpeg" | "image/jpg"
+        )
+    {
+        return Err(MultimodalError::UnsupportedMedia(content_type));
+    }
+    let mut resp = resp;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| MultimodalError::Fetch(e.to_string()))?
+    {
+        let total = bytes.len() + chunk.len();
+        if total > MAX_FETCH_BYTES {
+            return Err(MultimodalError::TooLarge(total));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let image = decode_rgb8(&bytes)?;
+    Ok(preprocess_image(
+        cfg,
+        &image.rgb8,
+        image.height,
+        image.width,
+    )?)
+}
+
 /// Expand each `<|image_pad|>` to `grid_t * grid_h * grid_w / merge^2` pad
 /// tokens, consuming `grids` in order (HF `replace_image_token`).
 pub fn expand_image_pads(
@@ -233,7 +314,7 @@ pub fn expand_image_pads(
 mod tests {
     use super::*;
 
-    fn png_data_url(width: u32, height: u32) -> String {
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let img = image::RgbImage::from_fn(width, height, |x, y| {
             image::Rgb([x as u8 * 10, y as u8 * 20, 7])
         });
@@ -243,7 +324,11 @@ mod tests {
             image::ImageFormat::Png,
         )
         .unwrap();
-        let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        bytes
+    }
+
+    fn png_data_url(width: u32, height: u32) -> String {
+        let payload = base64::engine::general_purpose::STANDARD.encode(png_bytes(width, height));
         format!("data:image/png;base64,{payload}")
     }
 
@@ -332,5 +417,107 @@ mod tests {
             decode_data_url(&url),
             Err(MultimodalError::TooLarge(_))
         ));
+    }
+
+    fn small_cfg() -> ImageProcessorConfig {
+        ImageProcessorConfig {
+            patch_size: 1,
+            temporal_patch_size: 1,
+            merge_size: 1,
+            min_pixels: 1,
+            max_pixels: 64,
+            image_mean: [0.5; 3],
+            image_std: [0.5; 3],
+        }
+    }
+
+    fn no_proxy_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    async fn spawn_raw(response: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(&response).await;
+            }
+        });
+        format!("http://{addr}/image")
+    }
+
+    #[tokio::test]
+    async fn fetch_data_url_uses_processor() {
+        let out = fetch_with_client(&no_proxy_client(), &png_data_url(2, 3), &small_cfg())
+            .await
+            .unwrap();
+        assert_eq!(out.grid, [1, 3, 2]);
+        assert_eq!(out.pixel_values.len(), 3 * 2 * 3);
+    }
+
+    #[tokio::test]
+    async fn fetches_http_png_image() {
+        let url = spawn_raw(http_response("200 OK", "image/png", &png_bytes(3, 2))).await;
+        let out = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
+            .await
+            .unwrap();
+        assert_eq!(out.grid, [1, 2, 3]);
+        assert_eq!(out.pixel_values.len(), 3 * 2 * 3);
+    }
+
+    #[tokio::test]
+    async fn rejects_http_error_status() {
+        let url = spawn_raw(http_response("404 Not Found", "text/plain", b"nope")).await;
+        let err = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MultimodalError::Fetch(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_image_content_type() {
+        let url = spawn_raw(http_response("200 OK", "text/html", b"<html/>")).await;
+        let err = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MultimodalError::UnsupportedMedia(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_http_content_length() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_FETCH_BYTES + 1
+        );
+        let url = spawn_raw(head.into_bytes()).await;
+        let err = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MultimodalError::TooLarge(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_scheme() {
+        let err = fetch_with_client(&no_proxy_client(), "ftp://example.com/a.png", &small_cfg())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MultimodalError::UnsupportedUrl), "{err}");
     }
 }

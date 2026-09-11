@@ -1814,3 +1814,14 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   mixed batch（image prefill + text decode）、image decode delta、section 不一致拒绝。
 - 真机 GPU 前向与 server 接线（VisionGpu 执行、HTTP(S) 抓取、body limit）
   是 C3f（二）/C4，需 GPU 窗口。
+
+## Qwen3.8-27B Stage C3f（二·1）：HTTP(S) 图像抓取（#146，2026-09-11）
+
+- `mach_server::multimodal::fetch_image_url`：data URL 复用 C3e 解析；http(s)
+  用 reqwest(native-tls)：30s 超时、最多 5 次重定向、响应体 64MiB 上限
+  （先看 Content-Length，再流式累计）、Content-Type 校验（缺省时交给解码器
+  猜格式），再走 C3d 预处理。
+- 本地 TCP HTTP 对拍：PNG 200、404、text/html、超长 Content-Length、非 http
+  scheme、data URL 六项测试。
+- body limit 与 handler 接线随 C3f（二·2）一起做：vision 开关打开前不改默认
+  2MiB，避免功能未启用时放大请求体预算。
