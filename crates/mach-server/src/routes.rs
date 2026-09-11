@@ -882,13 +882,18 @@ pub async fn healthz() -> &'static str {
 /// axum default.
 pub const MAX_CHAT_BODY_BYTES: usize = 96 << 20;
 
-pub fn router(state: AppState) -> axum::Router {
-    use axum::routing::{get, post};
-    let limit = if state.engine.image_runtime().is_some() {
+/// Chat request body limit: multimodal serving allows one encoded image.
+fn chat_body_limit(image_enabled: bool) -> usize {
+    if image_enabled {
         MAX_CHAT_BODY_BYTES
     } else {
         2 << 20
-    };
+    }
+}
+
+pub fn router(state: AppState) -> axum::Router {
+    use axum::routing::{get, post};
+    let limit = chat_body_limit(state.engine.image_runtime().is_some());
     let chat = axum::Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .layer(axum::extract::DefaultBodyLimit::max(limit));
@@ -1081,5 +1086,34 @@ mod tests {
         assert_eq!(remaining_patch_budget(5000, 8192), Some(3192));
         assert_eq!(remaining_patch_budget(8192, 8192), None);
         assert_eq!(remaining_patch_budget(9000, 8192), None);
+    }
+
+    #[tokio::test]
+    async fn chat_body_limit_rejects_oversized_text_request() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let state = AppState {
+            engine: ServerEngine::new(1),
+            model: "test".into(),
+            tok: None,
+            chat_format: ChatFormat::Qwen,
+        };
+        let app = router(state);
+        let text = "a".repeat((2 << 20) + 1024);
+        let body = serde_json::json!({"messages": [{"role": "user", "content": text}]});
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn chat_body_limit_selects_text_and_vision_budgets() {
+        assert_eq!(chat_body_limit(false), 2 << 20);
+        assert_eq!(chat_body_limit(true), MAX_CHAT_BODY_BYTES);
     }
 }

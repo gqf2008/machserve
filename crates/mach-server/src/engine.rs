@@ -17,6 +17,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::oneshot;
 
+/// Write the merged vision features (raw little-endian f32) plus metadata
+/// for the C4 comparator (MACH_VISION_DUMP=<prefix>).
+fn dump_vision_features(
+    path: &std::path::Path,
+    features: &[f32],
+    grids: &[VisionGrid],
+) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(features.len().saturating_mul(4));
+    for value in features {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path.with_extension("bin"), bytes)?;
+    let meta = serde_json::json!({
+        "grids": grids,
+        "values": features.len(),
+        "sum": features.iter().map(|v| *v as f64).sum::<f64>(),
+    });
+    std::fs::write(path.with_extension("json"), meta.to_string())
+}
+
 /// A submitted generation request.
 struct Request {
     prompt: Vec<u32>,
@@ -57,6 +77,8 @@ struct VisionRuntime {
     gpu: VisionGpu,
     image_token_id: u32,
     max_tokens: usize,
+    /// Dev-only feature dump prefix (MACH_VISION_DUMP), for C4 parity checks.
+    dump_path: Option<std::path::PathBuf>,
 }
 
 impl VisionRuntime {
@@ -68,6 +90,7 @@ impl VisionRuntime {
             weights: setup.weights,
             gpu,
             max_tokens: setup.max_tokens,
+            dump_path: std::env::var_os("MACH_VISION_DUMP").map(std::path::PathBuf::from),
         })
     }
 
@@ -102,6 +125,11 @@ impl VisionRuntime {
         }
         let prep = VisionGpu::prepare(&self.cfg, &self.weights, &grids)?;
         let features = self.gpu.forward(&pixel_values, &prep)?;
+        if let Some(path) = &self.dump_path
+            && let Err(e) = dump_vision_features(path, &features, &grids)
+        {
+            eprintln!("engine: vision dump failed: {e}");
+        }
 
         let merge_unit = self
             .cfg
@@ -761,8 +789,8 @@ impl ServerEngine {
                     }
                     // Admission failure (e.g. paged page-pool exhaustion):
                     // reject the request instead of panicking the engine
-                    // thread. The oneshot delivers an empty completion; the
-                    // caller sees an empty generation rather than a hang.
+                    // thread. The oneshot carries the engine error; the caller
+                    // sees a structured failure rather than a hang.
                     Err(e) => {
                         eprintln!("engine: rejecting request: {e}");
                         let _ = r.done.send(Err(e));
