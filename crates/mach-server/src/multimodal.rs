@@ -186,81 +186,216 @@ pub fn preprocess_data_url(
     )?)
 }
 
-/// Fetch an `http(s)://` image (bounded) or decode a data URL, then run the
-/// C3d image processor.
+/// Fetch an `http(s)://` image (bounded, public addresses only) or decode a
+/// data URL, then run the C3d image processor.
 pub async fn fetch_image_url(
     url: &str,
     cfg: &ImageProcessorConfig,
 ) -> Result<ProcessedImage, MultimodalError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| MultimodalError::Fetch(e.to_string()))?;
-    fetch_with_client(&client, url, cfg).await
+    fetch_impl(url, cfg, false).await
 }
 
-async fn fetch_with_client(
-    client: &reqwest::Client,
+/// Max redirect hops followed manually (each hop is re-validated).
+const MAX_REDIRECTS: usize = 5;
+
+async fn fetch_impl(
     url: &str,
     cfg: &ImageProcessorConfig,
+    allow_private: bool,
 ) -> Result<ProcessedImage, MultimodalError> {
     if url.starts_with("data:") {
         return preprocess_data_url(url, cfg);
     }
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    let mut current = parse_http_url(url)?;
+    let mut hops = 0usize;
+    loop {
+        let addr = resolve_public(&current, allow_private).await?;
+        let client = build_fetch_client(&current, addr, allow_private)?;
+        let resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| MultimodalError::Fetch(e.to_string()))?;
+        if resp.status().is_redirection() {
+            if hops >= MAX_REDIRECTS {
+                return Err(MultimodalError::Fetch(format!(
+                    "too many redirects (> {MAX_REDIRECTS})"
+                )));
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| MultimodalError::Fetch("redirect without Location".into()))?;
+            let next = current
+                .join(location)
+                .map_err(|e| MultimodalError::Fetch(format!("bad redirect target: {e}")))?;
+            if current.scheme() == "https" && next.scheme() != "https" {
+                return Err(MultimodalError::Fetch(
+                    "refusing HTTPS to HTTP redirect".into(),
+                ));
+            }
+            current = parse_http_url(next.as_str())?;
+            hops += 1;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(MultimodalError::Fetch(format!("HTTP {}", resp.status())));
+        }
+        if let Some(len) = resp.content_length() {
+            let len = usize::try_from(len).map_err(|_| MultimodalError::TooLarge(usize::MAX))?;
+            if len > MAX_FETCH_BYTES {
+                return Err(MultimodalError::TooLarge(len));
+            }
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !content_type.is_empty()
+            && !matches!(
+                content_type.as_str(),
+                "image/png" | "image/jpeg" | "image/jpg"
+            )
+        {
+            return Err(MultimodalError::UnsupportedMedia(content_type));
+        }
+        let bytes = read_body_limited(resp, MAX_FETCH_BYTES).await?;
+        let image = decode_rgb8(&bytes)?;
+        return Ok(preprocess_image(
+            cfg,
+            &image.rgb8,
+            image.height,
+            image.width,
+        )?);
+    }
+}
+
+fn parse_http_url(url: &str) -> Result<reqwest::Url, MultimodalError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| MultimodalError::UnsupportedUrl)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
         return Err(MultimodalError::UnsupportedUrl);
     }
-    let resp = client
-        .get(url)
-        .send()
+    Ok(parsed)
+}
+
+async fn resolve_public(
+    url: &reqwest::Url,
+    allow_private: bool,
+) -> Result<std::net::SocketAddr, MultimodalError> {
+    let host = url.host_str().ok_or(MultimodalError::UnsupportedUrl)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(MultimodalError::UnsupportedUrl)?;
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| MultimodalError::Fetch(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(MultimodalError::Fetch(format!("HTTP {}", resp.status())));
+        .map_err(|e| MultimodalError::Fetch(e.to_string()))?
+        .collect();
+    let addr = addrs
+        .first()
+        .copied()
+        .ok_or_else(|| MultimodalError::Fetch("image host resolved to no addresses".into()))?;
+    if !allow_private {
+        for candidate in &addrs {
+            if !is_public_ip(candidate.ip()) {
+                return Err(MultimodalError::Fetch(format!(
+                    "image URL resolves to non-public address {}",
+                    candidate.ip()
+                )));
+            }
+        }
     }
-    if let Some(len) = resp.content_length()
-        && len > MAX_FETCH_BYTES as u64
+    Ok(addr)
+}
+
+fn build_fetch_client(
+    url: &reqwest::Url,
+    addr: std::net::SocketAddr,
+    allow_private: bool,
+) -> Result<reqwest::Client, MultimodalError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(host) = url.host_str()
+        && host.parse::<std::net::IpAddr>().is_err()
     {
-        return Err(MultimodalError::TooLarge(len as usize));
+        builder = builder.resolve(host, addr);
     }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if !content_type.is_empty()
-        && !matches!(
-            content_type.as_str(),
-            "image/png" | "image/jpeg" | "image/jpg"
-        )
-    {
-        return Err(MultimodalError::UnsupportedMedia(content_type));
+    if allow_private {
+        builder = builder.no_proxy();
     }
-    let mut resp = resp;
+    builder
+        .build()
+        .map_err(|e| MultimodalError::Fetch(e.to_string()))
+}
+
+async fn read_body_limited(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, MultimodalError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
         .map_err(|e| MultimodalError::Fetch(e.to_string()))?
     {
-        let total = bytes.len() + chunk.len();
-        if total > MAX_FETCH_BYTES {
+        let total = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(MultimodalError::TooLarge(usize::MAX))?;
+        if total > limit {
             return Err(MultimodalError::TooLarge(total));
         }
         bytes.extend_from_slice(&chunk);
     }
-    let image = decode_rgb8(&bytes)?;
-    Ok(preprocess_image(
-        cfg,
-        &image.rgb8,
-        image.height,
-        image.width,
-    )?)
+    Ok(bytes)
+}
+
+/// SSRF guard: reject loopback, private, link-local, unspecified, multicast,
+/// broadcast, CGNAT, documentation and IPv6 ULA/link-local addresses.
+#[must_use]
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64))
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let is_ula = (seg[0] & 0xfe00) == 0xfc00;
+            let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+            let is_doc = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            let embedded_public = v6
+                .to_ipv4_mapped()
+                .is_none_or(|v4| is_public_ip(IpAddr::V4(v4)));
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_ula
+                || is_link_local
+                || is_doc
+                || !embedded_public)
+        }
+    }
 }
 
 /// Expand each `<|image_pad|>` to `grid_t * grid_h * grid_w / merge^2` pad
@@ -431,7 +566,7 @@ mod tests {
         }
     }
 
-    fn no_proxy_client() -> reqwest::Client {
+    fn test_client() -> reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
@@ -465,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_data_url_uses_processor() {
-        let out = fetch_with_client(&no_proxy_client(), &png_data_url(2, 3), &small_cfg())
+        let out = fetch_impl(&png_data_url(2, 3), &small_cfg(), true)
             .await
             .unwrap();
         assert_eq!(out.grid, [1, 3, 2]);
@@ -475,9 +610,7 @@ mod tests {
     #[tokio::test]
     async fn fetches_http_png_image() {
         let url = spawn_raw(http_response("200 OK", "image/png", &png_bytes(3, 2))).await;
-        let out = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
-            .await
-            .unwrap();
+        let out = fetch_impl(&url, &small_cfg(), true).await.unwrap();
         assert_eq!(out.grid, [1, 2, 3]);
         assert_eq!(out.pixel_values.len(), 3 * 2 * 3);
     }
@@ -485,18 +618,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_http_error_status() {
         let url = spawn_raw(http_response("404 Not Found", "text/plain", b"nope")).await;
-        let err = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
-            .await
-            .unwrap_err();
+        let err = fetch_impl(&url, &small_cfg(), true).await.unwrap_err();
         assert!(matches!(err, MultimodalError::Fetch(_)), "{err}");
     }
 
     #[tokio::test]
     async fn rejects_non_image_content_type() {
         let url = spawn_raw(http_response("200 OK", "text/html", b"<html/>")).await;
-        let err = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
-            .await
-            .unwrap_err();
+        let err = fetch_impl(&url, &small_cfg(), true).await.unwrap_err();
         assert!(matches!(err, MultimodalError::UnsupportedMedia(_)), "{err}");
     }
 
@@ -507,17 +636,131 @@ mod tests {
             MAX_FETCH_BYTES + 1
         );
         let url = spawn_raw(head.into_bytes()).await;
-        let err = fetch_with_client(&no_proxy_client(), &url, &small_cfg())
-            .await
-            .unwrap_err();
+        let err = fetch_impl(&url, &small_cfg(), true).await.unwrap_err();
         assert!(matches!(err, MultimodalError::TooLarge(_)), "{err}");
     }
 
     #[tokio::test]
     async fn rejects_unsupported_scheme() {
-        let err = fetch_with_client(&no_proxy_client(), "ftp://example.com/a.png", &small_cfg())
+        let err = fetch_impl("ftp://example.com/a.png", &small_cfg(), true)
             .await
             .unwrap_err();
         assert!(matches!(err, MultimodalError::UnsupportedUrl), "{err}");
+    }
+
+    #[test]
+    fn rejects_private_and_special_ips() {
+        use std::net::IpAddr;
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_public_ip(ip), "{ip} must be rejected");
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_public_ip(ip), "{ip} must be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_private_host_without_connecting() {
+        let err = fetch_impl("http://127.0.0.1:9/image", &small_cfg(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MultimodalError::Fetch(_)), "{err}");
+        assert!(err.to_string().contains("non-public"), "{err}");
+    }
+
+    async fn spawn_redirect_server(hops: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for i in 0..=hops {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                if i < hops {
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /hop{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        i + 1
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                } else {
+                    let body = png_bytes(3, 2);
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&body);
+                    let _ = socket.write_all(&response).await;
+                }
+            }
+        });
+        format!("http://{addr}/start")
+    }
+
+    #[tokio::test]
+    async fn follows_five_redirects_and_rejects_sixth() {
+        let ok_url = spawn_redirect_server(5).await;
+        let out = fetch_impl(&ok_url, &small_cfg(), true).await.unwrap();
+        assert_eq!(out.grid, [1, 2, 3]);
+
+        let too_many = spawn_redirect_server(6).await;
+        let err = fetch_impl(&too_many, &small_cfg(), true).await.unwrap_err();
+        assert!(err.to_string().contains("too many redirects"), "{err}");
+    }
+
+    async fn spawn_chunked_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let payload = [7u8; 16];
+                let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n".to_vec();
+                response.extend_from_slice(&payload);
+                response.extend_from_slice(b"\r\n0\r\n\r\n");
+                let _ = socket.write_all(&response).await;
+            }
+        });
+        format!("http://{addr}/image")
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_rejects_chunked_overflow() {
+        let url = spawn_chunked_server().await;
+        let resp = test_client().get(&url).send().await.unwrap();
+        let err = read_body_limited(resp, 8).await.unwrap_err();
+        assert!(matches!(err, MultimodalError::TooLarge(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn accepts_content_type_with_parameters() {
+        let url = spawn_raw(http_response(
+            "200 OK",
+            "image/png; charset=binary",
+            &png_bytes(3, 2),
+        ))
+        .await;
+        let out = fetch_impl(&url, &small_cfg(), true).await.unwrap();
+        assert_eq!(out.grid, [1, 2, 3]);
     }
 }
