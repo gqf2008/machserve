@@ -1779,5 +1779,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - 对拍测试：smart_resize 5 组边界（含 200:1 拒绝）、4x5→8x6 的 144 像素
   bicubic 逐位一致、tiny/small/real 三组 preprocessing golden。
 - 说明：checkpoint 声明 `Qwen2VLImageProcessorFast`（torchvision）；本模块与
-  框架无关的 PIL 参考逐位一致，fast 后端仅 bicubic 核细节不同，grid/token
+  框架无关的 PIL 参考逐位一致，fast 后端除 bicubic 核外还会融合
+  rescale/normalize，数值可能有 ULP 级偏差，grid/token 布局一致。C4 真机
+  图片问答需复核 fast/PIL 漂移。C3d 只做 RGB8 preprocessing，图像解码/
+  base64/HTTP content parts 留待 C3e。
   布局一致。图像解码/base64/HTTP content parts 留待 C3e。

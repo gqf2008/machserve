@@ -3,11 +3,12 @@
 //! Reference: `transformers` 5.16.1 `Qwen2VLImageProcessorPil`
 //! (`models/qwen2_vl/image_processing_pil_qwen2_vl.py`) and Pillow 12.3.0
 //! (`src/libImaging/Resample.c`). Qwen3.8-27B ships
-//! `image_processor_type = Qwen2VLImageProcessorFast`; that backend differs
-//! only in the torchvision resampling kernel, while grid/token semantics are
-//! identical. This module matches the framework-independent PIL reference
-//! bit-for-bit, including the 22-bit fixed-point BICUBIC resampler, so image
-//! inputs are reproducible without torchvision.
+//! `image_processor_type = Qwen2VLImageProcessorFast`; fast/torchvision also
+//! fuses rescale+normalize and uses its own bicubic kernel, so it is not
+//! bitwise-equal to this PIL-based path. This module matches the
+//! framework-independent PIL reference bit-for-bit (22-bit fixed-point
+//! BICUBIC resampler), making image inputs deterministic without torchvision;
+//! fast-vs-PIL numerical drift must be re-validated at C4 end to end.
 //!
 //! For one image the output layout matches HF exactly:
 //! - `grid = [1, resized_height / patch_size, resized_width / patch_size]`;
@@ -72,6 +73,23 @@ impl ImageProcessorConfig {
         }
         if let Some(x) = v.get("image_std") {
             cfg.image_std = json_rgb(x, "image_std")?;
+        }
+        for flag in ["do_resize", "do_rescale", "do_normalize", "do_convert_rgb"] {
+            if v.get(flag).and_then(serde_json::Value::as_bool) == Some(false) {
+                return Err(Error::InvalidArgument(format!(
+                    "image processor {flag}=false is not supported"
+                )));
+            }
+        }
+        if let Some(x) = v.get("rescale_factor") {
+            let factor = x
+                .as_f64()
+                .ok_or_else(|| Error::InvalidArgument("rescale_factor must be a number".into()))?;
+            if (factor - 1.0 / 255.0).abs() > 1e-12 {
+                return Err(Error::InvalidArgument(format!(
+                    "image processor rescale_factor {factor} is not supported (expected 1/255)"
+                )));
+            }
         }
         cfg.validate()?;
         Ok(cfg)

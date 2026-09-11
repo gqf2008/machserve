@@ -226,3 +226,74 @@ fn preprocess_rejects_bad_inputs() {
     assert!(smart_resize(4, 4, 0, 1, 16).is_err());
     assert!(smart_resize(0, 4, 2, 1, 16).is_err());
 }
+
+#[test]
+fn downscale_nondefault_preprocess_matches_hf_golden() {
+    let cfg = ImageProcessorConfig {
+        patch_size: 2,
+        temporal_patch_size: 3,
+        merge_size: 2,
+        min_pixels: 64,
+        max_pixels: 1024,
+        image_mean: [0.25, 0.5, 0.75],
+        image_std: [0.5, 0.25, 0.2],
+    };
+    let img = lcg_image(40, 60, 0x5a5a1234_deadbeef);
+    let out = preprocess_image(&cfg, &img, 40, 60).unwrap();
+    assert_eq!(out.grid, [1, 12, 18]);
+    assert_eq!(out.tokens(), 216);
+    assert_eq!(out.pixel_values.len(), 216 * 36);
+    let samples: [(usize, [u32; 6]); 3] = [
+        (
+            0,
+            [
+                1058083090, 1053148614, 1058741020, 1062688600, 1058083090, 1053148614,
+            ],
+        ),
+        (
+            100 * 36,
+            [
+                1054464474, 1061504326, 1065057148, 1058741020, 1054464474, 1061504326,
+            ],
+        ),
+        (
+            215 * 36,
+            [
+                1042457252, 1042457252, 1047720692, 1055517162, 1042457252, 1042457252,
+            ],
+        ),
+    ];
+    for (start, want) in samples {
+        for (i, &bits) in want.iter().enumerate() {
+            assert_eq!(
+                out.pixel_values[start + i].to_bits(),
+                bits,
+                "index {}",
+                start + i
+            );
+        }
+    }
+    assert_checksums(
+        &out.pixel_values,
+        -1781.3878052830696,
+        -7_005_965.9489017725,
+        7097.543473012898,
+    );
+}
+
+#[test]
+fn rejects_unsupported_preprocessor_flags() {
+    for bad in [
+        r#"{"do_normalize": false}"#,
+        r#"{"do_rescale": false}"#,
+        r#"{"rescale_factor": 0.5}"#,
+        r#"{"merge_size": 0}"#,
+        r#"{"image_std": [0.5, 0.0, 0.5]}"#,
+    ] {
+        let json: serde_json::Value = serde_json::from_str(bad).unwrap();
+        assert!(
+            ImageProcessorConfig::from_hf_json(&json).is_err(),
+            "config should be rejected: {bad}"
+        );
+    }
+}
