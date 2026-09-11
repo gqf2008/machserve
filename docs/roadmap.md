@@ -1761,5 +1761,7 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   mask 用显式 vision/video features 覆盖指定行；内核计数 72→73。
 - `BatchedModel::set_row_embeddings` / `clear_row_embeddings` 提供行级
   override 生命周期；M-RoPE、row-embed 状态切换都使 graph cache 失效。
-- GPU parity：用 token embedding 自身作为 override，注入模型与普通 gather
-  模型 logits 逐元素对拍一致（finite + 1e-5）。
+- GPU parity：`embed_scatter_rows` 直接 kernel 对拍（mask=0 保留原值、mask!=0
+  精确覆盖），以及「部分行、每行不同 features」的注入模型与替换 token 参考模型
+  logits 逐元素对拍（finite + 1e-5）；负例覆盖 total>i32::MAX 与行数不足
+  fail-fast。

@@ -98,7 +98,7 @@ fn embed_scatter_rows_matches_cpu() {
 
 #[test]
 #[ignore = "GPU embedding injection parity; set MACH_TEST_EMBED_GPU=1"]
-fn row_embedding_override_matches_replaced_token_reference() {
+fn row_embedding_partial_override_matches_replaced_token_reference() {
     if !gpu_enabled() {
         return;
     }
@@ -109,16 +109,24 @@ fn row_embedding_override_matches_replaced_token_reference() {
     let mut reference = BatchedModel::with_rows(Arc::clone(&hip), cfg, &w, 1, 4).unwrap();
     let mut normal = BatchedModel::with_rows(hip, cfg, &w, 1, 4).unwrap();
     let tokens = [3u32, 17, 42, 5];
-    let source = 99u32;
+    // Distinct per-row features catch layout mistakes: row r must read
+    // features[r*d..(r+1)*d], not just replicate the first row.
+    let feature_tokens = [99u32, 100, 101, 102];
+    let mask = [0i32, 1, 0, 1];
+    // Masked rows 1 and 3 use explicit embeddings; rows 0 and 2 keep the
+    // normal gather result, so the reference swaps only the masked tokens.
+    let ref_tokens = [tokens[0], feature_tokens[1], tokens[2], feature_tokens[3]];
     let lens = [0u32, 1, 2, 3];
     let slots = [0u32, 0, 0, 0];
     let d = cfg.d_model;
-    let source_embed = &w.tok_emb[source as usize * d..(source as usize + 1) * d];
-    let features: Vec<f32> = std::iter::repeat_n(source_embed, tokens.len())
-        .flatten()
-        .copied()
+    let features: Vec<f32> = feature_tokens
+        .iter()
+        .flat_map(|&t| {
+            w.tok_emb[t as usize * d..(t as usize + 1) * d]
+                .iter()
+                .copied()
+        })
         .collect();
-    let mask = [1i32; 4];
     injected
         .set_row_embeddings(&features, &mask, tokens.len())
         .unwrap();
@@ -127,7 +135,6 @@ fn row_embedding_override_matches_replaced_token_reference() {
     let mut params_c = params_a.clone();
     let counts = vec![Vec::new(); tokens.len()];
     let bias = vec![Vec::new(); tokens.len()];
-    let ref_tokens = [source; 4];
     reference
         .decode_step_explicit(
             &ref_tokens,
@@ -162,10 +169,58 @@ fn row_embedding_override_matches_replaced_token_reference() {
     }
     assert!(
         max_diff < 1e-5,
-        "injected vs replaced-token ref mismatch: {max_diff}"
+        "partial injection vs replaced-token ref mismatch: {max_diff}"
     );
     assert!(
         baseline_diff > 1e-3,
-        "override test is vacuous: injected and normal logits differ by only {baseline_diff}"
+        "partial override test is vacuous: injected and normal logits differ by only {baseline_diff}"
     );
+}
+
+#[test]
+#[ignore = "GPU embedding injection guard; set MACH_TEST_EMBED_GPU=1"]
+fn embed_scatter_rows_rejects_i32_overflow() {
+    if !gpu_enabled() {
+        return;
+    }
+    let hip = hip::hip().expect("HIP runtime");
+    let k = HipKernels::new(hip).unwrap();
+    let err = k
+        .launch_embed_scatter_rows(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            65536,
+            32768,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("exceeds i32"), "{err}");
+}
+
+#[test]
+#[ignore = "GPU embedding injection guard; set MACH_TEST_EMBED_GPU=1"]
+fn row_embedding_row_mismatch_fails_fast() {
+    if !gpu_enabled() {
+        return;
+    }
+    let hip = hip::hip().expect("HIP runtime");
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 55).unwrap();
+    let mut model = BatchedModel::with_rows(hip, cfg, &w, 1, 4).unwrap();
+    let d = cfg.d_model;
+    let features = w.tok_emb[99 * d..100 * d].to_vec();
+    let mask = [1i32];
+    model.set_row_embeddings(&features, &mask, 1).unwrap();
+    let tokens = [3u32, 17, 42, 5];
+    let lens = [0u32, 1, 2, 3];
+    let slots = [0u32, 0, 0, 0];
+    let mut params = vec![SamplingParams::default(); tokens.len()];
+    let counts = vec![Vec::new(); tokens.len()];
+    let bias = vec![Vec::new(); tokens.len()];
+    let err = model
+        .decode_step_explicit(&tokens, &lens, &slots, &mut params, &counts, &bias, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("row embeddings"), "{err}");
 }
