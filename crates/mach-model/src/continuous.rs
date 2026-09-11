@@ -11,6 +11,7 @@
 //! slot, so callers can track outputs across compaction.
 
 use crate::batched::BatchedModel;
+use crate::multimodal::{MultimodalPrompt, StepSeq, step_overrides};
 use crate::sampling::SamplingParams;
 use crate::state_reuse::{ReuseStats, StateReuse};
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
@@ -61,6 +62,9 @@ struct SeqState {
     /// The token to feed next (first generated token after prefill, then each
     /// subsequent sampled token).
     first_decode: Option<u32>,
+    /// Multimodal row overrides / M-RoPE positions, when this request has
+    /// one or more images.
+    multimodal: Option<MultimodalPrompt>,
 }
 
 /// Finished sequence output retained until `ack` (keyed by stable id).
@@ -207,6 +211,8 @@ pub struct ContinuousModel {
     /// Paged-KV mode (opt-in): page pool + per-slot block tables with
     /// cross-request prefix sharing (delta-only past the reuse boundary).
     paged: Option<PagedEngineState>,
+    /// M-RoPE section for multimodal prompts (opt-in).
+    mrope_section: Option<[usize; 3]>,
 }
 
 /// Reuse statistics of a paged-KV engine (cross-request prompt sharing).
@@ -253,6 +259,7 @@ impl ContinuousModel {
             next_id: 1,
             state_reuse: None,
             paged,
+            mrope_section: None,
         }
     }
 
@@ -627,7 +634,14 @@ impl ContinuousModel {
         self.state_reuse.as_ref().map(|sr| sr.store().len())
     }
 
-    /// Adds a sequence; returns its stable id.
+    /// Sets the M-RoPE section used to build per-step tables for multimodal
+    /// prompts. Required before [`Self::add_multimodal`].
+    pub fn set_mrope_section(&mut self, section: [usize; 3]) {
+        self.mrope_section = Some(section);
+    }
+
+    /// Adds a text-only sequence; returns its stable id.
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &mut self,
         prompt: &[u32],
@@ -635,8 +649,64 @@ impl ContinuousModel {
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
         logit_bias: Vec<(u32, f32)>,
-        mut params: SamplingParams,
+        params: SamplingParams,
     ) -> Result<SeqId, Error> {
+        self.add_inner(prompt, max_new, eos, stop_seqs, logit_bias, params, None)
+    }
+
+    /// Adds a multimodal sequence: `multimodal` carries the row-level vision
+    /// overrides and M-RoPE positions for `prompt`. State-reuse and paged-KV
+    /// engines are rejected — image rows must not reuse or share KV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_multimodal(
+        &mut self,
+        prompt: &[u32],
+        multimodal: MultimodalPrompt,
+        max_new: usize,
+        eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
+        params: SamplingParams,
+    ) -> Result<SeqId, Error> {
+        self.add_inner(
+            prompt,
+            max_new,
+            eos,
+            stop_seqs,
+            logit_bias,
+            params,
+            Some(multimodal),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_inner(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
+        mut params: SamplingParams,
+        multimodal: Option<MultimodalPrompt>,
+    ) -> Result<SeqId, Error> {
+        if multimodal.is_some() {
+            if self.mrope_section.is_none() {
+                return Err(Error::Model(
+                    "multimodal prompt requires set_mrope_section".into(),
+                ));
+            }
+            if self.state_reuse.is_some() {
+                return Err(Error::Model(
+                    "multimodal prompt is not supported with state reuse".into(),
+                ));
+            }
+            if self.paged.is_some() {
+                return Err(Error::Model(
+                    "multimodal prompt is not supported with paged KV".into(),
+                ));
+            }
+        }
         if prompt.is_empty() {
             return Err(Error::Model("prompt must not be empty".into()));
         }
@@ -765,6 +835,7 @@ impl ContinuousModel {
             params,
             len,
             first_decode: None,
+            multimodal,
         });
         self.active += 1;
         Ok(id)
@@ -845,6 +916,27 @@ impl ContinuousModel {
             }
         }
 
+        // Assemble per-row multimodal overrides for this step. Without an
+        // image this is a no-op and the scalar RoPE path is unchanged.
+        let step_seqs: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, count, prefill))| {
+                let s = self.seqs[i].as_ref().expect("active slot");
+                StepSeq {
+                    offset: s.len,
+                    count,
+                    prefill,
+                    prompt: s.multimodal.as_ref(),
+                }
+            })
+            .collect();
+        let overrides = step_overrides(
+            &step_seqs,
+            self.model.config(),
+            self.mrope_section.unwrap_or([0, 0, 0]),
+        )?;
+
         // Skip the batched forward when no row is produced this step (every
         // active sequence is at the hard context limit or over budget): an
         // empty batch would start gridDim=0 grids, which ROCm rejects
@@ -859,15 +951,46 @@ impl ContinuousModel {
             // GEMV kernels (per-row, launch-cheap) vs the hipBLAS host loop
             // (per-expert weight reuse for multi-row prefill chunks).
             let decode_only = rows.iter().all(|&(_, _, wp)| !wp);
-            let out = self.model.decode_step_explicit(
-                &tokens,
-                &lens,
-                &slots,
-                &mut params,
-                &row_counts,
-                &row_bias,
-                decode_only,
-            )?;
+            let out = if overrides.mrope {
+                let mut set = Ok(());
+                if overrides.row_embed {
+                    set = self.model.set_row_embeddings(
+                        &overrides.row_embeddings,
+                        &overrides.row_mask,
+                        overrides.rows,
+                    );
+                }
+                if set.is_ok() {
+                    set =
+                        self.model
+                            .set_mrope_tables(&overrides.cos, &overrides.sin, overrides.rows);
+                }
+                let out = match set {
+                    Ok(()) => self.model.decode_step_explicit(
+                        &tokens,
+                        &lens,
+                        &slots,
+                        &mut params,
+                        &row_counts,
+                        &row_bias,
+                        decode_only,
+                    ),
+                    Err(e) => Err(e),
+                };
+                self.model.clear_row_embeddings();
+                self.model.clear_mrope_tables();
+                out?
+            } else {
+                self.model.decode_step_explicit(
+                    &tokens,
+                    &lens,
+                    &slots,
+                    &mut params,
+                    &row_counts,
+                    &row_bias,
+                    decode_only,
+                )?
+            };
             // The sampler advanced each row's seed one RNG step (rows of one
             // sequence start from the same seed); the last row's value is the
             // sequence's authoritative next seed.
