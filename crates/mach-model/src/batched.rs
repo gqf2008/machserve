@@ -4543,6 +4543,11 @@ impl BatchedModel {
         self.cfg.max_seq_len
     }
 
+    /// Model configuration (d_model, rotary dim, rope theta, ...).
+    #[must_use]
+    pub const fn config(&self) -> &Config {
+        &self.cfg
+    }
     /// Whether this model carries GDN (hybrid linear-attention) layers.
     /// Such models apply the per-slot recurrent state exactly once per step
     /// row, so callers must keep one row per slot: sequential prefill (one

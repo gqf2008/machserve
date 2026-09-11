@@ -1798,3 +1798,19 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   `multimodal_not_implemented`，不静默忽略；文本-only 路径零变化。
 - 测试：data URL 解码/预处理、pad 展开与负例、content parts serde、
   Qwen 模板占位符渲染。HTTP(S) 抓取、vision 前向与 per-request 注入是 C3f。
+
+## Qwen3.8-27B Stage C3f（一）：多模态 prompt 组装与引擎 step 注入（#146，2026-09-11）
+
+- 新增 `mach_model::multimodal`：`VisionImage`（merged features + grid）、
+  `MultimodalPrompt::build`（校验 pad run/feature 长度、生成 `mm_token_type_ids`
+  与 `image_grid_thw`、复用 `qwen3_5_mrope_positions` + `cos_sin`）、
+  `step_overrides`（把一条或多条序列的 image/decode/text 行组装成 batch 级
+  row embedding mask + M-RoPE 表）。
+- `ContinuousModel` 增加 `set_mrope_section` / `add_multimodal`：multimodal
+  序列在 step 前 set_row_embeddings/set_mrope_tables、step 后无条件 clear；
+  text-only 路径（`overrides.mrope=false`）零分配零行为变化；state-reuse/paged
+  engine 拒绝 multimodal（图像 KV 不可复用）。
+- 测试：文本拒绝、单图/双图 pad 映射、position/feature 行对齐、offset>0 分块、
+  mixed batch（image prefill + text decode）、image decode delta、section 不一致拒绝。
+- 真机 GPU 前向与 server 接线（VisionGpu 执行、HTTP(S) 抓取、body limit）
+  是 C3f（二）/C4，需 GPU 窗口。
