@@ -12,6 +12,8 @@ default = []
 hip = ["mach-model/hip"]
 
 [dependencies]
+base64 = ">=0.22.1, <0.23"
+image = { version = ">=0.25.6, <0.26", default-features = false, features = ["png", "jpeg"] }
 axum = "0.8"
 mach-kernel-sys = { workspace = true }
 mach-model = { workspace = true }
