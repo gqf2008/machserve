@@ -38,6 +38,9 @@ pub mod scheduler_fsm;
 pub mod speculative;
 pub mod state_reuse;
 pub mod tokenizer;
+
+pub mod vision;
+
 pub mod weights;
 
 pub use config::Config;
