@@ -1850,3 +1850,32 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   路径都在分配 patch buffer 前按 `MACH_VISION_MAX_TOKENS` 拒绝（400）。
 - 离线测试：engine image_runtime 往返、router 两种状态、engine error → HTTP 状态映射、
   preprocessor 路径解析、fetch/patch 上限；真机视觉前向与图片问答 E2E 属 C4。
+
+## Qwen3.8-27B Stage C4：图像解码 EXIF orientation 与解码预算（#146，2026-09-11）
+
+- `mach_server::multimodal::decode_rgb8` 现在读取 EXIF orientation 并应用
+  `apply_orientation`，对齐 HF `load_image` 的 `PIL.ImageOps.exif_transpose`；
+  8 种方向全部覆盖（含 6 的顺时针 90°，16x24 → 24x16），`orientation()`
+  读取失败按 `NoTransforms` 处理，与"图片无 EXIF"同径。
+- 为拿到 orientation 改用 `into_decoder()` + `DynamicImage::from_decoder()`，
+  会丢掉 `ImageReader::decode()` 内部的 `limits.reserve(total_bytes)` 头部级
+  预检（PNG 只在构造 decoder 时把 `max_alloc` 交给 `png::Limits`，JPEG 后端
+  不消费它，两者都替代不了这一步），现显式补回。
+- RGB8 超限检查前移到 `from_decoder()` 之前、用头部尺寸判定（旋转/翻转不改变
+  像素总数）：超过 `MAX_RGB8_BYTES` 的图在分配像素前即被拒，不再出现"先解压
+  最多 512MiB、再方向复制一份、最后才发现超 256MiB"的峰值。
+- 方向变换作用在 RGB8 缓冲上（`DynamicImage::ImageRgb8` + `apply_orientation`）
+  而非解码器原生缓冲，旋转产生的那份拷贝因此受 RGB8 预算约束；峰值分配上界为
+  `MAX_DECODE_BYTES + MAX_RGB8_BYTES`（此前改法可达 2×解码缓冲）。
+- 测试：`tests/vision_decode.rs` 用 Pillow 12.3.0 生成的 orientation 1..8
+  四象限 JPEG fixture（16x24）逐象限对照（容差 16：实测 zune-jpeg vs libjpeg
+  ≤2，而错误方向差 ≥188）；`multimodal::tests` 增加两个阳性对照——
+  `rejects_decode_bomb_from_metadata_before_decoding`（解码预算）与
+  `rejects_oversized_rgb8_from_header_before_decoding`（RGB8 预算，用 IDAT
+  截断的 PNG 区分"头部拒绝"与"解码后拒绝"），临时移除对应检查都会变红。
+- 门禁：`cargo fmt --all --check`、`mach-server --features hip --lib`（38）、
+  `--bin mach-server`（23）、`--test vision_decode`（1）、`mach-model --lib`（228）、
+  `offline_tests`（2/73）、双面 `cargo check --workspace --all-targets`、
+  `cargo clippy --workspace --all-targets --features hip -- -D warnings` 全绿。
+- 真机项仍留 C4：7900 XTX 上跑 golden/e2e/compare、HF 整模型 greedy token/logits
+  对拍、VRAM/TTFT 记录。

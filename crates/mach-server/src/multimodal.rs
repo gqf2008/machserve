@@ -7,7 +7,7 @@
 //! injection are C3f; the chat handler fails fast for images until then.
 
 use base64::Engine as _;
-use image::GenericImageView as _;
+use image::ImageDecoder as _;
 use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image_limited};
 use mach_model::vision::VisionGrid;
 use serde::Deserialize;
@@ -147,17 +147,34 @@ fn decode_rgb8_with_limit(
     bytes: &[u8],
     max_rgb8_bytes: usize,
 ) -> Result<DecodedImage, MultimodalError> {
+    decode_rgb8_with_limits(bytes, MAX_DECODE_BYTES, max_rgb8_bytes)
+}
+
+fn decode_rgb8_with_limits(
+    bytes: &[u8],
+    max_decode_bytes: u64,
+    max_rgb8_bytes: usize,
+) -> Result<DecodedImage, MultimodalError> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader = reader
         .with_guessed_format()
         .map_err(|e| MultimodalError::Decode(e.to_string()))?;
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_BYTES);
-    reader.limits(limits);
-    let img = reader
-        .decode()
+    limits.max_alloc = Some(max_decode_bytes);
+    reader.limits(limits.clone());
+    let mut decoder = reader
+        .into_decoder()
         .map_err(|e| MultimodalError::Decode(e.to_string()))?;
-    let (width, height) = img.dimensions();
+    // `ImageReader::decode` charges `total_bytes` against the allocation budget
+    // before reading any pixels; `into_decoder` + `from_decoder` skips that, so
+    // repeat the decode-time check here.
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| MultimodalError::Decode(e.to_string()))?;
+    // Reject an oversized RGB8 result from the header, before `from_decoder`
+    // allocates the decoded buffer. Orientation only permutes pixels, so
+    // `width * height * 3` is the final size.
+    let (width, height) = decoder.dimensions();
     let rgb_bytes = (width as usize)
         .checked_mul(height as usize)
         .and_then(|v| v.checked_mul(3))
@@ -165,7 +182,19 @@ fn decode_rgb8_with_limit(
     if rgb_bytes > max_rgb8_bytes {
         return Err(MultimodalError::TooLarge(rgb_bytes));
     }
-    let rgb = img.into_rgb8();
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let img = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| MultimodalError::Decode(e.to_string()))?;
+    // Orient the RGB8 buffer rather than the decoder-native one: rotations copy
+    // the whole image, and doing it after the RGB8 conversion keeps that copy
+    // inside `max_rgb8_bytes`. Peak allocation is therefore bounded by
+    // `max_decode_bytes` (decoded buffer) + `max_rgb8_bytes` (converted and
+    // rotated buffers), never the 2x decoded buffer the native path would need.
+    let mut oriented = image::DynamicImage::ImageRgb8(img.into_rgb8());
+    oriented.apply_orientation(orientation);
+    let rgb = oriented.into_rgb8();
     let (width, height) = rgb.dimensions();
     Ok(DecodedImage {
         rgb8: rgb.into_raw(),
@@ -598,6 +627,56 @@ mod tests {
         .unwrap();
         let err = decode_rgb8_with_limit(&bytes, 8).unwrap_err();
         assert!(matches!(err, MultimodalError::TooLarge(48)), "{err}");
+    }
+
+    fn jpeg_bytes(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 5) as u8, 7])
+        });
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn rejects_decode_bomb_from_metadata_before_decoding() {
+        // The JPEG decoder only maps max_image_width/height and ignores
+        // max_alloc, so without the header-level reserve guard this 12 KiB
+        // image would be fully decoded (and allocated) despite the 1 KiB budget.
+        let bytes = jpeg_bytes(64, 64);
+        let err = decode_rgb8_with_limits(&bytes, 1024, MAX_RGB8_BYTES).unwrap_err();
+        assert!(matches!(err, MultimodalError::Decode(_)), "{err}");
+    }
+
+    #[test]
+    fn rejects_oversized_rgb8_from_header_before_decoding() {
+        // Build a 64x64 PNG and cut its IDAT short: the header still reports
+        // 12288 RGB8 bytes but the pixels cannot be decoded. A permissive RGB8
+        // budget therefore surfaces the decode failure, while a tight one must
+        // fail from the header - proving the size check runs before any decode
+        // (and before `from_decoder` allocates the pixel buffer).
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb([120, 130, 140]));
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        bytes.truncate(60);
+
+        let Err(decode_err) = decode_rgb8_with_limits(&bytes, MAX_DECODE_BYTES, 64 * 64 * 3) else {
+            panic!("truncated PNG must not decode");
+        };
+        assert!(
+            matches!(decode_err, MultimodalError::Decode(_)),
+            "{decode_err}"
+        );
+        let err = decode_rgb8_with_limits(&bytes, MAX_DECODE_BYTES, 64 * 64 * 3 - 1).unwrap_err();
+        assert!(matches!(err, MultimodalError::TooLarge(12288)), "{err}");
     }
 
     #[test]
