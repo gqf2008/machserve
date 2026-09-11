@@ -5,7 +5,9 @@
 //! `preprocessor_config.json` values and a deterministic 64-bit LCG image,
 //! then embedded as raw `f32` bit patterns so the assertions are exact.
 
-use mach_model::image_processor::{ImageProcessorConfig, preprocess_image, smart_resize};
+use mach_model::image_processor::{
+    ImageProcessorConfig, preprocess_image, preprocess_image_limited, smart_resize,
+};
 
 fn lcg_image(height: usize, width: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
@@ -300,4 +302,23 @@ fn rejects_unsupported_preprocessor_flags() {
             "config should be rejected: {bad}"
         );
     }
+}
+
+#[test]
+fn preprocess_rejects_patch_budget() {
+    let cfg = ImageProcessorConfig {
+        patch_size: 1,
+        temporal_patch_size: 1,
+        merge_size: 1,
+        min_pixels: 1,
+        max_pixels: 64,
+        image_mean: [0.5; 3],
+        image_std: [0.5; 3],
+    };
+    let img = lcg_image(4, 4, 7);
+    let err = preprocess_image_limited(&cfg, &img, 4, 4, 8)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("exceeds limit 8"), "{err}");
+    assert!(preprocess_image_limited(&cfg, &img, 4, 4, 16).is_ok());
 }

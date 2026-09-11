@@ -42,15 +42,20 @@ use mach_model::batched::BatchedModel;
 #[cfg(feature = "hip")]
 use mach_model::config::ModelDType;
 #[cfg(feature = "hip")]
+use mach_model::image_processor::ImageProcessorConfig;
+#[cfg(feature = "hip")]
 use mach_model::loader::{
-    load_safetensors, load_safetensors_fp8, load_safetensors_q4, validate_checkpoint,
+    load_safetensors, load_safetensors_fp8, load_safetensors_q4, load_vision_weights,
+    validate_checkpoint,
 };
 #[cfg(feature = "hip")]
 use mach_model::tokenizer::Tokenizer;
 #[cfg(feature = "hip")]
+use mach_model::vision::VisionConfig;
+#[cfg(feature = "hip")]
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
-use mach_server::{AppState, ChatFormat, ServerEngine, router};
+use mach_server::{AppState, ChatFormat, ImageRuntimeConfig, ServerEngine, VisionSetup, router};
 #[cfg(any(feature = "hip", test))]
 use std::ffi::OsStr;
 #[cfg(any(feature = "hip", test))]
@@ -397,6 +402,19 @@ fn resolve_config_path(root: &Path, model: &str, explicit: Option<&OsStr>) -> Pa
     } else {
         root.join("qwen-config.json")
     }
+}
+
+/// Resolve `preprocessor_config.json` beside a checkpoint directory or shard.
+#[cfg(feature = "hip")]
+fn resolve_preprocessor_path(checkpoint: &Path) -> Option<PathBuf> {
+    let direct = checkpoint.join("preprocessor_config.json");
+    if direct.exists() {
+        return Some(direct);
+    }
+    checkpoint
+        .parent()
+        .map(|p| p.join("preprocessor_config.json"))
+        .filter(|p| p.exists())
 }
 
 /// Resolve the tokenizer beside a checkpoint directory/shard parent, with an
@@ -1011,6 +1029,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Optional multimodal (Qwen3.5 vision) support: MACH_VISION=1 loads the
+    // vision tower weights and image preprocessor config, and serves
+    // image_url requests through the OpenAI chat endpoint.
+    let mut vision_setup = None;
+    let mut image_runtime = None;
+    if std::env::var("MACH_VISION").is_ok_and(|v| v != "0") && !spec {
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read config for vision"),
+        )
+        .expect("parse config for vision");
+        let vision_cfg = VisionConfig::from_hf_json(&raw).expect("vision_config");
+        let pre_path = resolve_preprocessor_path(&checkpoint_path)
+            .expect("MACH_VISION=1 requires preprocessor_config.json");
+        let pre_raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&pre_path).expect("read preprocessor_config.json"),
+        )
+        .expect("parse preprocessor_config.json");
+        let processor =
+            ImageProcessorConfig::from_hf_json(&pre_raw).expect("image processor config");
+        let max_tokens = match std::env::var("MACH_VISION_MAX_TOKENS") {
+            Ok(v) => v
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid MACH_VISION_MAX_TOKENS: {v}")),
+            Err(_) => 8192,
+        };
+        let weights =
+            load_vision_weights(&checkpoint_path, &vision_cfg).expect("load vision weights");
+        println!(
+            "vision: depth={} hidden={} merge={} image_token={} max_patches={max_tokens}",
+            vision_cfg.depth,
+            vision_cfg.hidden_size,
+            vision_cfg.spatial_merge_size,
+            vision_cfg.image_token_id
+        );
+        image_runtime = Some(ImageRuntimeConfig {
+            processor,
+            image_token_id: vision_cfg.image_token_id,
+            spatial_merge_size: vision_cfg.spatial_merge_size,
+            max_patches: max_tokens,
+        });
+        vision_setup = Some(VisionSetup {
+            cfg: vision_cfg,
+            weights,
+            max_tokens,
+        });
+    } else if std::env::var("MACH_VISION").is_ok_and(|v| v != "0") {
+        eprintln!("warning: MACH_VISION is not supported with MACH_SPEC; disabling vision");
+    }
+    if vision_setup.is_some() && paged_tpp.is_some() {
+        eprintln!("warning: MACH_VISION is not supported with paged KV; disabling vision");
+        vision_setup = None;
+        image_runtime = None;
+    }
+
     let (engine, engine_handle) = if q4 {
         let wq4: WeightsQ4 =
             load_safetensors_q4(&checkpoint_path, &cfg, true).expect("load q4 weights");
@@ -1022,6 +1094,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(tpp) => ServerEngine::with_paged(capacity, prefill_rows, tpp),
             None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
         };
+        if let Some(setup) = vision_setup.take() {
+            eng.set_vision(hip.clone(), setup);
+        }
         let handle = match q4_device {
             2 => eng.clone().spawn_q4_all(hip, cfg, wq4, kv_int8)?,
             1 => eng.clone().spawn_q4_device(hip, cfg, wq4)?,
@@ -1039,6 +1114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(tpp) => ServerEngine::with_paged(capacity, prefill_rows, tpp),
             None => ServerEngine::with_prefill_rows(capacity, prefill_rows),
         };
+        if let Some(setup) = vision_setup.take() {
+            eng.set_vision(hip.clone(), setup);
+        }
         let handle = eng.clone().spawn_fp8(hip, cfg, wfp8)?;
         (eng, handle)
     } else if spec {
@@ -1091,9 +1169,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             ServerEngine::with_prefill_rows(capacity, prefill_rows)
         };
+        if let Some(setup) = vision_setup.take() {
+            eng.set_vision(hip.clone(), setup);
+        }
         let handle = eng.clone().spawn(hip, cfg, w)?;
         (eng, handle)
     };
+    if let Some(image) = image_runtime {
+        engine.set_image_runtime(image);
+    }
     let state = AppState {
         engine: engine.clone(),
         model: model_name,
@@ -1734,5 +1818,24 @@ mod paged_tpp_tests {
         assert!(validate_paged_tpp(&cfg, Some("48")).is_err());
         // Valid custom value.
         assert_eq!(validate_paged_tpp(&cfg, Some("128")).unwrap(), 128);
+    }
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod vision_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_preprocessor_config_for_dir_and_shard() {
+        let dir = std::env::temp_dir().join(format!("mach-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("preprocessor_config.json"), b"{}").unwrap();
+        let want = dir.join("preprocessor_config.json");
+        assert_eq!(resolve_preprocessor_path(&dir), Some(want.clone()));
+        let shard = dir.join("model-00001-of-00002.safetensors");
+        std::fs::write(&shard, b"x").unwrap();
+        assert_eq!(resolve_preprocessor_path(&shard), Some(want));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

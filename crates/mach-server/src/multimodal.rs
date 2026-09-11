@@ -8,7 +8,7 @@
 
 use base64::Engine as _;
 use image::GenericImageView as _;
-use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image};
+use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image_limited};
 use mach_model::vision::VisionGrid;
 use serde::Deserialize;
 
@@ -179,12 +179,23 @@ pub fn preprocess_data_url(
     url: &str,
     cfg: &ImageProcessorConfig,
 ) -> Result<ProcessedImage, MultimodalError> {
+    preprocess_data_url_limited(url, cfg, usize::MAX)
+}
+
+/// Like preprocess_data_url but applies the patch budget before the
+/// patch buffer is allocated.
+pub fn preprocess_data_url_limited(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
     let image = decode_data_url(url)?;
-    Ok(preprocess_image(
+    Ok(preprocess_image_limited(
         cfg,
         &image.rgb8,
         image.height,
         image.width,
+        max_patches,
     )?)
 }
 
@@ -194,21 +205,44 @@ pub async fn fetch_image_url(
     url: &str,
     cfg: &ImageProcessorConfig,
 ) -> Result<ProcessedImage, MultimodalError> {
-    tokio::time::timeout(FETCH_TIMEOUT, fetch_impl(url, cfg, false))
-        .await
-        .map_err(|_| MultimodalError::Fetch("image fetch timed out".into()))?
+    fetch_image_url_limited(url, cfg, usize::MAX).await
+}
+
+/// Like [`fetch_image_url`] but rejects images above `max_patches` before
+/// allocating the patch buffer.
+pub async fn fetch_image_url_limited(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
+    tokio::time::timeout(
+        FETCH_TIMEOUT,
+        fetch_impl_limited(url, cfg, false, max_patches),
+    )
+    .await
+    .map_err(|_| MultimodalError::Fetch("image fetch timed out".into()))?
 }
 
 /// Max redirect hops followed manually (each hop is re-validated).
 const MAX_REDIRECTS: usize = 5;
 
+#[cfg(test)]
 async fn fetch_impl(
     url: &str,
     cfg: &ImageProcessorConfig,
     allow_private: bool,
 ) -> Result<ProcessedImage, MultimodalError> {
+    fetch_impl_limited(url, cfg, allow_private, usize::MAX).await
+}
+
+async fn fetch_impl_limited(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    allow_private: bool,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
     if url.starts_with("data:") {
-        return preprocess_data_url(url, cfg);
+        return preprocess_data_url_limited(url, cfg, max_patches);
     }
     let mut current = parse_http_url(url)?;
     let mut hops = 0usize;
@@ -272,11 +306,12 @@ async fn fetch_impl(
         }
         let bytes = read_body_limited(resp, MAX_FETCH_BYTES).await?;
         let image = decode_rgb8(&bytes)?;
-        return Ok(preprocess_image(
+        return Ok(preprocess_image_limited(
             cfg,
             &image.rgb8,
             image.height,
             image.width,
+            max_patches,
         )?);
     }
 }
@@ -799,5 +834,31 @@ mod tests {
         .await;
         let out = fetch_impl(&url, &small_cfg(), true).await.unwrap();
         assert_eq!(out.grid, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn fetch_limit_rejects_oversized_grid() {
+        let url = spawn_raw(http_response("200 OK", "image/png", &png_bytes(4, 4))).await;
+        let err = fetch_impl_limited(&url, &small_cfg(), true, 8)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn preprocess_data_url_limit_rejects_oversized_grid() {
+        let err = preprocess_data_url_limited(&png_data_url(4, 4), &small_cfg(), 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_data_url_limit_rejects_oversized_grid() {
+        let err = fetch_image_url_limited(&png_data_url(4, 4), &small_cfg(), 8)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds limit"), "{err}");
     }
 }
