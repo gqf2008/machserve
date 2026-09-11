@@ -419,6 +419,15 @@ impl SpeculativeEngine {
         }) || !self.batch.is_active(s)
     }
 
+    /// Force-finishes in-flight request `s` (its client stalled or
+    /// disconnected) so it stops consuming batch capacity; the tokens
+    /// generated so far stay readable for any later `generated` call.
+    pub fn cancel(&mut self, s: usize) {
+        if self.batch.is_active(s) {
+            self.batch.finish(s);
+        }
+    }
+
     /// Number of requests still decoding.
     #[must_use]
     pub fn active(&self) -> usize {

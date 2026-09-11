@@ -825,11 +825,17 @@ impl ServerEngine {
                 let mut txs = self.txs.lock().unwrap();
                 let mut streams = self.streams.lock().unwrap();
                 for (id, tok) in outputs {
-                    if model.is_done(id) {
-                        // Stream the final generated token before closing.
-                        if let Some(stx) = streams.get(&id) {
-                            let _ = stx.try_send(tok);
-                        }
+                    let done = model.is_done(id);
+                    // The final token takes the same path as every other
+                    // token: a stalled consumer must surface as an error (and
+                    // free the slot) rather than be reported as a clean finish
+                    // with a truncated body.
+                    if push_token(&mut streams, &mut txs, id, tok) == TokenDelivery::Stalled {
+                        model.cancel(id);
+                        model.ack(id);
+                        continue;
+                    }
+                    if done {
                         let output = model.generated(id);
                         let lps = model.generated_logprobs(id);
                         let tlps = model.generated_top_logprobs(id);
@@ -840,20 +846,6 @@ impl ServerEngine {
                         }
                         // Closing the stream sender signals end-of-stream.
                         streams.remove(&id);
-                    } else if let Some(stx) = streams.get(&id) {
-                        // `step()` only returns real tokens (first generated /
-                        // decode), so every non-done output is streamed. A
-                        // consumer that stopped draining must fail explicitly:
-                        // silently dropping tokens would truncate the response.
-                        if stx.try_send(tok).is_err() {
-                            if let Some(tx) = txs.remove(&id) {
-                                let _ = tx.send(Err(EngineError::InvalidRequest(
-                                    "stream consumer stalled: token dropped".into(),
-                                )));
-                            }
-                            streams.remove(&id);
-                            model.ack(id);
-                        }
                     }
                 }
             } else {
@@ -932,24 +924,19 @@ impl ServerEngine {
                 let mut streams = self.streams.lock().unwrap();
                 for (id, tok) in outputs {
                     let id = id as SeqId;
-                    if engine.is_done(id as usize) {
-                        if let Some(stx) = streams.get(&id) {
-                            let _ = stx.try_send(tok);
-                        }
+                    let done = engine.is_done(id as usize);
+                    // Same contract as the continuous path: the final token
+                    // must not be silently dropped for a stalled consumer.
+                    if push_token(&mut streams, &mut txs, id, tok) == TokenDelivery::Stalled {
+                        engine.cancel(id as usize);
+                        continue;
+                    }
+                    if done {
                         let output = engine.generated(id as usize);
                         let reason = engine.finish_reason(id as usize);
                         if let Some(tx) = txs.remove(&id) {
                             // Spec mode is greedy-only: no logprobs tracked.
                             let _ = tx.send(Ok((output, Vec::new(), Vec::new(), reason)));
-                        }
-                        streams.remove(&id);
-                    } else if let Some(stx) = streams.get(&id)
-                        && stx.try_send(tok).is_err()
-                    {
-                        if let Some(tx) = txs.remove(&id) {
-                            let _ = tx.send(Err(EngineError::InvalidRequest(
-                                "stream consumer stalled: token dropped".into(),
-                            )));
                         }
                         streams.remove(&id);
                     }
@@ -967,6 +954,44 @@ impl ServerEngine {
             }
         }
     }
+}
+
+/// Outcome of handing one step's token to a streaming client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenDelivery {
+    /// The token was queued, or the request is not streamed.
+    Ok,
+    /// The consumer stalled: the token was dropped, the completion has been
+    /// failed with a structured error and both channels were removed.
+    Stalled,
+}
+
+/// Pushes `tok` to the streaming client of `id`, if the request streams.
+///
+/// A full channel means the consumer stopped draining. Silently dropping the
+/// token would truncate the response — and for the final token it would report
+/// a clean finish for an incomplete body — so the completion is failed here
+/// and the caller only has to cancel the underlying sequence.
+fn push_token(
+    streams: &mut HashMap<SeqId, tokio::sync::mpsc::Sender<u32>>,
+    txs: &mut HashMap<SeqId, DoneSender>,
+    id: SeqId,
+    tok: u32,
+) -> TokenDelivery {
+    let stalled = match streams.get(&id) {
+        Some(stx) => stx.try_send(tok).is_err(),
+        None => false,
+    };
+    if stalled {
+        if let Some(tx) = txs.remove(&id) {
+            let _ = tx.send(Err(EngineError::InvalidRequest(
+                "stream consumer stalled: token dropped".into(),
+            )));
+        }
+        streams.remove(&id);
+        return TokenDelivery::Stalled;
+    }
+    TokenDelivery::Ok
 }
 
 #[cfg(test)]
@@ -1065,5 +1090,54 @@ mod tests {
         let err = submit.join().unwrap().expect_err("must be rejected");
         assert!(matches!(err, EngineError::ShuttingDown), "{err}");
         assert!(engine.pending.lock().unwrap().is_empty());
+    }
+
+    /// A full token channel must fail the request instead of completing it.
+    /// This is what makes the *final* token — which is pushed through the
+    /// same path as every other token — unable to truncate a response while
+    /// still reporting a clean `finish_reason`.
+    #[test]
+    fn final_token_full_channel_fails_instead_of_completing() {
+        let id: SeqId = 5;
+        let (tok_tx, _tok_rx) = tokio::sync::mpsc::channel(1);
+        tok_tx.try_send(1).unwrap(); // channel is now full
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let mut streams = HashMap::new();
+        streams.insert(id, tok_tx);
+        let mut txs = HashMap::new();
+        txs.insert(id, done_tx);
+
+        let outcome = push_token(&mut streams, &mut txs, id, 2);
+
+        assert_eq!(outcome, TokenDelivery::Stalled);
+        assert!(streams.is_empty(), "stream sender removed");
+        assert!(txs.is_empty(), "completion sender removed");
+        let err = done_rx
+            .try_recv()
+            .expect("completion must be signalled")
+            .expect_err("a dropped token must fail the request");
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    /// With room in the channel (or when the request is not streamed) the
+    /// token is queued and the completion is left for the engine to send.
+    #[test]
+    fn push_token_leaves_completion_when_not_stalled() {
+        let id: SeqId = 6;
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(1);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let mut streams = HashMap::new();
+        streams.insert(id, tok_tx);
+        let mut txs = HashMap::new();
+        txs.insert(id, done_tx);
+
+        assert_eq!(push_token(&mut streams, &mut txs, id, 9), TokenDelivery::Ok);
+        assert_eq!(tok_rx.try_recv().unwrap(), 9);
+        assert!(txs.contains_key(&id), "completion still pending");
+        assert!(done_rx.try_recv().is_err(), "completion not signalled yet");
+
+        // A request that does not stream has no sender to stall.
+        let mut streams = HashMap::new();
+        assert_eq!(push_token(&mut streams, &mut txs, id, 9), TokenDelivery::Ok);
     }
 }

@@ -1178,6 +1178,21 @@ impl ContinuousModel {
         self.finished.retain(|f| f.id != id);
     }
 
+    /// Force-finishes an in-flight sequence whose client stalled or
+    /// disconnected, so it stops consuming batch capacity. The tokens
+    /// generated so far move to the finished list (callers that already
+    /// reported an error should `ack` them away). Returns `false` for
+    /// unknown or already-finished ids.
+    pub fn cancel(&mut self, id: SeqId) -> bool {
+        let Some(slot) =
+            (0..self.active).find(|&i| self.seqs[i].as_ref().is_some_and(|s| s.id == id))
+        else {
+            return false;
+        };
+        self.finish(slot);
+        true
+    }
+
     fn finish(&mut self, slot: usize) {
         assert!(slot < self.active, "finish out of range");
         // State-reuse mode: leave a token-boundary anchor at the sequence end
