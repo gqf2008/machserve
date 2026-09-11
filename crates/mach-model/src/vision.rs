@@ -8,6 +8,15 @@
 
 use crate::Error;
 
+/// MLP activation used by the vision tower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionActivation {
+    /// PyTorch gelu_pytorch_tanh: the Qwen3.5 vision MLP default.
+    GeluPytorchTanh,
+    /// Exact erf GELU (used by the footprint merger, not the vision MLP).
+    Gelu,
+}
+
 /// Qwen3.5/Qwen3.8 vision-tower configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisionConfig {
@@ -43,6 +52,8 @@ pub struct VisionConfig {
     pub mrope_section: [usize; 3],
     /// Whether M-RoPE uses the interleaved layout.
     pub mrope_interleaved: bool,
+    /// Vision MLP activation from ision_config.hidden_act.
+    pub hidden_act: VisionActivation,
 }
 
 /// Header-only summary for a checkpoint's vision tensors.
@@ -76,6 +87,7 @@ impl Default for VisionConfig {
             vision_end_token_id: 248054,
             mrope_section: [11, 11, 10],
             mrope_interleaved: true,
+            hidden_act: VisionActivation::GeluPytorchTanh,
         }
     }
 }
@@ -137,6 +149,17 @@ impl VisionConfig {
         }
         if let Some(v) = rope.get("mrope_interleaved").and_then(|x| x.as_bool()) {
             cfg.mrope_interleaved = v;
+        }
+        if let Some(act) = vc.get("hidden_act").and_then(|x| x.as_str()) {
+            cfg.hidden_act = match act {
+                "gelu_pytorch_tanh" => VisionActivation::GeluPytorchTanh,
+                "gelu" => VisionActivation::Gelu,
+                other => {
+                    return Err(Error::Model(format!(
+                        "unsupported vision hidden_act {other:?}"
+                    )));
+                }
+            };
         }
         cfg.validate()?;
         Ok(cfg)
@@ -409,7 +432,10 @@ pub fn vision_forward(
         )?;
         let fc1 = linear_forward(&norm2, total_patches, hidden, &layer.mlp_fc1)?;
         let mut gelu = fc1;
-        gelu_inplace(&mut gelu);
+        match cfg.hidden_act {
+            VisionActivation::GeluPytorchTanh => gelu_tanh_inplace(&mut gelu),
+            VisionActivation::Gelu => gelu_erf_inplace(&mut gelu),
+        }
         let fc2 = linear_forward(&gelu, total_patches, cfg.intermediate_size, &layer.mlp_fc2)?;
         for (v, p) in x.iter_mut().zip(fc2) {
             *v += p;
@@ -437,7 +463,7 @@ pub fn vision_forward(
     }
     let fc1 = linear_forward(&merged, total_merged, merge_dim, &w.merger_fc1)?;
     let mut gelu = fc1;
-    gelu_inplace(&mut gelu);
+    gelu_erf_inplace(&mut gelu);
     let out = linear_forward(&gelu, total_merged, merge_dim, &w.merger_fc2)?;
     Ok(out)
 }
@@ -507,9 +533,17 @@ fn layer_norm(
     Ok(out)
 }
 
-fn gelu_inplace(x: &mut [f32]) {
+fn gelu_erf_inplace(x: &mut [f32]) {
     for v in x {
         *v = 0.5 * *v * (1.0 + erf(*v / std::f32::consts::SQRT_2));
+    }
+}
+
+fn gelu_tanh_inplace(x: &mut [f32]) {
+    let c = (2.0f32 / std::f32::consts::PI).sqrt();
+    for v in x {
+        let v3 = *v * *v * *v;
+        *v = 0.5 * *v * (1.0 + (c * (*v + 0.044_715 * v3)).tanh());
     }
 }
 

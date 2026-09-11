@@ -1712,8 +1712,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 先落地 Stage C 的离线数值底座，不接 GPU/HTTP：
 
 - `VisionConfig`：解析 `vision_config`、image/video/vision token id 与 M-RoPE section；
-- `validate_vision_checkpoint`：header-only 核对 27B 的 333 个 `model.visual.*`
-  张量，shape/payload/dtype 任一不符即 fail fast；真实 18 分片校验通过，
+- `validate_vision_checkpoint`：先走完整 index/shard 校验，再 header-only 核对 27B 的 333 个 `model.visual.*`
+  张量，shape/payload/dtype/重复 key 任一不符即 fail fast；真实 18 分片校验通过，
   payload 921,460,192 bytes；
 - `load_vision_weights`：按 shard 流式读取视觉权重，不回读文本/`mtp.*` 栈；
 - CPU `vision_forward`：patch embed、learned position 双线性插值、vision RoPE、

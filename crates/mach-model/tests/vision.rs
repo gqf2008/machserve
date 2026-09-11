@@ -2,7 +2,7 @@
 
 use mach_model::loader::{load_vision_weights, validate_vision_checkpoint};
 use mach_model::vision::{
-    VisionConfig, VisionLayerWeights, VisionLinear, VisionWeights, vision_forward,
+    VisionActivation, VisionConfig, VisionLayerWeights, VisionLinear, VisionWeights, vision_forward,
 };
 use std::path::{Path, PathBuf};
 
@@ -58,6 +58,7 @@ fn tiny_cfg() -> VisionConfig {
         vision_end_token_id: 104,
         mrope_section: [1, 1, 2],
         mrope_interleaved: true,
+        hidden_act: VisionActivation::GeluPytorchTanh,
     }
 }
 
@@ -126,6 +127,7 @@ fn cpu_vision_forward_matches_hf_golden() {
         vision_end_token_id: 104,
         mrope_section: [1, 1, 1],
         mrope_interleaved: true,
+        hidden_act: VisionActivation::GeluPytorchTanh,
     };
     let layer = VisionLayerWeights {
         norm1_weight: fill("blocks.0.norm1.weight", 4),
@@ -177,7 +179,7 @@ fn cpu_vision_forward_matches_hf_golden() {
     ];
     assert_eq!(got.len(), want.len());
     for (i, (a, b)) in got.iter().zip(want).enumerate() {
-        assert!((a - b).abs() < 2e-5, "token {i}: {a} vs {b}");
+        assert!((a - b).abs() < 5e-7, "token {i}: {a} vs {b}");
     }
 }
 #[test]
@@ -192,6 +194,51 @@ fn validates_complete_vision_header() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn write_index(dir: &Path, map: &[(String, String)]) {
+    let mut weight_map = serde_json::Map::new();
+    for (name, file) in map {
+        weight_map.insert(name.clone(), serde_json::Value::String(file.clone()));
+    }
+    let value = serde_json::json!({ "weight_map": weight_map });
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn rejects_missing_indexed_non_visual_shard() {
+    let cfg = tiny_cfg();
+    let dir = tmp_dir("missing-indexed-shard");
+    let tensors = cfg.expected_tensors();
+    write_bf16(&dir.join("model-00001-of-00002.safetensors"), &tensors);
+    let mut map: Vec<(String, String)> = tensors
+        .iter()
+        .map(|(name, _)| (name.clone(), "model-00001-of-00002.safetensors".into()))
+        .collect();
+    map[0].1 = "model-00002-of-00002.safetensors".into();
+    write_index(&dir, &map);
+    let err = validate_vision_checkpoint(&dir, &cfg)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing"), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn rejects_duplicate_same_file_tensor_key() {
+    let cfg = tiny_cfg();
+    let dir = tmp_dir("duplicate-key");
+    let mut tensors = cfg.expected_tensors();
+    tensors.push(tensors[0].clone());
+    write_bf16(&dir.join("model.safetensors"), &tensors);
+    let err = validate_vision_checkpoint(&dir, &cfg)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("duplicate"), "{err}");
+    let _ = std::fs::remove_dir_all(dir);
+}
 #[test]
 fn loads_complete_vision_weights() {
     let cfg = tiny_cfg();
@@ -265,9 +312,9 @@ fn rejects_unexpected_visual_tensor() {
 }
 
 #[test]
-#[ignore = "real Qwen3.8 header validation; set MACH_TEST_MODEL to the model directory"]
 fn validates_real_qwen38_vision_header() {
     let Some(path) = mach_model::real_test_model_path() else {
+        eprintln!("skipping real Qwen3.8 header validation: MACH_TEST_MODEL is not set");
         return;
     };
     let config: serde_json::Value =

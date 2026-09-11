@@ -14,6 +14,8 @@ use crate::weights::{LayerWeightsFp8, LayerWeightsQ4, WeightsFp8, WeightsQ4};
 use crate::{Config, Error, LayerWeights, Weights};
 #[cfg(windows)]
 use memmap2::Mmap;
+use serde::de::DeserializeSeed;
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
@@ -54,82 +56,98 @@ fn normalize_tensor_name(name: &str) -> String {
     }
 }
 
-/// Parse a safetensors header and validate every tensor range against the
-/// shard's data-section length. No tensor payload is read.
-fn parse_safetensors_header(
-    header: &serde_json::Value,
+#[derive(serde::Deserialize)]
+struct RawTensorJson {
+    dtype: String,
+    shape: Vec<u64>,
+    data_offsets: [u64; 2],
+}
+
+struct SafetensorsHeaderVisitor {
     data_len: usize,
-) -> Result<HashMap<String, RawTensor>, Error> {
-    let mut tensors = HashMap::new();
-    let obj = header
-        .as_object()
-        .ok_or_else(|| Error::Model("header not an object".into()))?;
-    for (name, v) in obj {
-        if name == "__metadata__" {
-            continue;
-        }
-        let o = v
-            .as_object()
-            .ok_or_else(|| Error::Model(format!("tensor {name}: not an object")))?;
-        let dtype = o
-            .get("dtype")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Model(format!("tensor {name}: missing dtype")))?
-            .to_string();
-        let shape = o
-            .get("shape")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::Model(format!("tensor {name}: missing shape")))?;
-        let mut shape_usize = Vec::with_capacity(shape.len());
-        for dim in shape {
-            let d = dim
-                .as_u64()
-                .ok_or_else(|| Error::Model(format!("tensor {name}: shape entry not a u64")))?;
-            shape_usize.push(
-                usize::try_from(d).map_err(|_| {
-                    Error::Model(format!("tensor {name}: shape dimension too large"))
-                })?,
+}
+
+impl<'de> DeserializeSeed<'de> for SafetensorsHeaderVisitor {
+    type Value = HashMap<String, RawTensor>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SafetensorsHeaderVisitor {
+    type Value = HashMap<String, RawTensor>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a safetensors header object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut tensors = HashMap::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if name == "__metadata__" {
+                let _: IgnoredAny = map.next_value()?;
+                continue;
+            }
+            let v: RawTensorJson = map.next_value()?;
+            if v.data_offsets[0] > v.data_offsets[1] || v.data_offsets[1] > self.data_len as u64 {
+                return Err(de::Error::custom(format!(
+                    "tensor {name}: data_offsets {:?} out of bounds (data len {})",
+                    v.data_offsets, self.data_len
+                )));
+            }
+            let shape = v
+                .shape
+                .into_iter()
+                .map(|d| {
+                    usize::try_from(d)
+                        .map_err(|_| de::Error::custom(format!("tensor {name}: shape too large")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let name = normalize_tensor_name(&name);
+            if tensors.contains_key(&name) {
+                return Err(de::Error::custom(format!(
+                    "duplicate tensor {name} after namespace normalization"
+                )));
+            }
+            tensors.insert(
+                name.clone(),
+                RawTensor {
+                    dtype: v.dtype,
+                    shape,
+                    start: usize::try_from(v.data_offsets[0]).map_err(|_| {
+                        de::Error::custom(format!("tensor {name}: offset too large"))
+                    })?,
+                    end: usize::try_from(v.data_offsets[1]).map_err(|_| {
+                        de::Error::custom(format!("tensor {name}: offset too large"))
+                    })?,
+                },
             );
         }
-        let off = o
-            .get("data_offsets")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::Model(format!("tensor {name}: missing data_offsets")))?;
-        if off.len() != 2 {
-            return Err(Error::Model(format!(
-                "tensor {name}: data_offsets must have 2 entries, got {}",
-                off.len()
-            )));
-        }
-        let start = off[0]
-            .as_u64()
-            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[0] not a u64")))?;
-        let end = off[1]
-            .as_u64()
-            .ok_or_else(|| Error::Model(format!("tensor {name}: data_offsets[1] not a u64")))?;
-        if start > end || end > data_len as u64 {
-            return Err(Error::Model(format!(
-                "tensor {name}: data_offsets [{start}, {end}) out of bounds (data len {data_len})"
-            )));
-        }
-        let name = normalize_tensor_name(name);
-        if tensors.contains_key(&name) {
-            return Err(Error::Model(format!(
-                "duplicate tensor {name} after namespace normalization"
-            )));
-        }
-        tensors.insert(
-            name.clone(),
-            RawTensor {
-                dtype,
-                shape: shape_usize,
-                start: usize::try_from(start)
-                    .map_err(|_| Error::Model(format!("tensor {name}: offset too large")))?,
-                end: usize::try_from(end)
-                    .map_err(|_| Error::Model(format!("tensor {name}: offset too large")))?,
-            },
-        );
+        Ok(tensors)
     }
+}
+
+/// Parse a safetensors header and validate every tensor range against the
+/// shard's data-section length. No tensor payload is read. The visitor is
+/// intentionally not `serde_json::Value`: duplicate JSON keys must be
+/// rejected rather than silently overwritten by the map implementation.
+fn parse_safetensors_header_bytes(
+    header: &[u8],
+    data_len: usize,
+) -> Result<HashMap<String, RawTensor>, Error> {
+    let mut de = serde_json::Deserializer::from_slice(header);
+    let tensors = SafetensorsHeaderVisitor { data_len }
+        .deserialize(&mut de)
+        .map_err(|e| Error::Model(format!("bad JSON header: {e}")))?;
+    de.end()
+        .map_err(|e| Error::Model(format!("bad JSON header trailing data: {e}")))?;
     Ok(tensors)
 }
 
@@ -162,12 +180,10 @@ fn read_safetensors_header(path: &Path) -> Result<(HashMap<String, RawTensor>, u
     let mut header_bytes = vec![0u8; header_len];
     file.read_exact(&mut header_bytes)
         .map_err(|e| Error::Model(format!("read {path:?} header: {e}")))?;
-    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
     let data_bytes = file_len - data_start;
     let data_len = usize::try_from(data_bytes)
         .map_err(|_| Error::Model(format!("{path:?}: data section too large")))?;
-    let tensors = parse_safetensors_header(&header, data_len)?;
+    let tensors = parse_safetensors_header_bytes(&header_bytes, data_len)?;
     Ok((tensors, data_bytes))
 }
 
@@ -246,12 +262,10 @@ fn parse_safetensors(path: &Path) -> Result<ParsedSafetensors, Error> {
         }
         let data_start = usize::try_from(data_start)
             .map_err(|_| Error::Model(format!("{path:?}: header too large")))?;
-        let header: serde_json::Value = serde_json::from_slice(&map[8..data_start])
-            .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
         let data_len = map_len
             .checked_sub(data_start)
             .ok_or_else(|| Error::Model(format!("{path:?}: mapped data length underflow")))?;
-        let tensors = parse_safetensors_header(&header, data_len)?;
+        let tensors = parse_safetensors_header_bytes(&map[8..data_start], data_len)?;
         Ok(ParsedSafetensors {
             tensors,
             storage: map,
@@ -293,10 +307,9 @@ fn parse_safetensors_owned(path: &Path) -> Result<(HashMap<String, RawTensor>, V
     }
     let header_len = usize::try_from(header_len)
         .map_err(|_| Error::Model(format!("{path:?}: header too large")))?;
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])
-        .map_err(|e| Error::Model(format!("{path:?}: bad JSON header: {e}")))?;
+    let tensors =
+        parse_safetensors_header_bytes(&bytes[8..8 + header_len], bytes.len() - 8 - header_len)?;
     let data = bytes.split_off(8 + header_len);
-    let tensors = parse_safetensors_header(&header, data.len())?;
     Ok((tensors, data))
 }
 
@@ -500,6 +513,7 @@ pub fn validate_vision_checkpoint(
     cfg: &VisionConfig,
 ) -> Result<VisionCheckpointLayout, Error> {
     cfg.validate()?;
+    let checkpoint = validate_checkpoint(path)?;
     let expected: HashMap<String, Vec<usize>> = cfg.expected_tensors().into_iter().collect();
     let files: Vec<PathBuf> = if path.is_dir() {
         let mut files: Vec<PathBuf> = std::fs::read_dir(path)
@@ -582,7 +596,7 @@ pub fn validate_vision_checkpoint(
         )));
     }
     Ok(VisionCheckpointLayout {
-        shards: files.len(),
+        shards: checkpoint.shards,
         tensors: seen.len(),
         payload_bytes,
     })
