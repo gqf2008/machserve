@@ -1879,3 +1879,31 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   `cargo clippy --workspace --all-targets --features hip -- -D warnings` 全绿。
 - 真机项仍留 C4：7900 XTX 上跑 golden/e2e/compare、HF 整模型 greedy token/logits
   对拍、VRAM/TTFT 记录。
+
+## Qwen3.8-27B Stage C4：多模态请求路径的阻塞与连接复用（#146，2026-09-11）
+
+- 图片解码 + 预处理（base64、PNG/JPEG 解码、22-bit bicubic resize）改到
+  `tokio::task::spawn_blocking` 执行；此前 data URL 与 HTTP 两条路径都在 async
+  worker 上直接跑，大图会拖住其它请求。
+- 并发上限 `IMAGE_JOB_PERMITS = 2`：阻塞池默认可涨到数百线程，而单次解码峰值
+  可达 `MAX_DECODE_BYTES + MAX_RGB8_BYTES`。许可由 `acquire_image_job()` 在
+  **读取图片字节之前**取得，并随 `run_image_job` 移进 blocking 闭包——阻塞作业
+  不可取消，许可若留在调用方 future 上，`FETCH_TIMEOUT`/abort 会在作业仍运行时
+  提前归还额度；提前取得同时限制了排队期间持有的输入缓冲数量。
+- HTTP(S) 抓取复用 `reqwest::Client`：原实现每个重定向跳都新建 client，连接池与
+  TLS 会话完全不复用。现按 (scheme, host, port, 解析地址) 缓存（`CLIENT_CACHE_CAP
+  = 64`，按最近使用淘汰，`pool_max_idle_per_host = 2` + 30s idle）；键含固定后的
+  地址，DNS 变更或 SSRF rebinding 不会命中为其它地址固定的连接。
+- 测试（均做过阳性对照）：`decode_jobs_run_off_the_async_worker`（作业线程 !=
+  async worker）、`run_image_job_enforces_permit_cap`（局部信号量下峰值恰好为
+  上限）、`production_image_jobs_are_capped`（走生产 `acquire_image_job`：两个
+  作业占满后第三个不得启动，放宽生产信号量即变红）、
+  `cancelled_jobs_keep_their_permit`（abort 调用方后许可仍被占用，改回调用方
+  持有即变红）、`reuses_http_connections_across_fetches`（同源 3 次抓取只建
+  1 条连接）、`client_cache_is_bounded`（灌 72 个 origin 后不超上限）。
+- 门禁：`cargo fmt --all --check`、`mach-server --features hip --lib`（44）、
+  `--bin mach-server`（23）、`--test vision_decode`（1）、`mach-model --lib`（228）、
+  `offline_tests`（2/73）、双面 `cargo check --workspace --all-targets`、
+  `cargo clippy --workspace --all-targets --features hip -- -D warnings` 全绿。
+- 说明：`spawn_blocking` 作业不可取消，`FETCH_TIMEOUT` 触发后 CPU 作业仍会跑完
+  （此时它仍占着一个许可）；此前内联执行时超时同样中断不了它。
