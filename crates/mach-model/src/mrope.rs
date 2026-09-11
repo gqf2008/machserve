@@ -111,11 +111,43 @@ pub fn qwen3_5_mrope_positions(
             "vision spatial_merge_size must be positive".into(),
         ));
     }
-    let mut video_frames = Vec::new();
+    let mut image_tokens = 0usize;
+    for g in image_grid_thw {
+        image_tokens = image_tokens
+            .checked_add(validate_vision_grid(*g, merge)?.3)
+            .ok_or_else(|| Error::InvalidArgument("image token count overflow".into()))?;
+    }
+    if image_tokens > input_ids.len() {
+        return Err(Error::InvalidArgument(format!(
+            "image grids expand to {image_tokens} tokens but input has {}",
+            input_ids.len()
+        )));
+    }
+    let mut video_frame_count = 0usize;
+    let mut video_tokens = 0usize;
     for g in video_grid_thw {
-        let [t, h, w] = *g;
-        for _ in 0..t {
-            video_frames.push([1, h, w]);
+        let (frames, _, _, tokens) = validate_vision_grid(*g, merge)?;
+        video_frame_count = video_frame_count
+            .checked_add(frames)
+            .ok_or_else(|| Error::InvalidArgument("video frame count overflow".into()))?;
+        video_tokens = video_tokens
+            .checked_add(tokens)
+            .ok_or_else(|| Error::InvalidArgument("video token count overflow".into()))?;
+    }
+    if video_tokens > input_ids.len() {
+        return Err(Error::InvalidArgument(format!(
+            "video grids expand to {video_tokens} tokens but input has {}",
+            input_ids.len()
+        )));
+    }
+    let mut video_frames = Vec::new();
+    video_frames
+        .try_reserve(video_frame_count)
+        .map_err(|_| Error::InvalidArgument("video frame allocation failed".into()))?;
+    for g in video_grid_thw {
+        let (_, _, _, _) = validate_vision_grid(*g, merge)?;
+        for _ in 0..g[0] {
+            video_frames.push([1, g[1], g[2]]);
         }
     }
 
@@ -207,7 +239,7 @@ pub fn qwen3_5_mrope_positions(
     Ok(MropePositions { pos, delta })
 }
 
-fn vision_group_len(g: [u32; 3], merge: usize) -> Result<usize, Error> {
+fn validate_vision_grid(g: [u32; 3], merge: usize) -> Result<(usize, usize, usize, usize), Error> {
     let t = usize::try_from(g[0]).map_err(|_| Error::InvalidArgument("grid t too large".into()))?;
     let h = usize::try_from(g[1]).map_err(|_| Error::InvalidArgument("grid h too large".into()))?;
     let w = usize::try_from(g[2]).map_err(|_| Error::InvalidArgument("grid w too large".into()))?;
@@ -216,9 +248,17 @@ fn vision_group_len(g: [u32; 3], merge: usize) -> Result<usize, Error> {
             "invalid or unmerged vision grid {g:?} for merge {merge}"
         )));
     }
-    t.checked_mul(h / merge)
-        .and_then(|v| v.checked_mul(w / merge))
-        .ok_or_else(|| Error::InvalidArgument("vision group length overflow".into()))
+    let hh = h / merge;
+    let ww = w / merge;
+    let tokens = t
+        .checked_mul(hh)
+        .and_then(|v| v.checked_mul(ww))
+        .ok_or_else(|| Error::InvalidArgument("vision group length overflow".into()))?;
+    Ok((t, hh, ww, tokens))
+}
+
+fn vision_group_len(g: [u32; 3], merge: usize) -> Result<usize, Error> {
+    Ok(validate_vision_grid(g, merge)?.3)
 }
 
 fn vision_positions(
@@ -332,6 +372,56 @@ mod tests {
         assert_eq!(p.delta, -4);
     }
 
+    #[test]
+    fn zero_t_video_grid_is_rejected() {
+        let err = qwen3_5_mrope_positions(
+            &[1, 2],
+            &[2, 2],
+            &[],
+            &[[0, 4, 4], [1, 4, 4]],
+            &VisionConfig::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid"), "{err}");
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn cos_sin_matches_hf_real_config() {
+        let cfg = Config::qwen3_5(64, 4, 1, 1, 256, 128, 256, 128, 2, 4, 8, 4);
+        let p = MropePositions {
+            pos: vec![[2, 2, 2], [2, 3, 2], [2, 2, 2]],
+            delta: 0,
+        };
+        let (cos, sin) = p.cos_sin(&cfg, [11, 11, 10]).unwrap();
+        let dim = cfg.attn_rotary_dim();
+        assert_eq!(dim, 64);
+        let want = [
+            (
+                [-0.41614684, 0.35433567, 0.74494207],
+                [0.90929741, 0.93511832, 0.66712916],
+            ),
+            (
+                [-0.41614684, -0.23973489, 0.74494207],
+                [0.90929741, 0.97083837, 0.66712916],
+            ),
+            (
+                [-0.41614684, 0.35433567, 0.74494207],
+                [0.90929741, 0.93511832, 0.66712916],
+            ),
+        ];
+        for (t, (wc, ws)) in want.iter().enumerate() {
+            for i in 0..3 {
+                assert!((cos[t * dim + i] - wc[i]).abs() < 1e-6);
+                assert!((sin[t * dim + i] - ws[i]).abs() < 1e-6);
+            }
+            for i in 0..dim / 2 {
+                assert_eq!(cos[t * dim + i], cos[t * dim + dim / 2 + i]);
+                assert_eq!(sin[t * dim + i], sin[t * dim + dim / 2 + i]);
+            }
+        }
+    }
     #[test]
     fn cos_sin_uses_interleaved_mrope() {
         let p = MropePositions {

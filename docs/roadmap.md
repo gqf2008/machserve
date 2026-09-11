@@ -1744,4 +1744,4 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - `MropePositions::cos_sin` 实现 interleaved M-RoPE：T 轴基准，
   H/W 按 `mrope_section` 每隔 3 位覆盖，生成 token-major cos/sin 表。
 - 对拍：文本、单图 `[1,4,4]`、双帧视频 `[2,4,4]` 三组位置与 HF
-  `get_rope_index` 逐元素一致；cos/sin 表有限性回归通过。
+  `get_rope_index` 逐元素一致；cos/sin 表对真实 64 维 partial-rotary 配置做了 HF golden 对拍（含 interleave 与后半复制）。
