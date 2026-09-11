@@ -1754,3 +1754,12 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - `BatchedModel::set_mrope_tables` / `clear_mrope_tables` / `set_rope_delta`
   提供表模式与 delta 控制；full-attention 层优先走表模式，其余路径保持原
   scalar RoPE。
+
+## Qwen3.8-27B Stage C3c：vision feature 行级 embedding 注入（#146，2026-09-11）
+
+- 新增 `EMBED_SCATTER_ROWS`：正常 f32/f16/Q4 token embedding gather 后，按
+  mask 用显式 vision/video features 覆盖指定行；内核计数 72→73。
+- `BatchedModel::set_row_embeddings` / `clear_row_embeddings` 提供行级
+  override 生命周期；M-RoPE、row-embed 状态切换都使 graph cache 失效。
+- GPU parity：用 token embedding 自身作为 override，注入模型与普通 gather
+  模型 logits 逐元素对拍一致（finite + 1e-5）。
