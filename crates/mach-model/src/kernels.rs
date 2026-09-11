@@ -3588,7 +3588,7 @@ impl HipKernels {
     ) -> Result<(), Error> {
         if rows <= 0 || cols <= 0 {
             return Err(Error::InvalidArgument(format!(
-                "layer_norm requires positive rows/cols, got {rows}x{cols}"
+                "rms_norm requires positive rows/cols, got {rows}x{cols}"
             )));
         }
         let xp = x;
@@ -3716,7 +3716,7 @@ impl HipKernels {
     ) -> Result<(), Error> {
         if rows <= 0 || cols <= 0 {
             return Err(Error::InvalidArgument(format!(
-                "layer_norm requires positive rows/cols, got {rows}x{cols}"
+                "rms_norm requires positive rows/cols, got {rows}x{cols}"
             )));
         }
         let xp = x;

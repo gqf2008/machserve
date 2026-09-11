@@ -15,6 +15,55 @@ use crate::vision::{
 use mach_kernel_sys::hip;
 use std::sync::Arc;
 
+fn checked_mul(a: usize, b: usize, what: &str) -> Result<usize, Error> {
+    a.checked_mul(b)
+        .ok_or_else(|| Error::InvalidArgument(format!("vision {what} size overflow")))
+}
+
+fn validate_scratch_sizes(cfg: &VisionConfig, max_tokens: usize) -> Result<(), Error> {
+    let h = cfg.hidden_size;
+    let hd = cfg.head_dim();
+    let inter = cfg.intermediate_size;
+    let merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size;
+    let patch_dim = checked_mul(
+        checked_mul(cfg.in_channels, cfg.temporal_patch_size, "patch")?,
+        checked_mul(cfg.patch_size, cfg.patch_size, "patch")?,
+        "patch",
+    )?;
+    let qkv_dim = checked_mul(3, h, "qkv")?;
+    let merger_dim = checked_mul(h, merge_unit, "merger")?;
+    let max_merged = max_tokens / merge_unit.max(1);
+    let _seg_bytes = checked_mul(max_tokens, 4, "segment")?;
+    for (name, size) in [
+        ("pixel", checked_mul(max_tokens, patch_dim, "pixel")?),
+        ("pos", checked_mul(max_tokens, h, "pos")?),
+        ("rope", checked_mul(max_tokens, hd, "rope")?),
+        ("qkv", checked_mul(max_tokens, qkv_dim, "qkv")?),
+        ("mlp", checked_mul(max_tokens, inter, "mlp")?),
+        ("out", checked_mul(max_merged, cfg.out_hidden_size, "out")?),
+    ] {
+        if size > i32::MAX as usize {
+            return Err(Error::InvalidArgument(format!(
+                "vision {name} scratch {size} exceeds i32"
+            )));
+        }
+    }
+    for (name, size) in [
+        ("hidden", h),
+        ("head_dim", hd),
+        ("intermediate", inter),
+        ("qkv", qkv_dim),
+        ("merger", merger_dim),
+        ("out", cfg.out_hidden_size),
+    ] {
+        if size > i32::MAX as usize {
+            return Err(Error::InvalidArgument(format!(
+                "vision {name} dimension {size} exceeds i32"
+            )));
+        }
+    }
+    Ok(())
+}
 struct LayerDev {
     norm1_w: *mut f32,
     norm1_b: *mut f32,
@@ -71,6 +120,7 @@ impl VisionGpu {
     ) -> Result<Self, Error> {
         cfg.validate()?;
         validate_vision_weights(&cfg, w)?;
+        validate_scratch_sizes(&cfg, max_tokens)?;
         if max_tokens == 0 {
             return Err(Error::InvalidArgument(
                 "vision max_tokens must be positive".into(),
@@ -190,18 +240,18 @@ impl VisionGpu {
                 self.max_tokens
             )));
         }
-        if pixel_values.len() != tokens * patch_dim {
+        let expected_pixels = checked_mul(tokens, patch_dim, "pixel input")?;
+        if pixel_values.len() != expected_pixels {
             return Err(Error::InvalidArgument(format!(
-                "vision pixel_values has {} elements, expected {}",
-                pixel_values.len(),
-                tokens * patch_dim
+                "vision pixel_values has {} elements, expected {expected_pixels}",
+                pixel_values.len()
             )));
         }
         if !tokens.is_multiple_of(merge_unit)
             || merged != tokens / merge_unit
-            || prep.pos_embeddings.len() != tokens * hidden
-            || prep.cos.len() != tokens * hd
-            || prep.sin.len() != tokens * hd
+            || prep.pos_embeddings.len() != checked_mul(tokens, hidden, "pos")?
+            || prep.cos.len() != checked_mul(tokens, hd, "rope")?
+            || prep.sin.len() != checked_mul(tokens, hd, "rope")?
             || prep.seg_start.len() != tokens
             || prep.seg_len.len() != tokens
         {
@@ -492,5 +542,17 @@ impl Drop for VisionGpu {
         for &p in &self.allocs {
             let _ = hip::free(&self.hip, p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_size_overflow_is_rejected() {
+        let cfg = VisionConfig::default();
+        assert!(validate_scratch_sizes(&cfg, 16).is_ok());
+        assert!(validate_scratch_sizes(&cfg, 1usize << 63).is_err());
     }
 }

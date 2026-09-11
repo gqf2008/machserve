@@ -793,16 +793,35 @@ fn axis_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2]) {
 /// descriptors. `pixel_values` itself stays with the caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisionPrepared {
-    pub pos_embeddings: Vec<f32>,
-    pub cos: Vec<f32>,
-    pub sin: Vec<f32>,
-    pub seg_start: Vec<i32>,
-    pub seg_len: Vec<i32>,
-    pub tokens: usize,
-    pub merged_tokens: usize,
-    pub max_seg: usize,
+    pub(crate) pos_embeddings: Vec<f32>,
+    pub(crate) cos: Vec<f32>,
+    pub(crate) sin: Vec<f32>,
+    pub(crate) seg_start: Vec<i32>,
+    pub(crate) seg_len: Vec<i32>,
+    pub(crate) tokens: usize,
+    pub(crate) merged_tokens: usize,
+    pub(crate) max_seg: usize,
 }
 
+impl VisionPrepared {
+    /// Number of packed vision patches.
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Number of merged vision features.
+    #[must_use]
+    pub const fn merged_tokens(&self) -> usize {
+        self.merged_tokens
+    }
+
+    /// Largest frame-local attention segment.
+    #[must_use]
+    pub const fn max_seg(&self) -> usize {
+        self.max_seg
+    }
+}
 /// Prepare the host-side tensors consumed by [`vision_forward`] and the GPU
 /// runtime. This is deliberately separate from pixel preprocessing: the image
 /// processor packs pixels, while this function mirrors the HF vision tower's
@@ -818,7 +837,7 @@ pub fn prepare_vision_inputs(
             "vision grids must not be empty".into(),
         ));
     }
-    let merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size;
+    let merge_unit = checked_mul(cfg.spatial_merge_size, cfg.spatial_merge_size, "merge unit")?;
     let mut tokens = 0usize;
     let mut merged_tokens = 0usize;
     let mut segments = Vec::new();
@@ -835,15 +854,25 @@ pub fn prepare_vision_inputs(
                 cfg.spatial_merge_size
             )));
         }
-        let frame = h * wd;
+        let frame = checked_mul(h, wd, "frame")?;
+        let frame_merged = checked_mul(
+            h / cfg.spatial_merge_size,
+            wd / cfg.spatial_merge_size,
+            "merged frame",
+        )?;
+        let patch_count = checked_mul(t, frame, "patch count")?;
+        let merged_count = checked_mul(t, frame_merged, "merged count")?;
         for ti in 0..t {
-            segments.push((tokens + ti * frame, frame));
+            let start = tokens
+                .checked_add(checked_mul(ti, frame, "segment start")?)
+                .ok_or_else(|| Error::InvalidArgument("vision segment start overflow".into()))?;
+            segments.push((start, frame));
         }
         tokens = tokens
-            .checked_add(t * frame)
+            .checked_add(patch_count)
             .ok_or_else(|| Error::InvalidArgument("vision patch count overflow".into()))?;
         merged_tokens = merged_tokens
-            .checked_add(t * (h / cfg.spatial_merge_size) * (wd / cfg.spatial_merge_size))
+            .checked_add(merged_count)
             .ok_or_else(|| Error::InvalidArgument("vision merged token count overflow".into()))?;
     }
     if !tokens.is_multiple_of(merge_unit) {
@@ -880,6 +909,11 @@ pub fn prepare_vision_inputs(
     })
 }
 
+fn checked_mul(a: usize, b: usize, what: &str) -> Result<usize, Error> {
+    a.checked_mul(b)
+        .ok_or_else(|| Error::Model(format!("vision {what} size overflow")))
+}
+
 /// Validate all vision weight tensor lengths against the configured shapes.
 ///
 /// `VisionGpu::new` uploads raw pointers derived from these vectors, so this
@@ -889,8 +923,13 @@ pub fn validate_vision_weights(cfg: &VisionConfig, w: &VisionWeights) -> Result<
     cfg.validate()?;
     let h = cfg.hidden_size;
     let inter = cfg.intermediate_size;
-    let patch_dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-    let merger = cfg.merger_input_dim();
+    let patch_dim = checked_mul(
+        checked_mul(cfg.in_channels, cfg.temporal_patch_size, "patch")?,
+        checked_mul(cfg.patch_size, cfg.patch_size, "patch")?,
+        "patch",
+    )?;
+    let merge_unit = checked_mul(cfg.spatial_merge_size, cfg.spatial_merge_size, "merge")?;
+    let merger = checked_mul(h, merge_unit, "merger")?;
     let check = |name: &str, got: usize, want: usize| -> Result<(), Error> {
         if got != want {
             return Err(Error::Model(format!(
@@ -902,26 +941,26 @@ pub fn validate_vision_weights(cfg: &VisionConfig, w: &VisionWeights) -> Result<
     check(
         "patch_embed.weight",
         w.patch_embed_weight.len(),
-        h * patch_dim,
+        checked_mul(h, patch_dim, "patch weight")?,
     )?;
     check("patch_embed.bias", w.patch_embed_bias.len(), h)?;
     check(
         "pos_embed.weight",
         w.pos_embed_weight.len(),
-        cfg.num_position_embeddings * h,
+        checked_mul(cfg.num_position_embeddings, h, "pos embed")?,
     )?;
     check("merger.norm.weight", w.merger_norm_weight.len(), h)?;
     check("merger.norm.bias", w.merger_norm_bias.len(), h)?;
     check(
         "merger.fc1.weight",
         w.merger_fc1.weight.len(),
-        merger * merger,
+        checked_mul(merger, merger, "merger fc1")?,
     )?;
     check("merger.fc1.bias", w.merger_fc1.bias.len(), merger)?;
     check(
         "merger.fc2.weight",
         w.merger_fc2.weight.len(),
-        cfg.out_hidden_size * merger,
+        checked_mul(cfg.out_hidden_size, merger, "merger fc2")?,
     )?;
     check(
         "merger.fc2.bias",
@@ -939,15 +978,32 @@ pub fn validate_vision_weights(cfg: &VisionConfig, w: &VisionWeights) -> Result<
         let p = |name: &str| format!("layers.{i}.{name}");
         check(&p("norm1.weight"), layer.norm1_weight.len(), h)?;
         check(&p("norm1.bias"), layer.norm1_bias.len(), h)?;
-        check(&p("qkv.weight"), layer.qkv.weight.len(), 3 * h * h)?;
-        check(&p("qkv.bias"), layer.qkv.bias.len(), 3 * h)?;
-        check(&p("attn.proj.weight"), layer.attn_proj.weight.len(), h * h)?;
+        let qkv_weight = checked_mul(checked_mul(3, h, "qkv")?, h, "qkv")?;
+        check(&p("qkv.weight"), layer.qkv.weight.len(), qkv_weight)?;
+        check(
+            &p("qkv.bias"),
+            layer.qkv.bias.len(),
+            checked_mul(3, h, "qkv bias")?,
+        )?;
+        check(
+            &p("attn.proj.weight"),
+            layer.attn_proj.weight.len(),
+            checked_mul(h, h, "attn proj")?,
+        )?;
         check(&p("attn.proj.bias"), layer.attn_proj.bias.len(), h)?;
         check(&p("norm2.weight"), layer.norm2_weight.len(), h)?;
         check(&p("norm2.bias"), layer.norm2_bias.len(), h)?;
-        check(&p("mlp.fc1.weight"), layer.mlp_fc1.weight.len(), inter * h)?;
+        check(
+            &p("mlp.fc1.weight"),
+            layer.mlp_fc1.weight.len(),
+            checked_mul(inter, h, "mlp fc1")?,
+        )?;
         check(&p("mlp.fc1.bias"), layer.mlp_fc1.bias.len(), inter)?;
-        check(&p("mlp.fc2.weight"), layer.mlp_fc2.weight.len(), h * inter)?;
+        check(
+            &p("mlp.fc2.weight"),
+            layer.mlp_fc2.weight.len(),
+            checked_mul(h, inter, "mlp fc2")?,
+        )?;
         check(&p("mlp.fc2.bias"), layer.mlp_fc2.bias.len(), h)?;
     }
     Ok(())

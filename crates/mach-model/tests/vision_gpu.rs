@@ -82,7 +82,7 @@ fn gpu_vision_forward_matches_cpu() {
     let grids = [[1, 2, 4], [2, 2, 2]];
     let prep = VisionGpu::prepare(&cfg, &w, &grids).unwrap();
     let cpu = vision_forward(&cfg, &w, &pixel, &grids).unwrap();
-    let mut gpu = VisionGpu::new(hip, cfg, &w, prep.tokens).unwrap();
+    let mut gpu = VisionGpu::new(hip, cfg, &w, prep.tokens()).unwrap();
     let got = gpu.forward(&pixel, &prep).unwrap();
     assert_eq!(cpu.len(), got.len());
     let mut max_diff = 0.0f32;
