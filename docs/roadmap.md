@@ -1944,3 +1944,30 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - 门禁：双面 `cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo test -p mach-server --lib`（CPU 29 / hip 44）、
   `--test vision_decode`（CPU 1 / hip 1）、`cargo fmt --all --check` 全绿。
+
+## Qwen3.8-27B Stage C4：真机 HTTP 多模态链路跑通（视觉特征 GPU↔HF 对拍通过，整模型 token/logits 待补）（#146，2026-09-11）
+
+- 7900 XTX（ROCm 6.2 / Windows）上跑通完整 HTTP 多模态链路：
+  `MACH_Q4=1 MACH_Q4_DEVICE=2 MACH_CAPACITY=1 MACH_VISION_MAX_TOKENS=2048`；
+  从进程启动到**首个请求开始** 123.3s（`load_plus_wait_seconds`，含 healthz 等待与
+  一次 VRAM 采样），日志 preflight `VRAM free 23.84GiB / 23.98GiB, estimated need
+  16.42GiB`（加载前预算，非实际占用）。
+- 图片问答：HTTP 200，SSE 回答正确描述图片（红圆 / 白方 / 黄三角 / 深蓝底），
+  **TTFT 3.15s**；`temperature=0` 连发两次输出逐字一致。
+- GPU↔HF 视觉特征对拍（`vision_c4_compare.py --atol 1e-3 --rtol 1e-3 --require-hash`）：
+  **pass**，`max_abs_diff 7.362e-4`、`mean_abs 1.626e-6`、`nonfinite 0`、grid 与输入
+  SHA-256 绑定一致（该工具用 numpy 混合容差；近零特征上的 `max_rel_diff 22.6` 与
+  pass 不矛盾）。
+- 负例与确定性（新增 `tools/vision_c4_negative.py`，报告
+  `artifacts/vision-c4/negatives.json`）：超 patch 预算的 2048x2048 图（16384 patch）
+  返回 400、不带 `MACH_VISION` 返回 501 `multimodal_not_implemented`、同服务纯文本
+  200、同图两次 `temperature=0` 逐字一致。
+- Fast/PIL 漂移实测：torchvision 0.29.0+cpu 的 Fast 路径与 PIL 路径 grid 相同、
+  `max_abs_diff 5.9e-8`（ULP 级）；PIL 参考与 Rust 生产预处理**逐位相同**。
+- runbook 修正：dense 27B 必须带 `MACH_Q4_DEVICE=2`（`=1` 只保 MoE expert pool，
+  dense 权重仍按 f16 上传；该结论来自 Q4-on-device 运行时语义与实测 preflight，
+  `estimate_vram` 对 1/2 取同一系数）、补 `--max-patches 2048`（128x128 图 → 放大到
+  256x256 → grid `[1,16,16]` = 256 patch / 64 merged token）；并记录 `doctor`
+  跨进程读不到服务占用、本次未采到实际 VRAM 占用。
+- 剩余唯一验收项：HF 整模型 greedy token/logits 参考（本机 31GB 内存装不下 BF16 27B、
+  PyTorch 无 Windows ROCm 轮子），需在 ≥64GB 内存机器或 Linux+ROCm 环境生成后对比。
