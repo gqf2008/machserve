@@ -8,6 +8,6 @@ pub mod multimodal;
 pub mod routes;
 
 #[cfg(feature = "hip")]
-pub use engine::ServerEngine;
+pub use engine::{ImageRuntimeConfig, ServerEngine, VisionSetup};
 #[cfg(feature = "hip")]
 pub use routes::{AppState, ChatFormat, router};

@@ -5,8 +5,12 @@
 use mach_kernel_sys::hip::Hip;
 use mach_model::batched::BatchedModel;
 use mach_model::continuous::{ContinuousModel, SeqId};
+use mach_model::image_processor::ProcessedImage;
+use mach_model::multimodal::{MultimodalPrompt, VisionImage};
 use mach_model::sampling::SamplingParams;
 use mach_model::speculative::SpeculativeEngine;
+use mach_model::vision::{VisionConfig, VisionGrid, VisionWeights};
+use mach_model::vision_gpu::VisionGpu;
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,9 +25,108 @@ struct Request {
     stop_seqs: Vec<Vec<u32>>,
     logit_bias: Vec<(u32, f32)>,
     params: SamplingParams,
+    /// Preprocessed images (empty for text-only requests).
+    images: Vec<ProcessedImage>,
     done: DoneSender,
     /// Streaming: per-token channel (None for non-streaming requests).
     tokens_tx: Option<tokio::sync::mpsc::Sender<u32>>,
+}
+
+/// Vision tower configuration and weights, consumed by the engine thread.
+pub struct VisionSetup {
+    pub cfg: VisionConfig,
+    pub weights: VisionWeights,
+    /// Maximum packed vision patches the GPU tower scratch supports.
+    pub max_tokens: usize,
+}
+
+/// Image preprocessing/token config exposed to the HTTP handler.
+#[derive(Debug, Clone)]
+pub struct ImageRuntimeConfig {
+    pub processor: mach_model::image_processor::ImageProcessorConfig,
+    pub image_token_id: u32,
+    pub spatial_merge_size: usize,
+}
+
+/// GPU vision runtime owned by (and created on) the engine thread.
+struct VisionRuntime {
+    cfg: VisionConfig,
+    weights: VisionWeights,
+    gpu: VisionGpu,
+    image_token_id: u32,
+    max_tokens: usize,
+}
+
+impl VisionRuntime {
+    fn new(hip: &Arc<Hip>, setup: VisionSetup) -> Result<Self, EngineError> {
+        let gpu = VisionGpu::new(Arc::clone(hip), setup.cfg, &setup.weights, setup.max_tokens)?;
+        Ok(Self {
+            image_token_id: setup.cfg.image_token_id,
+            cfg: setup.cfg,
+            weights: setup.weights,
+            gpu,
+            max_tokens: setup.max_tokens,
+        })
+    }
+
+    /// Run the tower over `images` and build the text-side prompt overrides.
+    fn encode(
+        &mut self,
+        text_cfg: &Config,
+        prompt: &[u32],
+        images: &[ProcessedImage],
+    ) -> Result<MultimodalPrompt, EngineError> {
+        if images.is_empty() {
+            return Err(EngineError::InvalidRequest("no images to encode".into()));
+        }
+        let grids: Vec<VisionGrid> = images.iter().map(|i| i.grid).collect();
+        let mut pixel_values = Vec::new();
+        let mut patches = 0usize;
+        for image in images {
+            pixel_values.extend_from_slice(&image.pixel_values);
+            patches = patches
+                .checked_add(image.grid[0] * image.grid[1] * image.grid[2])
+                .ok_or_else(|| EngineError::InvalidRequest("vision patch count overflow".into()))?;
+        }
+        if patches > self.max_tokens {
+            return Err(EngineError::InvalidRequest(format!(
+                "vision patches {patches} exceed cap {}",
+                self.max_tokens
+            )));
+        }
+        let prep = VisionGpu::prepare(&self.cfg, &self.weights, &grids)?;
+        let features = self.gpu.forward(&pixel_values, &prep)?;
+
+        let merge_unit = self
+            .cfg
+            .spatial_merge_size
+            .checked_mul(self.cfg.spatial_merge_size)
+            .ok_or_else(|| EngineError::InvalidRequest("merge size overflow".into()))?;
+        let hidden = self.cfg.out_hidden_size;
+        let mut offset = 0usize;
+        let mut vision_images = Vec::with_capacity(images.len());
+        for image in images {
+            let rows = (image.grid[0] * image.grid[1] * image.grid[2]) / merge_unit;
+            let end = offset + rows * hidden;
+            if end > features.len() {
+                return Err(EngineError::InvalidRequest(
+                    "vision feature buffer shorter than expected".into(),
+                ));
+            }
+            vision_images.push(VisionImage {
+                features: features[offset..end].to_vec(),
+                grid: image.grid,
+            });
+            offset = end;
+        }
+        Ok(MultimodalPrompt::build(
+            prompt,
+            &vision_images,
+            self.image_token_id,
+            text_cfg,
+            &self.cfg,
+        )?)
+    }
 }
 
 /// Completion delivery: generated tokens, per-token log-probs, per-token
@@ -55,6 +158,10 @@ pub struct ServerEngine {
     /// Cross-request reuse stats snapshot (paged engines; updated by the
     /// engine thread after every step).
     paged_stats: Mutex<Option<mach_model::continuous::PagedReuseStats>>,
+    /// Optional vision tower (consumed by the engine thread at spawn).
+    vision: Mutex<Option<(Arc<Hip>, VisionSetup)>>,
+    /// Image preprocessing/token config for the HTTP handler.
+    image: Mutex<Option<ImageRuntimeConfig>>,
     /// Graceful-shutdown flag: the engine thread drains then exits.
     shutdown: AtomicBool,
 }
@@ -126,6 +233,28 @@ impl ServerEngine {
         )
     }
 
+    /// Enables the multimodal vision tower; call before `spawn*`.
+    pub fn set_vision(&self, hip: Arc<Hip>, setup: VisionSetup) {
+        *self.vision.lock().unwrap() = Some((hip, setup));
+    }
+
+    /// True when a vision tower was installed before spawn.
+    #[must_use]
+    pub fn vision_enabled(&self) -> bool {
+        self.vision.lock().unwrap().is_some()
+    }
+
+    /// Installs the image preprocessing/token config used by the handler.
+    pub fn set_image_runtime(&self, cfg: ImageRuntimeConfig) {
+        *self.image.lock().unwrap() = Some(cfg);
+    }
+
+    /// Image config when multimodal serving is enabled.
+    #[must_use]
+    pub fn image_runtime(&self) -> Option<ImageRuntimeConfig> {
+        self.image.lock().unwrap().clone()
+    }
+
     /// Cross-request prefix-reuse statistics of a paged engine (updated by
     /// the engine thread after every step), else `None`.
     #[must_use]
@@ -153,6 +282,8 @@ impl ServerEngine {
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             paged_stats: Mutex::new(None),
+            vision: Mutex::new(None),
+            image: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -185,10 +316,34 @@ impl ServerEngine {
         Ok(())
     }
 
-    /// Submits a generation request; resolves when the sequence finishes.
+    /// Submits a text-only generation request; resolves when the sequence finishes.
     pub async fn submit(
         self: &Arc<Self>,
         prompt: Vec<u32>,
+        max_new: usize,
+        eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
+        params: SamplingParams,
+    ) -> Result<(Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str), EngineError> {
+        self.submit_multimodal(
+            prompt,
+            Vec::new(),
+            max_new,
+            eos,
+            stop_seqs,
+            logit_bias,
+            params,
+        )
+        .await
+    }
+
+    /// Submits a generation request with preprocessed images (empty = text-only).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_multimodal(
+        self: &Arc<Self>,
+        prompt: Vec<u32>,
+        images: Vec<ProcessedImage>,
         max_new: usize,
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
@@ -212,6 +367,7 @@ impl ServerEngine {
                 stop_seqs,
                 logit_bias,
                 params,
+                images,
                 done: tx,
                 tokens_tx: None,
             });
@@ -222,10 +378,34 @@ impl ServerEngine {
 
     /// Submits a streaming generation request. The returned `Receiver<u32>`
     /// yields one token per generated step; the oneshot resolves with the full
-    /// output when the sequence finishes (stream closes at the same time).
+    /// Submits a streaming text-only generation request.
     pub async fn submit_stream(
         self: &Arc<Self>,
         prompt: Vec<u32>,
+        max_new: usize,
+        eos: Option<u32>,
+        stop_seqs: Vec<Vec<u32>>,
+        logit_bias: Vec<(u32, f32)>,
+        params: SamplingParams,
+    ) -> Result<(DoneReceiver, tokio::sync::mpsc::Receiver<u32>), EngineError> {
+        self.submit_stream_multimodal(
+            prompt,
+            Vec::new(),
+            max_new,
+            eos,
+            stop_seqs,
+            logit_bias,
+            params,
+        )
+        .await
+    }
+
+    /// Submits a streaming request with preprocessed images (empty = text-only).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_stream_multimodal(
+        self: &Arc<Self>,
+        prompt: Vec<u32>,
+        images: Vec<ProcessedImage>,
         max_new: usize,
         eos: Option<u32>,
         stop_seqs: Vec<Vec<u32>>,
@@ -250,6 +430,7 @@ impl ServerEngine {
                 stop_seqs,
                 logit_bias,
                 params,
+                images,
                 done: tx,
                 tokens_tx: Some(tokens_tx),
             });
@@ -272,7 +453,7 @@ impl ServerEngine {
         cfg: Config,
         w: Weights,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
-        let mut model = if let Some(tpp) = self.paged_tpp {
+        let model = if let Some(tpp) = self.paged_tpp {
             ContinuousModel::with_paged_prefill_rows(
                 hip,
                 cfg,
@@ -293,10 +474,7 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
-        Ok(std::thread::Builder::new()
-            .name("mach-engine".into())
-            .spawn(move || self.run(&mut model))
-            .expect("spawn engine thread"))
+        Ok(self.spawn_engine_thread(model))
     }
 
     /// Spawns a storage-Q4 engine thread: weights are dequantized to f16 per
@@ -315,7 +493,7 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model = if let Some(tpp) = self.paged_tpp {
+        let model = if let Some(tpp) = self.paged_tpp {
             ContinuousModel::with_paged_prefill_rows_q4(
                 hip,
                 cfg,
@@ -327,10 +505,7 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows_q4(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
-        Ok(std::thread::Builder::new()
-            .name("mach-engine".into())
-            .spawn(move || self.run(&mut model))
-            .expect("spawn engine thread"))
+        Ok(self.spawn_engine_thread(model))
     }
 
     /// Spawns a storage-Q4 engine with the expert pool kept in Q4 ON DEVICE
@@ -349,7 +524,7 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model = if let Some(tpp) = self.paged_tpp {
+        let model = if let Some(tpp) = self.paged_tpp {
             ContinuousModel::with_paged_prefill_rows_q4_device(
                 hip,
                 cfg,
@@ -367,10 +542,7 @@ impl ServerEngine {
                 self.prefill_rows,
             )?
         };
-        Ok(std::thread::Builder::new()
-            .name("mach-engine".into())
-            .spawn(move || self.run(&mut model))
-            .expect("spawn engine thread"))
+        Ok(self.spawn_engine_thread(model))
     }
 
     /// Spawns a dense Q4-on-device engine (`MACH_Q4_DEVICE=2`): the expert
@@ -395,7 +567,7 @@ impl ServerEngine {
                 "MACH_KV=int8 is not wired for paged KV yet; unset MACH_PAGED".into(),
             ));
         }
-        let mut model = if let Some(tpp) = self.paged_tpp {
+        let model = if let Some(tpp) = self.paged_tpp {
             ContinuousModel::with_paged_prefill_rows_q4_all(
                 hip,
                 cfg,
@@ -421,10 +593,7 @@ impl ServerEngine {
                 self.prefill_rows,
             )?
         };
-        Ok(std::thread::Builder::new()
-            .name("mach-engine".into())
-            .spawn(move || self.run(&mut model))
-            .expect("spawn engine thread"))
+        Ok(self.spawn_engine_thread(model))
     }
 
     /// Spawns a storage-FP8 engine thread: weights are dequantized to f16 per
@@ -443,7 +612,7 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        let mut model = if let Some(tpp) = self.paged_tpp {
+        let model = if let Some(tpp) = self.paged_tpp {
             ContinuousModel::with_paged_prefill_rows_fp8(
                 hip,
                 cfg,
@@ -455,10 +624,7 @@ impl ServerEngine {
         } else {
             ContinuousModel::with_prefill_rows_fp8(hip, cfg, &w, self.capacity, self.prefill_rows)?
         };
-        Ok(std::thread::Builder::new()
-            .name("mach-engine".into())
-            .spawn(move || self.run(&mut model))
-            .expect("spawn engine thread"))
+        Ok(self.spawn_engine_thread(model))
     }
 
     /// Spawns a speculative-decoding engine thread (greedy-only).
@@ -486,42 +652,102 @@ impl ServerEngine {
             .expect("spawn engine thread"))
     }
 
-    fn run(self: &Arc<Self>, model: &mut ContinuousModel) {
-        loop {
-            // Admit pending requests while capacity allows (continuous batching).
-            {
-                let mut pending = self.pending.lock().unwrap();
-                let mut txs = self.txs.lock().unwrap();
-                let mut streams = self.streams.lock().unwrap();
-                while !pending.is_empty() && model.active() < self.capacity {
-                    let r = pending.pop_front().expect("checked non-empty");
-                    match model.add(
-                        &r.prompt,
-                        r.max_new,
-                        r.eos,
-                        r.stop_seqs,
-                        r.logit_bias,
-                        r.params,
-                    ) {
-                        Ok(id) => {
-                            txs.insert(id, r.done);
-                            if let Some(stx) = r.tokens_tx {
-                                streams.insert(id, stx);
-                            }
+    /// Spawns the engine thread; builds the GPU vision runtime inside it when
+    /// a setup was installed via [`Self::set_vision`].
+    fn spawn_engine_thread(
+        self: &Arc<Self>,
+        mut model: ContinuousModel,
+    ) -> std::thread::JoinHandle<()> {
+        let engine = Arc::clone(self);
+        let setup = self.vision.lock().unwrap().take();
+        std::thread::Builder::new()
+            .name("mach-engine".into())
+            .spawn(move || {
+                let mut vision = match setup {
+                    Some((hip, setup)) => match VisionRuntime::new(&hip, setup) {
+                        Ok(runtime) => {
+                            model.set_mrope_section(runtime.cfg.mrope_section);
+                            Some(runtime)
                         }
-                        // Admission failure (e.g. paged page-pool exhaustion):
-                        // reject the request instead of panicking the engine
-                        // thread while holding the pending/txs locks. The
-                        // oneshot delivers an empty completion; the caller
-                        // sees an empty generation rather than a hang.
                         Err(e) => {
-                            eprintln!("engine: rejecting request: {e}");
-                            let _ = r.done.send((Vec::new(), Vec::new(), Vec::new(), "error"));
-                            drop(r.tokens_tx);
+                            eprintln!("engine: vision runtime disabled: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                engine.run(&mut model, vision.as_mut());
+            })
+            .expect("spawn engine thread")
+    }
+
+    fn run(self: &Arc<Self>, model: &mut ContinuousModel, mut vision: Option<&mut VisionRuntime>) {
+        loop {
+            // Admit pending requests while capacity allows (continuous
+            // batching). Each request is popped under the lock, then vision
+            // encoding / admission runs without holding it: a multi-second
+            // vision forward must not block HTTP submissions.
+            loop {
+                let r = {
+                    let mut pending = self.pending.lock().unwrap();
+                    if pending.is_empty() || model.active() >= self.capacity {
+                        None
+                    } else {
+                        pending.pop_front()
+                    }
+                };
+                let Some(r) = r else {
+                    break;
+                };
+                let admitted: Result<SeqId, EngineError> = if r.images.is_empty() {
+                    model
+                        .add(
+                            &r.prompt,
+                            r.max_new,
+                            r.eos,
+                            r.stop_seqs,
+                            r.logit_bias,
+                            r.params,
+                        )
+                        .map_err(EngineError::from)
+                } else {
+                    match vision.as_mut() {
+                        Some(vision) => match vision.encode(model.config(), &r.prompt, &r.images) {
+                            Ok(multimodal) => model
+                                .add_multimodal(
+                                    &r.prompt,
+                                    multimodal,
+                                    r.max_new,
+                                    r.eos,
+                                    r.stop_seqs,
+                                    r.logit_bias,
+                                    r.params,
+                                )
+                                .map_err(EngineError::from),
+                            Err(e) => Err(e),
+                        },
+                        None => Err(EngineError::InvalidRequest(
+                            "vision runtime is not enabled".into(),
+                        )),
+                    }
+                };
+                match admitted {
+                    Ok(id) => {
+                        self.txs.lock().unwrap().insert(id, r.done);
+                        if let Some(stx) = r.tokens_tx {
+                            self.streams.lock().unwrap().insert(id, stx);
                         }
                     }
+                    // Admission failure (e.g. paged page-pool exhaustion):
+                    // reject the request instead of panicking the engine
+                    // thread. The oneshot delivers an empty completion; the
+                    // caller sees an empty generation rather than a hang.
+                    Err(e) => {
+                        eprintln!("engine: rejecting request: {e}");
+                        let _ = r.done.send((Vec::new(), Vec::new(), Vec::new(), "error"));
+                        drop(r.tokens_tx);
+                    }
                 }
-                drop(streams);
             }
             if model.active() > 0 {
                 let outputs = model.step().expect("engine step");

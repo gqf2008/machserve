@@ -1828,3 +1828,18 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   拒绝、非 http scheme、data URL；另有私网/特殊 IP 拒绝与 DNS 解析校验单测。
 - body limit 与 handler 接线随 C3f（二·2）一起做：vision 开关打开前不改默认
   2MiB，避免功能未启用时放大请求体预算。
+
+## Qwen3.8-27B Stage C3f（二·2）：VisionGpu 执行与多模态请求接线（#146，2026-09-11）
+
+- `ServerEngine` 新增 `set_vision(VisionSetup{cfg,weights,max_tokens})` 与
+  `set_image_runtime(ImageRuntimeConfig{processor,image_token_id,merge})`；引擎线程内建
+  `VisionGpu`（默认关闭，`MACH_VISION=1` 才启用），启动时设置 M-RoPE section。
+- admission：图片请求在**释放 pending 锁之后**跑 vision tower（拼接 pixel_values →
+  `VisionGpu::prepare/forward` → 按图切分 merged features → `MultimodalPrompt::build`）
+  再 `ContinuousModel::add_multimodal`；text-only 仍走原 `add` 路径。
+- `MACH_VISION=1` 时 main 从 config.json 解析 `VisionConfig`、加载 `model.visual.*` 权重、
+  读 `preprocessor_config.json`；`MACH_SPEC` / paged KV 与 vision 不兼容时启动告警并禁用。
+- routes：图片 part → `fetch_image_url`（data/http(s)）→ `expand_image_pads` →
+  `submit_multimodal`；vision 未启用仍 501。vision 启用时 chat body limit 96MiB，
+  否则保持 axum 默认 2MiB。
+- 本批仅编译 + CPU 门禁验证；真机视觉前向与图片问答 E2E 属 C4。

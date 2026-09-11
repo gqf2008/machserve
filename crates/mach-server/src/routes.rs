@@ -657,17 +657,38 @@ pub async fn chat_completions(
     Json(req): Json<ChatRequest>,
 ) -> Response {
     let (text, image_urls) = chat_text(state.chat_format, &req.messages);
-    if !image_urls.is_empty() {
-        return err_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "multimodal image requests are not yet wired to the continuous engine",
-            "invalid_request_error",
-            "multimodal_not_implemented",
-        );
-    }
     let tokens = match &state.tok {
         Some(t) => t.encode(&text),
         None => naive_encode(&text),
+    };
+    let (tokens, images) = if image_urls.is_empty() {
+        (tokens, Vec::new())
+    } else {
+        let Some(image_cfg) = state.engine.image_runtime() else {
+            return err_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "multimodal image requests require MACH_VISION=1",
+                "invalid_request_error",
+                "multimodal_not_implemented",
+            );
+        };
+        let mut images = Vec::with_capacity(image_urls.len());
+        for url in &image_urls {
+            match crate::multimodal::fetch_image_url(url, &image_cfg.processor).await {
+                Ok(image) => images.push(image),
+                Err(e) => return bad_request(&format!("image: {e}")),
+            }
+        }
+        let grids: Vec<mach_model::vision::VisionGrid> = images.iter().map(|i| i.grid).collect();
+        match crate::multimodal::expand_image_pads(
+            &tokens,
+            image_cfg.image_token_id,
+            &grids,
+            image_cfg.spatial_merge_size,
+        ) {
+            Ok(tokens) => (tokens, images),
+            Err(e) => return bad_request(&format!("image: {e}")),
+        }
     };
     // Stop at the chat end token when the real tokenizer is configured.
     let eos = state
@@ -701,7 +722,7 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         let (rx_final, rx_tokens) = match state
             .engine
-            .submit_stream(tokens, req.max_tokens, eos, stop, bias, params)
+            .submit_stream_multimodal(tokens, images, req.max_tokens, eos, stop, bias, params)
             .await
         {
             Ok(x) => x,
@@ -745,8 +766,9 @@ pub async fn chat_completions(
         );
         let (output, lps, tlps, reason) = match state
             .engine
-            .submit(
+            .submit_multimodal(
                 tokens.clone(),
+                images.clone(),
                 req.max_tokens,
                 eos,
                 stop.clone(),
@@ -811,12 +833,24 @@ pub async fn healthz() -> &'static str {
 }
 
 /// Builds the axum router.
+/// Largest accepted chat body when multimodal serving is enabled: one
+/// 64MiB base64 image plus JSON overhead. Text-only keeps the axum default.
+pub const MAX_CHAT_BODY_BYTES: usize = 96 << 20;
+
 pub fn router(state: AppState) -> axum::Router {
     use axum::routing::{get, post};
+    let limit = if state.engine.image_runtime().is_some() {
+        MAX_CHAT_BODY_BYTES
+    } else {
+        2 << 20
+    };
+    let chat = axum::Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .layer(axum::extract::DefaultBodyLimit::max(limit));
     axum::Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/completions", post(completions))
-        .route("/v1/chat/completions", post(chat_completions))
+        .merge(chat)
         .with_state(state)
 }
 

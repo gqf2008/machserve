@@ -642,6 +642,12 @@ impl ContinuousModel {
         self.mrope_section = Some(section);
     }
 
+    /// Model configuration (d_model, rotary dim, rope theta, ...).
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        self.model.config()
+    }
+
     /// Adds a text-only sequence; returns its stable id.
     #[allow(clippy::too_many_arguments)]
     pub fn add(
