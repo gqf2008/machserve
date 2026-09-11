@@ -13,6 +13,11 @@ Stage C 的离线链路已经合入；本文档描述真机 GPU 窗口打开后�
 ## 安全注意
 
 - 一次只加载一个服务；启动前确认没有其它推理进程占用 GPU；
+- VRAM 采样优先用 `rocm-smi`；Windows ROCm 常不含该命令（本机就没有），此时
+  自动回退到 `mach-server doctor`（走 `hip::mem_info()`，并保留 `MACH_HIP_PATH`
+  以便定位自定义 ROCm 安装）。summary 的 `vram_before`/`vram_after` 是
+  `{source,value,error}`：采样失败只记进 `error`，不会冒充采样值，且
+  `vram_ok=false` 会让 E2E 退出码非 0；
 - 27B 必须走 Q4（`MACH_Q4=1`），`MACH_CAPACITY=1`、`MACH_PREFILL_ROWS` 按显存收紧；
 - 观察 `server.log` 的 VRAM 预检与运行日志；任何 OOM/驱动错误立即停服并记录；
 - E2E 脚本会在 finally 中停服；若异常退出，手动确认 `mach-server` 进程已结束再重跑。
@@ -62,7 +67,22 @@ python tools/vision_c4_golden.py --smoke   # 可选：tiny CPU 前向自检 hidd
 python tools/vision_c4_e2e.py --selftest  # 可选：SSE error/TTFT 解析自检
 ```
 
-3) mach-server E2E（同一张图、stream TTFT、SHA-256、VRAM 采样；dump MachServe merged features）：
+3) 开真机前先做一次预检（不启动服务、不加载模型；会做一次轻量 `doctor` 设备
+   查询以确认 VRAM 采样可用）：
+
+```powershell
+python tools/vision_c4_e2e.py --dry-run `
+  --binary target/release/mach-server.exe --model-dir .models/qwen3.8-27b `
+  --image artifacts/vision-c4/input.png
+```
+
+预检会检查二进制是可执行文件、模型目录有 `config.json` /
+`preprocessor_config.json` / `tokenizer.json` 与 safetensors 分片、图片存在、
+`--max-patches > 0`、输出目录可写、端口可绑定，并实际探测 VRAM 采样
+（`rocm-smi` 缺失时回退 `mach-server doctor`）。`problems` 非空或 VRAM 采样不可用
+时退出码为 1，先修再开真机。
+
+4) mach-server E2E（同一张图、stream TTFT、SHA-256、VRAM 采样；dump MachServe merged features）：
 
 ```powershell
 python tools/vision_c4_e2e.py --binary target/release/mach-server.exe `
@@ -71,7 +91,7 @@ python tools/vision_c4_e2e.py --binary target/release/mach-server.exe `
   --extra-env MACH_VISION_DUMP=artifacts/vision-c4/ms_features
 ```
 
-4) 数值对拍（HF `hf_golden_features.npy` vs MachServe `ms_features.bin/json`；compare 同时校验 grid 与输入 SHA-256 绑定）：
+5) 数值对拍（HF `hf_golden_features.npy` vs MachServe `ms_features.bin/json`；compare 同时校验 grid 与输入 SHA-256 绑定）：
 
 ```powershell
 python tools/vision_c4_compare.py `
@@ -80,7 +100,7 @@ python tools/vision_c4_compare.py `
   --e2e-summary artifacts/vision-c4/summary.json --require-hash --atol 1e-3 --rtol 1e-3
 ```
 
-5) 负例（重启服务后）：
+6) 负例（重启服务后）：
 
 - 不设 `MACH_VISION` 时图片请求应返回 501 `multimodal_not_implemented`；
 - 超 `MACH_VISION_MAX_TOKENS` 的图片应返回 400，不得空完成；
@@ -90,7 +110,7 @@ python tools/vision_c4_compare.py `
 
 - 服务启动日志出现 vision 配置与权重加载；`/healthz` 200；
 - E2E 每次只发一个 vision 请求；`MACH_VISION_DUMP` 会被覆盖，summary 校验 dump 非空且 mtime 新于请求开始，SSE `data: {"error": ...}` 会让脚本返回非 0；
-- 图片问答请求 200，回答能描述图片内容；`summary.json` 含 `ttft_seconds`、VRAM 采样、输入 SHA-256；
+- 图片问答请求 200，回答能描述图片内容；`summary.json` 含 `ttft_seconds`、VRAM 采样（`vram_ok=true`）、输入 SHA-256；
 - `vision_c4_compare.py` 的 `max_abs_diff`/`max_rel_diff` 在约定容差内、`nonfinite == 0`（HF 侧必须是 transformer 视觉塔真实输出；PIL 回退只用于 processor 参考）；
 - temperature=0 多次运行输出一致；HF 整模型 greedy token/logits 参考由操作员按现有 HF 环境补充并记录；
 - 文本-only 回归、501/400 负例通过；VRAM/TTFT/耗时写入 `artifacts/vision-c4/summary.json` 并回填 Issue #146。
