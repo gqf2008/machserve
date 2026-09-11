@@ -14,7 +14,7 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 | decode 吞吐(B=64,短 ctx) | 12887 tok/s(4.97 ms/step) |
 | **长 context decode(2048)** | **13.40 ms/step(4778 tok/s/seq,GQA 复用 2.6x)** |
 | **Qwen3-30B-A3B 单流(真机,2026-09-02)** | **88 tok/s(Q4-on-device,11.33ms/step;24GB 消费级 GPU;#95 后累计 13.3→11.33)** |
-| **Qwen3.8-27B Q4-all prefill(4020-token prompt,真机,2026-09-11)** | **55.2s ≈73 tok/s(Q4 行复用 kernel 后 1.78x;此前 98.2s ≈41 tok/s)** |
+| **Qwen3.8-27B Q4-all prefill(4020-token prompt,真机,2026-09-11)** | **51.3s ≈77 tok/s(Q4 行复用 + LM head 同分派后 1.92x;此前 98.2s ≈41 tok/s)** |
 | **长 prompt TTFT** | 512-token 57ms / 2048-token 289ms(分块 prefill;`MACH_PREFILL_ROWS=512` 默认,长 prompt -25~40%) |
 | 上下文能力 | 8192 tokens(fp16 KV) |
 | **数值正确性** | GPU vs 真 transformers 模型最终 logits 差 **4e-5**,chat 回答正确 |

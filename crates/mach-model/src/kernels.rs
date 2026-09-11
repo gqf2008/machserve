@@ -8616,6 +8616,39 @@ mod gpu_tests {
         }
     }
 
+    /// The rowbatch wrapper must reject shapes the kernel cannot serve
+    /// instead of launching it and leaving `out` untouched. The guard runs
+    /// before any pointer is dereferenced, so null buffers are safe here.
+    #[test]
+    fn gemv_q4_rowbatch_rejects_illegal_shapes() {
+        let Ok(h) = hip::hip() else {
+            eprintln!("skipping: ROCm runtime not available");
+            return;
+        };
+        if hip::device_count().map(|n| n <= 0).unwrap_or(true) {
+            eprintln!("skipping: no HIP device");
+            return;
+        }
+        let k = HipKernels::new(h.clone()).expect("HipKernels");
+        // (n, d, batch) — each violates exactly one precondition.
+        for (n, d, batch) in [(4i32, 8i32, 0i32), (4, 12, 8), (0, 16, 8), (4, 0, 8)] {
+            let err = k
+                .launch_gemv_q4_rowbatch(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    n,
+                    d,
+                    batch,
+                )
+                .expect_err("illegal shape must be rejected");
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "n={n} d={d} batch={batch}: {err}"
+            );
+        }
+    }
     /// `embed_gather_q4` vs the CPU dequantized row gather (batch of token
     /// ids, duplicate ids included to pin the read-only row reuse).
     #[test]
