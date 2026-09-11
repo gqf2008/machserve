@@ -34,6 +34,7 @@ python tools/vision_c4_golden.py --model-dir .models/qwen3.8-27b `
   --image artifacts/vision-c4/input.png --out artifacts/vision-c4/hf_golden.json `
   --tower --allow-pil-fallback
 python tools/vision_c4_golden.py --smoke   # 可选：tiny CPU 前向自检 hidden_states/pooler_output
+python tools/vision_c4_e2e.py --selftest  # 可选：SSE error/TTFT 解析自检
 ```
 
 3) mach-server E2E（同一张图、stream TTFT、SHA-256、VRAM 采样；dump MachServe merged features）：
@@ -45,12 +46,13 @@ python tools/vision_c4_e2e.py --binary target/release/mach-server.exe `
   --extra-env MACH_VISION_DUMP=artifacts/vision-c4/ms_features
 ```
 
-4) 数值对拍（HF `hf_golden_features.npy` vs MachServe `ms_features.bin/json`）：
+4) 数值对拍（HF `hf_golden_features.npy` vs MachServe `ms_features.bin/json`；compare 同时校验 grid 与输入 SHA-256 绑定）：
 
 ```powershell
 python tools/vision_c4_compare.py `
   --hf-npy artifacts/vision-c4/hf_golden_features.npy `
-  --ms-prefix artifacts/vision-c4/ms_features --atol 1e-3 --rtol 1e-3
+  --ms-prefix artifacts/vision-c4/ms_features --hf-json artifacts/vision-c4/hf_golden.json `
+  --atol 1e-3 --rtol 1e-3
 ```
 
 5) 负例（重启服务后）：
@@ -62,6 +64,7 @@ python tools/vision_c4_compare.py `
 ## 验收
 
 - 服务启动日志出现 vision 配置与权重加载；`/healthz` 200；
+- E2E 每次只发一个 vision 请求；`MACH_VISION_DUMP` 会被覆盖，summary 校验 dump 非空且 mtime 新于请求开始，SSE `data: {"error": ...}` 会让脚本返回非 0；
 - 图片问答请求 200，回答能描述图片内容；`summary.json` 含 `ttft_seconds`、VRAM 采样、输入 SHA-256；
 - `vision_c4_compare.py` 的 `max_abs_diff`/`max_rel_diff` 在约定容差内、`nonfinite == 0`（HF 侧必须是 transformer 视觉塔真实输出；PIL 回退只用于 processor 参考）；
 - temperature=0 多次运行输出一致；HF 整模型 greedy token/logits 参考由操作员按现有 HF 环境补充并记录；

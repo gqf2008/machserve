@@ -70,6 +70,75 @@ def wait_health(base, timeout):
     return False
 
 
+def parse_sse_data(lines, started):
+    """Return (ttft_seconds, stream_error) parsed from decoded SSE lines."""
+    ttft = None
+    error = None
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception as exc:
+            error = error or ("invalid SSE JSON: " + str(exc))
+            continue
+        if isinstance(data, dict) and data.get("error"):
+            message = data["error"]
+            if isinstance(message, dict):
+                message = message.get("message", message)
+            error = error or str(message)
+            continue
+        if ttft is None and isinstance(data, dict):
+            choices = data.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    ttft = time.time() - started
+    return ttft, error
+
+
+def dump_status(prefix, before):
+    """Validate MACH_VISION_DUMP files exist, are fresh and non-empty."""
+    status = {}
+    for suffix in (".bin", ".json"):
+        path = prefix + suffix
+        if not os.path.exists(path):
+            status[suffix] = {"error": "missing"}
+            continue
+        size = os.path.getsize(path)
+        mtime = os.path.getmtime(path)
+        entry = {"size": size, "mtime": mtime}
+        if size == 0:
+            entry["error"] = "empty"
+        if before.get(suffix) is not None and mtime <= before[suffix]:
+            entry["error"] = "stale"
+        status[suffix] = entry
+    return status
+
+
+def selftest():
+    content = [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n",
+        "data: [DONE]\n",
+    ]
+    ttft, error = parse_sse_data(content, time.time())
+    assert ttft is not None and error is None, (ttft, error)
+    failure = [
+        "data: {\"error\":{\"message\":\"boom\"}}\n",
+        "data: [DONE]\n",
+    ]
+    ttft, error = parse_sse_data(failure, time.time())
+    assert ttft is None and error == "boom", (ttft, error)
+    empty = ["data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n"]
+    ttft, error = parse_sse_data(empty, time.time())
+    assert ttft is None and error is None, (ttft, error)
+    print("vision_c4_e2e selftest ok")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/release/mach-server.exe")
@@ -82,8 +151,13 @@ def main():
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--extra-env", action="append", default=[])
     parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.selftest:
+        selftest()
+        return 0
+
 
     if args.image:
         with open(args.image, "rb") as handle:
@@ -153,7 +227,15 @@ def main():
                 data=json.dumps(request).encode(),
                 headers={"content-type": "application/json"},
             )
+            dump_prefix = env.get("MACH_VISION_DUMP")
+            dump_before = {}
+            if dump_prefix:
+                for suffix in (".bin", ".json"):
+                    path = dump_prefix + suffix
+                    if os.path.exists(path):
+                        dump_before[suffix] = os.path.getmtime(path)
             first_data = None
+            stream_error = None
             try:
                 with urllib.request.urlopen(req, timeout=args.timeout) as resp:
                     status = resp.status
@@ -162,25 +244,34 @@ def main():
                     else:
                         parts = []
                         for raw_line in resp:
-                            line = raw_line.decode("utf-8", "replace")
-                            if first_data is None and line.startswith("data:"):
-                                first_data = time.time() - request_started
-                            parts.append(line)
+                            parts.append(raw_line.decode("utf-8", "replace"))
                         body = "".join(parts)
+                        first_data, stream_error = parse_sse_data(parts, request_started)
             except urllib.error.HTTPError as exc:
                 status = exc.code
                 body = exc.read().decode("utf-8", "replace")
             elapsed = time.time() - request_started
+            dump_files = dump_status(dump_prefix, dump_before) if dump_prefix else None
+            dump_error = None
+            if dump_files:
+                for entry in dump_files.values():
+                    if entry.get("error"):
+                        dump_error = entry["error"]
+                        break
             summary = {
                 "status": status,
                 "elapsed_seconds": elapsed,
                 "ttft_seconds": first_data,
                 "load_plus_wait_seconds": request_started - started,
                 "stream": not args.no_stream,
+                "stream_error": stream_error,
                 "image_bytes": len(data),
                 "image_sha256": image_sha256,
                 "vram_before": vram_before,
                 "vram_after": sample_vram(),
+                "dump_prefix": dump_prefix,
+                "dump_files": dump_files,
+                "dump_error": dump_error,
                 "response": body,
             }
             with open(os.path.join(args.out_dir, "response.json"), "w", encoding="utf-8") as out:
@@ -188,7 +279,7 @@ def main():
             with open(os.path.join(args.out_dir, "summary.json"), "w", encoding="utf-8") as out:
                 json.dump(summary, out, indent=2)
             print(json.dumps(summary, indent=2))
-            return 0 if status == 200 else 1
+            return 0 if status == 200 and stream_error is None and dump_error is None else 1
         finally:
             proc.terminate()
             try:

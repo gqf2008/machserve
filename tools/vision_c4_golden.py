@@ -13,6 +13,7 @@ Example:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -153,6 +154,7 @@ def main():
     if not args.model_dir or not args.image or not args.out:
         parser.error("--model-dir/--image/--out are required unless --smoke")
 
+    image_sha256 = hashlib.sha256(open(args.image, "rb").read()).hexdigest()
     img = np.asarray(Image.open(args.image).convert("RGB"), dtype=np.uint8)
     proc, kind = load_processor(args.model_dir, args.allow_pil_fallback)
     hidden_states, grid = process(proc, img)
@@ -164,6 +166,7 @@ def main():
             "width": int(img.shape[1]),
         },
         "processor": kind,
+        "image_sha256": image_sha256,
         "grid": grid,
         "hidden_states_shape": list(np.asarray(hidden_states).shape),
         "hidden_states_sum": float(flat.sum()),
