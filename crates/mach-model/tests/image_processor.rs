@@ -286,7 +286,11 @@ fn rejects_unsupported_preprocessor_flags() {
     for bad in [
         r#"{"do_normalize": false}"#,
         r#"{"do_rescale": false}"#,
+        r#"{"do_resize": false}"#,
+        r#"{"do_convert_rgb": false}"#,
         r#"{"rescale_factor": 0.5}"#,
+        r#"{"resample": 2}"#,
+        r#"{"resample": "bilinear"}"#,
         r#"{"merge_size": 0}"#,
         r#"{"image_std": [0.5, 0.0, 0.5]}"#,
     ] {

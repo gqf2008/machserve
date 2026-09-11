@@ -91,6 +91,16 @@ impl ImageProcessorConfig {
                 )));
             }
         }
+        if let Some(x) = v.get("resample") {
+            let bicubic = x.as_i64() == Some(3)
+                || x.as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("bicubic"));
+            if !bicubic {
+                return Err(Error::InvalidArgument(format!(
+                    "image processor resample {x} is not supported (only BICUBIC)"
+                )));
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }
