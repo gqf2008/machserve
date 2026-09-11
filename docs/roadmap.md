@@ -1733,3 +1733,15 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   与 CPU/HF golden 最大误差 1.04e-7。
 - 当前边界：attention score scratch 上限 8192 token/frame（更大需后续
   flash/tiled 版本）；视觉权重先按 f32 驻留，Q4/f16 化留后续。
+
+## Qwen3.8-27B Stage C3a：文本 M-RoPE 位置生成（#146，2026-09-11）
+
+落地 `mach_model::mrope`，不接 GPU/HTTP：
+
+- `qwen3_5_mrope_positions` 逐字复刻 HF `Qwen3_5Model.get_rope_index`：
+  text 标量递进、image/video `(t,h,w)` 展开成 3 轴位置、video 按帧消费、
+  `delta=max_pos+1-len`。
+- `MropePositions::cos_sin` 实现 interleaved M-RoPE：T 轴基准，
+  H/W 按 `mrope_section` 每隔 3 位覆盖，生成 token-major cos/sin 表。
+- 对拍：文本、单图 `[1,4,4]`、双帧视频 `[2,4,4]` 三组位置与 HF
+  `get_rope_index` 逐元素一致；cos/sin 表对真实 64 维 partial-rotary 配置做了 HF golden 对拍（含 interleave 与后半复制）。
