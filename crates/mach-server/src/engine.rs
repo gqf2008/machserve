@@ -174,10 +174,10 @@ impl VisionRuntime {
 
 /// Completion delivery: generated tokens, per-token log-probs, per-token
 /// top-`k` log-probs (OpenAI `top_logprobs`), and the OpenAI finish reason.
-type DonePayload = (Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str);
+pub(crate) type DonePayload = (Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str);
 /// Completion delivery: `Err` carries the engine error for the caller.
 type DoneSender = oneshot::Sender<Result<DonePayload, EngineError>>;
-type DoneReceiver = oneshot::Receiver<Result<DonePayload, EngineError>>;
+pub(crate) type DoneReceiver = oneshot::Receiver<Result<DonePayload, EngineError>>;
 
 /// Shared engine handle (channel side only; the model stays on the engine
 /// thread).
@@ -397,6 +397,12 @@ impl ServerEngine {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
+            // Re-check under the queue lock: a fatal engine failure may have
+            // set shutdown (and drained the queue) after the early check, and
+            // enqueueing now would leave the caller waiting forever.
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(EngineError::ShuttingDown);
+            }
             if pending.len() >= self.capacity * 2 {
                 return Err(EngineError::Busy);
             }
@@ -460,6 +466,9 @@ impl ServerEngine {
         let (tokens_tx, tokens_rx) = tokio::sync::mpsc::channel(256);
         {
             let mut pending = self.pending.lock().unwrap();
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(EngineError::ShuttingDown);
+            }
             if pending.len() >= self.capacity * 2 {
                 return Err(EngineError::Busy);
             }
@@ -799,36 +808,39 @@ impl ServerEngine {
                 }
             }
             if model.active() > 0 {
-                let outputs = model.step().expect("engine step");
+                let outputs = match model.step() {
+                    Ok(outputs) => outputs,
+                    Err(e) => {
+                        let msg = format!("engine step failed: {e}");
+                        eprintln!("{msg}; stopping engine");
+                        self.fail_all(&msg);
+                        self.shutdown.store(true, Ordering::Release);
+                        break;
+                    }
+                };
                 if self.paged_tpp.is_some() {
                     *self.paged_stats.lock().unwrap() = model.paged_reuse_stats();
                 }
                 // Deliver completed sequences.
                 let mut txs = self.txs.lock().unwrap();
                 let mut streams = self.streams.lock().unwrap();
-                for (id, tok) in outputs {
-                    if model.is_done(id) {
-                        // Stream the final generated token before closing.
-                        if let Some(stx) = streams.get(&id) {
-                            let _ = stx.try_send(tok);
-                        }
-                        let output = model.generated(id);
-                        let lps = model.generated_logprobs(id);
-                        let tlps = model.generated_top_logprobs(id);
-                        let reason = model.finish_reason(id);
-                        model.ack(id);
-                        if let Some(tx) = txs.remove(&id) {
-                            let _ = tx.send(Ok((output, lps, tlps, reason)));
-                        }
-                        // Closing the stream sender signals end-of-stream.
-                        streams.remove(&id);
-                    } else if let Some(stx) = streams.get(&id) {
-                        // `step()` only returns real tokens (first generated /
-                        // decode), so every non-done output is streamed.
-                        // Best-effort: drop tokens for a slow/closed client
-                        // rather than stalling the whole engine loop.
-                        let _ = stx.try_send(tok);
+                let (complete, cancel) =
+                    deliver_step_tokens(outputs, &mut streams, &mut txs, |id| model.is_done(id));
+                for id in cancel {
+                    model.cancel(id);
+                    model.ack(id);
+                }
+                for id in complete {
+                    let output = model.generated(id);
+                    let lps = model.generated_logprobs(id);
+                    let tlps = model.generated_top_logprobs(id);
+                    let reason = model.finish_reason(id);
+                    model.ack(id);
+                    if let Some(tx) = txs.remove(&id) {
+                        let _ = tx.send(Ok((output, lps, tlps, reason)));
                     }
+                    // Closing the stream sender signals end-of-stream.
+                    streams.remove(&id);
                 }
             } else {
                 // Idle: wait for new work, or exit once shutting down.
@@ -843,6 +855,32 @@ impl ServerEngine {
                 }
             }
         }
+    }
+
+    /// Fails every pending and in-flight request after a fatal engine error.
+    /// The engine stops afterwards, so callers get a structured error instead
+    /// of waiting for a completion that can never arrive.
+    fn fail_all(&self, message: &str) {
+        // Stop new submissions *before* draining: a submit that already passed
+        // its early check re-checks shutdown under the pending lock.
+        self.shutdown.store(true, Ordering::Release);
+        let mut pending = self.pending.lock().unwrap();
+        while let Some(r) = pending.pop_front() {
+            let _ = r.done.send(Err(EngineError::Model(mach_model::Error::Model(
+                message.to_string(),
+            ))));
+            drop(r.tokens_tx);
+        }
+        drop(pending);
+        let mut txs = self.txs.lock().unwrap();
+        for (_, tx) in txs.drain() {
+            let _ = tx.send(Err(EngineError::Model(mach_model::Error::Model(
+                message.to_string(),
+            ))));
+        }
+        drop(txs);
+        self.streams.lock().unwrap().clear();
+        self.cond.notify_all();
     }
 
     /// Speculative-decoding engine loop (greedy-only; draft + target models).
@@ -866,25 +904,40 @@ impl ServerEngine {
                 drop(streams);
             }
             if engine.active() > 0 {
-                let outputs = engine.step().expect("spec step");
+                let outputs = match engine.step() {
+                    Ok(outputs) => outputs,
+                    Err(e) => {
+                        let msg = format!("spec step failed: {e}");
+                        eprintln!("{msg}; stopping engine");
+                        self.fail_all(&msg);
+                        self.shutdown.store(true, Ordering::Release);
+                        break;
+                    }
+                };
                 let mut txs = self.txs.lock().unwrap();
                 let mut streams = self.streams.lock().unwrap();
-                for (id, tok) in outputs {
-                    let id = id as SeqId;
-                    if engine.is_done(id as usize) {
-                        if let Some(stx) = streams.get(&id) {
-                            let _ = stx.try_send(tok);
-                        }
-                        let output = engine.generated(id as usize);
-                        let reason = engine.finish_reason(id as usize);
-                        if let Some(tx) = txs.remove(&id) {
-                            // Spec mode is greedy-only: no logprobs tracked.
-                            let _ = tx.send(Ok((output, Vec::new(), Vec::new(), reason)));
-                        }
-                        streams.remove(&id);
-                    } else if let Some(stx) = streams.get(&id) {
-                        let _ = stx.try_send(tok);
+                // A speculative round can emit several tokens for one
+                // sequence and mark it finished in the same call, so the
+                // completion must wait until the whole group is queued.
+                let outputs: Vec<(SeqId, u32)> = outputs
+                    .into_iter()
+                    .map(|(id, t)| (id as SeqId, t))
+                    .collect();
+                let (complete, cancel) =
+                    deliver_step_tokens(outputs, &mut streams, &mut txs, |id| {
+                        engine.is_done(id as usize)
+                    });
+                for id in cancel {
+                    engine.cancel(id as usize);
+                }
+                for id in complete {
+                    let output = engine.generated(id as usize);
+                    let reason = engine.finish_reason(id as usize);
+                    if let Some(tx) = txs.remove(&id) {
+                        // Spec mode is greedy-only: no logprobs tracked.
+                        let _ = tx.send(Ok((output, Vec::new(), Vec::new(), reason)));
                     }
+                    streams.remove(&id);
                 }
             } else {
                 let mut pending = self.pending.lock().unwrap();
@@ -899,6 +952,91 @@ impl ServerEngine {
             }
         }
     }
+}
+
+/// Outcome of handing one step's token to a streaming client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenDelivery {
+    /// The token was queued, or the request is not streamed.
+    Ok,
+    /// The consumer stalled: the token was dropped, the completion has been
+    /// failed with a structured error and both channels were removed.
+    Stalled,
+}
+
+/// Pushes `tok` to the streaming client of `id`, if the request streams.
+///
+/// A full channel means the consumer stopped draining. Silently dropping the
+/// token would truncate the response — and for the final token it would report
+/// a clean finish for an incomplete body — so the completion is failed here
+/// and the caller only has to cancel the underlying sequence.
+fn push_token(
+    streams: &mut HashMap<SeqId, tokio::sync::mpsc::Sender<u32>>,
+    txs: &mut HashMap<SeqId, DoneSender>,
+    id: SeqId,
+    tok: u32,
+) -> TokenDelivery {
+    let stalled = match streams.get(&id) {
+        Some(stx) => stx.try_send(tok).is_err(),
+        None => false,
+    };
+    if stalled {
+        if let Some(tx) = txs.remove(&id) {
+            let _ = tx.send(Err(EngineError::InvalidRequest(
+                "stream consumer stalled: token dropped".into(),
+            )));
+        }
+        streams.remove(&id);
+        return TokenDelivery::Stalled;
+    }
+    TokenDelivery::Ok
+}
+
+/// Outcome of delivering one step's outputs, grouped per sequence.
+type StepDelivery = (Vec<SeqId>, Vec<SeqId>);
+
+/// Delivers one step's outputs to the streaming clients, grouped per
+/// sequence.
+///
+/// A speculative round can emit several tokens for one sequence and mark it
+/// finished in the same call, so the completion must not be sent until every
+/// token of that round has been queued — otherwise the trailing tokens are
+/// silently dropped while the client is told the response finished cleanly.
+///
+/// Returns `(to_complete, to_cancel)`: ids whose completion payload the caller
+/// must send (still present in `txs`/`streams`) and ids whose stalled consumer
+/// was failed here and whose sequence the caller must cancel.
+fn deliver_step_tokens(
+    outputs: Vec<(SeqId, u32)>,
+    streams: &mut HashMap<SeqId, tokio::sync::mpsc::Sender<u32>>,
+    txs: &mut HashMap<SeqId, DoneSender>,
+    is_done: impl Fn(SeqId) -> bool,
+) -> StepDelivery {
+    let mut groups: Vec<(SeqId, Vec<u32>)> = Vec::new();
+    for (id, tok) in outputs {
+        match groups.last_mut() {
+            Some((gid, toks)) if *gid == id => toks.push(tok),
+            _ => groups.push((id, vec![tok])),
+        }
+    }
+    let mut to_complete = Vec::new();
+    let mut to_cancel = Vec::new();
+    for (id, toks) in groups {
+        let done = is_done(id);
+        let mut stalled = false;
+        for tok in toks {
+            if push_token(streams, txs, id, tok) == TokenDelivery::Stalled {
+                stalled = true;
+                break;
+            }
+        }
+        if stalled {
+            to_cancel.push(id);
+        } else if done {
+            to_complete.push(id);
+        }
+    }
+    (to_complete, to_cancel)
 }
 
 #[cfg(test)]
@@ -920,5 +1058,191 @@ mod tests {
         assert_eq!(got.image_token_id, 7);
         assert_eq!(got.spatial_merge_size, 2);
         assert_eq!(got.max_patches, 128);
+    }
+
+    /// A fatal engine error must fail every queued *and* in-flight request and
+    /// close its token stream, so no caller waits for a completion that can
+    /// never arrive.
+    #[tokio::test]
+    async fn fail_all_fails_pending_and_inflight() {
+        let engine = ServerEngine::new(1);
+
+        let (pending_done_tx, pending_done_rx) = tokio::sync::oneshot::channel();
+        let (pending_tok_tx, mut pending_tok_rx) = tokio::sync::mpsc::channel(1);
+        engine.pending.lock().unwrap().push_back(Request {
+            prompt: vec![1],
+            max_new: 1,
+            eos: None,
+            stop_seqs: Vec::new(),
+            logit_bias: Vec::new(),
+            params: mach_model::sampling::SamplingParams::default(),
+            images: Vec::new(),
+            done: pending_done_tx,
+            tokens_tx: Some(pending_tok_tx),
+        });
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(1);
+        engine.txs.lock().unwrap().insert(7, done_tx);
+        engine.streams.lock().unwrap().insert(7, tok_tx);
+
+        engine.fail_all("boom");
+
+        let err = pending_done_rx
+            .await
+            .expect("pending completion signalled")
+            .expect_err("pending request must fail");
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(
+            pending_tok_rx.recv().await.is_none(),
+            "pending stream closed"
+        );
+
+        let err = done_rx
+            .await
+            .expect("in-flight completion signalled")
+            .expect_err("in-flight request must fail");
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(tok_rx.recv().await.is_none(), "in-flight stream closed");
+    }
+
+    /// A submit that passed the early shutdown check but lost the race with a
+    /// fatal engine failure must be rejected instead of enqueued into a queue
+    /// no engine thread will drain.
+    #[test]
+    fn submit_rechecks_shutdown_under_pending_lock() {
+        let engine = ServerEngine::new(1);
+        let guard = engine.pending.lock().unwrap();
+        let e2 = Arc::clone(&engine);
+        let submit = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(e2.submit(
+                vec![1],
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                mach_model::sampling::SamplingParams::default(),
+            ))
+        });
+        // Give the submit time to pass its early check and block on `pending`.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        engine.shutdown.store(true, Ordering::Release);
+        drop(guard);
+        let err = submit.join().unwrap().expect_err("must be rejected");
+        assert!(matches!(err, EngineError::ShuttingDown), "{err}");
+        assert!(engine.pending.lock().unwrap().is_empty());
+    }
+
+    /// A full token channel must fail the request instead of completing it.
+    /// This is what makes the *final* token — which is pushed through the
+    /// same path as every other token — unable to truncate a response while
+    /// still reporting a clean `finish_reason`.
+    #[test]
+    fn final_token_full_channel_fails_instead_of_completing() {
+        let id: SeqId = 5;
+        let (tok_tx, _tok_rx) = tokio::sync::mpsc::channel(1);
+        tok_tx.try_send(1).unwrap(); // channel is now full
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let mut streams = HashMap::new();
+        streams.insert(id, tok_tx);
+        let mut txs = HashMap::new();
+        txs.insert(id, done_tx);
+
+        let outcome = push_token(&mut streams, &mut txs, id, 2);
+
+        assert_eq!(outcome, TokenDelivery::Stalled);
+        assert!(streams.is_empty(), "stream sender removed");
+        assert!(txs.is_empty(), "completion sender removed");
+        let err = done_rx
+            .try_recv()
+            .expect("completion must be signalled")
+            .expect_err("a dropped token must fail the request");
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    /// With room in the channel (or when the request is not streamed) the
+    /// token is queued and the completion is left for the engine to send.
+    #[test]
+    fn push_token_leaves_completion_when_not_stalled() {
+        let id: SeqId = 6;
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(1);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let mut streams = HashMap::new();
+        streams.insert(id, tok_tx);
+        let mut txs = HashMap::new();
+        txs.insert(id, done_tx);
+
+        assert_eq!(push_token(&mut streams, &mut txs, id, 9), TokenDelivery::Ok);
+        assert_eq!(tok_rx.try_recv().unwrap(), 9);
+        assert!(txs.contains_key(&id), "completion still pending");
+        assert!(done_rx.try_recv().is_err(), "completion not signalled yet");
+
+        // A request that does not stream has no sender to stall.
+        let mut streams = HashMap::new();
+        assert_eq!(push_token(&mut streams, &mut txs, id, 9), TokenDelivery::Ok);
+    }
+
+    /// Regression for the speculative path: one round can emit several
+    /// tokens for a sequence *and* be the round that finishes it. All of the
+    /// tokens must be queued before the caller is told to complete, otherwise
+    /// the trailing ones vanish while the client sees a clean finish.
+    #[test]
+    fn spec_round_queues_every_token_before_completing() {
+        let id: SeqId = 7;
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(8);
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
+        let mut streams = HashMap::new();
+        streams.insert(id, tok_tx);
+        let mut txs = HashMap::new();
+        txs.insert(id, done_tx);
+
+        let (complete, cancel) = deliver_step_tokens(
+            vec![(id, 11), (id, 12), (id, 13)],
+            &mut streams,
+            &mut txs,
+            |_| true, // finished within this very round
+        );
+
+        assert_eq!(complete, vec![id], "completed once, after the group");
+        assert!(cancel.is_empty());
+        assert_eq!(tok_rx.try_recv().unwrap(), 11);
+        assert_eq!(tok_rx.try_recv().unwrap(), 12);
+        assert_eq!(tok_rx.try_recv().unwrap(), 13);
+        assert!(tok_rx.try_recv().is_err(), "no extra tokens");
+        assert!(
+            streams.contains_key(&id) && txs.contains_key(&id),
+            "the caller still owns the completion"
+        );
+    }
+
+    /// A stalled consumer on any token of the round fails the whole request
+    /// and asks the caller to cancel the sequence — the completion is never
+    /// sent.
+    #[test]
+    fn spec_round_stall_reports_cancel_and_fails_completion() {
+        let id: SeqId = 8;
+        let (tok_tx, _tok_rx) = tokio::sync::mpsc::channel(2);
+        tok_tx.try_send(0).unwrap();
+        tok_tx.try_send(0).unwrap(); // full
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let mut streams = HashMap::new();
+        streams.insert(id, tok_tx);
+        let mut txs = HashMap::new();
+        txs.insert(id, done_tx);
+
+        let (complete, cancel) =
+            deliver_step_tokens(vec![(id, 11), (id, 12)], &mut streams, &mut txs, |_| true);
+
+        assert!(complete.is_empty(), "a stalled round is never completed");
+        assert_eq!(cancel, vec![id]);
+        let err = done_rx
+            .try_recv()
+            .expect("completion must be signalled")
+            .expect_err("stalled consumer fails the request");
+        assert!(err.to_string().contains("stalled"), "{err}");
     }
 }

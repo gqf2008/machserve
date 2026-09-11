@@ -5,7 +5,7 @@
 //! (falls back to a naive byte-per-token mapping otherwise). Both endpoints
 //! support OpenAI-shaped `stream: true` -> SSE with per-token deltas.
 
-use crate::engine::{EngineError, ServerEngine};
+use crate::engine::{DoneReceiver, EngineError, ServerEngine};
 use crate::multimodal::{ChatContent, render_content};
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -495,41 +495,136 @@ fn emit_valid_prefix(acc: &mut Vec<u8>) -> String {
     }
 }
 
-/// Reads per-token ids, decodes incrementally and pushes SSE events.
+/// Frames buffered while the client is slower than the engine. The engine's
+/// own token channel is best-effort (`try_send`), so the consumer here must
+/// never stop draining; an exceeded backlog is reported as an explicit error
+/// instead of silently truncating the stream.
+const STREAM_FRAME_BACKLOG: usize = 4096;
+
+/// Upper bound for draining the tail of a finished stream. A client that keeps
+/// stalling is disconnected instead of hanging the streaming task.
+const STREAM_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reads per-token ids, decodes incrementally and pushes SSE events as they
+/// arrive, then a finish chunk once the engine reports completion.
+///
+/// The token stream must **not** be drained behind `done`: awaiting the
+/// completion signal first turns SSE into a single write at the end of the
+/// request, so clients cannot show tokens (and TTFT becomes the full
+/// generation time). Frames also must not block on the client: a stalled
+/// `tx.send` would stop draining `rx`, fill the engine channel and make it drop
+/// tokens.
 async fn stream_tokens(
     state: AppState,
     id: String,
     object: &'static str,
     created: u64,
-    reason: &'static str,
+    mut done: DoneReceiver,
     mut rx: tokio::sync::mpsc::Receiver<u32>,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
     let mut acc: Vec<u8> = Vec::new();
-    while let Some(tok) = rx.recv().await {
-        let bytes = match &state.tok {
-            Some(t) => t.decode_bytes(&[tok]),
-            None => vec![if tok < 256 { tok as u8 } else { b'?' }],
-        };
-        acc.extend_from_slice(&bytes);
-        let text = emit_valid_prefix(&mut acc);
-        if !text.is_empty() {
-            let ev = sse_chunk(&id, object, &state.model, created, &text, None);
-            if tx.send(Ok(Bytes::from(ev))).await.is_err() {
-                return; // client disconnected
+    let mut pending: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    let mut reason: Option<&'static str> = None;
+    let mut failure: Option<String> = None;
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut done, if reason.is_none() && failure.is_none() => {
+                match res {
+                    Ok(Ok((_, _, _, r))) => reason = Some(r),
+                    // A failed completion ends the stream: waiting for more
+                    // tokens would leave the task parked on `rx.recv()`.
+                    Ok(Err(e)) => {
+                        failure = Some(e.to_string());
+                        break;
+                    }
+                    Err(_) => {
+                        failure = Some("engine stopped before completion".into());
+                        break;
+                    }
+                }
+            }
+            maybe = rx.recv() => {
+                let Some(tok) = maybe else { break };
+                let bytes = match &state.tok {
+                    Some(t) => t.decode_bytes(&[tok]),
+                    None => vec![if tok < 256 { tok as u8 } else { b'?' }],
+                };
+                acc.extend_from_slice(&bytes);
+                let text = emit_valid_prefix(&mut acc);
+                if !text.is_empty() {
+                    if pending.len() >= STREAM_FRAME_BACKLOG {
+                        failure = Some("client too slow: stream backlog exhausted".into());
+                        break;
+                    }
+                    let ev = sse_chunk(&id, object, &state.model, created, &text, None);
+                    pending.push_back(Bytes::from(ev));
+                }
+            }
+            permit = tx.reserve(), if !pending.is_empty() => {
+                match permit {
+                    Ok(permit) => {
+                        if let Some(frame) = pending.pop_front() {
+                            permit.send(Ok(frame));
+                        }
+                    }
+                    Err(_) => return, // client disconnected
+                }
             }
         }
     }
-    let tail = String::from_utf8_lossy(&acc).into_owned();
-    if !tail.is_empty() {
-        let ev = sse_chunk(&id, object, &state.model, created, &tail, None);
-        let _ = tx.send(Ok(Bytes::from(ev))).await;
+    if let Some(message) = failure {
+        // A stalled client must not hang this task: bounded wait, and pending
+        // frames are dropped (the stream is being failed anyway).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_error(tx, &message),
+        )
+        .await;
+        return;
     }
-    let ev = sse_chunk(&id, object, &state.model, created, "", Some(reason));
-    let _ = tx.send(Ok(Bytes::from(ev))).await;
-    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+    if reason.is_none() {
+        // The token channel closed without the engine reporting completion:
+        // that is an error, not a normal stop.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream_error(tx, "token stream ended before completion"),
+        )
+        .await;
+        return;
+    }
+    // Everything left (buffered frames, the UTF-8 tail, the finish chunk and
+    // `[DONE]`) is sent under one deadline: a client that stops reading must
+    // not park this task forever.
+    let flush = async move {
+        while let Some(frame) = pending.pop_front() {
+            if tx.send(Ok(frame)).await.is_err() {
+                return;
+            }
+        }
+        let tail = String::from_utf8_lossy(&acc).into_owned();
+        if !tail.is_empty() {
+            let ev = sse_chunk(&id, object, &state.model, created, &tail, None);
+            if tx.send(Ok(Bytes::from(ev))).await.is_err() {
+                return;
+            }
+        }
+        let ev = sse_chunk(
+            &id,
+            object,
+            &state.model,
+            created,
+            "",
+            Some(reason.unwrap_or("stop")),
+        );
+        if tx.send(Ok(Bytes::from(ev))).await.is_err() {
+            return;
+        }
+        let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+    };
+    let _ = tokio::time::timeout(STREAM_FLUSH_TIMEOUT, flush).await;
 }
-
 fn sse_response(rx: tokio::sync::mpsc::Receiver<Result<Bytes, Infallible>>) -> Response {
     Response::builder()
         .header("content-type", "text/event-stream")
@@ -577,13 +672,7 @@ pub async fn completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            match rx_final.await {
-                Ok(Ok((_, _, _, reason))) => {
-                    stream_tokens(st, id2, "text_completion", created, reason, rx_tokens, tx).await;
-                }
-                Ok(Err(e)) => stream_error(tx, &e.to_string()).await,
-                Err(_) => stream_error(tx, "engine stopped before completion").await,
-            }
+            stream_tokens(st, id2, "text_completion", created, rx_final, rx_tokens, tx).await;
         });
         return sse_response(rx);
     }
@@ -771,22 +860,16 @@ pub async fn chat_completions(
         let id2 = id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
         tokio::spawn(async move {
-            match rx_final.await {
-                Ok(Ok((_, _, _, reason))) => {
-                    stream_tokens(
-                        st,
-                        id2,
-                        "chat.completion.chunk",
-                        created,
-                        reason,
-                        rx_tokens,
-                        tx,
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => stream_error(tx, &e.to_string()).await,
-                Err(_) => stream_error(tx, "engine stopped before completion").await,
-            }
+            stream_tokens(
+                st,
+                id2,
+                "chat.completion.chunk",
+                created,
+                rx_final,
+                rx_tokens,
+                tx,
+            )
+            .await;
         });
         return sse_response(rx);
     }
@@ -1115,5 +1198,248 @@ mod tests {
     fn chat_body_limit_selects_text_and_vision_budgets() {
         assert_eq!(chat_body_limit(false), 2 << 20);
         assert_eq!(chat_body_limit(true), MAX_CHAT_BODY_BYTES);
+    }
+
+    /// Regression: SSE used to await the engine's completion signal before
+    /// draining the token stream, so every frame arrived at the end of the
+    /// request (TTFT == full generation time). The first frame must reach the
+    /// client while the request is still running.
+    #[tokio::test]
+    async fn stream_tokens_emits_before_completion() {
+        use tokio::sync::{mpsc, oneshot};
+        let state = AppState {
+            engine: ServerEngine::new(1),
+            model: "test".into(),
+            tok: None,
+            chat_format: ChatFormat::Qwen,
+        };
+        let (tok_tx, tok_rx) = mpsc::channel(4);
+        let (done_tx, done_rx) = oneshot::channel();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let task = tokio::spawn(stream_tokens(
+            state,
+            "id".into(),
+            "text_completion",
+            0,
+            done_rx,
+            tok_rx,
+            out_tx,
+        ));
+
+        tok_tx.send(b'a' as u32).await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("first SSE frame must arrive before the engine reports completion")
+            .expect("frame present")
+            .unwrap();
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        assert!(text.contains("\"a\""), "{text}");
+
+        done_tx
+            .send(Ok((Vec::new(), Vec::new(), Vec::new(), "stop")))
+            .unwrap();
+        drop(tok_tx);
+        let mut rest = String::new();
+        while let Some(frame) = out_rx.recv().await {
+            rest.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(rest.contains("\"finish_reason\":\"stop\""), "{rest}");
+        assert!(rest.contains("[DONE]"), "{rest}");
+        task.await.unwrap();
+    }
+
+    fn stream_test_state() -> AppState {
+        AppState {
+            engine: ServerEngine::new(1),
+            model: "test".into(),
+            tok: None,
+            chat_format: ChatFormat::Qwen,
+        }
+    }
+
+    async fn collect_frames(
+        out_rx: &mut tokio::sync::mpsc::Receiver<Result<Bytes, Infallible>>,
+    ) -> String {
+        let mut all = String::new();
+        while let Some(frame) = out_rx.recv().await {
+            all.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        all
+    }
+
+    /// Tokens queued before the completion signal must all be delivered, and
+    /// the finish chunk keeps the engine's reason.
+    #[tokio::test]
+    async fn stream_tokens_drains_tokens_before_done() {
+        use tokio::sync::{mpsc, oneshot};
+        let (tok_tx, tok_rx) = mpsc::channel(4);
+        let (done_tx, done_rx) = oneshot::channel();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let task = tokio::spawn(stream_tokens(
+            stream_test_state(),
+            "id".into(),
+            "text_completion",
+            0,
+            done_rx,
+            tok_rx,
+            out_tx,
+        ));
+        for b in b"abc" {
+            tok_tx.send(*b as u32).await.unwrap();
+        }
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("\"a\""));
+        done_tx
+            .send(Ok((Vec::new(), Vec::new(), Vec::new(), "length")))
+            .unwrap();
+        drop(tok_tx);
+        let rest = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_frames(&mut out_rx),
+        )
+        .await
+        .unwrap();
+        assert!(rest.contains("\"b\"") && rest.contains("\"c\""), "{rest}");
+        assert!(rest.contains("\"finish_reason\":\"length\""), "{rest}");
+        assert!(rest.contains("[DONE]"), "{rest}");
+        task.await.unwrap();
+    }
+
+    /// An engine error must surface as an SSE error frame, not a finish chunk.
+    #[tokio::test]
+    async fn stream_tokens_reports_engine_error() {
+        use tokio::sync::{mpsc, oneshot};
+        let (_tok_tx, tok_rx) = mpsc::channel(4);
+        let (done_tx, done_rx) = oneshot::channel();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let task = tokio::spawn(stream_tokens(
+            stream_test_state(),
+            "id".into(),
+            "text_completion",
+            0,
+            done_rx,
+            tok_rx,
+            out_tx,
+        ));
+        done_tx
+            .send(Err(EngineError::Model(mach_model::Error::Model(
+                "boom".into(),
+            ))))
+            .unwrap();
+        let all = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_frames(&mut out_rx),
+        )
+        .await
+        .unwrap();
+        assert!(all.contains("boom"), "{all}");
+        assert!(all.contains("[DONE]"), "{all}");
+        assert!(!all.contains("finish_reason"), "{all}");
+        task.await.unwrap();
+    }
+
+    /// A closed token channel without completion is an error, not a `stop`.
+    #[tokio::test]
+    async fn stream_tokens_reports_close_without_done() {
+        use tokio::sync::mpsc;
+        let (tok_tx, tok_rx) = mpsc::channel(4);
+        let (_done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let task = tokio::spawn(stream_tokens(
+            stream_test_state(),
+            "id".into(),
+            "text_completion",
+            0,
+            done_rx,
+            tok_rx,
+            out_tx,
+        ));
+        drop(tok_tx);
+        let all = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_frames(&mut out_rx),
+        )
+        .await
+        .unwrap();
+        assert!(all.contains("ended before completion"), "{all}");
+        assert!(all.contains("[DONE]"), "{all}");
+        task.await.unwrap();
+    }
+
+    /// A slow client must not hang the streaming task, and an exhausted backlog
+    /// must surface as an explicit error instead of a silent truncation.
+    #[tokio::test]
+    async fn stream_tokens_stalled_client_terminates() {
+        use tokio::sync::{mpsc, oneshot};
+        let (tok_tx, tok_rx) = mpsc::channel(4);
+        let (_done_tx, done_rx) = oneshot::channel();
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let task = tokio::spawn(stream_tokens(
+            stream_test_state(),
+            "id".into(),
+            "text_completion",
+            0,
+            done_rx,
+            tok_rx,
+            out_tx,
+        ));
+        // Drain one frame every 50ms: slow enough that the local backlog
+        // overflows, fast enough to receive the explicit error frame.
+        let reader = tokio::spawn(async move {
+            let mut all = String::new();
+            while let Some(frame) = out_rx.recv().await {
+                all.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            all
+        });
+        for i in 0..(STREAM_FRAME_BACKLOG + 64) {
+            if tok_tx.send(b'a' as u32 + (i % 26) as u32).await.is_err() {
+                break;
+            }
+        }
+        let all = tokio::time::timeout(std::time::Duration::from_secs(60), reader)
+            .await
+            .expect("slow client must still receive a terminal frame")
+            .unwrap();
+        assert!(all.contains("client too slow"), "{all}");
+        assert!(all.contains("[DONE]"), "{all}");
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("streaming task must terminate for a slow client")
+            .unwrap();
+    }
+    /// A stalled client with a response *below* the backlog cap must terminate
+    /// too: the tail flush is bounded by `STREAM_FLUSH_TIMEOUT`.
+    #[tokio::test]
+    async fn stream_tokens_stalled_client_small_response_terminates() {
+        use tokio::sync::{mpsc, oneshot};
+        let (tok_tx, tok_rx) = mpsc::channel(8);
+        let (done_tx, done_rx) = oneshot::channel();
+        let (out_tx, _out_rx) = mpsc::channel(8); // never read
+        let task = tokio::spawn(stream_tokens(
+            stream_test_state(),
+            "id".into(),
+            "text_completion",
+            0,
+            done_rx,
+            tok_rx,
+            out_tx,
+        ));
+        for _ in 0..64 {
+            tok_tx.send(b'a' as u32).await.unwrap();
+        }
+        done_tx
+            .send(Ok((Vec::new(), Vec::new(), Vec::new(), "stop")))
+            .unwrap();
+        drop(tok_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("tail flush must be bounded for a stalled client")
+            .unwrap();
     }
 }
