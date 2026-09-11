@@ -690,11 +690,19 @@ impl ContinuousModel {
         mut params: SamplingParams,
         multimodal: Option<MultimodalPrompt>,
     ) -> Result<SeqId, Error> {
-        if multimodal.is_some() {
-            if self.mrope_section.is_none() {
-                return Err(Error::Model(
-                    "multimodal prompt requires set_mrope_section".into(),
-                ));
+        if let Some(multimodal) = &multimodal {
+            if self.mrope_section != Some(multimodal.mrope_section) {
+                return Err(Error::Model(format!(
+                    "multimodal M-RoPE section {:?} does not match engine section {:?}",
+                    multimodal.mrope_section, self.mrope_section
+                )));
+            }
+            if multimodal.prompt_len() != prompt.len() {
+                return Err(Error::Model(format!(
+                    "multimodal tables cover {} rows but prompt has {} tokens",
+                    multimodal.prompt_len(),
+                    prompt.len()
+                )));
             }
             if self.state_reuse.is_some() {
                 return Err(Error::Model(

@@ -1810,7 +1810,7 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   序列在 step 前 set_row_embeddings/set_mrope_tables、step 后无条件 clear；
   text-only 路径（`overrides.mrope=false`）零分配零行为变化；state-reuse/paged
   engine 拒绝 multimodal（图像 KV 不可复用）。
-- 测试：文本拒绝、单图/双图 pad 映射、position/feature 行对齐、mixed batch
-  （image prefill + text decode）与 image decode delta。
+- 测试：文本拒绝、单图/双图 pad 映射、position/feature 行对齐、offset>0 分块、
+  mixed batch（image prefill + text decode）、image decode delta、section 不一致拒绝。
 - 真机 GPU 前向与 server 接线（VisionGpu 执行、HTTP(S) 抓取、body limit）
   是 C3f（二）/C4，需 GPU 窗口。

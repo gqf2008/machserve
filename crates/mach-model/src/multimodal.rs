@@ -62,6 +62,8 @@ pub struct MultimodalPrompt {
     /// Full-prompt token-major cos/sin tables `[prompt_len, rotary_dim]`.
     pub cos: Vec<f32>,
     pub sin: Vec<f32>,
+    /// M-RoPE section this prompt was built with.
+    pub mrope_section: [usize; 3],
     d_model: usize,
     rotary_dim: usize,
 }
@@ -164,6 +166,7 @@ impl MultimodalPrompt {
             positions,
             cos,
             sin,
+            mrope_section: vision.mrope_section,
             d_model: cfg.d_model,
             rotary_dim: cfg.attn_rotary_dim(),
         })
@@ -409,6 +412,14 @@ pub fn step_overrides(
     let mut cursor = 0usize;
     let mut row_embed = false;
     for seq in seqs {
+        if let Some(prompt) = seq.prompt
+            && prompt.mrope_section != mrope_section
+        {
+            return Err(Error::InvalidArgument(format!(
+                "prompt M-RoPE section {:?} does not match engine section {mrope_section:?}",
+                prompt.mrope_section
+            )));
+        }
         for k in 0..seq.count {
             let feature = match seq.prompt {
                 Some(prompt) if seq.prefill => {
@@ -425,7 +436,10 @@ pub fn step_overrides(
                     prompt.feature_row(row)
                 }
                 Some(prompt) => {
-                    positions.push(prompt.generated_position(seq.offset)?);
+                    let index = seq.offset.checked_add(k).ok_or_else(|| {
+                        Error::InvalidArgument("multimodal decode offset overflow".into())
+                    })?;
+                    positions.push(prompt.generated_position(index)?);
                     None
                 }
                 None => {
@@ -575,5 +589,62 @@ mod step_tests {
         .unwrap();
         assert_eq!(out.cos, want_cos);
         assert_eq!(out.sin, want_sin);
+    }
+
+    #[test]
+    fn step_overrides_prefill_chunk_starts_inside_image() {
+        let (cfg, vision, prompt) = single_image_prompt();
+        let seqs = [StepSeq {
+            offset: 3,
+            count: 2,
+            prefill: true,
+            prompt: Some(&prompt),
+        }];
+        let out = step_overrides(&seqs, &cfg, vision.mrope_section).unwrap();
+        assert_eq!(out.row_mask, [1, 1]);
+        let d = cfg.d_model;
+        assert_eq!(&out.row_embeddings[0..d], &prompt.image_features[d..2 * d]);
+        assert_eq!(
+            &out.row_embeddings[d..2 * d],
+            &prompt.image_features[2 * d..3 * d]
+        );
+        let dim = out.rotary_dim;
+        assert_eq!(
+            &out.cos[0..dim],
+            &prompt.cos[3 * dim..4 * dim],
+            "chunk start must use the absolute prompt row"
+        );
+        assert_eq!(&out.cos[dim..2 * dim], &prompt.cos[4 * dim..5 * dim]);
+    }
+
+    #[test]
+    fn step_overrides_prefill_chunk_after_image_has_no_override() {
+        let (cfg, vision, prompt) = single_image_prompt();
+        let seqs = [StepSeq {
+            offset: 6,
+            count: 1,
+            prefill: true,
+            prompt: Some(&prompt),
+        }];
+        let out = step_overrides(&seqs, &cfg, vision.mrope_section).unwrap();
+        assert_eq!(out.row_mask, [0]);
+        assert!(!out.row_embed);
+        let dim = out.rotary_dim;
+        assert_eq!(&out.cos[0..dim], &prompt.cos[6 * dim..7 * dim]);
+    }
+
+    #[test]
+    fn step_overrides_rejects_section_mismatch() {
+        let (cfg, _vision, prompt) = single_image_prompt();
+        let seqs = [StepSeq {
+            offset: 0,
+            count: 1,
+            prefill: true,
+            prompt: Some(&prompt),
+        }];
+        let err = step_overrides(&seqs, &cfg, [1, 1, 1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match"), "{err}");
     }
 }
