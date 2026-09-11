@@ -23,6 +23,7 @@ pub mod kv_quant;
 pub mod loader;
 pub mod moe_backend;
 pub mod moe_offload;
+pub mod mrope;
 pub mod paged_kv;
 pub mod paged_scheduler;
 pub mod prefill_buffered;
