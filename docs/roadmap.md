@@ -1981,8 +1981,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   累加，权重行每 tile 只读一次，x 直接从 global 读。层 GEMM 与 LM head 统一走
   `batched.rs::launch_q4_dense`：`b > 1 && d % 8 == 0` 时走 rowbatch，其余（decode、d % 8 != 0）仍走 `gemv_q4`；`launch_gemv_q4_rowbatch` 对非法形状显式报 `InvalidArgument`，不再静默不写 out。
 - 真机 A/B（7900 XTX / Qwen3.8-27B Q4-all / 同一 prompt，release）：
-  - 4020-token prompt + 8 token 输出（单次观测；`perf_decode.py` 用 `split()` 估的长度实为词数，按 checkpoint tokenizer 准确计数为 4020 token）：`aea6764`（仅 rowbatch）**98.24s → 55.17s（1.78×）**；`e66f19b`（再并入 LM head 同分派，同 prompt/同机重测）**→ 51.31s（合计 1.92×）**。扣掉 8 个 decode token 后：before ≈41 tok/s、`aea6764` ≈73 tok/s、`e66f19b` ≈79 tok/s；
-  - decode TPOT 37.8ms → 35.0ms（`aea6764`）/ 37.8ms（`e66f19b`），噪声内不变——decode 不走新 kernel；
+  - 4020-token prompt + 8 token 输出（单次观测；`perf_decode.py` 用 `split()` 估的长度实为词数，按 checkpoint tokenizer 准确计数为 4020 token）：`fe3a089`（rebase 前 `aea6764`，仅 rowbatch）**98.24s → 55.17s（1.78×）**；`09daf67`（rebase 前 `e66f19b`，再并入 LM head 同分派，同 prompt/同机重测）**→ 51.31s（合计 ~1.9×）**。扣掉 8 个 decode token 后：before ≈41 tok/s、`fe3a089` ≈73 tok/s、`09daf67` ≈79 tok/s；
+  - decode TPOT 37.8ms → 35.0ms（`fe3a089`）/ 37.8ms（`09daf67`），噪声内不变——decode 不走新 kernel；
   - 加载到 `/healthz` ~114s（同量级）。
 - 正确性：`gemv_q4_rowbatch_matches_dequantized_cpu`（GPU 对拍 CPU dequant，6 组
   形状含非整 tile 尾部、`d=40` 跨 scale group 尾、`d=16384` 大收缩维）通过；
