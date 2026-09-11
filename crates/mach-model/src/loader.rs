@@ -7,6 +7,9 @@
 
 use crate::fp8::Fp8Tensor;
 use crate::q4::Q4Tensor;
+use crate::vision::{
+    VisionCheckpointLayout, VisionConfig, VisionLayerWeights, VisionLinear, VisionWeights,
+};
 use crate::weights::{LayerWeightsFp8, LayerWeightsQ4, WeightsFp8, WeightsQ4};
 use crate::{Config, Error, LayerWeights, Weights};
 #[cfg(windows)]
@@ -485,6 +488,205 @@ pub fn validate_checkpoint(path: &Path) -> Result<CheckpointLayout, Error> {
     })
 }
 
+/// Validate a Qwen3.5/Qwen3.8 vision tower from safetensors headers only.
+///
+/// Every expected `model.visual.*` tensor must be present exactly once with
+/// the configured shape and a payload length matching its dtype. Text and
+/// auxiliary (`mtp.*`) tensors are ignored; unexpected visual tensors fail
+/// loudly so a renamed/misclassified tower cannot silently run with missing
+/// weights.
+pub fn validate_vision_checkpoint(
+    path: &Path,
+    cfg: &VisionConfig,
+) -> Result<VisionCheckpointLayout, Error> {
+    cfg.validate()?;
+    let expected: HashMap<String, Vec<usize>> = cfg.expected_tensors().into_iter().collect();
+    let files: Vec<PathBuf> = if path.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        files.sort();
+        files
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if files.is_empty() {
+        return Err(Error::Model(format!("no .safetensors files in {path:?}")));
+    }
+
+    let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut payload_bytes = 0u64;
+    for file in &files {
+        let (tensors, _) = read_safetensors_header(file)?;
+        for (name, tensor) in tensors {
+            if !name.starts_with("model.visual.") {
+                continue;
+            }
+            if let Some(previous) = seen.insert(name.clone(), tensor.shape.clone()) {
+                return Err(Error::Model(format!(
+                    "{file:?}: visual tensor {name} appears more than once (previous shape {previous:?})"
+                )));
+            }
+            let want = expected.get(&name).ok_or_else(|| {
+                Error::Model(format!("{file:?}: unexpected visual tensor {name}"))
+            })?;
+            if &tensor.shape != want {
+                return Err(Error::Model(format!(
+                    "{file:?}: visual tensor {name} has shape {:?}, expected {want:?}",
+                    tensor.shape
+                )));
+            }
+            let elem_bytes = match tensor.dtype.as_str() {
+                "F32" => 4usize,
+                "F16" | "BF16" => 2usize,
+                other => {
+                    return Err(Error::Model(format!(
+                        "{file:?}: visual tensor {name} has unsupported dtype {other}"
+                    )));
+                }
+            };
+            let elems = tensor
+                .shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| Error::Model(format!("{name}: element count overflow")))?;
+            let want_span = elems
+                .checked_mul(elem_bytes)
+                .ok_or_else(|| Error::Model(format!("{name}: byte span overflow")))?;
+            let got_span = tensor.end - tensor.start;
+            if got_span != want_span {
+                return Err(Error::Model(format!(
+                    "{file:?}: visual tensor {name} has {got_span} payload bytes, expected {want_span}"
+                )));
+            }
+            payload_bytes = payload_bytes
+                .checked_add(got_span as u64)
+                .ok_or_else(|| Error::Model("vision payload byte count overflow".into()))?;
+        }
+    }
+
+    let mut missing: Vec<&str> = expected
+        .keys()
+        .filter(|name| !seen.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        return Err(Error::Model(format!(
+            "{} vision tensor(s) missing; first: {}",
+            missing.len(),
+            missing[0]
+        )));
+    }
+    Ok(VisionCheckpointLayout {
+        shards: files.len(),
+        tensors: seen.len(),
+        payload_bytes,
+    })
+}
+/// Load the Qwen3.5/Qwen3.8 vision tower into host f32 weights.
+///
+/// The checkpoint is streamed shard by shard; only the selected visual
+/// tensors are converted, so the text/LLM tensors and `mtp.*` stack are never
+/// materialized by this path.
+pub fn load_vision_weights(path: &Path, cfg: &VisionConfig) -> Result<VisionWeights, Error> {
+    cfg.validate()?;
+    let expected: HashMap<String, Vec<usize>> = cfg.expected_tensors().into_iter().collect();
+    let mut files: Vec<PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|e| Error::Model(format!("read dir {path:?}: {e}")))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    files.sort();
+    if files.is_empty() {
+        return Err(Error::Model(format!("no .safetensors files in {path:?}")));
+    }
+
+    let mut tensors: HashMap<String, Vec<f32>> = HashMap::with_capacity(expected.len());
+    for file in &files {
+        let parsed = parse_safetensors(file)?;
+        for (name, tensor) in &parsed.tensors {
+            if !name.starts_with("model.visual.") {
+                continue;
+            }
+            let shape = expected.get(name).ok_or_else(|| {
+                Error::Model(format!("{file:?}: unexpected visual tensor {name}"))
+            })?;
+            if &tensor.shape != shape {
+                return Err(Error::Model(format!(
+                    "{file:?}: visual tensor {name} has shape {:?}, expected {shape:?}",
+                    tensor.shape
+                )));
+            }
+            let elems = shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| Error::Model(format!("{name}: element count overflow")))?;
+            let values = tensor_f32(parsed.data(), tensor, elems, name)?;
+            if tensors.insert(name.clone(), values).is_some() {
+                return Err(Error::Model(format!(
+                    "{file:?}: visual tensor {name} appears more than once"
+                )));
+            }
+        }
+    }
+
+    let take = |map: &mut HashMap<String, Vec<f32>>, suffix: &str| -> Result<Vec<f32>, Error> {
+        map.remove(suffix)
+            .ok_or_else(|| Error::Model(format!("vision tensor {suffix} is missing")))
+    };
+    let take_linear =
+        |map: &mut HashMap<String, Vec<f32>>, prefix: &str| -> Result<VisionLinear, Error> {
+            Ok(VisionLinear {
+                weight: take(map, &format!("{prefix}.weight"))?,
+                bias: take(map, &format!("{prefix}.bias"))?,
+            })
+        };
+
+    let patch_embed_weight = take(&mut tensors, "model.visual.patch_embed.proj.weight")?;
+    let patch_embed_bias = take(&mut tensors, "model.visual.patch_embed.proj.bias")?;
+    let pos_embed_weight = take(&mut tensors, "model.visual.pos_embed.weight")?;
+    let mut layers = Vec::with_capacity(cfg.depth);
+    for li in 0..cfg.depth {
+        let p = |suffix: &str| format!("model.visual.blocks.{li}.{suffix}");
+        layers.push(VisionLayerWeights {
+            norm1_weight: take(&mut tensors, &p("norm1.weight"))?,
+            norm1_bias: take(&mut tensors, &p("norm1.bias"))?,
+            qkv: take_linear(&mut tensors, &p("attn.qkv"))?,
+            attn_proj: take_linear(&mut tensors, &p("attn.proj"))?,
+            norm2_weight: take(&mut tensors, &p("norm2.weight"))?,
+            norm2_bias: take(&mut tensors, &p("norm2.bias"))?,
+            mlp_fc1: take_linear(&mut tensors, &p("mlp.linear_fc1"))?,
+            mlp_fc2: take_linear(&mut tensors, &p("mlp.linear_fc2"))?,
+        });
+    }
+    let merger_norm_weight = take(&mut tensors, "model.visual.merger.norm.weight")?;
+    let merger_norm_bias = take(&mut tensors, "model.visual.merger.norm.bias")?;
+    let merger_fc1 = take_linear(&mut tensors, "model.visual.merger.linear_fc1")?;
+    let merger_fc2 = take_linear(&mut tensors, "model.visual.merger.linear_fc2")?;
+    if let Some(name) = tensors.keys().next() {
+        return Err(Error::Model(format!("unconsumed visual tensor {name}")));
+    }
+
+    Ok(VisionWeights {
+        patch_embed_weight,
+        patch_embed_bias,
+        pos_embed_weight,
+        layers,
+        merger_norm_weight,
+        merger_norm_bias,
+        merger_fc1,
+        merger_fc2,
+    })
+}
 /// Loads a tensor and converts it to f32 `[out, in]` row-major.
 fn tensor_f32(data: &[u8], t: &RawTensor, expected: usize, name: &str) -> Result<Vec<f32>, Error> {
     let n: usize = t.shape.iter().product();

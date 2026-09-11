@@ -1706,3 +1706,17 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - GDN/hybrid 只对 full-attention 层统计 KV，GDD 递归状态沿用 per-head 公式；
 - `doctor` 与启动 preflight 都读取 `MACH_KV` 并传入同一估算函数；
 - MLA/paged/spec 未接组合保持既有语义；纯 CPU/HIP-feature 测试钉住 dense 与 hybrid 公式。
+
+## Qwen3.8-27B Stage C1：视觉配置、header 校验与 CPU 参考（#146，2026-09-11）
+
+先落地 Stage C 的离线数值底座，不接 GPU/HTTP：
+
+- `VisionConfig`：解析 `vision_config`、image/video/vision token id 与 M-RoPE section；
+- `validate_vision_checkpoint`：header-only 核对 27B 的 333 个 `model.visual.*`
+  张量，shape/payload/dtype 任一不符即 fail fast；真实 18 分片校验通过，
+  payload 921,460,192 bytes；
+- `load_vision_weights`：按 shard 流式读取视觉权重，不回读文本/`mtp.*` 栈；
+- CPU `vision_forward`：patch embed、learned position 双线性插值、vision RoPE、
+  帧内双向 packed attention、LayerNorm/GELU MLP、spatial merge 与 merger；
+- 对拍：与 `transformers 5.16.1` `Qwen3_5VisionModel` 在单图 + 双帧视频混合
+  输入上逐元素误差 < 2e-5。
