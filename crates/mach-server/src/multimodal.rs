@@ -7,6 +7,7 @@
 //! injection are C3f; the chat handler fails fast for images until then.
 
 use base64::Engine as _;
+use image::GenericImageView as _;
 use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image};
 use mach_model::vision::VisionGrid;
 use serde::Deserialize;
@@ -19,6 +20,9 @@ pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>
 pub const MAX_ENCODED_IMAGE_BYTES: usize = 64 << 20;
 /// Largest decoded RGBA/RGB allocation accepted from the image decoder.
 const MAX_DECODE_BYTES: u64 = 512 << 20;
+/// Largest accepted RGB8 buffer after channel expansion. 256 MiB covers
+/// an ~89 MP RGB photo while bounding grayscale/CMYK decode bombs.
+pub const MAX_RGB8_BYTES: usize = 256 << 20;
 
 /// OpenAI `content`: a plain string or an array of typed parts.
 #[derive(Debug, Clone, Deserialize)]
@@ -53,7 +57,7 @@ pub enum MultimodalError {
     BadDataUrl(String),
     #[error("unsupported image media type: {0}")]
     UnsupportedMedia(String),
-    #[error("image payload is too large: {0} bytes")]
+    #[error("image data is too large: {0} bytes")]
     TooLarge(usize),
     #[error("image base64 decode failed: {0}")]
     Base64(String),
@@ -115,6 +119,9 @@ pub fn decode_data_url(url: &str) -> Result<DecodedImage, MultimodalError> {
         "image/png" | "image/jpeg" | "image/jpg" => {}
         other => return Err(MultimodalError::UnsupportedMedia(other.into())),
     }
+    if payload.len() > MAX_ENCODED_IMAGE_BYTES {
+        return Err(MultimodalError::TooLarge(payload.len()));
+    }
     let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
     if compact.len() > MAX_ENCODED_IMAGE_BYTES {
         return Err(MultimodalError::TooLarge(compact.len()));
@@ -127,6 +134,13 @@ pub fn decode_data_url(url: &str) -> Result<DecodedImage, MultimodalError> {
 
 /// Decode PNG/JPEG bytes to RGB8 with an allocation limit.
 pub fn decode_rgb8(bytes: &[u8]) -> Result<DecodedImage, MultimodalError> {
+    decode_rgb8_with_limit(bytes, MAX_RGB8_BYTES)
+}
+
+fn decode_rgb8_with_limit(
+    bytes: &[u8],
+    max_rgb8_bytes: usize,
+) -> Result<DecodedImage, MultimodalError> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader = reader
         .with_guessed_format()
@@ -137,7 +151,15 @@ pub fn decode_rgb8(bytes: &[u8]) -> Result<DecodedImage, MultimodalError> {
     let img = reader
         .decode()
         .map_err(|e| MultimodalError::Decode(e.to_string()))?;
-    let rgb = img.to_rgb8();
+    let (width, height) = img.dimensions();
+    let rgb_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|v| v.checked_mul(3))
+        .ok_or_else(|| MultimodalError::Decode("RGB8 size overflow".into()))?;
+    if rgb_bytes > max_rgb8_bytes {
+        return Err(MultimodalError::TooLarge(rgb_bytes));
+    }
+    let rgb = img.into_rgb8();
     let (width, height) = rgb.dimensions();
     Ok(DecodedImage {
         rgb8: rgb.into_raw(),
@@ -285,5 +307,30 @@ mod tests {
         assert!(expand_image_pads(&[1], 7, &[[1, 4, 4]], 2).is_err());
         assert!(expand_image_pads(&[7], 7, &[[1, 3, 3]], 2).is_err());
         assert!(expand_image_pads(&[7], 7, &[[1, 4, 4]], 0).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_rgb8_expansion() {
+        let img = image::GrayImage::from_pixel(4, 4, image::Luma([1u8]));
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let err = decode_rgb8_with_limit(&bytes, 8).unwrap_err();
+        assert!(matches!(err, MultimodalError::TooLarge(48)), "{err}");
+    }
+
+    #[test]
+    fn rejects_oversized_data_url_payload() {
+        let url = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_ENCODED_IMAGE_BYTES + 4)
+        );
+        assert!(matches!(
+            decode_data_url(&url),
+            Err(MultimodalError::TooLarge(_))
+        ));
     }
 }

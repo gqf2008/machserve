@@ -1790,8 +1790,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - `ChatMessage.content` 支持 OpenAI `string | parts`：`text` 与
   `image_url`（data URL base64 PNG/JPEG）；`render_content` 按模板插入
   `<|vision_start|><|image_pad|><|vision_end|>` 并按序收集图片 URL。
-- 新增 `mach_server::multimodal`：data URL 解析（仅 base64、限长 64MiB）、
-  `image` crate 解码为 RGB8（`Limits.max_alloc` 防解压炸弹）、复用 C3d
+- 新增 `mach_server::multimodal`：data URL 解析（仅 base64、编码 64MiB
+  + RGB8 256MiB 硬上限防解压炸弹）、`image` crate 解码、复用 C3d
   `preprocess_image`、`expand_image_pads` 按 `grid_t*grid_h*grid_w/merge^2`
   展开 pad token。
 - 引擎尚未接线：`/v1/chat/completions` 收到图片 part 时 fail fast 501
