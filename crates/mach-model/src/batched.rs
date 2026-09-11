@@ -299,6 +299,13 @@ pub struct BatchedModel {
     // device inputs
     tokens_dev: *mut i32,
     pos_dev: *mut i32,
+    /// Per-row M-RoPE table buffers (token-major [rows, rotary_dim]). mrope_active selects them over the scalar RoPE path.
+    mrope_cos_dev: *mut f32,
+    mrope_sin_dev: *mut f32,
+    mrope_active: bool,
+    mrope_rows: usize,
+    /// Added to the scalar RoPE position after a multimodal prompt (HF rope_deltas).
+    rope_delta: i32,
     // pinned host inputs
     tokens_host: *mut i32,
     pos_host: *mut i32,
@@ -1079,6 +1086,11 @@ impl BatchedModel {
             sampler,
             tokens_dev: std::ptr::null_mut(),
             pos_dev: std::ptr::null_mut(),
+            mrope_cos_dev: std::ptr::null_mut(),
+            mrope_sin_dev: std::ptr::null_mut(),
+            mrope_active: false,
+            mrope_rows: 0,
+            rope_delta: 0,
             tokens_host: std::ptr::null_mut(),
             pos_host: std::ptr::null_mut(),
             slots_host: std::ptr::null_mut(),
@@ -1359,6 +1371,9 @@ impl BatchedModel {
 
         self.tokens_dev = self.dalloc(b * 4)? as *mut i32;
         self.pos_dev = self.dalloc(b * 4)? as *mut i32;
+        let rope_dim = c.attn_rotary_dim();
+        self.mrope_cos_dev = self.dalloc(b * rope_dim * 4)?;
+        self.mrope_sin_dev = self.dalloc(b * rope_dim * 4)?;
         self.slots_dev = self.dalloc(b * 4)? as *mut i32;
         let max_runs = b.div_ceil(2);
         self.runs_dev = self.dalloc(max_runs * 4 * 4)? as *mut i32;
@@ -2298,6 +2313,11 @@ impl BatchedModel {
                 )?;
             }
         }
+        self.mrope_active = false;
+        self.mrope_rows = 0;
+        self.rope_delta = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
         if !self.int8_kv_cache.is_empty() {
             let payload_bytes =
                 self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim;
@@ -2447,6 +2467,71 @@ impl BatchedModel {
             .iter()
             .filter(|entry| entry.is_some())
             .count()
+    }
+    /// Upload token-major M-RoPE cos/sin tables for the next `rows` prompt
+    /// rows. While active, full-attention RoPE uses these tables instead of
+    /// the scalar `pos_dev` path. The tables are cleared after the multimodal
+    /// prompt by [`Self::clear_mrope_tables`].
+    pub fn set_mrope_tables(&mut self, cos: &[f32], sin: &[f32], rows: usize) -> Result<(), Error> {
+        self.mrope_active = false;
+        self.mrope_rows = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
+        let rot = self.cfg.attn_rotary_dim();
+        if rows == 0 || rows > self.rows {
+            return Err(Error::InvalidArgument(format!(
+                "M-RoPE rows {rows} outside 1..={}",
+                self.rows
+            )));
+        }
+        let want = rows
+            .checked_mul(rot)
+            .ok_or_else(|| Error::InvalidArgument("M-RoPE table size overflow".into()))?;
+        if cos.len() != want || sin.len() != want {
+            return Err(Error::InvalidArgument(format!(
+                "M-RoPE tables have ({}, {}), expected {want}",
+                cos.len(),
+                sin.len()
+            )));
+        }
+        hip::memcpy_async(
+            self.k.hip(),
+            self.mrope_cos_dev as *mut core::ffi::c_void,
+            cos.as_ptr() as *const core::ffi::c_void,
+            want * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        hip::memcpy_async(
+            self.k.hip(),
+            self.mrope_sin_dev as *mut core::ffi::c_void,
+            sin.as_ptr() as *const core::ffi::c_void,
+            want * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        self.mrope_rows = rows;
+        self.mrope_active = true;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
+        Ok(())
+    }
+
+    /// Return full-attention RoPE to the scalar `pos_dev` path.
+    pub fn clear_mrope_tables(&mut self) {
+        self.mrope_active = false;
+        self.mrope_rows = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
+    }
+
+    /// HF `rope_deltas` used for token-by-token text continuation after a
+    /// multimodal prompt. KV indices remain the real sequence positions; only
+    /// the RoPE angle is shifted by this delta.
+    pub fn set_rope_delta(&mut self, delta: i32) {
+        self.rope_delta = delta;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
     }
 
     /// Runs a batched decode step for `tokens` (one per sequence), returning the
@@ -3051,6 +3136,7 @@ impl BatchedModel {
                     rope,
                     rope,
                     RopeParams::from(c),
+                    0,
                 )?;
                 // compressed_kv = kv_a(xn); latent is followed by k_rope in
                 // kv_a, so extract it to a contiguous buffer before the RMSNorm
@@ -3084,6 +3170,7 @@ impl BatchedModel {
                     rope,
                     rope,
                     RopeParams::from(c),
+                    0,
                 )?;
                 // kv = kv_b_proj(latent): [batch, heads*(nope + v_hd)].
                 gemm(
@@ -3430,17 +3517,37 @@ impl BatchedModel {
                 // `attn_rotary_dim` coordinates rotate (== head_dim for every
                 // pre-Qwen3.5 family).
                 let rot = c.attn_rotary_dim() as i32;
-                k.launch_rope_batched(
-                    self.q,
-                    self.k_buf,
-                    self.pos_dev,
-                    b,
-                    c.n_heads as i32,
-                    c.n_kv_heads as i32,
-                    c.head_dim as i32,
-                    rot,
-                    RopeParams::from(c),
-                )?;
+                if self.mrope_active {
+                    if b as usize > self.mrope_rows {
+                        return Err(Error::InvalidArgument(
+                            "M-RoPE tables do not cover this step".into(),
+                        ));
+                    }
+                    k.launch_rope_batched_tables(
+                        self.q,
+                        self.k_buf,
+                        self.mrope_cos_dev,
+                        self.mrope_sin_dev,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        rot,
+                    )?;
+                } else {
+                    k.launch_rope_batched(
+                        self.q,
+                        self.k_buf,
+                        self.pos_dev,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        rot,
+                        RopeParams::from(c),
+                        self.rope_delta,
+                    )?;
+                }
                 let (kc, vc) = self.kv_cache[li];
                 if self.int8_kv {
                     let iv = self.int8_kv_cache[li].expect("full-attention INT8 KV cache");
