@@ -1720,3 +1720,16 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   帧内双向 packed attention、LayerNorm/GELU MLP、spatial merge 与 merger；
 - 对拍：与 `transformers 5.16.1` `Qwen3_5VisionModel` 在单图 + 双帧视频混合
   输入上逐元素误差 < 2e-5。
+
+## Qwen3.8-27B Stage C2：视觉塔 GPU runtime（#146，2026-09-11）
+
+在 C1 CPU 对拍底座后接入 HIP vision runtime，内核计数 66→71：
+
+- 新增 `LAYER_NORM`、`GELU_TANH`、`GELU_ERF`、`VISION_ROPE_APPLY`、
+  `VISION_ATTN`（packed 双向、逐时序帧 segment、动态 shared score scratch）。
+- `VisionGpu`：f32 权重驻留设备；hipBLAS 跑 patch/attn/proj/MLP/merger
+  GEMM；位置插值与 RoPE 表由 host 预处理后上传；输出 merged features。
+- GPU 对拍：tiny 模型、单图 `[1,2,4]` + 双帧视频 `[2,2,2]` 混合输入，
+  与 CPU/HF golden 最大误差 1.04e-7。
+- 当前边界：attention score scratch 上限 8192 token/frame（更大需后续
+  flash/tiled 版本）；视觉权重先按 f32 驻留，Q4/f16 化留后续。

@@ -642,7 +642,7 @@ fn vision_attention(
     Ok(out)
 }
 
-fn vision_rope(
+pub(crate) fn vision_rope(
     cfg: &VisionConfig,
     grids: &[VisionGrid],
     tokens: usize,
@@ -717,7 +717,7 @@ fn spatial_position_ids(cfg: &VisionConfig, grids: &[VisionGrid]) -> Result<Vec<
     Ok(out)
 }
 
-fn position_embeddings(
+pub(crate) fn position_embeddings(
     cfg: &VisionConfig,
     table: &[f32],
     grids: &[VisionGrid],
@@ -785,4 +785,96 @@ fn axis_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2]) {
         weights[i] = (1.0 - dist).max(0.0);
     }
     (taps, weights)
+}
+
+/// Host-prepared vision inputs shared by the CPU reference and GPU runtime:
+/// position embedding interpolation, vision RoPE tables and packed segment
+/// descriptors. `pixel_values` itself stays with the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionPrepared {
+    pub pos_embeddings: Vec<f32>,
+    pub cos: Vec<f32>,
+    pub sin: Vec<f32>,
+    pub seg_start: Vec<i32>,
+    pub seg_len: Vec<i32>,
+    pub tokens: usize,
+    pub merged_tokens: usize,
+    pub max_seg: usize,
+}
+
+/// Prepare the host-side tensors consumed by [`vision_forward`] and the GPU
+/// runtime. This is deliberately separate from pixel preprocessing: the image
+/// processor packs pixels, while this function mirrors the HF vision tower's
+/// position/RoPE/attention-segment conventions.
+pub fn prepare_vision_inputs(
+    cfg: &VisionConfig,
+    w: &VisionWeights,
+    grids: &[VisionGrid],
+) -> Result<VisionPrepared, Error> {
+    cfg.validate()?;
+    if grids.is_empty() {
+        return Err(Error::InvalidArgument(
+            "vision grids must not be empty".into(),
+        ));
+    }
+    let merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size;
+    let mut tokens = 0usize;
+    let mut merged_tokens = 0usize;
+    let mut segments = Vec::new();
+    for (image, g) in grids.iter().enumerate() {
+        let [t, h, wd] = *g;
+        if t == 0 || h == 0 || wd == 0 {
+            return Err(Error::InvalidArgument(format!(
+                "vision grid {image} has a zero dimension: {g:?}"
+            )));
+        }
+        if !h.is_multiple_of(cfg.spatial_merge_size) || !wd.is_multiple_of(cfg.spatial_merge_size) {
+            return Err(Error::InvalidArgument(format!(
+                "vision grid {image} must be divisible by spatial_merge_size {}: {g:?}",
+                cfg.spatial_merge_size
+            )));
+        }
+        let frame = h * wd;
+        for ti in 0..t {
+            segments.push((tokens + ti * frame, frame));
+        }
+        tokens = tokens
+            .checked_add(t * frame)
+            .ok_or_else(|| Error::InvalidArgument("vision patch count overflow".into()))?;
+        merged_tokens = merged_tokens
+            .checked_add(t * (h / cfg.spatial_merge_size) * (wd / cfg.spatial_merge_size))
+            .ok_or_else(|| Error::InvalidArgument("vision merged token count overflow".into()))?;
+    }
+    if !tokens.is_multiple_of(merge_unit) {
+        return Err(Error::InvalidArgument(format!(
+            "vision token count {tokens} is not divisible by merge unit {merge_unit}"
+        )));
+    }
+    let pos_embeddings = position_embeddings(cfg, &w.pos_embed_weight, grids, tokens)?;
+    let (cos, sin) = vision_rope(cfg, grids, tokens)?;
+    let mut seg_start = Vec::with_capacity(tokens);
+    let mut seg_len = Vec::with_capacity(tokens);
+    for &(start, len) in &segments {
+        for _ in 0..len {
+            seg_start.push(start as i32);
+            seg_len.push(len as i32);
+        }
+    }
+    let max_seg = segments.iter().map(|&(_, len)| len).max().unwrap_or(0);
+    if seg_start.len() != tokens {
+        return Err(Error::Model(format!(
+            "vision segment descriptors cover {} tokens, expected {tokens}",
+            seg_start.len()
+        )));
+    }
+    Ok(VisionPrepared {
+        pos_embeddings,
+        cos,
+        sin,
+        seg_start,
+        seg_len,
+        tokens,
+        merged_tokens,
+        max_seg,
+    })
 }

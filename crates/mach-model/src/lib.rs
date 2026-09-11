@@ -40,6 +40,8 @@ pub mod state_reuse;
 pub mod tokenizer;
 
 pub mod vision;
+#[cfg(feature = "hip")]
+pub mod vision_gpu;
 
 pub mod weights;
 
