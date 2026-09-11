@@ -12,12 +12,14 @@ Example:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import struct
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import zlib
 
@@ -43,6 +45,19 @@ def tiny_png(width=8, height=8):
     )
 
 
+
+
+def sample_vram():
+    try:
+        out = subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return out.decode("utf-8", "replace").strip()
+    except Exception:
+        return None
+
 def wait_health(base, timeout):
     end = time.time() + timeout
     while time.time() < end:
@@ -66,10 +81,10 @@ def main():
     parser.add_argument("--max-patches", type=int, default=8192)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--extra-env", action="append", default=[])
+    parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
     if args.image:
         with open(args.image, "rb") as handle:
             data = handle.read()
@@ -77,6 +92,7 @@ def main():
     else:
         data = tiny_png()
         mime = "image/png"
+    image_sha256 = hashlib.sha256(data).hexdigest()
     data_url = "data:" + mime + ";base64," + base64.b64encode(data).decode()
     request = {
         "messages": [
@@ -90,17 +106,23 @@ def main():
         ],
         "max_tokens": args.max_new,
         "temperature": 0,
+        "stream": not args.no_stream,
     }
     plan = {
         "binary": args.binary,
         "model_dir": args.model_dir,
         "port": args.port,
         "request_bytes": len(json.dumps(request)),
+        "stream": not args.no_stream,
+        "image_bytes": len(data),
+        "image_sha256": image_sha256,
         "out_dir": os.path.abspath(args.out_dir),
     }
     if args.dry_run:
         print(json.dumps(plan, indent=2))
         return 0
+
+    os.makedirs(args.out_dir, exist_ok=True)
 
     model_dir = os.path.normpath(args.model_dir)
     env = dict(os.environ)
@@ -124,20 +146,41 @@ def main():
             if not wait_health(base, args.timeout):
                 print("server did not become healthy; see " + log_path, file=sys.stderr)
                 return 2
+            vram_before = sample_vram()
             request_started = time.time()
             req = urllib.request.Request(
                 base + "/v1/chat/completions",
                 data=json.dumps(request).encode(),
                 headers={"content-type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-                body = resp.read().decode("utf-8", "replace")
-                status = resp.status
+            first_data = None
+            try:
+                with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+                    status = resp.status
+                    if args.no_stream:
+                        body = resp.read().decode("utf-8", "replace")
+                    else:
+                        parts = []
+                        for raw_line in resp:
+                            line = raw_line.decode("utf-8", "replace")
+                            if first_data is None and line.startswith("data:"):
+                                first_data = time.time() - request_started
+                            parts.append(line)
+                        body = "".join(parts)
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                body = exc.read().decode("utf-8", "replace")
             elapsed = time.time() - request_started
             summary = {
                 "status": status,
                 "elapsed_seconds": elapsed,
+                "ttft_seconds": first_data,
                 "load_plus_wait_seconds": request_started - started,
+                "stream": not args.no_stream,
+                "image_bytes": len(data),
+                "image_sha256": image_sha256,
+                "vram_before": vram_before,
+                "vram_after": sample_vram(),
                 "response": body,
             }
             with open(os.path.join(args.out_dir, "response.json"), "w", encoding="utf-8") as out:

@@ -882,13 +882,18 @@ pub async fn healthz() -> &'static str {
 /// axum default.
 pub const MAX_CHAT_BODY_BYTES: usize = 96 << 20;
 
-pub fn router(state: AppState) -> axum::Router {
-    use axum::routing::{get, post};
-    let limit = if state.engine.image_runtime().is_some() {
+/// Chat request body limit: multimodal serving allows one encoded image.
+fn chat_body_limit(image_enabled: bool) -> usize {
+    if image_enabled {
         MAX_CHAT_BODY_BYTES
     } else {
         2 << 20
-    };
+    }
+}
+
+pub fn router(state: AppState) -> axum::Router {
+    use axum::routing::{get, post};
+    let limit = chat_body_limit(state.engine.image_runtime().is_some());
     let chat = axum::Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .layer(axum::extract::DefaultBodyLimit::max(limit));
@@ -1104,5 +1109,11 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn chat_body_limit_selects_text_and_vision_budgets() {
+        assert_eq!(chat_body_limit(false), 2 << 20);
+        assert_eq!(chat_body_limit(true), MAX_CHAT_BODY_BYTES);
     }
 }
