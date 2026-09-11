@@ -754,6 +754,27 @@ pub fn gather_paged_int8(
 mod tests {
     use super::*;
 
+    fn sat_f64_to_f32(v: f64) -> f32 {
+        if v > f32::MAX as f64 {
+            f32::MAX
+        } else if v < f32::MIN as f64 {
+            f32::MIN
+        } else {
+            v as f32
+        }
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let mut max = 0.0f32;
+        for (x, y) in a.iter().zip(b) {
+            let d = (x - y).abs();
+            assert!(d.is_finite(), "non-finite diff: {x} vs {y}");
+            max = max.max(d);
+        }
+        max
+    }
+
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed
             .wrapping_mul(6364136223846793005)
@@ -798,6 +819,165 @@ mod tests {
         out
     }
 
+    /// CPU transcription of the contiguous INT8 kernel's double online-softmax
+    /// algorithm. It intentionally does not call `attention_decode_int8`.
+    fn simulated_online_int8(
+        q: &[f32],
+        n_heads: usize,
+        k: &Int8Kv,
+        v: &Int8Kv,
+        softmax_scale: f32,
+    ) -> Vec<f32> {
+        let tokens = k.tokens();
+        let head_dim = k.head_dim();
+        let groups = n_heads / k.heads();
+        let lanes = 256 / head_dim;
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kv = h / groups;
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            for d in 0..head_dim {
+                let mut partials = Vec::with_capacity(lanes);
+                for c in 0..lanes {
+                    let mut m = -1.0e300f64;
+                    let mut l = 0.0f64;
+                    let mut acc = 0.0f64;
+                    for p in (c..tokens).step_by(lanes) {
+                        let krow = k.head_row(p, kv).unwrap();
+                        let mut dot = 0.0f64;
+                        for j in 0..head_dim {
+                            dot += qh[j] as f64 * krow[j] as f64;
+                        }
+                        let sc = dot * k.scale(p, kv).unwrap() as f64 * softmax_scale as f64;
+                        let vv =
+                            v.head_row(p, kv).unwrap()[d] as f64 * v.scale(p, kv).unwrap() as f64;
+                        let mnew = m.max(sc);
+                        let alpha = (m - mnew).exp();
+                        let beta = (sc - mnew).exp();
+                        l = l * alpha + beta;
+                        acc = acc * alpha + beta * vv;
+                        m = mnew;
+                    }
+                    partials.push((m, l, acc));
+                }
+                let mut m = -1.0e300f64;
+                let mut l = 0.0f64;
+                let mut acc = 0.0f64;
+                for (mi, li, ai) in partials {
+                    let mnew = m.max(mi);
+                    let alpha = (m - mnew).exp();
+                    let beta = (mi - mnew).exp();
+                    l = l * alpha + li * beta;
+                    acc = acc * alpha + ai * beta;
+                    m = mnew;
+                }
+                out[h * head_dim + d] = sat_f64_to_f32(acc / l);
+            }
+        }
+        out
+    }
+
+    /// CPU transcription of the paged INT8 kernel with explicit
+    /// `table_offsets[sequence]` addressing.
+    #[allow(clippy::too_many_arguments)] // Mirrors the kernel signature.
+    fn simulated_paged_online_int8(
+        q: &[f32],
+        n_heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        tokens: usize,
+        payload_k: &[i8],
+        scales_k: &[f32],
+        payload_v: &[i8],
+        scales_v: &[f32],
+        layout: &PagedInt8KvLayout,
+        page_table: &[usize],
+        table_offsets: &[usize],
+        seq: usize,
+        softmax_scale: f32,
+    ) -> Vec<f32> {
+        let groups = n_heads / kv_heads;
+        let lanes = 256 / dim;
+        let mut out = vec![0.0f32; n_heads * dim];
+        for h in 0..n_heads {
+            let kv = h / groups;
+            let qh = &q[h * dim..(h + 1) * dim];
+            for d in 0..dim {
+                let mut partials = Vec::with_capacity(lanes);
+                for c in 0..lanes {
+                    let mut m = -1.0e300f64;
+                    let mut l = 0.0f64;
+                    let mut acc = 0.0f64;
+                    for p in (c..tokens).step_by(lanes) {
+                        let logical = p / layout.tokens_per_page();
+                        let off = p % layout.tokens_per_page();
+                        let page = page_table[table_offsets[seq] + logical];
+                        let pi = layout.payload_index(page, off, kv, 0).unwrap();
+                        let si = layout.scale_index(page, off, kv).unwrap();
+                        let mut dot = 0.0f64;
+                        for j in 0..dim {
+                            dot += qh[j] as f64 * payload_k[pi + j] as f64;
+                        }
+                        let sc = dot * scales_k[si] as f64 * softmax_scale as f64;
+                        let vv = payload_v[pi + d] as f64 * scales_v[si] as f64;
+                        let mnew = m.max(sc);
+                        let alpha = (m - mnew).exp();
+                        let beta = (sc - mnew).exp();
+                        l = l * alpha + beta;
+                        acc = acc * alpha + beta * vv;
+                        m = mnew;
+                    }
+                    partials.push((m, l, acc));
+                }
+                let mut m = -1.0e300f64;
+                let mut l = 0.0f64;
+                let mut acc = 0.0f64;
+                for (mi, li, ai) in partials {
+                    let mnew = m.max(mi);
+                    let alpha = (m - mnew).exp();
+                    let beta = (mi - mnew).exp();
+                    l = l * alpha + li * beta;
+                    acc = acc * alpha + ai * beta;
+                    m = mnew;
+                }
+                out[h * dim + d] = sat_f64_to_f32(acc / l);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn simulated_online_attention_matches_full_oracle() {
+        for dim in [8usize, 16] {
+            let (n_heads, kv_heads, tokens) = (6usize, 2usize, 260usize);
+            let mut seed = 41u64 + dim as u64;
+            let q: Vec<f32> = (0..n_heads * dim).map(|_| lcg(&mut seed)).collect();
+            let k32: Vec<f32> = (0..tokens * kv_heads * dim)
+                .map(|_| lcg(&mut seed) * 2.0)
+                .collect();
+            let v32: Vec<f32> = (0..tokens * kv_heads * dim)
+                .map(|_| lcg(&mut seed) * 2.0)
+                .collect();
+            let k = Int8Kv::quantize(&k32, kv_heads, dim).unwrap();
+            let v = Int8Kv::quantize(&v32, kv_heads, dim).unwrap();
+            let scale = 1.0 / (dim as f32).sqrt();
+            let got = simulated_online_int8(&q, n_heads, &k, &v, scale);
+            let want = attention_decode_int8(&q, n_heads, &k, &v, scale).unwrap();
+            let diff = max_abs_diff(&got, &want);
+            assert!(diff < 1e-5, "dim {dim}: online-vs-full diff {diff}");
+        }
+    }
+
+    #[test]
+    fn simulated_online_attention_saturates_finite_extremes() {
+        let q = vec![0.0f32; 8];
+        let k = Int8Kv::quantize(&[0.0f32; 8], 1, 8).unwrap();
+        let v = Int8Kv::quantize(&[f32::MAX; 8], 1, 8).unwrap();
+        let got = simulated_online_int8(&q, 1, &k, &v, 1.0);
+        assert!(got.iter().all(|x| x.is_finite()));
+        assert!(got.iter().all(|x| *x == f32::MAX));
+    }
+
     #[test]
     fn paged_gather_rejects_non_finite_scale() {
         let layout = PagedInt8KvLayout::new(2, 2, 1, 2).unwrap();
@@ -813,6 +993,89 @@ mod tests {
             gather_paged_int8(&layout, &[1], &payload, &scales, 1).is_err(),
             "NaN paged scale must be rejected"
         );
+    }
+
+    #[test]
+    fn simulated_paged_online_attention_matches_full_oracle() {
+        let (pages, tpp, kv_heads, n_heads, dim, tokens) =
+            (10usize, 64usize, 2usize, 4usize, 8usize, 260usize);
+        let layout = PagedInt8KvLayout::new(pages, tpp, kv_heads, dim).unwrap();
+        let page_table = [0usize, 1, 2, 3, 4, 5, 1, 2, 3, 4];
+        let table_offsets = [0usize, 5];
+        let mut seed = 43u64;
+        let q: Vec<f32> = (0..n_heads * dim).map(|_| lcg(&mut seed)).collect();
+        let k0: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let v0: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let k1: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let v1: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let kq0 = Int8Kv::quantize(&k0, kv_heads, dim).unwrap();
+        let vq0 = Int8Kv::quantize(&v0, kv_heads, dim).unwrap();
+        let kq1 = Int8Kv::quantize(&k1, kv_heads, dim).unwrap();
+        let vq1 = Int8Kv::quantize(&v1, kv_heads, dim).unwrap();
+        let mut payload_k = vec![0i8; layout.payload_len()];
+        let mut scales_k = vec![0.0f32; layout.scale_len()];
+        let mut payload_v = vec![0i8; layout.payload_len()];
+        let mut scales_v = vec![0.0f32; layout.scale_len()];
+        scatter_paged_int8(
+            &kq0,
+            &layout,
+            &page_table[..table_offsets[1]],
+            &mut payload_k,
+            &mut scales_k,
+        )
+        .unwrap();
+        scatter_paged_int8(
+            &vq0,
+            &layout,
+            &page_table[..table_offsets[1]],
+            &mut payload_v,
+            &mut scales_v,
+        )
+        .unwrap();
+        scatter_paged_int8(
+            &kq1,
+            &layout,
+            &page_table[table_offsets[1]..],
+            &mut payload_k,
+            &mut scales_k,
+        )
+        .unwrap();
+        scatter_paged_int8(
+            &vq1,
+            &layout,
+            &page_table[table_offsets[1]..],
+            &mut payload_v,
+            &mut scales_v,
+        )
+        .unwrap();
+        let scale = 1.0 / (dim as f32).sqrt();
+        let got = simulated_paged_online_int8(
+            &q,
+            n_heads,
+            kv_heads,
+            dim,
+            tokens,
+            &payload_k,
+            &scales_k,
+            &payload_v,
+            &scales_v,
+            &layout,
+            &page_table,
+            &table_offsets,
+            1,
+            scale,
+        );
+        let want = attention_decode_int8(&q, n_heads, &kq1, &vq1, scale).unwrap();
+        let diff = max_abs_diff(&got, &want);
+        assert!(diff < 1e-5, "paged online-vs-full diff {diff}");
     }
 
     #[test]
