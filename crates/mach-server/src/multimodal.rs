@@ -214,7 +214,7 @@ async fn fetch_impl(
     let mut hops = 0usize;
     loop {
         let addr = resolve_public(&current, allow_private).await?;
-        let client = build_fetch_client(&current, addr, allow_private)?;
+        let client = build_fetch_client(&current, addr)?;
         let resp = client
             .get(current.clone())
             .send()
@@ -325,7 +325,6 @@ async fn resolve_public(
 fn build_fetch_client(
     url: &reqwest::Url,
     addr: std::net::SocketAddr,
-    allow_private: bool,
 ) -> Result<reqwest::Client, MultimodalError> {
     let mut builder = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
@@ -335,7 +334,6 @@ fn build_fetch_client(
     {
         builder = builder.resolve(host, addr);
     }
-    let _ = allow_private;
     builder = builder.no_proxy();
     builder
         .build()
@@ -364,8 +362,9 @@ async fn read_body_limited(
     Ok(bytes)
 }
 
-/// SSRF guard: reject loopback, private, link-local, unspecified, multicast,
-/// broadcast, CGNAT, documentation and IPv6 ULA/link-local addresses.
+/// SSRF guard: reject every non-publicly-routable IPv4/IPv6 range we can
+/// name, including private/loopback/link-local/CGNAT/documentation/reserved
+/// blocks and IPv6 ULA/site-local/NAT64/6to4/Teredo/ORCHID/discard prefixes.
 #[must_use]
 pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
@@ -380,8 +379,8 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || o[0] == 0
-                || o[0] == 0
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
                 || (o[0] == 198 && (o[1] & 0xfe) == 18)
                 || (o[0] & 0xf0) == 240
                 || (o[0] == 100 && (o[1] & 0xc0) == 64))
@@ -390,11 +389,16 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
             let seg = v6.segments();
             let is_ula = (seg[0] & 0xfe00) == 0xfc00;
             let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
-            let is_doc = seg[0] == 0x2001 && seg[1] == 0x0db8;
-            let is_nat64 = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0];
+            let is_site_local = (seg[0] & 0xffc0) == 0xfec0;
+            let is_doc = (seg[0] == 0x2001 && seg[1] == 0x0db8) || (seg[0] & 0xfff0) == 0x3ff0;
+            let is_nat64 =
+                seg[0] == 0x0064 && seg[1] == 0xff9b && (seg[2] == 0x0000 || seg[2] == 0x0001);
             let is_6to4 = seg[0] == 0x2002;
             let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
-            let is_benchmark = seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0x0000;
+            let is_benchmark = seg[0] == 0x2001 && seg[1] == 0x0002;
+            let is_orchid = seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0010;
+            let is_orchid_v2 = seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020;
+            let is_discard = seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0;
             let embedded_public = v6
                 .to_ipv4_mapped()
                 .is_none_or(|v4| is_public_ip(IpAddr::V4(v4)));
@@ -403,11 +407,15 @@ pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
                 || is_ula
                 || is_link_local
+                || is_site_local
                 || is_doc
                 || is_nat64
                 || is_6to4
                 || is_teredo
                 || is_benchmark
+                || is_orchid
+                || is_orchid_v2
+                || is_discard
                 || !embedded_public)
         }
     }
@@ -686,6 +694,13 @@ mod tests {
             "2002:7f00:1::",
             "2001:0:0:0:0:0:0:1",
             "2001:2::1",
+            "fec0::1",
+            "64:ff9b:1:7f00:1::",
+            "100::1",
+            "2001:10::1",
+            "2001:20::1",
+            "3fff::1",
+            "192.88.99.1",
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(!is_public_ip(ip), "{ip} must be rejected");
