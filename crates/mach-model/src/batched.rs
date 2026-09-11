@@ -303,6 +303,7 @@ pub struct BatchedModel {
     mrope_cos_dev: *mut f32,
     mrope_sin_dev: *mut f32,
     mrope_active: bool,
+    mrope_rows: usize,
     /// Added to the scalar RoPE position after a multimodal prompt (HF rope_deltas).
     rope_delta: i32,
     // pinned host inputs
@@ -1088,6 +1089,7 @@ impl BatchedModel {
             mrope_cos_dev: std::ptr::null_mut(),
             mrope_sin_dev: std::ptr::null_mut(),
             mrope_active: false,
+            mrope_rows: 0,
             rope_delta: 0,
             tokens_host: std::ptr::null_mut(),
             pos_host: std::ptr::null_mut(),
@@ -2312,7 +2314,10 @@ impl BatchedModel {
             }
         }
         self.mrope_active = false;
+        self.mrope_rows = 0;
         self.rope_delta = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
         if !self.int8_kv_cache.is_empty() {
             let payload_bytes =
                 self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim;
@@ -2468,6 +2473,8 @@ impl BatchedModel {
     /// the scalar `pos_dev` path. The tables are cleared after the multimodal
     /// prompt by [`Self::clear_mrope_tables`].
     pub fn set_mrope_tables(&mut self, cos: &[f32], sin: &[f32], rows: usize) -> Result<(), Error> {
+        self.mrope_active = false;
+        self.mrope_rows = 0;
         let rot = self.cfg.attn_rotary_dim();
         if rows == 0 || rows > self.rows {
             return Err(Error::InvalidArgument(format!(
@@ -2501,13 +2508,19 @@ impl BatchedModel {
             hip::HIP_MEMCPY_HOST_TO_DEVICE,
             self.k.stream,
         )?;
+        self.mrope_rows = rows;
         self.mrope_active = true;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
         Ok(())
     }
 
     /// Return full-attention RoPE to the scalar `pos_dev` path.
     pub fn clear_mrope_tables(&mut self) {
         self.mrope_active = false;
+        self.mrope_rows = 0;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
     }
 
     /// HF `rope_deltas` used for token-by-token text continuation after a
@@ -2515,6 +2528,8 @@ impl BatchedModel {
     /// the RoPE angle is shifted by this delta.
     pub fn set_rope_delta(&mut self, delta: i32) {
         self.rope_delta = delta;
+        self.decode_graphs.clear();
+        self.greedy_graph = None;
     }
 
     /// Runs a batched decode step for `tokens` (one per sequence), returning the
@@ -3501,6 +3516,11 @@ impl BatchedModel {
                 // pre-Qwen3.5 family).
                 let rot = c.attn_rotary_dim() as i32;
                 if self.mrope_active {
+                    if b as usize > self.mrope_rows {
+                        return Err(Error::InvalidArgument(
+                            "M-RoPE tables do not cover this step".into(),
+                        ));
+                    }
                     k.launch_rope_batched_tables(
                         self.q,
                         self.k_buf,

@@ -184,6 +184,35 @@ fn batched_model_mrope_tables_match_scalar_text_only() {
     assert!(max_diff < 1e-5, "M-RoPE table model mismatch: {max_diff}");
 }
 #[test]
+#[ignore = "GPU M-RoPE lifecycle; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
+fn mrope_table_row_mismatch_fails_fast() {
+    if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
+        return;
+    }
+    let hip = hip::hip().expect("HIP runtime");
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 321).unwrap();
+    let mut model = BatchedModel::with_rows(hip, cfg, &w, 1, 4).unwrap();
+    let positions = MropePositions {
+        pos: vec![[0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3]],
+        delta: 0,
+    };
+    let rot = cfg.attn_rotary_dim();
+    let (cos, sin) = positions.cos_sin(&cfg, [1, 1, 1]).unwrap();
+    model.set_mrope_tables(&cos[..rot], &sin[..rot], 1).unwrap();
+    let tokens = [3u32, 17, 42, 5];
+    let lens = [0u32, 1, 2, 3];
+    let slots = [0u32, 0, 0, 0];
+    let mut params = vec![SamplingParams::default(); tokens.len()];
+    let counts = vec![Vec::new(); tokens.len()];
+    let bias = vec![Vec::new(); tokens.len()];
+    let err = model
+        .decode_step_explicit(&tokens, &lens, &slots, &mut params, &counts, &bias, false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("M-RoPE tables"), "{err}");
+}
+#[test]
 #[ignore = "GPU M-RoPE parity; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn rope_batched_tables_matches_cpu() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
