@@ -17,6 +17,31 @@ Stage C 的离线链路已经合入；本文档描述真机 GPU 窗口打开后�
 - 观察 `server.log` 的 VRAM 预检与运行日志；任何 OOM/驱动错误立即停服并记录；
 - E2E 脚本会在 finally 中停服；若异常退出，手动确认 `mach-server` 进程已结束再重跑。
 
+## CPU 真权重对拍（无需 GPU，建议先跑）
+
+`crates/mach-model/tests/vision_real_weights.rs` 用同一张图把 MachServe 的
+CPU 视觉塔钉在 transformers 上。它是 opt-in 的：两个环境变量都不设时打印 SKIP
+并返回，只设其中一个会直接失败（不静默降级）。注意 libtest 默认只显示
+`1 passed`，必须用 `--nocapture` 确认看到 SKIP 行或对拍结果行——**SKIP 不算验证**。
+128x128 输入（grid `[1,16,16]`）单线程约 11 分钟，所以不放进默认门禁。
+
+```powershell
+# 1) 生成 golden + raw f32（CPU，约 10s；--parity-export 产出对拍所需文件）
+python tools/vision_c4_golden.py --model-dir .models/qwen3.8-27b `
+  --image artifacts/vision-c4/input.png --out artifacts/vision-c4/hf_golden.json `
+  --tower --allow-pil-fallback --parity-export
+# 2) 跑 CPU 对拍
+$env:MACH_VISION_GOLDEN = "artifacts/vision-c4"
+$env:MACH_VISION_MODEL  = ".models/qwen3.8-27b"
+cargo test -p mach-model --test vision_real_weights -- --nocapture
+```
+
+实测（2026-09-11，grid `[1,16,16]`、64x5120 merged features）：容差为
+`|got-ref| <= 1e-3 * max(1, |ref|)`，`worst_ratio = 0.4488`（最差元素 index
+320103：`-1.2215794` vs `-1.2210314`，允许 `1.22e-3`，即只用到 45%），
+`nonfinite = 0`，单线程 687s。GPU 窗口建议以 CPU 参考为中间基准：先 CPU↔HF，
+再 GPU↔CPU。
+
 ## 步骤
 
 0) 准备同一张输入图片 `artifacts/vision-c4/input.png`（golden 与 E2E 必须使用它，脚本会记录 SHA-256）。
@@ -72,8 +97,23 @@ python tools/vision_c4_compare.py `
 
 ## C4 仍待处理
 
+真机窗口项（必须 7900 XTX）：
+
+- 步骤 1–5：golden/compare、图片问答 E2E、TTFT/VRAM 回填 Issue #146；
+- HF 整模型 greedy token/logits 参考（本机 31GB 内存装不下 BF16 27B，只能在
+  真机或另一台机器上生成）；
+- Fast/torchvision 与 PIL 归一路径的数值漂移复核（当前 golden 明确是 PIL 回退）。
+
+纯离线 P3（不阻塞真机）：
+
+- `crates/mach-server/tests/vision_decode.rs` 仍带 `#![cfg(feature = "hip")]`：
+  漏带 `--features hip` 时该测试目标编译成 0 测试即"通过"；标准门禁命令已带该
+  feature，是否把纯解码逻辑移进 CPU 可编译面留待真机验证后再定；
 - 高分辨率图片 tiling（当前 vision attention 段上限 `max_seg <= 8192`）；
-- EXIF orientation 与 HF `load_image` 对齐；
-- Fast/torchvision 与 PIL 归一路径的数值漂移复核；
-- vision × decode graph capture；HTTP client 连接池复用；CPU 预处理移入 `spawn_blocking` 或引擎线程；
-- 多图/并发请求的总显存预算。
+- 多图/并发请求的总显存预算（连接池复用与 CPU 预处理已由 PR #159 覆盖）。
+
+已暂停/不做：vision × decode graph capture（`CLAUDE.md` 记录服务链 graph 零收益、
+30B 在 ROCm 6.2/Windows 上有驱动腐化，方向已停）。
+
+已完成（无需在此重复）：EXIF orientation（PR #158）、HTTP client 连接池复用与
+CPU 预处理移出 async worker（PR #159）、CPU 真权重视觉塔对拍（PR #160）。

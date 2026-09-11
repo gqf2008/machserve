@@ -6,6 +6,11 @@ only the shards that contain model.visual.* and dumps the merged features to
 a .npy file for the comparator. The tower path needs torch + safetensors;
 failures are reported instead of silently skipped.
 
+With --tower --parity-export it also writes the raw little-endian f32 input and
+reference features (`ms_input_pixel.bin`, `hf_features.bin`, `parity_meta.json`)
+consumed by `crates/mach-model/tests/vision_real_weights.rs`, which pins the
+Rust CPU vision tower to transformers on the real checkpoint without a GPU.
+
 Example:
   python tools/vision_c4_golden.py --model-dir .models/qwen3.8-27b \
       --image artifacts/vision-c4/input.png --out artifacts/vision-c4/hf_golden.json \
@@ -112,6 +117,109 @@ def run_tower(model_dir, hidden_states, grid, out_prefix):
     return arr, shards, len(visual_keys)
 
 
+def write_parity_files(out_dir, pixel_values, features, meta, replace=os.replace):
+    """Stage the three parity files and swap them in as a group.
+
+    `replace` is injectable so `parity_export_selftest` can exercise the
+    rollback path. The `.npy`/`.json` written elsewhere are not part of this
+    group; they are each replaced on their own.
+    """
+    pixel_path = os.path.join(out_dir, "ms_input_pixel.bin")
+    feat_path = os.path.join(out_dir, "hf_features.bin")
+    meta_path = os.path.join(out_dir, "parity_meta.json")
+
+    def write_meta(path):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2)
+
+    staged = [
+        (
+            pixel_path + ".tmp",
+            pixel_path,
+            lambda path: np.asarray(pixel_values, dtype="<f4").tofile(path),
+        ),
+        (
+            feat_path + ".tmp",
+            feat_path,
+            lambda path: np.asarray(features, dtype="<f4").tofile(path),
+        ),
+        (meta_path + ".tmp", meta_path, write_meta),
+    ]
+    swapped = []
+    try:
+        for tmp, _target, write in staged:
+            write(tmp)
+        for tmp, target, _write in staged:
+            backup = target + ".bak"
+            if os.path.exists(backup):
+                os.remove(backup)
+            had_old = os.path.exists(target)
+            if had_old:
+                replace(target, backup)
+            # Register before installing: if the install fails, the old file is
+            # already parked in `.bak` and must still be restored.
+            swapped.append((target, backup, had_old))
+            replace(tmp, target)
+    except BaseException:
+        for tmp, _target, _write in staged:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        for target, backup, had_old in reversed(swapped):
+            if os.path.exists(target):
+                os.remove(target)
+            if had_old and os.path.exists(backup):
+                replace(backup, target)
+        raise
+    # Every install succeeded, so this is cleanup only: a failure here leaves a
+    # stale `.bak` rather than triggering a half-rolled-back set.
+    for _target, backup, had_old in swapped:
+        if had_old and os.path.exists(backup):
+            os.remove(backup)
+
+
+def parity_export_selftest():
+    """Exercise the group writer, including a failure while installing."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        write_parity_files(
+            tmp,
+            np.zeros(3, dtype="<f4"),
+            np.ones(3, dtype="<f4"),
+            {"dtype": "float32-le"},
+        )
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def failing_replace(src, dst):
+            calls["n"] += 1
+            # 1/2: backup+install pixel; 3/4: backup+install features.
+            if calls["n"] == 4:
+                raise OSError("injected failure installing hf_features.bin")
+            return real_replace(src, dst)
+
+        try:
+            write_parity_files(
+                tmp,
+                np.full(3, 9.0, dtype="<f4"),
+                np.full(3, 9.0, dtype="<f4"),
+                {"dtype": "float32-le"},
+                replace=failing_replace,
+            )
+        except OSError as exc:
+            assert "injected failure" in str(exc), exc
+        else:
+            raise AssertionError("injected failure did not propagate")
+
+        pixel = np.fromfile(os.path.join(tmp, "ms_input_pixel.bin"), dtype="<f4")
+        feats = np.fromfile(os.path.join(tmp, "hf_features.bin"), dtype="<f4")
+        assert np.array_equal(pixel, np.zeros(3, dtype="<f4")), pixel
+        assert np.array_equal(feats, np.ones(3, dtype="<f4")), feats
+        leftovers = [p for p in os.listdir(tmp) if p.endswith((".tmp", ".bak"))]
+        assert not leftovers, leftovers
+    print("parity export selftest ok")
+
+
 def tower_smoke():
     import torch
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
@@ -147,7 +255,22 @@ def main():
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--tower", action="store_true")
     parser.add_argument("--allow-pil-fallback", action="store_true")
+    parser.add_argument(
+        "--parity-export",
+        action="store_true",
+        help="also write raw f32 input/reference bins for the Rust CPU parity test",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run the parity-export group-writer/rollback selftest",
+    )
     args = parser.parse_args()
+    if args.parity_export and not args.tower:
+        parser.error("--parity-export needs --tower (it exports the tower features)")
+    if args.selftest:
+        parity_export_selftest()
+        return 0
     if args.smoke:
         tower_smoke()
         return 0
@@ -174,6 +297,7 @@ def main():
         "hidden_states_sum": float(flat.sum()),
         "hidden_states_first8": [float(x) for x in flat[:8]],
     }
+    features = None
     if args.tower:
         prefix = os.path.splitext(args.out)[0]
         features, shards, keys = run_tower(
@@ -186,6 +310,18 @@ def main():
         golden["features_sum"] = float(fflat.sum())
         golden["features_first8"] = [float(x) for x in fflat[:8]]
         golden["features_npy"] = prefix + "_features.npy"
+    if args.parity_export:
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        meta = {
+            "image_sha256": image_sha256,
+            "grid": grid,
+            "pixel_shape": list(np.asarray(hidden_states).shape),
+            "features_shape": list(np.asarray(features).shape),
+            "pixel_file": "ms_input_pixel.bin",
+            "features_file": "hf_features.bin",
+            "dtype": "float32-le",
+        }
+        write_parity_files(out_dir, hidden_states, features, meta)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(golden, handle, indent=2)
     print(json.dumps(golden, indent=2))
