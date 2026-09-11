@@ -174,10 +174,10 @@ impl VisionRuntime {
 
 /// Completion delivery: generated tokens, per-token log-probs, per-token
 /// top-`k` log-probs (OpenAI `top_logprobs`), and the OpenAI finish reason.
-type DonePayload = (Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str);
+pub(crate) type DonePayload = (Vec<u32>, Vec<f32>, Vec<Vec<(u32, f32)>>, &'static str);
 /// Completion delivery: `Err` carries the engine error for the caller.
 type DoneSender = oneshot::Sender<Result<DonePayload, EngineError>>;
-type DoneReceiver = oneshot::Receiver<Result<DonePayload, EngineError>>;
+pub(crate) type DoneReceiver = oneshot::Receiver<Result<DonePayload, EngineError>>;
 
 /// Shared engine handle (channel side only; the model stays on the engine
 /// thread).
@@ -397,6 +397,12 @@ impl ServerEngine {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
+            // Re-check under the queue lock: a fatal engine failure may have
+            // set shutdown (and drained the queue) after the early check, and
+            // enqueueing now would leave the caller waiting forever.
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(EngineError::ShuttingDown);
+            }
             if pending.len() >= self.capacity * 2 {
                 return Err(EngineError::Busy);
             }
@@ -460,6 +466,9 @@ impl ServerEngine {
         let (tokens_tx, tokens_rx) = tokio::sync::mpsc::channel(256);
         {
             let mut pending = self.pending.lock().unwrap();
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(EngineError::ShuttingDown);
+            }
             if pending.len() >= self.capacity * 2 {
                 return Err(EngineError::Busy);
             }
@@ -799,7 +808,16 @@ impl ServerEngine {
                 }
             }
             if model.active() > 0 {
-                let outputs = model.step().expect("engine step");
+                let outputs = match model.step() {
+                    Ok(outputs) => outputs,
+                    Err(e) => {
+                        let msg = format!("engine step failed: {e}");
+                        eprintln!("{msg}; stopping engine");
+                        self.fail_all(&msg);
+                        self.shutdown.store(true, Ordering::Release);
+                        break;
+                    }
+                };
                 if self.paged_tpp.is_some() {
                     *self.paged_stats.lock().unwrap() = model.paged_reuse_stats();
                 }
@@ -824,10 +842,18 @@ impl ServerEngine {
                         streams.remove(&id);
                     } else if let Some(stx) = streams.get(&id) {
                         // `step()` only returns real tokens (first generated /
-                        // decode), so every non-done output is streamed.
-                        // Best-effort: drop tokens for a slow/closed client
-                        // rather than stalling the whole engine loop.
-                        let _ = stx.try_send(tok);
+                        // decode), so every non-done output is streamed. A
+                        // consumer that stopped draining must fail explicitly:
+                        // silently dropping tokens would truncate the response.
+                        if stx.try_send(tok).is_err() {
+                            if let Some(tx) = txs.remove(&id) {
+                                let _ = tx.send(Err(EngineError::InvalidRequest(
+                                    "stream consumer stalled: token dropped".into(),
+                                )));
+                            }
+                            streams.remove(&id);
+                            model.ack(id);
+                        }
                     }
                 }
             } else {
@@ -843,6 +869,32 @@ impl ServerEngine {
                 }
             }
         }
+    }
+
+    /// Fails every pending and in-flight request after a fatal engine error.
+    /// The engine stops afterwards, so callers get a structured error instead
+    /// of waiting for a completion that can never arrive.
+    fn fail_all(&self, message: &str) {
+        // Stop new submissions *before* draining: a submit that already passed
+        // its early check re-checks shutdown under the pending lock.
+        self.shutdown.store(true, Ordering::Release);
+        let mut pending = self.pending.lock().unwrap();
+        while let Some(r) = pending.pop_front() {
+            let _ = r.done.send(Err(EngineError::Model(mach_model::Error::Model(
+                message.to_string(),
+            ))));
+            drop(r.tokens_tx);
+        }
+        drop(pending);
+        let mut txs = self.txs.lock().unwrap();
+        for (_, tx) in txs.drain() {
+            let _ = tx.send(Err(EngineError::Model(mach_model::Error::Model(
+                message.to_string(),
+            ))));
+        }
+        drop(txs);
+        self.streams.lock().unwrap().clear();
+        self.cond.notify_all();
     }
 
     /// Speculative-decoding engine loop (greedy-only; draft + target models).
@@ -866,7 +918,16 @@ impl ServerEngine {
                 drop(streams);
             }
             if engine.active() > 0 {
-                let outputs = engine.step().expect("spec step");
+                let outputs = match engine.step() {
+                    Ok(outputs) => outputs,
+                    Err(e) => {
+                        let msg = format!("spec step failed: {e}");
+                        eprintln!("{msg}; stopping engine");
+                        self.fail_all(&msg);
+                        self.shutdown.store(true, Ordering::Release);
+                        break;
+                    }
+                };
                 let mut txs = self.txs.lock().unwrap();
                 let mut streams = self.streams.lock().unwrap();
                 for (id, tok) in outputs {
@@ -882,8 +943,15 @@ impl ServerEngine {
                             let _ = tx.send(Ok((output, Vec::new(), Vec::new(), reason)));
                         }
                         streams.remove(&id);
-                    } else if let Some(stx) = streams.get(&id) {
-                        let _ = stx.try_send(tok);
+                    } else if let Some(stx) = streams.get(&id)
+                        && stx.try_send(tok).is_err()
+                    {
+                        if let Some(tx) = txs.remove(&id) {
+                            let _ = tx.send(Err(EngineError::InvalidRequest(
+                                "stream consumer stalled: token dropped".into(),
+                            )));
+                        }
+                        streams.remove(&id);
                     }
                 }
             } else {
@@ -920,5 +988,82 @@ mod tests {
         assert_eq!(got.image_token_id, 7);
         assert_eq!(got.spatial_merge_size, 2);
         assert_eq!(got.max_patches, 128);
+    }
+
+    /// A fatal engine error must fail every queued *and* in-flight request and
+    /// close its token stream, so no caller waits for a completion that can
+    /// never arrive.
+    #[tokio::test]
+    async fn fail_all_fails_pending_and_inflight() {
+        let engine = ServerEngine::new(1);
+
+        let (pending_done_tx, pending_done_rx) = tokio::sync::oneshot::channel();
+        let (pending_tok_tx, mut pending_tok_rx) = tokio::sync::mpsc::channel(1);
+        engine.pending.lock().unwrap().push_back(Request {
+            prompt: vec![1],
+            max_new: 1,
+            eos: None,
+            stop_seqs: Vec::new(),
+            logit_bias: Vec::new(),
+            params: mach_model::sampling::SamplingParams::default(),
+            images: Vec::new(),
+            done: pending_done_tx,
+            tokens_tx: Some(pending_tok_tx),
+        });
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(1);
+        engine.txs.lock().unwrap().insert(7, done_tx);
+        engine.streams.lock().unwrap().insert(7, tok_tx);
+
+        engine.fail_all("boom");
+
+        let err = pending_done_rx
+            .await
+            .expect("pending completion signalled")
+            .expect_err("pending request must fail");
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(
+            pending_tok_rx.recv().await.is_none(),
+            "pending stream closed"
+        );
+
+        let err = done_rx
+            .await
+            .expect("in-flight completion signalled")
+            .expect_err("in-flight request must fail");
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(tok_rx.recv().await.is_none(), "in-flight stream closed");
+    }
+
+    /// A submit that passed the early shutdown check but lost the race with a
+    /// fatal engine failure must be rejected instead of enqueued into a queue
+    /// no engine thread will drain.
+    #[test]
+    fn submit_rechecks_shutdown_under_pending_lock() {
+        let engine = ServerEngine::new(1);
+        let guard = engine.pending.lock().unwrap();
+        let e2 = Arc::clone(&engine);
+        let submit = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(e2.submit(
+                vec![1],
+                4,
+                None,
+                Vec::new(),
+                Vec::new(),
+                mach_model::sampling::SamplingParams::default(),
+            ))
+        });
+        // Give the submit time to pass its early check and block on `pending`.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        engine.shutdown.store(true, Ordering::Release);
+        drop(guard);
+        let err = submit.join().unwrap().expect_err("must be rejected");
+        assert!(matches!(err, EngineError::ShuttingDown), "{err}");
+        assert!(engine.pending.lock().unwrap().is_empty());
     }
 }
