@@ -615,20 +615,26 @@ impl ServerEngine {
                     .into(),
             ));
         }
-        if int8_kv && self.paged_tpp.is_some() {
-            return Err(EngineError::InvalidRequest(
-                "MACH_KV=int8 is not wired for paged KV yet; unset MACH_PAGED".into(),
-            ));
-        }
         let model = if let Some(tpp) = self.paged_tpp {
-            ContinuousModel::with_paged_prefill_rows_q4_all(
-                hip,
-                cfg,
-                &w,
-                self.capacity,
-                self.prefill_rows,
-                tpp,
-            )?
+            if int8_kv {
+                ContinuousModel::with_paged_prefill_rows_q4_all_int8_kv(
+                    hip,
+                    cfg,
+                    &w,
+                    self.capacity,
+                    self.prefill_rows,
+                    tpp,
+                )?
+            } else {
+                ContinuousModel::with_paged_prefill_rows_q4_all(
+                    hip,
+                    cfg,
+                    &w,
+                    self.capacity,
+                    self.prefill_rows,
+                    tpp,
+                )?
+            }
         } else if int8_kv {
             ContinuousModel::with_prefill_rows_q4_all_int8_kv(
                 hip,

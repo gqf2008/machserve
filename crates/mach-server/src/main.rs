@@ -20,7 +20,9 @@
 //! ~54GB would not fit in VRAM; all-Q4 ~13.5GB does),
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
 //! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
-//! engage paged KV — plain, Q4 and FP8 non-MLA). The paged-path safety cap is
+//! engage paged KV — plain, Q4 and FP8 non-MLA). MACH_KV=int8 is supported
+//! for contiguous or paged dense non-MLA checkpoints with Q4_DEVICE=2.
+//! The paged-path safety cap is
 //! MACH_PREFILL_ROWS<=64 / MACH_CAPACITY<=64 until controlled 512-row GPU
 //! validation of the tiled attention path lands.
 //! Limitations: paged KV serves
@@ -397,10 +399,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("MACH_KV=int8 currently requires MACH_Q4=1 MACH_Q4_DEVICE=2");
         std::process::exit(1);
     }
-    if kv_int8 && paged_requested {
-        eprintln!("MACH_KV=int8 is not wired for MACH_PAGED yet; unset MACH_PAGED");
-        std::process::exit(1);
-    }
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
@@ -429,6 +427,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if kv_int8 && cfg.kv_lora_rank > 0 {
         eprintln!("MACH_KV=int8 does not support MLA checkpoints yet (kv_lora_rank > 0)");
+        std::process::exit(1);
+    }
+    if kv_int8 && let Err(e) = BatchedModel::check_int8_kv_support(&cfg) {
+        eprintln!("MACH_KV=int8 unsupported: {e}");
         std::process::exit(1);
     }
     if q4 {
@@ -573,11 +575,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
     }
-    if kv_int8 {
-        println!(
-            "INT8 KV: contiguous full-attention payload i8 + per-token/head f32 scales (exact preflight estimate)"
-        );
-    }
     if estimate > free as u64 {
         eprintln!(
             "insufficient VRAM: need ~{:.2}GiB but only {:.2}GiB free; lower MACH_CAPACITY / MACH_PREFILL_ROWS or use a smaller model",
@@ -650,6 +647,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    if kv_int8 {
+        if paged_tpp.is_some() {
+            println!(
+                "INT8 KV: paged full-attention payload i8 + per-token/head f32 scales (exact preflight estimate)"
+            );
+        } else {
+            println!(
+                "INT8 KV: contiguous full-attention payload i8 + per-token/head f32 scales (exact preflight estimate)"
+            );
+        }
+    }
+
     // Safety cap: paged prefill batches above the empirically safe limit have
     // caused corrupted outputs and whole-machine resets on the project's 7900
     // XTX. Apply this before any weight load and make an overridden non-default

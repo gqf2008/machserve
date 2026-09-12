@@ -140,7 +140,8 @@ cargo run -p mach-server --release --features hip
 #     当前项目实测环境的保守上限 MACH_PREFILL_ROWS<=64、MACH_CAPACITY<=64，
 #     超过会告警截断/拒绝。已验证 Qwen3-8B/Q4-on-device/TPP=64/约 600 token；
 #     128+ 行已观测到错误输出/整机异常，其他模型与上下文仍需单独验证)、
-#   MACH_KV=int8(实验:Q4_DEVICE=2 的连续 full-attention K/V 用 INT8,预检按 payload+scales)、
+#   MACH_KV=int8(实验:Q4_DEVICE=2 的 dense 非 MLA full-attention K/V 用 INT8；
+#     支持连续与 MACH_PAGED 页池两种布局，预检按 payload+scales)、
 #   MACH_PAGED_DEBUG=1(分页复用 trace:每个请求一行 `paged: admit`/`paged: register`,
 #     含 reused_pages —— 该复用而缺失就是缓存未命中的直接证据)
 #   MACH_VISION=1 + MACH_VISION_DOWNSCALE=1(视觉超预算图降采样到
