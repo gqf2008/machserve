@@ -1695,8 +1695,23 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
   - 真机 Qwen3.8-27B：18 shards / 1199 tensors / Q4 all-device + INT8 KV，
     `capacity=1, max_seq=128, prefill_rows=4`，短 completion 8 tokens，
     0.42s，正常返回。
-- 当前限制：paged INT8 KV 尚未接 runtime；MLA 不支持；显存估算仍按 f16 KV
+- Stage 9 当时的限制：paged INT8 KV 尚未接 runtime；后续 #190 已补 paged runtime。MLA 仍不支持。
   保守计数；长 context / 多序列性能 A/B 待下一批真机窗口。
+
+## INT8 KV：paged runtime 接线（#190，2026-09-12）
+
+Stage 5 的 `kv_store_paged_int8` / `attn_decode_paged_int8_gqa` 已从
+compile-only 接到 dense、非 MLA、F16 计算路径：
+
+- `BatchedModel::with_paged_kv_rows_q4_all_int8_kv` 复用连续 INT8
+  payload/scales 分配；在 `tpp | max_seq_len` 下其元素总数与 paged 页池一致；
+- `run_kernels` 在 `MACH_PAGED + MACH_KV=int8` 时走 page-table store 与
+  correctness-first paged INT8 GQA attention；
+- paged INT8 禁用 graph capture；当前要求 `256 % head_dim == 0`；
+- server 不再拒绝 `MACH_KV=int8 + MACH_PAGED`（仍需
+  `MACH_Q4=1 MACH_Q4_DEVICE=2`，且 MLA/GDN 仍拒绝）；
+- 新增 opt-in GPU parity：paged INT8 vs paged F16，覆盖跨页 decode 与 packed
+  prefill；真机执行前不宣称 GPU 数值已验证。
 
 ## INT8 KV Stage 10：连续路径精确显存预检（#144，2026-09-11）
 

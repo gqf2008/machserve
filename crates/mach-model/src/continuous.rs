@@ -561,6 +561,33 @@ impl ContinuousModel {
         ))
     }
 
+    /// Paged dense Q4-on-device + INT8 KV (`MACH_Q4_DEVICE=2 MACH_KV=int8
+    /// MACH_PAGED=1`). The correctness-first paged INT8 kernels currently
+    /// support dense, non-MLA checkpoints only.
+    pub fn with_paged_prefill_rows_q4_all_int8_kv(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        capacity: usize,
+        prefill_rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        let model = BatchedModel::with_paged_kv_rows_q4_all_int8_kv(
+            hip,
+            cfg,
+            w,
+            capacity,
+            prefill_rows.max(capacity),
+            tokens_per_page,
+        )?;
+        Ok(Self::with_model(
+            model,
+            prefill_rows.max(capacity),
+            capacity,
+            Some(Self::paged_state(&cfg, capacity, tokens_per_page)),
+        ))
+    }
+
     /// [`Self::with_paged_prefill_rows`] for storage-FP8 weights (device f16).
     pub fn with_paged_prefill_rows_fp8(
         hip: Arc<Hip>,

@@ -669,6 +669,38 @@ impl BatchedModel {
         Ok(m)
     }
 
+    /// Paged dense Q4-on-device + INT8 KV. The existing INT8 payload/scales
+    /// allocation is reused because `tokens_per_page | max_seq_len`; only the
+    /// addressing changes from contiguous `[slot,pos]` to page-table
+    /// `[page,off]`. The correctness-first paged INT8 attention kernel requires
+    /// `256 % head_dim == 0`.
+    pub fn with_paged_kv_rows_q4_all_int8_kv(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model(
+                "paged INT8 KV currently requires dtype F16".into(),
+            ));
+        }
+        if cfg.kv_lora_rank != 0 {
+            return Err(Error::Model(
+                "paged INT8 KV does not support MLA checkpoints yet".into(),
+            ));
+        }
+        Self::check_int8_kv_support(&cfg)?;
+        let mut m = Self::build_common_with(hip, cfg, slots, rows, usize::MAX, true, |m| {
+            m.upload_weights_q4(w, true, true)
+        })?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
     /// [`Self::with_paged_kv_rows`] for storage-FP8 weights: E4M3 tensors are
     /// dequantized to f16 on upload; the tiled f16 paged kernels serve the device.
     pub fn with_paged_kv_rows_fp8(
@@ -775,6 +807,19 @@ impl BatchedModel {
     /// Pure `cfg` logic — CPU-runnable.
     pub fn check_paged_support(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
         Self::paged_guards(cfg, tokens_per_page)
+    }
+
+    /// INT8 KV geometry guard shared by contiguous and paged paths. The
+    /// correctness-first INT8 attention kernels split the thread block over
+    /// the key dimension and require `256 % head_dim == 0`.
+    pub fn check_int8_kv_support(cfg: &Config) -> Result<(), Error> {
+        if cfg.head_dim == 0 || cfg.head_dim > 256 || 256 % cfg.head_dim != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "INT8 KV attention requires head_dim <= 256 and 256 % head_dim == 0 (got {})",
+                cfg.head_dim
+            )));
+        }
+        Ok(())
     }
 
     /// Pages per sequence in paged mode (`max_seq / tokens_per_page`).
@@ -924,6 +969,7 @@ impl BatchedModel {
         slots: usize,
         rows: usize,
     ) -> Result<Self, Error> {
+        Self::check_int8_kv_support(&cfg)?;
         if cfg.dtype != ModelDType::F16 {
             return Err(Error::Model("INT8 KV requires dtype F16".into()));
         }
@@ -2964,6 +3010,7 @@ impl BatchedModel {
             || self.prefetch.is_some()
             || self.layer_dump.is_some()
             || self.cfg.dtype != ModelDType::F16
+            || (self.int8_kv && self.paged)
             || n == 0
             || n > GEMV_MAX_M as usize
         {
@@ -3762,7 +3809,51 @@ impl BatchedModel {
                     )?;
                 }
                 let (kc, vc) = self.kv_cache[li];
-                if self.int8_kv {
+                if self.int8_kv && self.paged {
+                    let iv = self.int8_kv_cache[li].expect("full-attention INT8 KV cache");
+                    let tpp = self.tokens_per_page as i32;
+                    k.launch_kv_store_paged_int8(
+                        self.k_buf,
+                        iv.kp,
+                        iv.ks,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_kv_store_paged_int8(
+                        self.v_buf,
+                        iv.vp,
+                        iv.vs,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_attn_decode_paged_int8_gqa(
+                        self.q,
+                        iv.kp as *const i8,
+                        iv.ks as *const f32,
+                        iv.vp as *const i8,
+                        iv.vs as *const f32,
+                        self.block_tables,
+                        self.attn,
+                        self.pos_dev,
+                        self.table_offsets,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        tpp,
+                    )?;
+                } else if self.int8_kv {
                     let iv = self.int8_kv_cache[li].expect("full-attention INT8 KV cache");
                     k.launch_kv_store_int8(
                         self.k_buf,
@@ -5317,6 +5408,18 @@ mod paged_support_tests {
         assert!(BatchedModel::check_paged_support(&mla, 64).is_err());
         mla.dtype = ModelDType::F32;
         assert!(BatchedModel::check_paged_support(&mla, 64).is_ok());
+    }
+
+    #[test]
+    fn check_int8_kv_support_requires_256_divisible_head_dim() {
+        let mut cfg = Config::tiny(); // head_dim 32
+        assert!(BatchedModel::check_int8_kv_support(&cfg).is_ok());
+        cfg.head_dim = 80;
+        assert!(BatchedModel::check_int8_kv_support(&cfg).is_err());
+        cfg.head_dim = 512;
+        assert!(BatchedModel::check_int8_kv_support(&cfg).is_err());
+        cfg.head_dim = 0;
+        assert!(BatchedModel::check_int8_kv_support(&cfg).is_err());
     }
 }
 

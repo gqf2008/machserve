@@ -455,3 +455,90 @@ fn batched_model_q4_int8_kv_prefill_matches_f16() {
         assert!(diff < 0.02, "prefill row {row} logit diff {diff}");
     }
 }
+
+#[test]
+#[ignore = "GPU runtime parity; run explicitly with MACH_TEST_INT8_KV=1"]
+fn batched_model_q4_paged_int8_kv_matches_f16_greedy() {
+    let Some((h, _)) = gpu_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let tpp = 32usize;
+    let w = Weights::random(&cfg, 456).unwrap();
+    let wq = WeightsQ4::from_weights(&w, &cfg);
+    let mut f16 =
+        BatchedModel::with_paged_kv_rows_q4_all(Arc::clone(&h), cfg, &wq, 1, 1, tpp).unwrap();
+    let mut int8 =
+        BatchedModel::with_paged_kv_rows_q4_all_int8_kv(Arc::clone(&h), cfg, &wq, 1, 1, tpp)
+            .unwrap();
+    assert!(int8.int8_kv_enabled());
+    assert!(int8.int8_kv_layer_count() > 0);
+
+    for step in 0..40u32 {
+        let token = (step * 37 + 11) % 1024 + 1;
+        let a = f16.decode_step(&[token]).unwrap()[0];
+        let b = int8.decode_step(&[token]).unwrap()[0];
+        assert_eq!(b, a, "paged INT8 greedy diverged at step {step}");
+    }
+}
+
+#[test]
+#[ignore = "GPU runtime prefill parity; run explicitly with MACH_TEST_INT8_KV=1"]
+fn batched_model_q4_paged_int8_kv_prefill_matches_f16() {
+    let Some((h, _)) = gpu_ctx() else { return };
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let tpp = 32usize;
+    let w = Weights::random(&cfg, 654).unwrap();
+    let wq = WeightsQ4::from_weights(&w, &cfg);
+    let mut f16 =
+        BatchedModel::with_paged_kv_rows_q4_all(Arc::clone(&h), cfg, &wq, 2, 4, tpp).unwrap();
+    let mut int8 =
+        BatchedModel::with_paged_kv_rows_q4_all_int8_kv(Arc::clone(&h), cfg, &wq, 2, 4, tpp)
+            .unwrap();
+    let table0: Vec<u32> = (0..8).collect();
+    let table1: Vec<u32> = (8..16).rev().collect();
+    f16.set_block_table(0, &table0).unwrap();
+    f16.set_block_table(1, &table1).unwrap();
+    int8.set_block_table(0, &table0).unwrap();
+    int8.set_block_table(1, &table1).unwrap();
+    let tokens = [3u32, 17, 42, 5];
+    let lens = [0u32, 1, 0, 1];
+    let slots = [0u32, 0, 1, 1];
+    let mut params_a: Vec<SamplingParams> = (0..tokens.len())
+        .map(|_| SamplingParams::default())
+        .collect();
+    let mut params_b = params_a.clone();
+    let counts_a: Vec<Vec<(u32, u32)>> = vec![Vec::new(); tokens.len()];
+    let counts_b = counts_a.clone();
+    let bias_a: Vec<Vec<(u32, f32)>> = vec![Vec::new(); tokens.len()];
+    let bias_b = bias_a.clone();
+    f16.decode_step_explicit(
+        &tokens,
+        &lens,
+        &slots,
+        &mut params_a,
+        &counts_a,
+        &bias_a,
+        false,
+    )
+    .unwrap();
+    int8.decode_step_explicit(
+        &tokens,
+        &lens,
+        &slots,
+        &mut params_b,
+        &counts_b,
+        &bias_b,
+        false,
+    )
+    .unwrap();
+    let a = f16.read_logits_rows(tokens.len()).unwrap();
+    let b = int8.read_logits_rows(tokens.len()).unwrap();
+    let vocab = cfg.vocab_size;
+    for row in 0..tokens.len() {
+        let ar = &a[row * vocab..(row + 1) * vocab];
+        let br = &b[row * vocab..(row + 1) * vocab];
+        let diff = max_abs_diff(ar, br);
+        assert!(diff < 0.02, "paged prefill row {row} logit diff {diff}");
+    }
+}
