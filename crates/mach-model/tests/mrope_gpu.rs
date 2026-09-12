@@ -149,8 +149,11 @@ fn cpu_delta(
 #[ignore = "GPU M-RoPE model parity; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn batched_model_mrope_tables_match_scalar_text_only() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
-        eprintln!("skipping: set MACH_TEST_MROPE_GPU=1 to run this ignored GPU M-RoPE test");
-        return;
+        // Explicitly selected (these are `#[ignore]`d) without the opt-in:
+        // fail loudly. A silent `return` here reports "ok", and libtest drops
+        // the output of passing tests, so even `eprintln!` is invisible under
+        // a bare `--ignored` run (`LESSON_测试SKIP分支被误读为通过需核对真实执行`).
+        panic!("MACH_TEST_MROPE_GPU=1 is required to run this GPU M-RoPE test");
     }
     let hip = hip::hip().expect("HIP runtime");
     let cfg = Config::tiny();
@@ -196,8 +199,11 @@ fn batched_model_mrope_tables_match_scalar_text_only() {
 #[ignore = "GPU M-RoPE lifecycle; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn mrope_table_row_mismatch_fails_fast() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
-        eprintln!("skipping: set MACH_TEST_MROPE_GPU=1 to run this ignored GPU M-RoPE test");
-        return;
+        // Explicitly selected (these are `#[ignore]`d) without the opt-in:
+        // fail loudly. A silent `return` here reports "ok", and libtest drops
+        // the output of passing tests, so even `eprintln!` is invisible under
+        // a bare `--ignored` run (`LESSON_测试SKIP分支被误读为通过需核对真实执行`).
+        panic!("MACH_TEST_MROPE_GPU=1 is required to run this GPU M-RoPE test");
     }
     let hip = hip::hip().expect("HIP runtime");
     let cfg = Config::tiny();
@@ -226,8 +232,11 @@ fn mrope_table_row_mismatch_fails_fast() {
 #[ignore = "GPU M-RoPE parity; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn rope_batched_tables_matches_cpu() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
-        eprintln!("skipping GPU M-RoPE parity: MACH_TEST_MROPE_GPU is not 1");
-        return;
+        // Explicitly selected (these are `#[ignore]`d) without the opt-in:
+        // fail loudly. A silent `return` here reports "ok", and libtest drops
+        // the output of passing tests, so even `eprintln!` is invisible under
+        // a bare `--ignored` run (`LESSON_测试SKIP分支被误读为通过需核对真实执行`).
+        panic!("MACH_TEST_MROPE_GPU=1 is required to run this GPU M-RoPE test");
     }
     let h = hip::hip().expect("HIP runtime");
     let k = HipKernels::new(Arc::clone(&h)).unwrap();
@@ -290,8 +299,11 @@ fn rope_batched_tables_matches_cpu() {
 #[ignore = "GPU M-RoPE parity; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn rope_batched_delta_matches_cpu() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
-        eprintln!("skipping: set MACH_TEST_MROPE_GPU=1 to run this ignored GPU M-RoPE test");
-        return;
+        // Explicitly selected (these are `#[ignore]`d) without the opt-in:
+        // fail loudly. A silent `return` here reports "ok", and libtest drops
+        // the output of passing tests, so even `eprintln!` is invisible under
+        // a bare `--ignored` run (`LESSON_测试SKIP分支被误读为通过需核对真实执行`).
+        panic!("MACH_TEST_MROPE_GPU=1 is required to run this GPU M-RoPE test");
     }
     let h = hip::hip().expect("HIP runtime");
     let k = HipKernels::new(Arc::clone(&h)).unwrap();
