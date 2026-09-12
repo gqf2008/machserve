@@ -47,6 +47,28 @@ cargo test -p mach-model --test vision_real_weights -- --ignored --nocapture
 `nonfinite = 0`，单线程 696.9s。GPU 窗口建议以 CPU 参考为中间基准：先 CPU↔HF，
 再 GPU↔CPU。
 
+### 整模型首步/短序列对拍（已有 artifact）
+
+已有 HF BF16 与 MachServe Q4-on-device 的 artifact 时，可用纯离线 comparator 钉住
+prompt 长度、vision grid / image-pad 数量、greedy 首 token 和完整短序列。它**不把 top-5
+logits 宣称**为量化后的逐值 parity；top-5 仅作诊断输出。
+
+```powershell
+python tools/vision_c4_compare_first_step.py --selftest
+python tools/vision_c4_compare_first_step.py `
+  --hf artifacts/vision-c4/hf_first_step.json `
+  --hf-full artifacts/vision-c4/hf_full_tokens.json `
+  --ms artifacts/vision-c4/ms_logprobs.json `
+  --ms-features artifacts/vision-c4/ms_features.json `
+  --ms-meta artifacts/vision-c4/parity_meta.json `
+  --out artifacts/vision-c4/first_step_compare.json
+```
+
+2026-09-12 对现有 artifact 实测：prompt 81/81、grid `[[1,16,16]]`、image-pad
+64/64、4-token greedy 序列 `[248068,271,248069,271]` HF/MS 逐位一致；HF 参考由
+CPU/disk offload 生成（`device_map_has_cuda=false`），comparator exit 0。完整 logits parity
+仍需在后续有受控 GPU/HF 窗口时单独跑。
+
 ## 步骤
 
 0) 准备同一张输入图片 `artifacts/vision-c4/input.png`（golden 与 E2E 必须使用它，脚本会记录 SHA-256）。

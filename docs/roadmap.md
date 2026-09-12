@@ -1932,6 +1932,10 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - **2026-09-12 验证骨架修正**：长对拍改为 `#[ignore]`，显式选中但缺 env 时 fail-loud；
   相对路径按测试 cwd 优先、仓库根回退解析，修复 runbook 中 `artifacts/...` 直接报路径不存在的问题。
   当前 master 复跑真实 27B 视觉塔 CPU↔HF 对拍：`worst_ratio=0.4488`、`nonfinite=0`、696.9s。
+- **2026-09-12 首步/短序列对拍（#183）**：新增 `tools/vision_c4_compare_first_step.py`，对已有
+  HF/MachServe artifact 校验 prompt 81/81、grid `[[1,16,16]]`、image-pad 64/64、首 token 以及
+  4-token greedy 序列 `[248068,271,248069,271]` 逐位一致；HF 参考由 CPU/disk offload 生成
+  （无 CUDA），top-5 logprobs 只报告不判 pass，明确 Q4/BF16 数值差异边界。
 
 **C4 至此只剩真机窗口项**：golden/compare E2E、HF 整模型 greedy token/logits
 （本机 31GB 内存装不下 BF16 27B）、Fast/PIL 漂移复核、VRAM/TTFT 回填。
