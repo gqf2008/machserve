@@ -1485,3 +1485,91 @@ fn batched_paged_f16_chunked_prefill_across_many_pages_repro() {
         );
     }
 }
+
+/// Same failing shape as the F16 repro above, but on the **Q4 dense** weight
+/// path (`with_paged_kv_rows_q4_all`) — which is what the 2026-09-12 real-
+/// machine failures used (`MACH_Q4_DEVICE=2`). The reference is the contiguous
+/// Q4-all model over the *same* quantized weights, so a logit gap isolates
+/// paged addressing/kernels from quantisation error.
+///
+/// Opt-in for the same reason as the F16 variant: the shape hard-powered-off
+/// the machine, so a bare `--ignored` batch run must NOT execute it.
+#[test]
+#[ignore = "known-bad shape (#168): needs MACH_TEST_PAGED_MANY_PAGE=1 and an operator watching"]
+fn batched_paged_q4_all_chunked_prefill_across_many_pages_repro() {
+    if std::env::var("MACH_TEST_PAGED_MANY_PAGE").as_deref() != Ok("1") {
+        panic!("MACH_TEST_PAGED_MANY_PAGE=1 is required to run this known-bad paged repro");
+    }
+    let hip = hip_ctx().unwrap_or_else(|| {
+        panic!("no HIP device is present; this repro is opt-in and must not silently skip")
+    });
+    let mut cfg = Config::llama(128, 2, 4, 2, 1024, 4096);
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 97).unwrap();
+    let wq = mach_model::WeightsQ4::from_weights(&w, &cfg);
+    let vocab = cfg.vocab_size;
+    let total = 640usize; // 10 pages: chunk1 = 512 rows (pages 0..7), chunk2 = 128 (pages 8..9)
+    let seq: Vec<u32> = (0..total as u32)
+        .map(|i| (i * 37 + 11) % 1024 + 1)
+        .collect();
+
+    // Reference: contiguous Q4-all over the same quantized weights, one row per step.
+    let mut contig = BatchedModel::with_rows_q4_all(hip.clone(), cfg, &wq, 1, 512).unwrap();
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(total);
+    for (i, &t) in seq.iter().enumerate() {
+        let (_, lm) = fwd_rows(&mut contig, &[t], &[i as u32], &[0u32], vocab);
+        ref_logits.push(lm);
+    }
+
+    // Q4 paged path: same tolerance convention as
+    // `batched_paged_q4_matches_dequantized_reference` (5e-2 on logits).
+    let check = |_row: usize, got: &[f32], want: &[f32], ctx: &str| {
+        let max = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 5e-2,
+            "{ctx}: q4 paged vs contiguous logits max diff {max}"
+        );
+    };
+
+    let mut paged =
+        BatchedModel::with_paged_kv_rows_q4_all(hip.clone(), cfg, &wq, 1, 512, tpp).unwrap();
+    let lens1: Vec<u32> = (0..512u32).collect();
+    let slots1: Vec<u32> = vec![0; 512];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..512], &lens1, &slots1, vocab);
+    for &row in &[0usize, 63, 64, 511] {
+        check(
+            row,
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("q4 many-page chunk1 row {row}"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "chunk1 greedy {row}"
+        );
+    }
+
+    let lens2: Vec<u32> = (512..total as u32).collect();
+    let slots2: Vec<u32> = vec![0; total - 512];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[512..], &lens2, &slots2, vocab);
+    for &row in &[0usize, total - 512 - 1] {
+        let pos = 512 + row;
+        check(
+            row,
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("q4 many-page chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "chunk2 greedy {pos}"
+        );
+    }
+}
