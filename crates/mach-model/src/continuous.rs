@@ -109,6 +109,13 @@ struct PagedEngineState {
     requests: usize,
     reused_tokens: usize,
     prompt_tokens: usize,
+    /// Verbose admission/registration trace (`MACH_PAGED_DEBUG=1`).
+    ///
+    /// Cross-request reuse is silent by construction: a request that
+    /// *misses* the cache just looks like any other full prefill. This
+    /// trace is the only way to tell "registered but not aliased"
+    /// (hashing/ordering bug) from "never registered" (timing bug).
+    debug: bool,
 }
 
 impl PagedEngineState {
@@ -597,6 +604,7 @@ impl ContinuousModel {
             requests: 0,
             reused_tokens: 0,
             prompt_tokens: 0,
+            debug: std::env::var("MACH_PAGED_DEBUG").is_ok_and(|v| v != "0"),
         }
     }
 
@@ -833,6 +841,15 @@ impl ContinuousModel {
             pg.requests += 1;
             pg.prompt_tokens += prompt.len();
             pg.reused_tokens += r;
+            if pg.debug {
+                eprintln!(
+                    "paged: admit id={id} prompt_tokens={} full_pages={} reused_pages={} reused_tokens={r} delta={}",
+                    prompt.len(),
+                    plan.full_pages,
+                    plan.reused_pages,
+                    prompt.len() - r,
+                );
+            }
             len = r;
             pending = prompt[r..].iter().copied().collect();
         }
@@ -1046,6 +1063,9 @@ impl ContinuousModel {
                         // partial page is freed at retire with the other
                         // unregistered content.
                         let full = pg.entries[i].full_pages;
+                        if pg.debug {
+                            eprintln!("paged: register slot={i} full_pages={full}");
+                        }
                         let chain = &pg.entries[i].chain[..full];
                         let t = pg.tables[i].as_ref().expect("paged slot table");
                         pg.builder.register_chain(chain, t);

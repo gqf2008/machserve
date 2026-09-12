@@ -29,3 +29,29 @@
 - **首请求两引擎对齐（17.0 vs 17.4 ms）**：确认 paged 路径无固有开销差；早期 7x 差是首跑引擎承担的一次性 hipBLAS/驱动初始化，热身已消除（A/B 口径见 `docs/benchmark-protocol.md`）。
 - **TPOT 差异是批形状产物**：分页引擎交错准入使后续 decode 多为单行小批；不做加速声称，真实多并发 decode 吞吐需 `lctx_bench`/服务端口径另行测量。
 - **结论 / 下一步**：跨请求前缀共享的 GPU 服务链已闭环（`MACH_PAGED=1`）。后续：真实模型（Qwen3-8B）同口径 A/B、共享前缀页接入后的页池驱逐/LRU（当前池容量=capacity×max_pages，装满即拒）、`scheduler_fsm` 替换隐式生命周期。
+
+## 真实模型同口径 A/B（harness 已就绪，待机器窗口）
+
+合成 tiny 模型上的数字（上一节）不能替代真实 checkpoint 的口径。真实模型 A/B 用
+`tools/paged_prefix_ab_real.py`，一个 arm 一次调用：
+
+```bash
+# arm 1（分页）
+python tools/paged_prefix_ab_real.py --arm paged
+# 留 >=10 分钟观察窗口，确认 doctor 的 device_count 没变，再做 arm 2
+python tools/paged_prefix_ab_real.py --arm contiguous
+```
+
+- 工作负载：5 个请求共享同一段长 system 块（`--shared-repeats 22` ≈ 1937 token），
+  只有末尾 user turn 不同，`max_new=8`、`temperature=0`、SSE 逐帧计时。
+- 分页 arm 会自动带 `MACH_PAGED_DEBUG=1`，服务日志里每个请求一行
+  `paged: admit id=… prompt_tokens=… full_pages=… reused_pages=…`，预填物化时一行
+  `paged: register slot=… full_pages=…`。**该复用而 `reused_pages=0` 就是缓存未命中的直接证据。**
+- **自检（肯定不变量）**：分页 arm 要求日志里出现 `paged: admit` 行，且至少一个请求
+  `reused_pages>0`；任一不满足即直接失败、不写 JSON。这样无论服务端以后用哪种文案静默
+  退化成 contiguous，都不会产出看起来正常的数字。harness 还会拒绝：非 200 状态、
+  `error` SSE 帧、无数据帧、缺 `finish_reason`、模型目录不存在、端口已被占用、子进程提前退出。
+- **安全约束**：两个 arm 必须拆到不同时间窗口，中间留 ≥10 分钟观察窗口。本机曾两次
+  在重 GPU arm 结束的同一秒级窗口内出现显示驱动 TDR（Event 4101），随后 7900 XTX
+  掉出 HIP 设备枚举（`doctor` 只剩核显），必须重启才能复位。每 arm 结束都查一次
+  4101 并比对 `mach-server doctor` 的 `device_count`。
