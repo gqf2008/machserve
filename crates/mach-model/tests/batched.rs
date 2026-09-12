@@ -1391,6 +1391,121 @@ mod paged_quantized_cpu_parity {
         let prompt: Vec<u32> = (0..20u32).map(|i| (i * 13 + 3) % 1024 + 1).collect();
         assert_paged_matches_cpu(&mut paged, cfg, &wd, &prompt, 5e-2);
     }
+
+    /// Same failing shape as the F16 repro above but on the **Q4 dense** weight
+    /// path (`with_paged_kv_rows_q4_all`), which is what the 2026-09-12 real-
+    /// machine failures used (`MACH_Q4_DEVICE=2`).
+    ///
+    /// Reference = **CPU** `RefModel` over the dequantized Q4 weights (this
+    /// module's convention): a GPU-vs-GPU pairing would be blind to a defect
+    /// shared by both GPU paths. Note what a red result does and does not say:
+    /// quantisation error cancels (same weights both sides), but the 512-row
+    /// chunk switches dense Q4 from `gemv_q4` to `gemv_q4_rowbatch`
+    /// (`launch_q4_dense`), so the difference axis is "paged KV **and** Q4
+    /// dense batch shape" — the 2026-09-12 no-paged long-prompt arm (same
+    /// `MACH_Q4_DEVICE=2`, 1958 tokens, prefill rows 512) left no Kernel-Power
+    /// 41, which weakly excludes the rowbatch axis but this case cannot.
+    ///
+    /// Run with `MACH_GRAPH` unset (and `MACH_LAYER_DUMP` too, so the run matches
+    /// the real failing config): with `MACH_GRAPH=1` the new 1-row decode step below
+    /// is graph-capturable (`n=1 <= GEMV_MAX_M`, dtype F16) while the 512/128-row
+    /// packed chunks are not (`graph_capture_ok`), so that step would run on a
+    /// different execution path than the chunks.
+    #[test]
+    #[ignore = "known-bad shape (#168): needs MACH_TEST_PAGED_MANY_PAGE=1 and an operator watching"]
+    fn batched_paged_q4_all_chunked_prefill_across_many_pages_repro() {
+        if std::env::var("MACH_TEST_PAGED_MANY_PAGE").as_deref() != Ok("1") {
+            panic!("MACH_TEST_PAGED_MANY_PAGE=1 is required to run this known-bad paged repro");
+        }
+        let hip = hip_ctx().unwrap_or_else(|| {
+            panic!("no HIP device is present; this repro is opt-in and must not silently skip")
+        });
+        let mut cfg = Config::llama(128, 2, 4, 2, 1024, 4096);
+        cfg.dtype = ModelDType::F16;
+        let tpp = 64usize;
+        let w = Weights::random(&cfg, 97).unwrap();
+        let wq = WeightsQ4::from_weights(&w, &cfg);
+        let wd = dequantize_q4(&wq);
+        let vocab = cfg.vocab_size;
+        // 640 tokens = 10 pages: chunk1 = 512 rows (pages 0..7), chunk2 = 128
+        // (pages 8..9) — the confirmed-failing real shape. `slots = 1` is the
+        // single-sequence shape the failing request used (the real server ran
+        // capacity 4, so slot-stride/pool-size is not covered here).
+        let total = 640usize;
+        let seq: Vec<u32> = (0..total as u32)
+            .map(|i| (i * 37 + 11) % 1024 + 1)
+            .collect();
+
+        // CPU reference over the same quantized weights, one token per step.
+        let mut cpu = RefModel::new(cfg, wd);
+        let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(total + 1);
+        for &t in &seq {
+            ref_logits.push(cpu.forward(&[t]));
+        }
+
+        let check = |_row: usize, got: &[f32], want: &[f32], ctx: &str| {
+            let d = max_abs_diff(got, want);
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                d <= 5e-2 * (1.0 + scale),
+                "{ctx}: max diff {d} (scale {scale})"
+            );
+        };
+
+        let mut paged =
+            BatchedModel::with_paged_kv_rows_q4_all(hip, cfg, &wq, 1, 512, tpp).unwrap();
+        let lens1: Vec<u32> = (0..512u32).collect();
+        let slots1: Vec<u32> = vec![0; 512];
+        let (s1, lm1) = fwd_rows(&mut paged, &seq[0..512], &lens1, &slots1, vocab);
+        for &row in &[0usize, 63, 64, 511] {
+            check(
+                row,
+                &lm1[row * vocab..(row + 1) * vocab],
+                &ref_logits[row],
+                &format!("q4 many-page chunk1 row {row}"),
+            );
+            assert_eq!(
+                s1[row],
+                greedy_argmax(&ref_logits[row]),
+                "chunk1 greedy {row}"
+            );
+        }
+
+        let lens2: Vec<u32> = (512..total as u32).collect();
+        let slots2: Vec<u32> = vec![0; total - 512];
+        let (s2, lm2) = fwd_rows(&mut paged, &seq[512..], &lens2, &slots2, vocab);
+        for &row in &[0usize, total - 512 - 1] {
+            let pos = 512 + row;
+            check(
+                row,
+                &lm2[row * vocab..(row + 1) * vocab],
+                &ref_logits[pos],
+                &format!("q4 many-page chunk2 row {row} (pos {pos})"),
+            );
+            assert_eq!(
+                s2[row],
+                greedy_argmax(&ref_logits[pos]),
+                "chunk2 greedy {pos}"
+            );
+        }
+
+        // The real symptom was a degenerate *generation*, so also pin the first
+        // decode step after the packed prefills (pos 640, slot 0).
+        let next_tok = greedy_argmax(&ref_logits[total - 1]);
+        ref_logits.push(cpu.forward(&[next_tok]));
+        let (s3, lm3) = fwd_rows(&mut paged, &[next_tok], &[total as u32], &[0u32], vocab);
+        check(
+            0,
+            &lm3[..vocab],
+            &ref_logits[total],
+            "q4 first decode after prefill",
+        );
+        assert_eq!(
+            s3[0],
+            greedy_argmax(&ref_logits[total]),
+            "first decode greedy"
+        );
+    }
 }
 
 /// **Known-bad shape repro (issue #168) — the shape seen to fail on the real
