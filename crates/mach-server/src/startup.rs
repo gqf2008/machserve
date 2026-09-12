@@ -8,7 +8,7 @@
 //! the default test面; the binary still drives them from its hip path.
 
 use mach_model::config::{Config, ModelDType};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Collapse a model-family name to a lowercase alphanumeric key so the two
 /// places it can come from agree: `model_type` is snake_case (`deepseek_v2`)
@@ -844,5 +844,36 @@ mod tests {
         // (2 bytes/weight): the weight term must be x2, or the preflight can
         // pass while the upload OOMs (regression).
         assert_eq!(fp8 - base, 1_000_000);
+    }
+}
+
+/// Resolve `preprocessor_config.json` beside a checkpoint directory or shard.
+pub fn resolve_preprocessor_path(checkpoint: &Path) -> Option<PathBuf> {
+    let direct = checkpoint.join("preprocessor_config.json");
+    if direct.exists() {
+        return Some(direct);
+    }
+    checkpoint
+        .parent()
+        .map(|p| p.join("preprocessor_config.json"))
+        .filter(|p| p.exists())
+}
+
+#[cfg(test)]
+mod vision_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_preprocessor_config_for_dir_and_shard() {
+        let dir = std::env::temp_dir().join(format!("mach-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("preprocessor_config.json"), b"{}").unwrap();
+        let want = dir.join("preprocessor_config.json");
+        assert_eq!(resolve_preprocessor_path(&dir), Some(want.clone()));
+        let shard = dir.join("model-00001-of-00002.safetensors");
+        std::fs::write(&shard, b"x").unwrap();
+        assert_eq!(resolve_preprocessor_path(&shard), Some(want));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
