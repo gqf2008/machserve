@@ -1392,3 +1392,68 @@ mod paged_quantized_cpu_parity {
         assert_paged_matches_cpu(&mut paged, cfg, &wd, &prompt, 5e-2);
     }
 }
+
+/// **Known-failing repro (issue #168) — `#[ignore]` until the fix lands.**
+///
+/// Server-shaped chunked paged prefill: chunk 1 is a full 512-row step that
+/// spans eight 64-token pages, chunk 2 continues past page 8. Every other
+/// chunked-prefill test covers <= 2 pages (or stays inside page 0), and this
+/// shape is the one observed on the real model (`MACH_PAGED=1` +
+/// `MACH_PREFILL_ROWS=512`) to produce degenerate output and to hard-power-off
+/// the machine — so it must NOT run in an unattended GPU job until fixed.
+#[test]
+#[ignore = "known failing repro (#168): paged multi-chunk prefill across 8+ pages; run only with an operator watching"]
+fn batched_paged_f16_chunked_prefill_across_many_pages_repro() {
+    let Some(hip) = hip_ctx() else { return };
+    let mut cfg = Config::llama(128, 2, 4, 2, 1024, 4096);
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 91).unwrap();
+    let vocab = cfg.vocab_size;
+    // 576 tokens = 9 pages of 64. Chunk 1 = 512 rows (pages 0..7);
+    // chunk 2 = 64 rows (page 8).
+    let total = 576usize;
+    let seq: Vec<u32> = (0..total as u32)
+        .map(|i| (i * 37 + 11) % 1024 + 1)
+        .collect();
+
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 512, tpp).unwrap();
+    let mut r = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(total);
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+
+    let lens1: Vec<u32> = (0..512u32).collect();
+    let slots1: Vec<u32> = vec![0; 512];
+    let (s1, lm1) = fwd_rows(&mut paged, &seq[0..512], &lens1, &slots1, vocab);
+    for &row in &[0usize, 63, 64, 511] {
+        assert_close(
+            &lm1[row * vocab..(row + 1) * vocab],
+            &ref_logits[row],
+            &format!("many-page chunk1 row {row}"),
+        );
+        assert_eq!(
+            s1[row],
+            greedy_argmax(&ref_logits[row]),
+            "chunk1 greedy {row}"
+        );
+    }
+
+    let lens2: Vec<u32> = (512..total as u32).collect();
+    let slots2: Vec<u32> = vec![0; total - 512];
+    let (s2, lm2) = fwd_rows(&mut paged, &seq[512..], &lens2, &slots2, vocab);
+    for &row in &[0usize, total - 512 - 1] {
+        let pos = 512 + row;
+        assert_close(
+            &lm2[row * vocab..(row + 1) * vocab],
+            &ref_logits[pos],
+            &format!("many-page chunk2 row {row} (pos {pos})"),
+        );
+        assert_eq!(
+            s2[row],
+            greedy_argmax(&ref_logits[pos]),
+            "chunk2 greedy {pos}"
+        );
+    }
+}
