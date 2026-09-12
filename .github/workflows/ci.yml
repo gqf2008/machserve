@@ -61,12 +61,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: engine HIP memory-pool parity
         run: cargo test -p mach-engine --features hip --lib -- --ignored --test-threads=1
-      # NOTE: this step runs only the *non*-`#[ignore]`d model tests. The opt-in
-      # GPU parity suites (`mrope_gpu`, and the real-model tests) are `#[ignore]`d
-      # and each needs its own env opt-in (e.g. MACH_TEST_MROPE_GPU=1) plus a
-      # device, so they are NOT covered here (nor by the CPU job) and must be
-      # run explicitly; the step name used to claim otherwise.
+      # NOTE: this step runs only the *non*-`#[ignore]`d model tests, and the two
+      # ways that leaves GPU parity uncovered are different:
+      #  - truly `#[ignore]`d suites (`mrope_gpu`, `embed_gpu`, `int8_kv`,
+      #    `vision_gpu`, ...) are simply not selected here (libtest reports them
+      #    as ignored); most also require a `MACH_TEST_*` opt-in and now fail
+      #    loudly if selected without it, so they must be requested explicitly;
+      #  - the real-model suites (`real_model`, `qwen3_real`, `qwen15_real`,
+      #    `qwen3_q4_real`, `moe_real`) are NOT ignored: they run here, but
+      #    self-skip via `eprintln! + return` when `MACH_TEST_MODEL` is unset,
+      #    and libtest only replays the output of *failing* tests — so they
+      #    report "ok" with nothing shown (the silent-green class tracked in #163).
       - name: model tests (hip, non-ignored only)
         run: cargo test -p mach-model --features hip -- --test-threads=1
+      # Same caveat: `crates/mach-server/tests/server.rs` has two `#[ignore]`d GPU
+      # parity cases that this command does not select.
       - name: server tests
         run: cargo test -p mach-server --features hip
