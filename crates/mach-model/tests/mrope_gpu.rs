@@ -149,6 +149,7 @@ fn cpu_delta(
 #[ignore = "GPU M-RoPE model parity; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn batched_model_mrope_tables_match_scalar_text_only() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
+        eprintln!("skipping: set MACH_TEST_MROPE_GPU=1 to run this ignored GPU M-RoPE test");
         return;
     }
     let hip = hip::hip().expect("HIP runtime");
@@ -195,6 +196,7 @@ fn batched_model_mrope_tables_match_scalar_text_only() {
 #[ignore = "GPU M-RoPE lifecycle; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn mrope_table_row_mismatch_fails_fast() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
+        eprintln!("skipping: set MACH_TEST_MROPE_GPU=1 to run this ignored GPU M-RoPE test");
         return;
     }
     let hip = hip::hip().expect("HIP runtime");
@@ -288,6 +290,7 @@ fn rope_batched_tables_matches_cpu() {
 #[ignore = "GPU M-RoPE parity; set MACH_TEST_MROPE_GPU=1 and run explicitly"]
 fn rope_batched_delta_matches_cpu() {
     if std::env::var("MACH_TEST_MROPE_GPU").as_deref() != Ok("1") {
+        eprintln!("skipping: set MACH_TEST_MROPE_GPU=1 to run this ignored GPU M-RoPE test");
         return;
     }
     let h = hip::hip().expect("HIP runtime");

@@ -44,7 +44,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: workspace lib tests
         run: cargo test --workspace --lib
-      - name: integration tests (CPU, model-gated GPU tests are ignored)
+      # `decode_slice` runs its CPU case here (the GPU cases are compiled out
+      # without the feature); `fp16` and `spec_decode` are `--features hip`-only
+      # suites, so without the feature they report "0 tests" rather than being
+      # skipped — they are NOT covered by this job. `load_safetensors` runs its
+      # CPU cases and compiles out its hip-gated GPU case.
+      - name: integration tests (CPU-reachable only)
         run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode
 
   gpu:

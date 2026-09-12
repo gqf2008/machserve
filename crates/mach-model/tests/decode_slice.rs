@@ -1,11 +1,17 @@
-//! P1 decode-slice acceptance tests (run on the 7900 XTX when `--features hip`).
-#![cfg(feature = "hip")]
-
-use mach_kernel_sys::hip;
-use mach_model::model::GpuModel;
+//! P1 decode-slice acceptance tests.
+//!
+//! `cpu_reference_advances_state` is pure CPU and runs in the default (no
+//! feature) test面 so it cannot be silently skipped; the GPU cases are
+//! `--features hip` only (each also self-skips when no HIP device exists).
 use mach_model::ref_model::RefModel;
 use mach_model::{Config, Weights};
 
+#[cfg(feature = "hip")]
+use mach_kernel_sys::hip;
+#[cfg(feature = "hip")]
+use mach_model::model::GpuModel;
+
+#[cfg(feature = "hip")]
 /// Skips the test when no HIP device is available.
 fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
     match hip::hip() {
@@ -30,6 +36,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+#[cfg(feature = "hip")]
 fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32, what: &str) {
     let max = max_abs_diff(got, want);
     let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -55,6 +62,7 @@ fn cpu_reference_advances_state() {
     );
 }
 
+#[cfg(feature = "hip")]
 #[test]
 fn gpu_matches_cpu_reference() {
     let Some(hip) = hip_ctx() else { return };
@@ -77,6 +85,7 @@ fn gpu_matches_cpu_reference() {
     );
 }
 
+#[cfg(feature = "hip")]
 #[test]
 fn gpu_matches_cpu_reference_large_dmodel() {
     // d_model 512 > one block (256 threads): catches kernels that only cover a
@@ -100,6 +109,7 @@ fn gpu_matches_cpu_reference_large_dmodel() {
     );
 }
 
+#[cfg(feature = "hip")]
 #[test]
 fn graph_replay_matches_eager() {
     let Some(hip) = hip_ctx() else { return };
@@ -127,6 +137,7 @@ fn graph_replay_matches_eager() {
     }
 }
 
+#[cfg(feature = "hip")]
 #[test]
 fn kv_cache_is_positional() {
     let Some(hip) = hip_ctx() else { return };
