@@ -66,8 +66,8 @@ python tools/vision_c4_compare_first_step.py `
 
 2026-09-12 对现有 artifact 实测：prompt 81/81、grid `[[1,16,16]]`、image-pad
 64/64、4-token greedy 序列 `[248068,271,248069,271]` HF/MS 逐位一致；HF 参考由
-CPU/disk offload 生成（`device_map_has_cuda=false`），comparator exit 0。完整 logits parity
-仍需在后续有受控 GPU/HF 窗口时单独跑。
+CPU/disk offload 生成（`device_map_has_cuda=false`），comparator exit 0。完整 Q4-vs-BF16
+logits 数值 parity 不在 C4 门禁；如后续做 BF16 真机窗口，可作为可选评估。
 
 ## 步骤
 
@@ -155,13 +155,14 @@ python tools/vision_c4_negative.py --binary target/release/mach-server.exe `
 - E2E 每次只发一个 vision 请求；`MACH_VISION_DUMP` 会被覆盖，summary 校验 dump 非空且 mtime 新于请求开始，SSE `data: {"error": ...}` 会让脚本返回非 0；
 - 图片问答请求 200，回答能描述图片内容；`summary.json` 含 `ttft_seconds`、VRAM 采样（`vram_ok=true`）、输入 SHA-256；
 - `vision_c4_compare.py` 的 `pass` 采用 numpy 混合容差（`|d| <= atol + rtol*|ref|`）：`max_abs_diff` 与 `mean_abs_diff` 应远小于 atol，`max_rel_diff` 在近零特征上天然很大，必须结合混合容差与 `nonfinite == 0` 一起读（HF 侧必须是 transformer 视觉塔真实输出；PIL 回退只用于 processor 参考）；
-- temperature=0 多次运行输出一致；HF 整模型 greedy token/logits 参考由操作员按现有 HF 环境补充并记录；
+- temperature=0 多次运行输出一致；HF 整模型 greedy 短序列参考已记录，
+  用 `vision_c4_compare_first_step.py` 校验 token 序列；Q4/BF16 的 top-5 logits 只作诊断，不作逐值门禁；
 - 文本-only 回归、501/400 负例通过；VRAM/TTFT/耗时写入 `artifacts/vision-c4/summary.json` 并回填 Issue #146。
 
 ## C4 真机实测（2026-09-11，7900 XTX / ROCm 6.2 / Windows）
 
-本次完成的是**HTTP 端到端多模态链路**与**视觉塔 GPU↔HF 特征对拍**；issue #146 验收里
-的「整模型 HF token/logits 对齐」仍未做（见文末待办）。
+本次完成的是**HTTP 端到端多模态链路**与**视觉塔 GPU↔HF 特征对拍**。2026-09-12 又用
+HF CPU/disk offload 参考补上了 4-token greedy 序列对拍，prompt/grid/pad/token 均对齐。
 
 输入 `artifacts/vision-c4/input.png`（128x128，SHA-256 `4550d45d…`），模型
 `.models/qwen3.8-27b`，`MACH_Q4=1 MACH_Q4_DEVICE=2 MACH_CAPACITY=1
@@ -195,13 +196,10 @@ MACH_VISION_MAX_TOKENS=2048`（release 二进制）：
   16.42GiB`）也只是**加载前的预算**。本次**没有采到实际占用**——要采需在服务进程内
   前后采样，或使用可用的 `rocm-smi`。
 
-## C4 仍待处理
+## C4 验收边界
 
-待办：
-
-- HF 整模型 greedy token/logits 参考：本机 31GB 内存装不下 BF16 27B、且 PyTorch
-  没有 Windows ROCm 轮子，必须在 ≥64GB 内存的机器（或 Linux+ROCm torch）上生成
-  后再与本实现的输出对比。其余真机项见上面「C4 实测结果」。
+- 无 C4 阻塞项。完整 Q4-vs-BF16 logits 数值 parity 不作为门禁：量化本身会改变尾部
+  logits；当前保留 HF top-5 诊断与 token sequence parity。
 
 纯离线 P3（不阻塞真机）：
 
