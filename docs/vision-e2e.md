@@ -25,9 +25,9 @@ Stage C 的离线链路已经合入；本文档描述真机 GPU 窗口打开后�
 ## CPU 真权重对拍（无需 GPU，建议先跑）
 
 `crates/mach-model/tests/vision_real_weights.rs` 用同一张图把 MachServe 的
-CPU 视觉塔钉在 transformers 上。它是 opt-in 的：两个环境变量都不设时打印 SKIP
-并返回，只设其中一个会直接失败（不静默降级）。注意 libtest 默认只显示
-`1 passed`，必须用 `--nocapture` 确认看到 SKIP 行或对拍结果行——**SKIP 不算验证**。
+CPU 视觉塔钉在 transformers 上。长对拍用例是 `#[ignore]` 的：必须显式 `--ignored`，
+并同时设置两个环境变量；任一缺失都会 fail-loud，不再用“SKIP 后 1 passed”冒充验证。
+相对路径先按测试进程 cwd 查找，再回退到仓库根目录，因此从仓库根运行下面命令即可。
 128x128 输入（grid `[1,16,16]`）单线程约 11 分钟，所以不放进默认门禁。
 
 ```powershell
@@ -36,15 +36,15 @@ python tools/vision_c4_golden.py --model-dir .models/qwen3.8-27b `
   --image artifacts/vision-c4/input.png --out artifacts/vision-c4/hf_golden.json `
   --tower --allow-pil-fallback --parity-export
 # 2) 跑 CPU 对拍
-$env:MACH_VISION_GOLDEN = "artifacts/vision-c4"
-$env:MACH_VISION_MODEL  = ".models/qwen3.8-27b"
-cargo test -p mach-model --test vision_real_weights -- --nocapture
+$env:MACH_VISION_GOLDEN = (Resolve-Path artifacts/vision-c4).Path
+$env:MACH_VISION_MODEL  = (Resolve-Path .models/qwen3.8-27b).Path
+cargo test -p mach-model --test vision_real_weights -- --ignored --nocapture
 ```
 
-实测（2026-09-11，grid `[1,16,16]`、64x5120 merged features）：容差为
+实测（2026-09-12 复跑，grid `[1,16,16]`、64x5120 merged features）：容差为
 `|got-ref| <= 1e-3 * max(1, |ref|)`，`worst_ratio = 0.4488`（最差元素 index
 320103：`-1.2215794` vs `-1.2210314`，允许 `1.22e-3`，即只用到 45%），
-`nonfinite = 0`，单线程 687s。GPU 窗口建议以 CPU 参考为中间基准：先 CPU↔HF，
+`nonfinite = 0`，单线程 696.9s。GPU 窗口建议以 CPU 参考为中间基准：先 CPU↔HF，
 再 GPU↔CPU。
 
 ## 步骤

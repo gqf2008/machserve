@@ -6,11 +6,11 @@
 //! merged features, so the CPU reference is pinned to transformers on the real
 //! checkpoint before anyone spends a GPU window on it.
 //!
-//! Opt-in: without `MACH_VISION_GOLDEN` *and* `MACH_VISION_MODEL` the test
-//! prints a SKIP line and returns. libtest still reports `1 passed`, so a real
-//! verification must be read from `--nocapture` output (the SKIP line, or the
-//! parity line with the measured ratios). Setting only one of the two
-//! variables is a configuration error and fails loudly.
+//! Opt-in: the long parity case is `#[ignore]`d. Run it with `--ignored` and
+//! set both `MACH_VISION_GOLDEN` and `MACH_VISION_MODEL`; the case fails loudly
+//! when either is missing. Relative paths are resolved from the current
+//! directory first, then from the workspace root, because Cargo runs tests with
+//! the package directory as cwd (so the runbook's `artifacts/...` spelling works).
 //!
 //! `docs/vision-e2e.md` documents the recipe; in short:
 //!
@@ -48,11 +48,38 @@ fn within_tolerance(got: f32, want: f32) -> bool {
     tolerance_ratio(got, want) <= 1.0
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
-        _ => None,
+fn resolve_relative_path(
+    raw: PathBuf,
+    cwd: &Path,
+    workspace_root: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if raw.is_absolute() || exists(&cwd.join(&raw)) {
+        return raw;
     }
+    let from_workspace = workspace_root.join(&raw);
+    if exists(&from_workspace) {
+        from_workspace
+    } else {
+        raw
+    }
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    let raw = match std::env::var_os(name) {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => return None,
+    };
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crate has a workspace parent");
+    Some(resolve_relative_path(
+        raw,
+        Path::new("."),
+        workspace_root,
+        |p| p.exists(),
+    ))
 }
 
 fn read_f32_le(path: &Path) -> Vec<f32> {
@@ -94,18 +121,36 @@ fn tolerance_flags_a_perturbed_feature() {
 }
 
 #[test]
+fn relative_path_falls_back_to_workspace_root() {
+    let raw = PathBuf::from("artifacts/vision-c4");
+    let cwd = Path::new("C:/repo/crates/mach-model");
+    let workspace_root = Path::new("C:/repo");
+    let local = cwd.join(&raw);
+    let from_workspace = workspace_root.join(&raw);
+    assert_eq!(
+        resolve_relative_path(raw.clone(), cwd, workspace_root, |p| p == local),
+        raw
+    );
+    assert_eq!(
+        resolve_relative_path(raw.clone(), cwd, workspace_root, |p| p == from_workspace),
+        from_workspace
+    );
+    assert_eq!(
+        resolve_relative_path(raw.clone(), cwd, workspace_root, |_| false),
+        raw
+    );
+}
+
+#[test]
+#[ignore = "real-checkpoint vision parity; set both MACH_VISION_* and run with --ignored"]
 fn cpu_vision_real_weights_match_hf_golden() {
     let golden = env_path("MACH_VISION_GOLDEN");
     let model_dir = env_path("MACH_VISION_MODEL");
     match (&golden, &model_dir) {
-        (None, None) => {
-            eprintln!(
-                "SKIP cpu_vision_real_weights_match_hf_golden: set MACH_VISION_GOLDEN \
-                 (golden dir) and MACH_VISION_MODEL (checkpoint dir), then rerun with \
-                 --nocapture to confirm this test really ran"
-            );
-            return;
-        }
+        (None, None) => panic!(
+            "MACH_VISION_GOLDEN and MACH_VISION_MODEL must both be set for the \
+             real-checkpoint vision parity test"
+        ),
         (Some(_), None) => panic!(
             "MACH_VISION_GOLDEN is set but MACH_VISION_MODEL is missing; set both or neither"
         ),
