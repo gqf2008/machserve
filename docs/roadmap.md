@@ -1698,6 +1698,16 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
 - Stage 9 当时的限制：paged INT8 KV 尚未接 runtime；后续 #190 已补 paged runtime。MLA 仍不支持。
   保守计数；长 context / 多序列性能 A/B 待下一批真机窗口。
 
+## Q4 KV Stage 1：packed int4 layout + CPU oracle（#192，2026-09-12）
+
+- `Q4Kv`：对称 int4，每 `(token, kv_head)` 一个 f32 scale；
+- 两个 nibble/byte，low nibble first；`[-7,7]` 对称编码，code 8 为零；
+- `PagedQ4KvLayout`：page-major packed payload + scales；
+- CPU scatter/gather、dequant、dot 和 full-attention decode oracle；
+- 测试覆盖 roundtrip 误差上界、odd head_dim packing、paged remap、坏页表、
+  非有限输入、GQA attention vs f32。
+- Stage 2（HIP kernels）和 Stage 3（`MACH_KV=q4` runtime）尚未实现。
+
 ## INT8 KV：paged runtime 接线（#190，2026-09-12）
 
 Stage 5 的 `kv_store_paged_int8` / `attn_decode_paged_int8_gqa` 已从
