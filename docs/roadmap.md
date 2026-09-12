@@ -1989,14 +1989,13 @@ HF↔MachServe 4-token greedy 序列对拍都已有记录；剩余 P3 增强是�
   `(row/query-tile, kv_head)`，同一 GQA group 复用 K/V tile；KV 按 bounded tile
   加载 shared memory；使用 `m/l/acc` online softmax，不再按 `max_seq_len` 分配
   整段 scores。
-- F16 再进一步接入 run-based query tile：`[row0, q_start, q_take]` 把混合
-  batch 按“同 slot + 连续 position”切 run，同一 block 同时覆盖多个 query row
-  和 GQA group；归约改为 warp-shuffle + 跨 warp 合并，K/V tile 用 8×f16
-  `uint4` 向量装载；tile 落在单页内时 page table 只查一次。F32 仍走 per-row
-  tiled kernel。
-- 新 kernel 进入 hiprtc offline 门禁（内核计数 74→78）；CPU run-tile
-  online-softmax 对拍覆盖跨页/非整除 tile/混合 slot；512-row GPU parity 作为
-  受控真机回归入口保留。
+- F16/F32 接入 run-based query tile：`[row0, q_start, q_take]` 把混合 batch
+  按“同 slot + 连续 position”切 run，同一 block 同时覆盖多个 query row 和
+  GQA group；归约改为 warp-shuffle + 跨 warp 合并，K/V tile 分别用 8×f16
+  `uint4` / 4×f32 `float4` 向量装载；tile 落在单页内时 page table 只查一次。
+- 新 kernel 进入 hiprtc offline 门禁（内核计数 74→79）；CPU run-tile
+  online-softmax 对拍覆盖跨页/非整除 tile/混合 slot；512-row GPU parity 与
+  F16/F32 mixed-slot GPU 回归作为受控真机入口保留。
 - server 的 `MACH_PREFILL_ROWS<=64` / `MACH_CAPACITY<=64` 安全 cap 暂不提前解除，
   等 512-row 真机验证通过后再单独放开。
 

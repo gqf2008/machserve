@@ -2830,7 +2830,7 @@ impl BatchedModel {
 
     /// Build and upload paged-attention work descriptors for the current rows.
     ///
-    /// Only the dense F16 paged path consumes these descriptors. Rows are
+    /// Only the dense F16/F32 paged paths consume these descriptors. Rows are
     /// grouped into maximal same-slot/consecutive-position runs, then split
     /// into `q_block` query tiles; each descriptor is `[row0, q_start, q_take]`.
     /// Pure decode rows stay on the existing per-row kernel, so this returns
@@ -2842,7 +2842,7 @@ impl BatchedModel {
         q_block: usize,
     ) -> Result<(i32, bool), Error> {
         if !self.paged
-            || self.cfg.dtype != ModelDType::F16
+            || !matches!(self.cfg.dtype, ModelDType::F16 | ModelDType::F32)
             || self.int8_kv
             || !self.mla_kv_cache.is_empty()
         {
@@ -3933,21 +3933,44 @@ impl BatchedModel {
                         c.head_dim as i32,
                         tpp,
                     )?;
-                    k.launch_attn_paged_tiled_f32_gqa(
-                        self.q,
-                        kc as *const f32,
-                        vc as *const f32,
-                        self.block_tables,
-                        self.attn,
-                        self.pos_dev,
-                        self.table_offsets,
-                        b,
-                        c.n_heads as i32,
-                        c.n_kv_heads as i32,
-                        c.head_dim as i32,
-                        scale,
-                        tpp,
-                    )?;
+                    if paged_runs_multi {
+                        debug_assert!(paged_runs > 0);
+                        let groups = (c.n_heads / c.n_kv_heads) as i32;
+                        let q_block = (16 / groups).clamp(1, 4);
+                        k.launch_attn_paged_tiled_f32_gqa_runs(
+                            self.q,
+                            kc as *const f32,
+                            vc as *const f32,
+                            self.block_tables,
+                            self.attn,
+                            self.paged_runs_dev,
+                            self.pos_dev,
+                            self.table_offsets,
+                            paged_runs,
+                            c.n_heads as i32,
+                            c.n_kv_heads as i32,
+                            c.head_dim as i32,
+                            scale,
+                            tpp,
+                            q_block,
+                        )?;
+                    } else {
+                        k.launch_attn_paged_tiled_f32_gqa(
+                            self.q,
+                            kc as *const f32,
+                            vc as *const f32,
+                            self.block_tables,
+                            self.attn,
+                            self.pos_dev,
+                            self.table_offsets,
+                            b,
+                            c.n_heads as i32,
+                            c.n_kv_heads as i32,
+                            c.head_dim as i32,
+                            scale,
+                            tpp,
+                        )?;
+                    }
                 } else {
                     k.launch_kv_store_batched(
                         self.k_buf,
