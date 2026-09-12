@@ -1706,7 +1706,7 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
 - CPU scatter/gather、dequant、dot 和 full-attention decode oracle；
 - 测试覆盖 roundtrip 误差上界、odd head_dim packing、paged remap、坏页表、
   非有限输入、GQA attention vs f32。
-- Stage 2（HIP kernels）已完成，见下节；Stage 3（`MACH_KV=q4` runtime）尚未实现。
+- Stage 2（HIP kernels）已完成，见下节；Stage 3 已接离线 runtime，见下下节。
 
 ## Q4 KV Stage 2：paged HIP store/attention + CPU-oracle parity（#192，2026-09-12）
 
@@ -1719,6 +1719,18 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
 - 新增 opt-in `q4_kv` GPU parity：store 写入与 CPU `Q4Kv::quantize` 对齐，
   attention 与 CPU `attention_decode_q4` 对拍，覆盖跨页/重映射 page table；
   未跑真机前不宣称 GPU 正确。
+
+## Q4 KV Stage 3：paged runtime 接线（#192，2026-09-12）
+
+- `MACH_KV=q4` 仅接受 `MACH_Q4=1 MACH_Q4_DEVICE=2 MACH_PAGED=1`，并要求
+  dense、非 MLA、F16 compute、`head_dim <= 256` 且 `n_heads % n_kv_heads == 0`；
+- `BatchedModel` 新增 `Q4KvDev` packed payload/scales 分配、paged Q4 store/attention
+  分派、reset 清理与状态 anchor/连续 compaction 显式拒绝；
+- `estimate_vram_kv` 按每 token/head 的 `2*ceil(head_dim/2) + 8` 字节做精确预检，
+  CPU 测试覆盖 odd `head_dim` 与容量组合；
+- paged Q4 禁用 graph capture；server 在权重加载前完成 mode/geometry/page 检查，
+  无效组合 fail-fast，不静默回退到 f16 KV；
+- 真机 GPU parity / 性能矩阵仍未执行，当前只完成编译与 CPU 预检接线。
 
 ## INT8 KV：paged runtime 接线（#190，2026-09-12）
 

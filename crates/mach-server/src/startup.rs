@@ -335,6 +335,29 @@ pub fn estimate_vram(
     q4_device: bool,
     kv_int8: bool,
 ) -> u64 {
+    estimate_vram_kv(
+        cfg, capacity, file_bytes, draft, fp8, q4_device, kv_int8, false,
+    )
+}
+
+/// [`estimate_vram`] extended with packed-Q4 KV. Keeping the original
+/// signature preserves the large existing test surface; runtime callers use
+/// this entry point so the KV mode is explicit.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_vram_kv(
+    cfg: &Config,
+    capacity: usize,
+    file_bytes: u64,
+    draft: Option<(&Config, u64)>,
+    fp8: bool,
+    q4_device: bool,
+    kv_int8: bool,
+    kv_q4: bool,
+) -> u64 {
+    assert!(
+        !(kv_int8 && kv_q4),
+        "INT8 and Q4 KV modes are mutually exclusive"
+    );
     let kv_elem = if cfg.dtype == ModelDType::F16 { 2 } else { 4 };
     let kv = if cfg.kv_lora_rank > 0 {
         capacity
@@ -342,6 +365,10 @@ pub fn estimate_vram(
             * cfg.n_heads
             * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
             * 4
+    } else if kv_q4 {
+        // Packed Q4 stores K and V as ceil(head_dim/2)-byte payloads plus one
+        // f32 scale per token/head for each of K and V.
+        capacity * cfg.max_seq_len * cfg.n_kv_heads * (cfg.head_dim.div_ceil(2) * 2 + 8)
     } else if kv_int8 {
         // Contiguous INT8 KV stores K and V as i8 payloads plus one f32 scale
         // per token/head for each of K and V: 2*head_dim + 2*4 bytes per
@@ -464,6 +491,35 @@ mod tests {
                 assert_eq!(int8, f16 - f16_kv + int8_kv, "cap={cap} max_seq={max_seq}");
             }
         }
+    }
+
+    #[test]
+    fn q4_dense_accounts_packed_payload_and_scales() {
+        let mut cfg = dense_cfg();
+        cfg.dtype = ModelDType::F16;
+        cfg.head_dim = 65; // odd dimension pins ceil(head_dim/2)
+        for cap in [1usize, 8] {
+            for max_seq in [64usize, 128] {
+                cfg.max_seq_len = max_seq;
+                let f16 = estimate_vram(&cfg, cap, 0, None, false, false, false);
+                let q4 = estimate_vram_kv(&cfg, cap, 0, None, false, false, false, true);
+                let f16_kv =
+                    (cfg.n_layers * cap * max_seq * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
+                let q4_kv = (cfg.n_layers
+                    * cap
+                    * max_seq
+                    * cfg.n_kv_heads
+                    * (cfg.head_dim.div_ceil(2) * 2 + 8)) as u64;
+                assert_eq!(q4, f16 - f16_kv + q4_kv, "cap={cap} max_seq={max_seq}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "mutually exclusive")]
+    fn estimate_vram_kv_rejects_mixed_quantized_modes() {
+        let cfg = dense_cfg();
+        let _ = estimate_vram_kv(&cfg, 1, 0, None, false, false, true, true);
     }
     #[test]
     fn mla_estimate_uses_expanded_per_head_kv() {
