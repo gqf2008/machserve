@@ -1570,6 +1570,101 @@ fn batched_paged_tiled_f16_gqa_matches_reference_for_long_prefill() {
     }
 }
 
+/// Run-based tiled attention regression: two slots with different block
+/// tables in one mixed-prefill call must match independent single-sequence
+/// decoding. This is the GPU counterpart of the CPU run-descriptor test.
+#[test]
+#[ignore = "controlled-power run-based paged attention regression; set MACH_TEST_PAGED_TILED_ATTN_RUNS=1"]
+fn batched_paged_tiled_f16_gqa_runs_match_reference_mixed_slots() {
+    if std::env::var("MACH_TEST_PAGED_TILED_ATTN_RUNS").as_deref() != Ok("1") {
+        panic!("MACH_TEST_PAGED_TILED_ATTN_RUNS=1 is required for this controlled run-based test");
+    }
+    let hip = hip_ctx().unwrap_or_else(|| {
+        panic!("no HIP device is present; this test is opt-in and must not silently skip")
+    });
+    let mut cfg = Config::llama(1024, 2, 8, 2, 1024, 256);
+    cfg.dtype = ModelDType::F16;
+    let tpp = 8usize;
+    let w = Weights::random(&cfg, 0x5eed).unwrap();
+    let vocab = cfg.vocab_size;
+
+    let seq0: Vec<u32> = (0..12u32).map(|i| (i * 37 + 11) % 1024 + 1).collect();
+    let seq1: Vec<u32> = (0..11u32).map(|i| (i * 53 + 7) % 1024 + 1).collect();
+    let as_i32 = |v: &[u32]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+    let pool_pages = (2 * cfg.max_seq_len / tpp) as u32;
+    let mut builder = GpuPagedTableBuilder::new(pool_pages, tpp);
+    let (t0, _) = builder.build_table(&as_i32(&seq0)).unwrap();
+    let (t1, _) = builder.build_table(&as_i32(&seq1)).unwrap();
+
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 2, 8, tpp).unwrap();
+    paged.set_decode_graph_enabled(false);
+    paged.set_block_table(0, t0.pages()).unwrap();
+    paged.set_block_table(1, t1.pages()).unwrap();
+
+    let mut ref0 = GpuModel::new(hip.clone(), cfg, &w).unwrap();
+    let mut ref1 = GpuModel::new(hip, cfg, &w).unwrap();
+    let mut r0 = Vec::with_capacity(seq0.len());
+    let mut r1 = Vec::with_capacity(seq1.len());
+    for &t in &seq0 {
+        r0.push(ref0.decode_step(t).unwrap());
+    }
+    for &t in &seq1 {
+        r1.push(ref1.decode_step(t).unwrap());
+    }
+
+    let check = |row: usize, want: &[f32], got: &[f32], ctx: &str| {
+        let max = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 0.1, "{ctx} row {row}: max diff {max}");
+        assert_eq!(greedy_argmax(got), greedy_argmax(want), "{ctx} row {row}");
+    };
+
+    let tokens1: Vec<u32> = seq0[..4].iter().chain(&seq1[..3]).copied().collect();
+    let lens1: Vec<u32> = (0..4u32).chain(0..3).collect();
+    let slots1: Vec<u32> = [0u32; 4].into_iter().chain([1u32; 3]).collect();
+    let (_, lm1) = fwd_rows(&mut paged, &tokens1, &lens1, &slots1, vocab);
+    for row in 0..4 {
+        check(
+            row,
+            &r0[row],
+            &lm1[row * vocab..(row + 1) * vocab],
+            "slot0 chunk1",
+        );
+    }
+    for row in 0..3 {
+        check(
+            4 + row,
+            &r1[row],
+            &lm1[(4 + row) * vocab..(5 + row) * vocab],
+            "slot1 chunk1",
+        );
+    }
+
+    let tokens2: Vec<u32> = seq0[4..8].iter().chain(&seq1[3..7]).copied().collect();
+    let lens2: Vec<u32> = (4..8u32).chain(3..7).collect();
+    let slots2: Vec<u32> = [0u32; 4].into_iter().chain([1u32; 4]).collect();
+    let (_, lm2) = fwd_rows(&mut paged, &tokens2, &lens2, &slots2, vocab);
+    for row in 0..4 {
+        check(
+            4 + row,
+            &r0[4 + row],
+            &lm2[row * vocab..(row + 1) * vocab],
+            "slot0 chunk2",
+        );
+    }
+    for row in 0..4 {
+        check(
+            4 + row,
+            &r1[3 + row],
+            &lm2[(4 + row) * vocab..(5 + row) * vocab],
+            "slot1 chunk2",
+        );
+    }
+}
+
 /// Qwen3-8B produced degenerate output once a paged prefill needed a **second**
 /// chunk (`~630 token = 10 pages / 2 chunks`), and hard-powered-off the box at
 /// 30 pages / 4 chunks. Every existing chunked-prefill test covers <= 2 pages

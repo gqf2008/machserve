@@ -318,10 +318,11 @@ pub struct BatchedModel {
     /// Per-row KV cache slot (row index != slot during chunked prefill).
     slots_host: *mut i32,
     slots_dev: *mut i32,
-    /// Prefill-attention run descriptors `[qoff, count, base, slot] x N` and
-    /// per-row mask (1 = row covered by a run -> prefill attention).
-    runs_host: *mut i32,
-    runs_dev: *mut i32,
+    /// Paged-attention work descriptors `[row0, q_start, q_take] x N`.
+    /// A run is one contiguous same-slot/ascending-position block; work items
+    /// split runs into query tiles consumed by the run-based tiled kernel.
+    paged_runs_host: *mut i32,
+    paged_runs_dev: *mut i32,
     run_mask_host: *mut i32,
     run_mask_dev: *mut i32,
     /// GDN chunked-scan run descriptors `[row_base, count, pos_base, slot] x
@@ -1164,8 +1165,8 @@ impl BatchedModel {
             pos_host: std::ptr::null_mut(),
             slots_host: std::ptr::null_mut(),
             slots_dev: std::ptr::null_mut(),
-            runs_host: std::ptr::null_mut(),
-            runs_dev: std::ptr::null_mut(),
+            paged_runs_host: std::ptr::null_mut(),
+            paged_runs_dev: std::ptr::null_mut(),
             run_mask_host: std::ptr::null_mut(),
             run_mask_dev: std::ptr::null_mut(),
             gdn_runs_host: std::ptr::null_mut(),
@@ -1453,18 +1454,18 @@ impl BatchedModel {
         self.row_embed_dev = self.dalloc(row_embed_bytes)?;
         self.row_embed_mask_dev = self.dalloc(row_embed_mask_bytes)? as *mut i32;
         self.slots_dev = self.dalloc(b * 4)? as *mut i32;
-        let max_runs = b.div_ceil(2);
-        self.runs_dev = self.dalloc(max_runs * 4 * 4)? as *mut i32;
+        let paged_run_bytes = b * 3 * 4;
+        self.paged_runs_dev = self.dalloc(paged_run_bytes)? as *mut i32;
         self.run_mask_dev = self.dalloc(b * 4)? as *mut i32;
         let th = hip::host_malloc(self.k.hip(), b * 4)?;
         let ph = hip::host_malloc(self.k.hip(), b * 4)?;
         let sh = hip::host_malloc(self.k.hip(), b * 4)?;
-        let rh = hip::host_malloc(self.k.hip(), max_runs * 4 * 4)?;
+        let rh = hip::host_malloc(self.k.hip(), paged_run_bytes)?;
         let mh = hip::host_malloc(self.k.hip(), b * 4)?;
         self.tokens_host = th as *mut i32;
         self.pos_host = ph as *mut i32;
         self.slots_host = sh as *mut i32;
-        self.runs_host = rh as *mut i32;
+        self.paged_runs_host = rh as *mut i32;
         self.run_mask_host = mh as *mut i32;
         // GDN run descriptors: at most one run per slot (== batch entries).
         let grh = hip::host_malloc(self.k.hip(), b * 4 * 4)?;
@@ -2827,6 +2828,51 @@ impl BatchedModel {
         }
     }
 
+    /// Build and upload paged-attention work descriptors for the current rows.
+    ///
+    /// Only the dense F16 paged path consumes these descriptors. Rows are
+    /// grouped into maximal same-slot/consecutive-position runs, then split
+    /// into `q_block` query tiles; each descriptor is `[row0, q_start, q_take]`.
+    /// Pure decode rows stay on the existing per-row kernel, so this returns
+    /// `any_multi == false` for that shape.
+    fn stage_paged_attn_runs(
+        &mut self,
+        lens: &[u32],
+        slots: &[u32],
+        q_block: usize,
+    ) -> Result<(i32, bool), Error> {
+        if !self.paged
+            || self.cfg.dtype != ModelDType::F16
+            || self.int8_kv
+            || !self.mla_kv_cache.is_empty()
+        {
+            return Ok((0, false));
+        }
+        let (runs, any_multi) = crate::paged_kv::build_tiled_attn_runs(lens, slots, q_block);
+        let n = runs.len();
+        debug_assert!(n <= self.rows, "paged run count exceeds row capacity");
+        if n == 0 || !any_multi {
+            return Ok((n as i32, false));
+        }
+        unsafe {
+            for (i, run) in runs.iter().enumerate() {
+                let dst = self.paged_runs_host.add(i * 3);
+                *dst = run[0];
+                *dst.add(1) = run[1];
+                *dst.add(2) = run[2];
+            }
+        }
+        hip::memcpy_async(
+            self.k.hip(),
+            self.paged_runs_dev as *mut core::ffi::c_void,
+            self.paged_runs_host as *const core::ffi::c_void,
+            n * 3 * 4,
+            hip::HIP_MEMCPY_HOST_TO_DEVICE,
+            self.k.stream,
+        )?;
+        Ok((n as i32, true))
+    }
+
     /// Device half of [`Self::refresh_table_offsets`]: stream-ordered H2D of
     /// the pinned offsets staging. No-op outside paged mode.
     fn upload_table_offsets(&self, n: usize) -> Result<(), Error> {
@@ -3132,9 +3178,9 @@ impl BatchedModel {
         slots: *const i32,
         run_mask: *const i32,
         decode_only: bool,
-        num_runs: i32,
         gdn_runs: i32,
-        paged_same_slot: bool,
+        paged_runs: i32,
+        paged_runs_multi: bool,
     ) -> Result<(), Error> {
         let c = self.cfg;
         let b = count;
@@ -3783,18 +3829,20 @@ impl BatchedModel {
                         c.head_dim as i32,
                         tpp,
                     )?;
-                    if paged_same_slot {
+                    if paged_runs_multi {
+                        debug_assert!(paged_runs > 0);
                         let groups = (c.n_heads / c.n_kv_heads) as i32;
                         let q_block = (16 / groups).clamp(1, 4);
-                        k.launch_attn_paged_tiled_f16_gqa_qblock(
+                        k.launch_attn_paged_tiled_f16_gqa_runs(
                             self.q,
                             kc as *const u16,
                             vc as *const u16,
                             self.block_tables,
                             self.attn,
+                            self.paged_runs_dev,
                             self.pos_dev,
                             self.table_offsets,
-                            b,
+                            paged_runs,
                             c.n_heads as i32,
                             c.n_kv_heads as i32,
                             c.head_dim as i32,
@@ -3855,30 +3903,6 @@ impl BatchedModel {
                         scale,
                         c.max_seq_len as i32,
                     )?;
-                    // Shared-KV prefill attention for detected runs.
-                    // Run descriptors are read from the pinned host copy.
-                    let runs = self.runs_host;
-                    for ri in 0..num_runs {
-                        let qoff = unsafe { *runs.add((ri * 4) as usize) };
-                        let cc = unsafe { *runs.add((ri * 4 + 1) as usize) };
-                        let base = unsafe { *runs.add((ri * 4 + 2) as usize) };
-                        let slot = unsafe { *runs.add((ri * 4 + 3) as usize) };
-                        k.launch_attn_prefill_f16(
-                            self.q,
-                            kc as *const u16,
-                            vc as *const u16,
-                            self.attn,
-                            qoff,
-                            cc,
-                            base,
-                            c.n_heads as i32,
-                            c.n_kv_heads as i32,
-                            c.head_dim as i32,
-                            scale,
-                            c.max_seq_len as i32,
-                            slot,
-                        )?;
-                    }
                 } else if self.paged {
                     // Paged decode (dense F32): KV store + attention go through
                     // the per-slot block tables into the page pool. Rows are
@@ -4741,11 +4765,12 @@ impl BatchedModel {
                 num_gdn_runs = 0;
             }
         }
-        // Prefill-attention runs are currently disabled: the naive shared-KV
-        // kernel is occupancy-bound and slower than decode attention on this
-        // GPU (see roadmap). All rows use decode attention (run_mask = 0).
+        // Non-paged prefill attention runs are currently disabled: the naive
+        // shared-KV kernel is occupancy-bound and slower than decode attention
+        // on this GPU (see roadmap). Paged F16 attention builds its own
+        // run descriptors above; all non-paged rows use decode attention
+        // (run_mask = 0).
         let run_mask = vec![0i32; n];
-        let num_runs = 0;
         // Host staging: refresh every pinned input mirror. Replayable graphs
         // re-read these buffers on every launch, so this write is the ONLY
         // per-step input work in the graph path.
@@ -4766,9 +4791,13 @@ impl BatchedModel {
         // run eagerly below or are recorded inside the decode graph.
         self.sampler.sample_batched_stage(params, counts, bias)?;
         let vocab = self.cfg.vocab_size;
+        let groups = (self.cfg.n_heads / self.cfg.n_kv_heads).max(1);
+        let q_block = (16 / groups).clamp(1, 4);
+        let (paged_runs, paged_runs_multi) = self.stage_paged_attn_runs(lens, slots, q_block)?;
         // Graphs record the legacy one-row-per-slot GDN kernels; a chunked
-        // step (mixed prefill rows) must stay on the eager per-run path.
-        if num_gdn_runs == 0 && self.graph_capture_ok(n, decode_only) {
+        // step (mixed prefill rows) or a multi-row paged run must stay on the
+        // eager per-run path.
+        if num_gdn_runs == 0 && !paged_runs_multi && self.graph_capture_ok(n, decode_only) {
             let key = n as i32;
             if !self.decode_graphs.contains_key(&key) {
                 self.capture_decode_graph(key)?;
@@ -4782,18 +4811,14 @@ impl BatchedModel {
                 .sample_batched_readback(self.logits, params, vocab);
         }
         self.upload_decode_inputs(n)?;
-        let paged_same_slot = self.paged
-            && !slots.is_empty()
-            && slots.iter().all(|&s| s == slots[0])
-            && lens.windows(2).all(|w| w[1] == w[0].saturating_add(1));
         self.run_kernels(
             n as i32,
             self.slots_dev,
             self.run_mask_dev,
             decode_only,
-            num_runs,
             num_gdn_runs,
-            paged_same_slot,
+            paged_runs,
+            paged_runs_multi,
         )?;
         self.sampler
             .sample_batched_after_stage(self.logits, params, vocab)

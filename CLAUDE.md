@@ -66,7 +66,7 @@ HTTP handler(axum)→ channel → **唯一后台引擎线程**(模型/GPU 状态
 ## 关键约定
 
 1. **双编译面**:`--features hip` 开/关都必须编译通过且 CPU 测试绿(CI 两面都 check)。GPU 代码全部 `#[cfg(feature = "hip")]`,CPU 参考路径不依赖 hip。
-2. **离线内核编译门禁**:新增 HIP 内核源码(`kernels.rs` 的 `const`)**必须**同步加入 `kernels.rs` 内 `offline_tests` 模块的 `ALL_KERNELS` 列表(当前 77 个;计数由 `kernel_count_matches_documented_gate` 测试机器校验——改列表须同步更新该断言与本文档计数)——hiprtc 只需 ROCm 运行时、无需 GPU 设备即可离线编译。注意:该测试是 `#[cfg(all(test, feature = "hip"))]`；显式运行它时若 ROCm 运行时不不可用会 fail-loud，不再 skip。CPU CI 不带 hip feature、不执行它（GPU job 仅 workflow_dispatch 手动触发），坏内核靠**本机** `cargo test -p mach-model --features hip --lib offline` 拦下，而不是 CPU CI。
+2. **离线内核编译门禁**:新增 HIP 内核源码(`kernels.rs` 的 `const`)**必须**同步加入 `kernels.rs` 内 `offline_tests` 模块的 `ALL_KERNELS` 列表(当前 78 个;计数由 `kernel_count_matches_documented_gate` 测试机器校验——改列表须同步更新该断言与本文档计数)——hiprtc 只需 ROCm 运行时、无需 GPU 设备即可离线编译。注意:该测试是 `#[cfg(all(test, feature = "hip"))]`；显式运行它时若 ROCm 运行时不不可用会 fail-loud，不再 skip。CPU CI 不带 hip feature、不执行它（GPU job 仅 workflow_dispatch 手动触发），坏内核靠**本机** `cargo test -p mach-model --features hip --lib offline` 拦下，而不是 CPU CI。
 3. **正确性方法论**:每条 GPU 路径都要有 CPU 参考对拍测试(logits 逐位/容差一致);独立 fp64 参考在 `tools/ref_llama.py`。真机对拍记录进 `docs/roadmap.md` 进度日志。
 4. **GPU 测试**:`--test-threads 1` 强制;sampling 的 GPU 测试 `#[ignore]`d(`-- --ignored` 显式跑);真实大模型测试用 `MACH_TEST_MODEL` 门控。
 5. **文档同步**:里程碑完成后在 `docs/roadmap.md` 追加进度日志条目(含验证命令与结果),README 性能地图与 `docs/tokenspeed-alignment.md` 状态表按需同步;基准方法论在 `docs/benchmark-protocol.md`。
