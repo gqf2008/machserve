@@ -39,13 +39,11 @@ fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
         Ok(h) => match hip::device_count() {
             Ok(n) if n > 0 => Some(h),
             _ => {
-                eprintln!("skipping HIP test: no device");
-                None
+                panic!("no HIP device is present; this test is opt-in and must not silently skip");
             }
         },
         Err(e) => {
-            eprintln!("skipping HIP test: {e}");
-            None
+            panic!("HIP runtime is unavailable: {e}");
         }
     }
 }
@@ -103,12 +101,12 @@ fn qwen3_moe_tiny_cfg() -> Config {
 }
 
 #[test]
+#[ignore = "real-MoE GPU parity; needs .models/model.safetensors; run with --ignored"]
 fn qwen3_moe_tiny_decodes_finite_and_deterministic() {
     let Some(path) = model_path() else {
-        eprintln!(
-            "skipping qwen3_moe_tiny: .models/model.safetensors not present (see doc comment)"
+        panic!(
+            ".models/model.safetensors is required to run this MoE test (see the module doc for the download)"
         );
-        return;
     };
     let Some(hip) = hip_ctx() else { return };
 

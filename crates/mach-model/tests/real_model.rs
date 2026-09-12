@@ -20,24 +20,22 @@ use mach_model::sampling::SamplingParams;
 use mach_model::{Config, Weights};
 
 #[test]
+#[ignore = "real-model GPU parity; set MACH_TEST_MODEL and run with --ignored"]
 fn real_model_decodes_finite_and_deterministic() {
     // Cargo test runs from the crate dir; the model lives at the repo root.
     let Some(model_path) = mach_model::real_test_model_path() else {
-        eprintln!("skipping real_model: set MACH_TEST_MODEL to a .safetensors path");
-        return;
+        panic!(
+            "MACH_TEST_MODEL must point at a checkpoint to run this real-model test (opt-in: run with --ignored)"
+        );
     };
     let hip = match hip::hip() {
         Ok(h) => match hip::device_count() {
             Ok(n) if n > 0 => h,
-            _ => {
-                eprintln!("skipping real_model: no device");
-                return;
-            }
+            _ => panic!(
+                "no HIP device is present (this real-model test is opt-in: run with --ignored)"
+            ),
         },
-        Err(e) => {
-            eprintln!("skipping real_model: {e}");
-            return;
-        }
+        Err(e) => panic!("HIP runtime is unavailable: {e}"),
     };
 
     let cfg = Config::llama(16, 2, 4, 4, 32000, 2048);
@@ -65,23 +63,21 @@ fn real_model_decodes_finite_and_deterministic() {
 }
 
 #[test]
+#[ignore = "real-model GPU parity; set MACH_TEST_MODEL and run with --ignored"]
 fn real_model_samples_with_seed_deterministically() {
     let Some(model_path) = mach_model::real_test_model_path() else {
-        eprintln!("skipping real_model: set MACH_TEST_MODEL to a .safetensors path");
-        return;
+        panic!(
+            "MACH_TEST_MODEL must point at a checkpoint to run this real-model test (opt-in: run with --ignored)"
+        );
     };
     let hip = match hip::hip() {
         Ok(h) => match hip::device_count() {
             Ok(n) if n > 0 => h,
-            _ => {
-                eprintln!("skipping real_model sampling: no device");
-                return;
-            }
+            _ => panic!(
+                "no HIP device is present (this real-model test is opt-in: run with --ignored)"
+            ),
         },
-        Err(e) => {
-            eprintln!("skipping real_model sampling: {e}");
-            return;
-        }
+        Err(e) => panic!("HIP runtime is unavailable: {e}"),
     };
 
     let cfg = Config::llama(16, 2, 4, 4, 32000, 2048);
@@ -120,23 +116,21 @@ fn real_model_samples_with_seed_deterministically() {
 }
 
 #[test]
+#[ignore = "real-model GPU parity; set MACH_TEST_MODEL and run with --ignored"]
 fn real_model_fp16_matches_fp32() {
     let Some(model_path) = mach_model::real_test_model_path() else {
-        eprintln!("skipping real_model: set MACH_TEST_MODEL to a .safetensors path");
-        return;
+        panic!(
+            "MACH_TEST_MODEL must point at a checkpoint to run this real-model test (opt-in: run with --ignored)"
+        );
     };
     let hip = match hip::hip() {
         Ok(h) => match hip::device_count() {
             Ok(n) if n > 0 => h,
-            _ => {
-                eprintln!("skipping real_model fp16: no device");
-                return;
-            }
+            _ => panic!(
+                "no HIP device is present (this real-model test is opt-in: run with --ignored)"
+            ),
         },
-        Err(e) => {
-            eprintln!("skipping real_model fp16: {e}");
-            return;
-        }
+        Err(e) => panic!("HIP runtime is unavailable: {e}"),
     };
     let cfg = Config::llama(16, 2, 4, 4, 32000, 2048);
     let w: Weights = load_safetensors(&model_path, &cfg, false).expect("load weights");

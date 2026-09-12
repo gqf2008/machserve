@@ -48,7 +48,7 @@ jobs:
       # without the feature); `fp16` and `spec_decode` are `--features hip`-only
       # suites, so without the feature they report "0 tests" rather than being
       # skipped — they are NOT covered by this job. `load_safetensors` runs its
-      # CPU cases (16) and compiles out its 9 hip-gated GPU cases (25 with hip).
+      # CPU cases (15 passed + 1 ignored) and compiles out its 9 hip-gated GPU cases (25 with hip, 8 ignored).
       - name: integration tests (CPU-reachable only)
         run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode
 
