@@ -53,6 +53,8 @@ jobs:
       # real-checkpoint parity is `#[ignore]`d and is not run by this job.
       - name: integration tests (CPU-reachable only)
         run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode --test vision_real_weights
+      - name: vision first-step comparator selftest
+        run: python tools/vision_c4_compare_first_step.py --selftest
 
   gpu:
     name: GPU parity (opt-in, self-hosted AMD)
