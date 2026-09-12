@@ -1879,8 +1879,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   `--bin mach-server`（23）、`--test vision_decode`（1）、`mach-model --lib`（228）、
   `offline_tests`（2/73）、双面 `cargo check --workspace --all-targets`、
   `cargo clippy --workspace --all-targets --features hip -- -D warnings` 全绿。
-- 真机项仍留 C4：7900 XTX 上跑 golden/e2e/compare、HF 整模型 greedy token/logits
-  对拍、VRAM/TTFT 记录。
+- 当时真机项留给 C4：7900 XTX 上跑 golden/e2e/compare、整模型参考、VRAM/TTFT
+  记录；这些已在 2026-09-12 的后续记录中补齐。
 
 ## Qwen3.8-27B Stage C4：多模态请求路径的阻塞与连接复用（#146，2026-09-11）
 
@@ -1937,8 +1937,9 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   4-token greedy 序列 `[248068,271,248069,271]` 逐位一致；HF 参考由 CPU/disk offload 生成
   （无 CUDA），top-5 logprobs 只报告不判 pass，明确 Q4/BF16 数值差异边界。
 
-**C4 至此只剩真机窗口项**：golden/compare E2E、HF 整模型 greedy token/logits
-（本机 31GB 内存装不下 BF16 27B）、Fast/PIL 漂移复核、VRAM/TTFT 回填。
+**C4 核心验收已闭环**：golden/compare E2E、Fast/PIL 漂移、VRAM/TTFT 回填以及
+HF↔MachServe 4-token greedy 序列对拍都已有记录；剩余 P3 增强是高分辨率整图 tiling。
+完整 Q4-vs-BF16 logits 数值 parity 不作为门禁，保留 top-5 诊断。
 
 ## Qwen3.8-27B Stage C4：图像解码测试进入 CPU 测试面（#146，2026-09-11）
 
@@ -1954,7 +1955,7 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   `cargo test -p mach-server --lib`（CPU 29 / hip 44）、
   `--test vision_decode`（CPU 1 / hip 1）、`cargo fmt --all --check` 全绿。
 
-## Qwen3.8-27B Stage C4：真机 HTTP 多模态链路跑通（视觉特征 GPU↔HF 对拍通过，整模型 token/logits 待补）（#146，2026-09-11）
+## Qwen3.8-27B Stage C4：真机 HTTP 多模态链路跑通（视觉特征 GPU↔HF 对拍通过）（#146，2026-09-11；09-12 补短序列 token 对拍）
 
 - 7900 XTX（ROCm 6.2 / Windows）上跑通完整 HTTP 多模态链路：
   `MACH_Q4=1 MACH_Q4_DEVICE=2 MACH_CAPACITY=1 MACH_VISION_MAX_TOKENS=2048`；
@@ -1978,8 +1979,9 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
   `estimate_vram` 对 1/2 取同一系数）、补 `--max-patches 2048`（128x128 图 → 放大到
   256x256 → grid `[1,16,16]` = 256 patch / 64 merged token）；并记录 `doctor`
   跨进程读不到服务占用、本次未采到实际 VRAM 占用。
-- 剩余唯一验收项：HF 整模型 greedy token/logits 参考（本机 31GB 内存装不下 BF16 27B、
-  PyTorch 无 Windows ROCm 轮子），需在 ≥64GB 内存机器或 Linux+ROCm 环境生成后对比。
+- **修正（2026-09-12）**：HF 参考已用本机 CPU/disk offload 生成（PyTorch 2.14.0+cpu，
+  `device_map_has_cuda=false`）；4-token greedy 序列与 MachServe 逐位一致。完整 Q4-vs-BF16
+  logits 数值 parity 不作为验收门禁，top-5 仅保留诊断。
 
 ## Qwen3.8-27B Stage C4：Q4-on-device prefill 行复用（#146，2026-09-11）
 
