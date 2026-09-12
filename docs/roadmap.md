@@ -1706,7 +1706,19 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
 - CPU scatter/gather、dequant、dot 和 full-attention decode oracle；
 - 测试覆盖 roundtrip 误差上界、odd head_dim packing、paged remap、坏页表、
   非有限输入、GQA attention vs f32。
-- Stage 2（HIP kernels）和 Stage 3（`MACH_KV=q4` runtime）尚未实现。
+- Stage 2（HIP kernels）已完成，见下节；Stage 3（`MACH_KV=q4` runtime）尚未实现。
+
+## Q4 KV Stage 2：paged HIP store/attention + CPU-oracle parity（#192，2026-09-12）
+
+- 新增 `kv_store_paged_q4`：按 page table 写入 packed `[page,tpp,head,packed_dim]`，
+  每 `(token, kv_head)` 独立 f32 scale；low nibble first，code 8 为零，
+  odd `head_dim` 高位补 0；
+- 新增 `attn_decode_paged_q4_gqa`：block-per-(sequence, query head) 的
+  correctness-first double 软/累加路径，每线程持有输出维，支持 `head_dim <= 256`；
+- 两个 kernel 进入 HIPRTC offline 门禁（内核计数 79→81，当前 81）；
+- 新增 opt-in `q4_kv` GPU parity：store 写入与 CPU `Q4Kv::quantize` 对齐，
+  attention 与 CPU `attention_decode_q4` 对拍，覆盖跨页/重映射 page table；
+  未跑真机前不宣称 GPU 正确。
 
 ## INT8 KV：paged runtime 接线（#190，2026-09-12）
 
