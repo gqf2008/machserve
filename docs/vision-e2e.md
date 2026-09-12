@@ -102,6 +102,9 @@ int4，设备上仍会把 dense 权重解量化成 f16（`doctor` 估算 ~53 GiB
 放大到 256x256，得 grid `[1,16,16]` = **256 patch（merge 后 64 个视觉 token）**，
 2048 足够且把 vision scratch 压到最小；不设时默认 8192。
 
+默认超预算图仍返回 400。若希望把过大图片自动缩到 `MACH_VISION_MAX_TOKENS` 内再服务，
+可显式加 `MACH_VISION_DOWNSCALE=1`；这只改变超预算图的回退策略，预算内的图逐位不变。
+
 5) 数值对拍（HF `hf_golden_features.npy` vs MachServe `ms_features.bin/json`；compare 同时校验 grid 与输入 SHA-256 绑定）：
 
 ```powershell

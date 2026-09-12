@@ -1848,6 +1848,8 @@ Stage 9 后，`estimate_vram` 不再把连续 INT8 KV 按 f16 保守计数：
 - 内存预算：新增 `preprocess_image_limited` / `preprocess_data_url_limited` /
   `fetch_image_url_limited`；route 对每张图使用剩余预算（`total` 累加），data URL 与 HTTP
   路径都在分配 patch buffer 前按 `MACH_VISION_MAX_TOKENS` 拒绝（400）。
+- 超预算图可选降采样：`MACH_VISION_DOWNSCALE=1` 时把像素预算收紧到 patch 上限，
+  再用同一 HF 兼容 processor 缩图；默认不设仍保持上面的 400 契约（#146）。
 - 离线测试：engine image_runtime 往返、router 两种状态、engine error → HTTP 状态映射、
   preprocessor 路径解析、fetch/patch 上限；真机视觉前向与图片问答 E2E 属 C4。
 

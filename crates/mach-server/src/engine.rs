@@ -68,6 +68,10 @@ pub struct ImageRuntimeConfig {
     pub spatial_merge_size: usize,
     /// Maximum total vision patches accepted per request.
     pub max_patches: usize,
+    /// `MACH_VISION_DOWNSCALE=1`: an image whose grid exceeds the remaining
+    /// patch budget is downscaled into it instead of rejected (400). The
+    /// default keeps the strict rejection contract.
+    pub downscale_oversized: bool,
 }
 
 /// GPU vision runtime owned by (and created on) the engine thread.
@@ -1052,12 +1056,14 @@ mod tests {
             image_token_id: 7,
             spatial_merge_size: 2,
             max_patches: 128,
+            downscale_oversized: true,
         };
         engine.set_image_runtime(cfg);
         let got = engine.image_runtime().unwrap();
         assert_eq!(got.image_token_id, 7);
         assert_eq!(got.spatial_merge_size, 2);
         assert_eq!(got.max_patches, 128);
+        assert!(got.downscale_oversized);
     }
 
     /// A fatal engine error must fail every queued *and* in-flight request and

@@ -6,7 +6,8 @@
 //! then embedded as raw `f32` bit patterns so the assertions are exact.
 
 use mach_model::image_processor::{
-    ImageProcessorConfig, preprocess_image, preprocess_image_limited, smart_resize,
+    ImageProcessorConfig, preprocess_image, preprocess_image_limited,
+    preprocess_image_limited_downscaling, smart_resize,
 };
 
 fn lcg_image(height: usize, width: usize, seed: u64) -> Vec<u8> {
@@ -321,4 +322,42 @@ fn preprocess_rejects_patch_budget() {
         .to_string();
     assert!(err.contains("exceeds limit 8"), "{err}");
     assert!(preprocess_image_limited(&cfg, &img, 4, 4, 16).is_ok());
+}
+
+/// Opt-in downscaling policy (`MACH_VISION_DOWNSCALE=1`): an over-cap image is
+/// served at a reduced grid instead of rejected, while the strict default path
+/// keeps rejecting it and in-cap images stay bit-identical between the two.
+#[test]
+fn downscaling_policy_fits_oversized_image_into_cap() {
+    let cfg = real_cfg();
+    let cap = 8192usize;
+    // 2000x1500 (3 MP): HF resizes it to a 94x126 = 11844-patch grid, above the
+    // kernel cap; a common photo size that used to be a hard 400.
+    let big = lcg_image(1500, 2000, 0xfeed_face_dead_beef);
+    let strict = preprocess_image_limited(&cfg, &big, 1500, 2000, cap);
+    assert!(
+        strict.is_err(),
+        "the default (strict) policy must still reject"
+    );
+    let out = preprocess_image_limited_downscaling(&cfg, &big, 1500, 2000, cap).unwrap();
+    let patches = out.grid[1] * out.grid[2];
+    assert!(
+        patches <= cap,
+        "grid {:?} = {patches} > cap {cap}",
+        out.grid
+    );
+    let want = 2000.0 / 1500.0;
+    let got = out.grid[2] as f64 / out.grid[1] as f64;
+    assert!(
+        (got - want).abs() / want < 0.05,
+        "aspect {got} vs {want} (grid {:?})",
+        out.grid
+    );
+
+    // An image that already fits is untouched by the opt-in policy.
+    let small = lcg_image(1000, 1000, 0x0fed_cba9_8765_4321);
+    let a = preprocess_image_limited(&cfg, &small, 1000, 1000, cap).unwrap();
+    let b = preprocess_image_limited_downscaling(&cfg, &small, 1000, 1000, cap).unwrap();
+    assert_eq!(a.grid, b.grid);
+    assert_eq!(a.pixel_values, b.pixel_values);
 }
