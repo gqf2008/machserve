@@ -1,5 +1,6 @@
 //! MachServe OpenAI-compatible HTTP server over the continuous-batching engine.
 
+pub mod chat;
 #[cfg(feature = "hip")]
 pub mod engine;
 pub mod multimodal;
