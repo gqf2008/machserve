@@ -1,8 +1,10 @@
 //! Env-gated GPU parity harness for INT8 KV kernels.
 //!
 //! These tests are `#[ignore]` by default and additionally require
-//! `MACH_TEST_INT8_KV=1`. With the env var unset they return before touching a
-//! HIP device. Run only in a dedicated GPU window:
+//! `MACH_TEST_INT8_KV=1`. Selecting them explicitly (`--ignored`) without that
+//! opt-in fails loudly (panic) before any device is touched, rather than
+//! reporting "ok" — libtest drops the output of passing tests, so a silent
+//! `return` would be invisible (see RULE_可达性 / #163).
 //!
 //! `$env:MACH_TEST_INT8_KV='1'; cargo test -p mach-model --features hip --test int8_kv -- --ignored --test-threads 1`
 #![cfg(feature = "hip")]
@@ -103,8 +105,9 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 fn gpu_ctx() -> Option<(Arc<hip::Hip>, HipKernels)> {
     if std::env::var("MACH_TEST_INT8_KV").as_deref() != Ok("1") {
-        eprintln!("skipping: MACH_TEST_INT8_KV != 1");
-        return None;
+        // `#[ignore]`d + explicitly selected => a missing opt-in must fail
+        // loudly (libtest drops the output of passing tests).
+        panic!("MACH_TEST_INT8_KV=1 is required to run these INT8 KV parity tests");
     }
     let h = hip::hip()
         .unwrap_or_else(|e| panic!("MACH_TEST_INT8_KV=1 but HIP runtime is unavailable: {e}"));
