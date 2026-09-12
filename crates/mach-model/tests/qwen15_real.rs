@@ -24,13 +24,11 @@ fn hip_ctx() -> Option<std::sync::Arc<hip::Hip>> {
         Ok(h) => match hip::device_count() {
             Ok(n) if n > 0 => Some(h),
             _ => {
-                eprintln!("skipping HIP test: no device");
-                None
+                panic!("no HIP device is present; this test is opt-in and must not silently skip");
             }
         },
         Err(e) => {
-            eprintln!("skipping HIP test: {e}");
-            None
+            panic!("HIP runtime is unavailable: {e}");
         }
     }
 }
@@ -84,10 +82,12 @@ fn qwen2_1_5b_cfg() -> Config {
 }
 
 #[test]
+#[ignore = "real-model GPU parity; set MACH_TEST_MODEL and run with --ignored"]
 fn qwen2_1_5b_decodes_finite_and_deterministic() {
     let Some(path) = model_path() else {
-        eprintln!("skipping qwen2_1_5b: set MACH_TEST_MODEL to a .safetensors path");
-        return;
+        panic!(
+            "MACH_TEST_MODEL must point at a checkpoint to run this real-model test (opt-in: run with --ignored)"
+        );
     };
     let Some(hip) = hip_ctx() else { return };
 

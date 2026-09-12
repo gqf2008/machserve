@@ -599,10 +599,12 @@ fn sharded_load_matches_single_file() {
 /// Opt-in real-checkpoint header/index validation. Set `MACH_TEST_MODEL` to a
 /// `.safetensors` file or an HF model directory; no tensor payload is loaded.
 #[test]
+#[ignore = "real-checkpoint header/index validation; set MACH_TEST_MODEL and run with --ignored"]
 fn validate_real_checkpoint_when_requested() {
     let Ok(path) = std::env::var("MACH_TEST_MODEL") else {
-        eprintln!("skipping real checkpoint validation: MACH_TEST_MODEL not set");
-        return;
+        // Opt-in test: selecting it explicitly without the env must fail loudly
+        // (libtest drops the output of passing tests).
+        panic!("MACH_TEST_MODEL must point at a .safetensors file or HF dir to run this test");
     };
     let layout = validate_checkpoint(std::path::Path::new(&path)).unwrap();
     eprintln!(
