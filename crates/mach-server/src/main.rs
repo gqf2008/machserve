@@ -685,6 +685,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             image_token_id: vision_cfg.image_token_id,
             spatial_merge_size: vision_cfg.spatial_merge_size,
             max_patches: max_tokens,
+            downscale_oversized: std::env::var("MACH_VISION_DOWNSCALE").is_ok_and(|v| v != "0"),
         });
         vision_setup = Some(VisionSetup {
             cfg: vision_cfg,

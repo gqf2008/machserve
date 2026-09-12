@@ -499,9 +499,21 @@ pub async fn chat_completions(
                     image_cfg.max_patches
                 ));
             };
-            match crate::multimodal::fetch_image_url_limited(url, &image_cfg.processor, remaining)
+            // `MACH_VISION_DOWNSCALE=1` turns an over-budget image into a
+            // downscaled one instead of a 400 (default keeps the strict
+            // rejection contract).
+            let fetched = if image_cfg.downscale_oversized {
+                crate::multimodal::fetch_image_url_limited_downscaling(
+                    url,
+                    &image_cfg.processor,
+                    remaining,
+                )
                 .await
-            {
+            } else {
+                crate::multimodal::fetch_image_url_limited(url, &image_cfg.processor, remaining)
+                    .await
+            };
+            match fetched {
                 Ok(image) => {
                     let patches = image.grid[0] * image.grid[1] * image.grid[2];
                     total_patches = match total_patches.checked_add(patches) {
@@ -715,6 +727,7 @@ mod tests {
             image_token_id: 1,
             spatial_merge_size: 2,
             max_patches: 16,
+            downscale_oversized: false,
         });
         let vision = AppState {
             engine,

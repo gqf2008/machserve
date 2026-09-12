@@ -8,7 +8,10 @@
 
 use base64::Engine as _;
 use image::ImageDecoder as _;
-use mach_model::image_processor::{ImageProcessorConfig, ProcessedImage, preprocess_image_limited};
+use mach_model::image_processor::{
+    ImageProcessorConfig, ProcessedImage, preprocess_image_limited,
+    preprocess_image_limited_downscaling,
+};
 use mach_model::vision::VisionGrid;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -220,14 +223,38 @@ pub fn preprocess_data_url_limited(
     cfg: &ImageProcessorConfig,
     max_patches: usize,
 ) -> Result<ProcessedImage, MultimodalError> {
+    preprocess_data_url_capped(url, cfg, max_patches, false)
+}
+
+/// Opt-in variant (`MACH_VISION_DOWNSCALE=1`): an image over the patch budget
+/// is downscaled into it instead of being rejected.
+pub fn preprocess_data_url_limited_downscaling(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
+    preprocess_data_url_capped(url, cfg, max_patches, true)
+}
+
+fn preprocess_data_url_capped(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+    downscale: bool,
+) -> Result<ProcessedImage, MultimodalError> {
     let image = decode_data_url(url)?;
-    Ok(preprocess_image_limited(
-        cfg,
-        &image.rgb8,
-        image.height,
-        image.width,
-        max_patches,
-    )?)
+    let processed = if downscale {
+        preprocess_image_limited_downscaling(
+            cfg,
+            &image.rgb8,
+            image.height,
+            image.width,
+            max_patches,
+        )
+    } else {
+        preprocess_image_limited(cfg, &image.rgb8, image.height, image.width, max_patches)
+    };
+    Ok(processed?)
 }
 
 /// Fetch an `http(s)://` image (bounded, public addresses only) or decode a
@@ -246,9 +273,28 @@ pub async fn fetch_image_url_limited(
     cfg: &ImageProcessorConfig,
     max_patches: usize,
 ) -> Result<ProcessedImage, MultimodalError> {
+    fetch_image_url_capped(url, cfg, max_patches, false).await
+}
+
+/// Opt-in variant (`MACH_VISION_DOWNSCALE=1`): an image over the patch budget
+/// is downscaled into it instead of being rejected.
+pub async fn fetch_image_url_limited_downscaling(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+) -> Result<ProcessedImage, MultimodalError> {
+    fetch_image_url_capped(url, cfg, max_patches, true).await
+}
+
+async fn fetch_image_url_capped(
+    url: &str,
+    cfg: &ImageProcessorConfig,
+    max_patches: usize,
+    downscale: bool,
+) -> Result<ProcessedImage, MultimodalError> {
     tokio::time::timeout(
         FETCH_TIMEOUT,
-        fetch_impl_limited(url, cfg, false, max_patches),
+        fetch_impl_limited(url, cfg, false, max_patches, downscale),
     )
     .await
     .map_err(|_| MultimodalError::Fetch("image fetch timed out".into()))?
@@ -263,7 +309,7 @@ async fn fetch_impl(
     cfg: &ImageProcessorConfig,
     allow_private: bool,
 ) -> Result<ProcessedImage, MultimodalError> {
-    fetch_impl_limited(url, cfg, allow_private, usize::MAX).await
+    fetch_impl_limited(url, cfg, allow_private, usize::MAX, false).await
 }
 
 /// Concurrency cap for CPU-bound image jobs. `spawn_blocking` grows its pool to
@@ -312,13 +358,18 @@ async fn fetch_impl_limited(
     cfg: &ImageProcessorConfig,
     allow_private: bool,
     max_patches: usize,
+    downscale: bool,
 ) -> Result<ProcessedImage, MultimodalError> {
     if url.starts_with("data:") {
         let permit = acquire_image_job().await?;
         let url = url.to_owned();
         let cfg = cfg.clone();
         return run_image_job(permit, move || {
-            preprocess_data_url_limited(&url, &cfg, max_patches)
+            if downscale {
+                preprocess_data_url_limited_downscaling(&url, &cfg, max_patches)
+            } else {
+                preprocess_data_url_limited(&url, &cfg, max_patches)
+            }
         })
         .await;
     }
@@ -389,13 +440,18 @@ async fn fetch_impl_limited(
         let cfg = cfg.clone();
         return run_image_job(permit, move || {
             let image = decode_rgb8(&bytes)?;
-            Ok(preprocess_image_limited(
-                &cfg,
-                &image.rgb8,
-                image.height,
-                image.width,
-                max_patches,
-            )?)
+            let processed = if downscale {
+                preprocess_image_limited_downscaling(
+                    &cfg,
+                    &image.rgb8,
+                    image.height,
+                    image.width,
+                    max_patches,
+                )
+            } else {
+                preprocess_image_limited(&cfg, &image.rgb8, image.height, image.width, max_patches)
+            };
+            Ok(processed?)
         })
         .await;
     }
@@ -1364,7 +1420,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_limit_rejects_oversized_grid() {
         let url = spawn_raw(http_response("200 OK", "image/png", &png_bytes(4, 4))).await;
-        let err = fetch_impl_limited(&url, &small_cfg(), true, 8)
+        let err = fetch_impl_limited(&url, &small_cfg(), true, 8, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeds limit"), "{err}");
@@ -1385,5 +1441,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn preprocess_data_url_downscaling_fits_oversized_grid() {
+        let out =
+            preprocess_data_url_limited_downscaling(&png_data_url(8, 8), &small_cfg(), 16).unwrap();
+        assert_eq!(out.grid, [1, 4, 4]);
+        assert_eq!(out.pixel_values.len(), 4 * 4 * 3);
+    }
+
+    #[tokio::test]
+    async fn fetch_data_url_downscaling_fits_oversized_grid() {
+        let out = fetch_image_url_limited_downscaling(&png_data_url(8, 8), &small_cfg(), 16)
+            .await
+            .unwrap();
+        assert_eq!(out.grid, [1, 4, 4]);
+    }
+
+    #[tokio::test]
+    async fn fetch_http_downscaling_fits_oversized_grid() {
+        let url = spawn_raw(http_response("200 OK", "image/png", &png_bytes(8, 8))).await;
+        let out = fetch_impl_limited(&url, &small_cfg(), true, 16, true)
+            .await
+            .unwrap();
+        assert_eq!(out.grid, [1, 4, 4]);
     }
 }

@@ -229,6 +229,39 @@ pub fn preprocess_image_limited(
     width: usize,
     max_patches: usize,
 ) -> Result<ProcessedImage, Error> {
+    preprocess_image_capped(cfg, rgb8, height, width, max_patches, false)
+}
+
+/// Opt-in variant of [`preprocess_image_limited`] (`MACH_VISION_DOWNSCALE=1`):
+/// when the resized grid would exceed `max_patches`, downscale further to the
+/// largest grid that fits instead of rejecting the image.
+///
+/// `max_patches` is the vision attention kernel's per-image segment limit (the
+/// whole frame's patch segment is staged in dynamic shared memory), so a larger
+/// grid genuinely cannot run. HF's own processor would serve it (`max_pixels` is
+/// 16.7 MP = 65536 patches for Qwen3.8), which is why a caller may prefer a
+/// lower-resolution answer over a 400. Images that already fit `max_patches` are
+/// bit-identical to the strict path.
+///
+/// Fails only when even `min_pixels` cannot fit inside the cap.
+pub fn preprocess_image_limited_downscaling(
+    cfg: &ImageProcessorConfig,
+    rgb8: &[u8],
+    height: usize,
+    width: usize,
+    max_patches: usize,
+) -> Result<ProcessedImage, Error> {
+    preprocess_image_capped(cfg, rgb8, height, width, max_patches, true)
+}
+
+fn preprocess_image_capped(
+    cfg: &ImageProcessorConfig,
+    rgb8: &[u8],
+    height: usize,
+    width: usize,
+    max_patches: usize,
+    downscale: bool,
+) -> Result<ProcessedImage, Error> {
     cfg.validate()?;
     if height == 0 || width == 0 {
         return Err(Error::InvalidArgument(
@@ -245,8 +278,26 @@ pub fn preprocess_image_limited(
             rgb8.len()
         )));
     }
+    // Opt-in downscaling: cap the pixel budget so the aligned grid fits
+    // (`patches == (h/patch)*(w/patch) == h*w/patch^2` for aligned sizes).
+    // `preprocess_image` passes `usize::MAX`, whose derived budget overflows, so
+    // the clamp is skipped there.
+    let (eff_min_pixels, eff_max_pixels) = if downscale {
+        match max_patches
+            .checked_mul(cfg.patch_size)
+            .and_then(|v| v.checked_mul(cfg.patch_size))
+        {
+            Some(cap) => {
+                let max = cfg.max_pixels.min(cap);
+                (cfg.min_pixels.min(max), max)
+            }
+            None => (cfg.min_pixels, cfg.max_pixels),
+        }
+    } else {
+        (cfg.min_pixels, cfg.max_pixels)
+    };
     let (resized_h, resized_w) =
-        smart_resize(height, width, cfg.factor(), cfg.min_pixels, cfg.max_pixels)?;
+        smart_resize(height, width, cfg.factor(), eff_min_pixels, eff_max_pixels)?;
     let resized = resize_rgb8_bicubic(rgb8, height, width, resized_h, resized_w)?;
     let grid_h = resized_h / cfg.patch_size;
     let grid_w = resized_w / cfg.patch_size;
