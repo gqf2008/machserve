@@ -49,8 +49,10 @@ jobs:
       # suites, so without the feature they report "0 tests" rather than being
       # skipped — they are NOT covered by this job. `load_safetensors` runs its
       # CPU cases (15 passed + 1 ignored) and compiles out its 9 hip-gated GPU cases (25 with hip, 8 ignored).
+      # `vision_real_weights` contributes its 2 fast tests (path/tolerance); the 11-minute
+      # real-checkpoint parity is `#[ignore]`d and is not run by this job.
       - name: integration tests (CPU-reachable only)
-        run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode
+        run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode --test vision_real_weights
 
   gpu:
     name: GPU parity (opt-in, self-hosted AMD)
