@@ -142,6 +142,8 @@ cargo run -p mach-server --release --features hip
 #     128+ 行已观测到错误输出/整机异常，其他模型与上下文仍需单独验证)、
 #   MACH_KV=int8(实验:Q4_DEVICE=2 的 dense 非 MLA full-attention K/V 用 INT8；
 #     支持连续与 MACH_PAGED 页池两种布局，预检按 payload+scales)、
+#   MACH_KV=q4(实验:Q4_DEVICE=2 的 dense 非 MLA F16 full-attention K/V 用 packed int4；
+#     仅 MACH_PAGED=1 页池，预检按 packed payload+scales；真机 parity 待验证)、
 #   MACH_PAGED_DEBUG=1(分页复用 trace:每个请求一行 `paged: admit`/`paged: register`,
 #     含 reused_pages —— 该复用而缺失就是缓存未命中的直接证据)
 #   MACH_VISION=1 + MACH_VISION_DOWNSCALE=1(视觉超预算图降采样到

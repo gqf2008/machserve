@@ -608,6 +608,7 @@ impl ServerEngine {
         cfg: Config,
         w: WeightsQ4,
         int8_kv: bool,
+        q4_kv: bool,
     ) -> Result<std::thread::JoinHandle<()>, EngineError> {
         if self.offload_slots.is_some() {
             return Err(EngineError::InvalidRequest(
@@ -615,8 +616,22 @@ impl ServerEngine {
                     .into(),
             ));
         }
+        if q4_kv && (int8_kv || self.paged_tpp.is_none()) {
+            return Err(EngineError::InvalidRequest(
+                "Q4 KV requires MACH_PAGED=1 and is mutually exclusive with INT8 KV".into(),
+            ));
+        }
         let model = if let Some(tpp) = self.paged_tpp {
-            if int8_kv {
+            if q4_kv {
+                ContinuousModel::with_paged_prefill_rows_q4_all_q4_kv(
+                    hip,
+                    cfg,
+                    &w,
+                    self.capacity,
+                    self.prefill_rows,
+                    tpp,
+                )?
+            } else if int8_kv {
                 ContinuousModel::with_paged_prefill_rows_q4_all_int8_kv(
                     hip,
                     cfg,

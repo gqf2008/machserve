@@ -21,7 +21,8 @@
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
 //! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
 //! engage paged KV — plain, Q4 and FP8 non-MLA). MACH_KV=int8 is supported
-//! for contiguous or paged dense non-MLA checkpoints with Q4_DEVICE=2.
+//! for contiguous or paged dense non-MLA checkpoints with Q4_DEVICE=2;
+//! MACH_KV=q4 is paged-only for dense non-MLA F16-compute checkpoints.
 //! The paged-path safety cap is
 //! MACH_PREFILL_ROWS<=64 / MACH_CAPACITY<=64 until controlled 512-row GPU
 //! validation of the tiled attention path lands.
@@ -61,7 +62,7 @@ use mach_model::vision::VisionConfig;
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
 use mach_server::startup::{
-    PAGED_PREFILL_ROWS_MAX, cap_paged_prefill_rows, config_from_json, estimate_vram,
+    PAGED_PREFILL_ROWS_MAX, cap_paged_prefill_rows, config_from_json, estimate_vram_kv,
     model_file_bytes, resolve_preprocessor_path,
 };
 #[cfg(feature = "hip")]
@@ -204,6 +205,29 @@ fn validate_paged_tpp(
     Ok(tpp)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "hip"), allow(dead_code))]
+enum KvMode {
+    F16,
+    Int8,
+    Q4,
+}
+
+#[cfg_attr(not(feature = "hip"), allow(dead_code))]
+fn parse_kv_mode_value(raw: Option<&str>) -> Result<KvMode, String> {
+    match raw {
+        None | Some("") | Some("0") | Some("f16") => Ok(KvMode::F16),
+        Some("int8") => Ok(KvMode::Int8),
+        Some("q4") => Ok(KvMode::Q4),
+        Some(other) => Err(format!("MACH_KV must be f16, int8 or q4, got {other:?}")),
+    }
+}
+
+#[cfg_attr(not(feature = "hip"), allow(dead_code))]
+fn parse_kv_mode() -> Result<KvMode, String> {
+    parse_kv_mode_value(std::env::var("MACH_KV").ok().as_deref())
+}
+
 /// Parses and validates `MACH_TPP` for a branch that actually engages paged
 /// KV (`MACH_PAGED` already checked by the caller). Runs BEFORE any weight
 /// load: a bad value fails fast instead of aborting after the multi-minute
@@ -316,23 +340,45 @@ fn run_doctor() {
         config_from_json(&config_path)
     }))
     .ok();
-    if let Some(cfg) = cfg {
+    if let Some(mut cfg) = cfg {
+        match std::env::var("MACH_DTYPE").as_deref() {
+            Ok("f32") => cfg.dtype = ModelDType::F32,
+            Ok("f16") => cfg.dtype = ModelDType::F16,
+            _ => {}
+        }
         let fb = model_file_bytes(&checkpoint_path);
         let cap = std::env::var("MACH_CAPACITY")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
         let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
-        let q4_device = std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v != "0");
-        // Doctor is diagnostic-only: mirror the runtime's reachable INT8-KV
+        let q4_device_code = match std::env::var("MACH_Q4_DEVICE").as_deref() {
+            Ok("2") => 2u8,
+            Ok(v) if v != "0" && !v.is_empty() => 1u8,
+            _ => 0u8,
+        };
+        let q4_device = q4_device_code != 0;
+        // Doctor is diagnostic-only: mirror the runtime's reachable quantized-KV
         // constraints, but fall back to the conservative f16 estimate for an
         // invalid combination instead of aborting the whole doctor run.
-        let kv_int8 = std::env::var("MACH_KV").is_ok_and(|v| v == "int8")
-            && std::env::var("MACH_Q4").is_ok_and(|v| v != "0")
-            && std::env::var("MACH_Q4_DEVICE").is_ok_and(|v| v == "2")
-            && !std::env::var("MACH_PAGED").is_ok_and(|v| v != "0")
-            && cfg.kv_lora_rank == 0;
-        let need = estimate_vram(&cfg, cap, fb, None, fp8, q4_device, kv_int8);
+        let kv_mode = parse_kv_mode().unwrap_or(KvMode::F16);
+        let q4_weights = std::env::var("MACH_Q4").is_ok_and(|v| v != "0") && q4_device_code == 2;
+        let paged = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
+        let paged_ok = paged
+            && validate_paged_tpp(&cfg, std::env::var("MACH_TPP").ok().as_deref())
+                .ok()
+                .is_some_and(|tpp| BatchedModel::check_paged_support(&cfg, tpp).is_ok());
+        let kv_int8 = kv_mode == KvMode::Int8
+            && q4_weights
+            && cfg.kv_lora_rank == 0
+            && BatchedModel::check_int8_kv_support(&cfg).is_ok();
+        let kv_q4 = kv_mode == KvMode::Q4
+            && q4_weights
+            && paged_ok
+            && cfg.kv_lora_rank == 0
+            && cfg.dtype == ModelDType::F16
+            && BatchedModel::check_q4_kv_support(&cfg).is_ok();
+        let need = estimate_vram_kv(&cfg, cap, fb, None, fp8, q4_device, kv_int8, kv_q4);
         let gib = need as f64 / (1024.0 * 1024.0 * 1024.0);
         println!(
             "estimate: d_model={} layers={} experts={} need ~{:.2} GiB (capacity {cap})",
@@ -387,16 +433,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // per tensor on the device), cutting host RAM ~2x vs f16 / ~4x vs f32.
     let fp8 = std::env::var("MACH_FP8").is_ok_and(|v| v != "0");
     let paged_requested = std::env::var("MACH_PAGED").is_ok_and(|v| v != "0");
-    let kv_int8 = match std::env::var("MACH_KV").as_deref() {
-        Err(_) | Ok("") | Ok("0") | Ok("f16") => false,
-        Ok("int8") => true,
-        Ok(other) => {
-            eprintln!("MACH_KV must be f16 or int8, got {other:?}");
+    let kv_mode = match parse_kv_mode() {
+        Ok(mode) => mode,
+        Err(msg) => {
+            eprintln!("{msg}");
             std::process::exit(1);
         }
     };
+    let (kv_int8, kv_q4) = match kv_mode {
+        KvMode::F16 => (false, false),
+        KvMode::Int8 => (true, false),
+        KvMode::Q4 => (false, true),
+    };
     if kv_int8 && (!q4 || q4_device != 2) {
         eprintln!("MACH_KV=int8 currently requires MACH_Q4=1 MACH_Q4_DEVICE=2");
+        std::process::exit(1);
+    }
+    if kv_q4 && (!q4 || q4_device != 2) {
+        eprintln!("MACH_KV=q4 currently requires MACH_Q4=1 MACH_Q4_DEVICE=2");
         std::process::exit(1);
     }
     let addr = std::env::var("MACH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
@@ -431,6 +485,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if kv_int8 && let Err(e) = BatchedModel::check_int8_kv_support(&cfg) {
         eprintln!("MACH_KV=int8 unsupported: {e}");
+        std::process::exit(1);
+    }
+    if kv_q4 && cfg.kv_lora_rank > 0 {
+        eprintln!("MACH_KV=q4 does not support MLA checkpoints yet (kv_lora_rank > 0)");
+        std::process::exit(1);
+    }
+    if kv_q4 && let Err(e) = BatchedModel::check_q4_kv_support(&cfg) {
+        eprintln!("MACH_KV=q4 unsupported: {e}");
         std::process::exit(1);
     }
     if q4 {
@@ -546,7 +608,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In Q4 mode the device holds dequantized f16 weights (~4x the packed int4
     // file size), so the preflight weight term must account for that or it can
     // pass while the upload OOMs.
-    let estimate = estimate_vram(
+    let estimate = estimate_vram_kv(
         &cfg,
         capacity,
         file_bytes,
@@ -554,6 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fp8,
         q4_device != 0,
         kv_int8,
+        kv_q4,
     );
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     println!(
@@ -647,7 +710,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    if kv_int8 {
+    if kv_q4 && paged_tpp.is_none() {
+        eprintln!("MACH_KV=q4 currently requires MACH_PAGED=1 (paged-only kernels)");
+        std::process::exit(1);
+    }
+    if kv_q4 {
+        println!(
+            "Q4 KV: paged packed-int4 payload + per-token/head f32 scales (exact preflight estimate)"
+        );
+    } else if kv_int8 {
         if paged_tpp.is_some() {
             println!(
                 "INT8 KV: paged full-attention payload i8 + per-token/head f32 scales (exact preflight estimate)"
@@ -750,7 +821,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eng.set_vision(hip.clone(), setup);
         }
         let handle = match q4_device {
-            2 => eng.clone().spawn_q4_all(hip, cfg, wq4, kv_int8)?,
+            2 => eng.clone().spawn_q4_all(hip, cfg, wq4, kv_int8, kv_q4)?,
             1 => eng.clone().spawn_q4_device(hip, cfg, wq4)?,
             _ => eng.clone().spawn_q4(hip, cfg, wq4)?,
         };
@@ -1002,5 +1073,15 @@ mod paged_tpp_tests {
         assert!(validate_paged_tpp(&cfg, Some("48")).is_err());
         // Valid custom value.
         assert_eq!(validate_paged_tpp(&cfg, Some("128")).unwrap(), 128);
+    }
+
+    #[test]
+    fn kv_mode_accepts_exactly_three_modes() {
+        assert_eq!(parse_kv_mode_value(None).unwrap(), KvMode::F16);
+        assert_eq!(parse_kv_mode_value(Some("f16")).unwrap(), KvMode::F16);
+        assert_eq!(parse_kv_mode_value(Some("int8")).unwrap(), KvMode::Int8);
+        assert_eq!(parse_kv_mode_value(Some("q4")).unwrap(), KvMode::Q4);
+        assert!(parse_kv_mode_value(Some("int4")).is_err());
+        assert!(parse_kv_mode_value(Some("Q4")).is_err());
     }
 }

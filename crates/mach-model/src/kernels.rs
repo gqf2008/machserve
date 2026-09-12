@@ -7543,8 +7543,8 @@ impl HipKernels {
         )?)
     }
 
-    /// Paged INT8 GQA decode attention. Correctness-first double math; the
-    /// runtime remains disabled until GPU parity is recorded.
+    /// Paged INT8 GQA decode attention. Correctness-first double math; this is
+    /// the opt-in paged INT8 runtime path, with gfx1100 parity still pending.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_attn_decode_paged_int8_gqa(
         &self,
@@ -7682,9 +7682,10 @@ impl HipKernels {
         )?)
     }
 
-    /// Paged Q4 GQA decode attention. Correctness-first double math; the
-    /// runtime remains disabled until GPU parity is recorded. Device q/K/V
-    /// inputs are expected to be finite, matching the CPU oracle contract.
+    /// Paged Q4 GQA decode attention. Correctness-first double math; this is
+    /// the opt-in `MACH_KV=q4` runtime path, with gfx1100 parity still
+    /// pending. Device q/K/V inputs are expected to be finite, matching the
+    /// CPU oracle contract.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_attn_decode_paged_q4_gqa(
         &self,

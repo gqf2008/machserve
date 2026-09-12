@@ -161,6 +161,17 @@ struct Int8KvDev {
     vs: *mut f32,
 }
 
+/// Packed Q4 KV buffers for one full-attention layer: packed nibble payload
+/// plus per-token/head f32 scales. The backing allocation has the same
+/// element count as INT8, but each head row is `ceil(head_dim/2)` bytes.
+#[derive(Clone, Copy)]
+struct Q4KvDev {
+    kp: *mut u8,
+    ks: *mut f32,
+    vp: *mut u8,
+    vs: *mut f32,
+}
+
 /// Dense (non-expert) Q4 weights per layer (dense Q4-on-device mode,
 /// `MACH_Q4_DEVICE=2`): every big GEMM tensor stays raw Q4 on device — the
 /// memory path for DENSE 27B-class checkpoints, where the dequantized f16
@@ -411,6 +422,10 @@ pub struct BatchedModel {
     /// full-attention layers carry Some.
     int8_kv: bool,
     int8_kv_cache: Vec<Option<Int8KvDev>>,
+    /// Optional packed Q4 KV buffers, index-aligned with layers; only
+    /// full-attention layers carry Some. Paged-only in the initial runtime.
+    q4_kv: bool,
+    q4_kv_cache: Vec<Option<Q4KvDev>>,
     /// MLA KV caches (kv_lora_rank > 0): expanded per-head k/v, layout
     /// `[batch, max_seq, heads, hd]` / `[batch, max_seq, heads, v_hd]`.
     mla_kv_cache: Vec<(*mut core::ffi::c_void, *mut core::ffi::c_void)>,
@@ -694,7 +709,37 @@ impl BatchedModel {
             ));
         }
         Self::check_int8_kv_support(&cfg)?;
-        let mut m = Self::build_common_with(hip, cfg, slots, rows, usize::MAX, true, |m| {
+        let mut m = Self::build_common_with(hip, cfg, slots, rows, usize::MAX, true, false, |m| {
+            m.upload_weights_q4(w, true, true)
+        })?;
+        m.init_paged(tokens_per_page)?;
+        Ok(m)
+    }
+
+    /// Paged dense Q4-on-device + packed Q4 KV (`MACH_Q4_DEVICE=2
+    /// MACH_KV=q4 MACH_PAGED=1`). The Q4 store/attention kernels are
+    /// paged-only and currently cover dense, non-MLA, F16-compute models.
+    pub fn with_paged_kv_rows_q4_all_q4_kv(
+        hip: Arc<Hip>,
+        cfg: Config,
+        w: &WeightsQ4,
+        slots: usize,
+        rows: usize,
+        tokens_per_page: usize,
+    ) -> Result<Self, Error> {
+        Self::paged_guards(&cfg, tokens_per_page)?;
+        if cfg.dtype != ModelDType::F16 {
+            return Err(Error::Model(
+                "paged Q4 KV currently requires dtype F16".into(),
+            ));
+        }
+        if cfg.kv_lora_rank != 0 {
+            return Err(Error::Model(
+                "paged Q4 KV does not support MLA checkpoints yet".into(),
+            ));
+        }
+        Self::check_q4_kv_support(&cfg)?;
+        let mut m = Self::build_common_with(hip, cfg, slots, rows, usize::MAX, false, true, |m| {
             m.upload_weights_q4(w, true, true)
         })?;
         m.init_paged(tokens_per_page)?;
@@ -817,6 +862,24 @@ impl BatchedModel {
             return Err(Error::InvalidArgument(format!(
                 "INT8 KV attention requires head_dim <= 256 and 256 % head_dim == 0 (got {})",
                 cfg.head_dim
+            )));
+        }
+        Ok(())
+    }
+
+    /// Q4 KV geometry guard. The correctness-first Q4 attention kernel keeps
+    /// one output dimension per thread, so `head_dim <= 256` is required.
+    pub fn check_q4_kv_support(cfg: &Config) -> Result<(), Error> {
+        if cfg.head_dim == 0 || cfg.head_dim > 256 {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV attention requires head_dim <= 256 (got {})",
+                cfg.head_dim
+            )));
+        }
+        if cfg.n_kv_heads == 0 || !cfg.n_heads.is_multiple_of(cfg.n_kv_heads) {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV attention requires n_heads divisible by n_kv_heads ({}/{})",
+                cfg.n_heads, cfg.n_kv_heads
             )));
         }
         Ok(())
@@ -978,7 +1041,7 @@ impl BatchedModel {
                 "INT8 KV does not support MLA yet (kv_lora_rank > 0)".into(),
             ));
         }
-        Self::build_common_with(hip, cfg, slots, rows, usize::MAX, true, |m| {
+        Self::build_common_with(hip, cfg, slots, rows, usize::MAX, true, false, |m| {
             m.upload_weights_q4(w, true, true)
         })
     }
@@ -1174,9 +1237,10 @@ impl BatchedModel {
         expert_slots: usize,
         upload: impl FnOnce(&mut Self) -> Result<(), Error>,
     ) -> Result<Self, Error> {
-        Self::build_common_with(hip, cfg, slots, rows, expert_slots, false, upload)
+        Self::build_common_with(hip, cfg, slots, rows, expert_slots, false, false, upload)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_common_with(
         hip: Arc<Hip>,
         cfg: Config,
@@ -1184,10 +1248,12 @@ impl BatchedModel {
         rows: usize,
         expert_slots: usize,
         int8_kv: bool,
+        q4_kv: bool,
         upload: impl FnOnce(&mut Self) -> Result<(), Error>,
     ) -> Result<Self, Error> {
         assert!(slots >= 1, "slots must be >= 1");
         assert!(rows >= slots, "rows must be >= slots");
+        assert!(!(int8_kv && q4_kv), "INT8 and Q4 KV are mutually exclusive");
         let k = Arc::new(HipKernels::new(Arc::clone(&hip))?);
         let sampler = BatchedSampler::new(Arc::clone(&hip), k.stream, rows)?;
         let mut m = Self {
@@ -1283,6 +1349,8 @@ impl BatchedModel {
             kv_cache: Vec::new(),
             int8_kv,
             int8_kv_cache: Vec::new(),
+            q4_kv,
+            q4_kv_cache: Vec::new(),
             mla_kv_cache: Vec::new(),
             lens: vec![0; slots],
             last_row_by_slot: vec![0; slots],
@@ -1560,7 +1628,7 @@ impl BatchedModel {
         // Dense KV cache: skipped on the MLA path (kv_lora_rank > 0), which
         // keeps its expanded per-head KV in `mla_kv_cache`; allocating it here
         // would waste VRAM (n_kv_heads = n_heads, head_dim = nope+rope).
-        if c.kv_lora_rank == 0 && !self.int8_kv {
+        if c.kv_lora_rank == 0 && !self.int8_kv && !self.q4_kv {
             let kv_bytes = self.batch * c.max_seq_len * c.n_kv_heads * c.head_dim * kv_elem;
             for _ in 0..c.n_layers {
                 let kk = self.dalloc(kv_bytes)?;
@@ -1583,6 +1651,23 @@ impl BatchedModel {
                 let vp = self.dalloc(payload_bytes)? as *mut i8;
                 let vs = self.dalloc(scale_bytes)?;
                 self.int8_kv_cache[li] = Some(Int8KvDev { kp, ks, vp, vs });
+            }
+        }
+        if self.q4_kv {
+            let packed_dim = c.head_dim.div_ceil(2);
+            let payload_bytes = self.batch * c.max_seq_len * c.n_kv_heads * packed_dim;
+            let scale_bytes = self.batch * c.max_seq_len * c.n_kv_heads * 4;
+            self.kv_cache = vec![(std::ptr::null_mut(), std::ptr::null_mut()); c.n_layers];
+            self.q4_kv_cache = vec![None; c.n_layers];
+            for li in 0..c.n_layers {
+                if c.gdn_enabled() && !c.layer_is_full_attn(li) {
+                    continue;
+                }
+                let kp = self.dalloc(payload_bytes)? as *mut u8;
+                let ks = self.dalloc(scale_bytes)?;
+                let vp = self.dalloc(payload_bytes)? as *mut u8;
+                let vs = self.dalloc(scale_bytes)?;
+                self.q4_kv_cache[li] = Some(Q4KvDev { kp, ks, vp, vs });
             }
         }
         if c.kv_lora_rank > 0 {
@@ -2481,6 +2566,33 @@ impl BatchedModel {
                 }
             }
         }
+        if !self.q4_kv_cache.is_empty() {
+            let packed_dim = self.cfg.head_dim.div_ceil(2);
+            let payload_bytes =
+                self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * packed_dim;
+            let scale_bytes = self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * 4;
+            for entry in &self.q4_kv_cache {
+                let Some(qv) = entry else { continue };
+                unsafe {
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(qv.kp as *mut _, 0, payload_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(qv.ks as *mut _, 0, scale_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(qv.vp as *mut _, 0, payload_bytes),
+                    )?;
+                    hip::check(
+                        self.k.hip(),
+                        (self.k.hip().api.hip_memset)(qv.vs as *mut _, 0, scale_bytes),
+                    )?;
+                }
+            }
+        }
         if !self.mla_kv_cache.is_empty() {
             let c = self.cfg;
             let heads = c.n_heads;
@@ -2601,6 +2713,21 @@ impl BatchedModel {
     #[must_use]
     pub fn int8_kv_layer_count(&self) -> usize {
         self.int8_kv_cache
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
+    }
+
+    /// Whether this model keeps full-attention KV in the paged packed-Q4 path.
+    #[must_use]
+    pub const fn q4_kv_enabled(&self) -> bool {
+        self.q4_kv
+    }
+
+    /// Number of layers with allocated packed-Q4 K/V buffers.
+    #[must_use]
+    pub fn q4_kv_layer_count(&self) -> usize {
+        self.q4_kv_cache
             .iter()
             .filter(|entry| entry.is_some())
             .count()
@@ -2890,6 +3017,7 @@ impl BatchedModel {
         if !self.paged
             || !matches!(self.cfg.dtype, ModelDType::F16 | ModelDType::F32)
             || self.int8_kv
+            || self.q4_kv
             || !self.mla_kv_cache.is_empty()
         {
             return Ok((0, false));
@@ -3011,6 +3139,7 @@ impl BatchedModel {
             || self.layer_dump.is_some()
             || self.cfg.dtype != ModelDType::F16
             || (self.int8_kv && self.paged)
+            || self.q4_kv
             || n == 0
             || n > GEMV_MAX_M as usize
         {
@@ -3809,7 +3938,56 @@ impl BatchedModel {
                     )?;
                 }
                 let (kc, vc) = self.kv_cache[li];
-                if self.int8_kv && self.paged {
+                if self.q4_kv {
+                    if !self.paged {
+                        return Err(Error::InvalidArgument(
+                            "Q4 KV requires paged mode (MACH_PAGED=1)".into(),
+                        ));
+                    }
+                    let qv = self.q4_kv_cache[li].expect("full-attention Q4 KV cache");
+                    let tpp = self.tokens_per_page as i32;
+                    k.launch_kv_store_paged_q4(
+                        self.k_buf,
+                        qv.kp,
+                        qv.ks,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_kv_store_paged_q4(
+                        self.v_buf,
+                        qv.vp,
+                        qv.vs,
+                        self.pos_dev,
+                        self.table_offsets,
+                        self.block_tables,
+                        b,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        tpp,
+                    )?;
+                    k.launch_attn_decode_paged_q4_gqa(
+                        self.q,
+                        qv.kp as *const u8,
+                        qv.ks as *const f32,
+                        qv.vp as *const u8,
+                        qv.vs as *const f32,
+                        self.block_tables,
+                        self.attn,
+                        self.pos_dev,
+                        self.table_offsets,
+                        b,
+                        c.n_heads as i32,
+                        c.n_kv_heads as i32,
+                        c.head_dim as i32,
+                        scale,
+                        tpp,
+                    )?;
+                } else if self.int8_kv && self.paged {
                     let iv = self.int8_kv_cache[li].expect("full-attention INT8 KV cache");
                     let tpp = self.tokens_per_page as i32;
                     k.launch_kv_store_paged_int8(
@@ -4958,9 +5136,9 @@ impl BatchedModel {
                 self.batch
             )));
         }
-        if self.int8_kv {
+        if self.int8_kv || self.q4_kv {
             return Err(Error::InvalidArgument(
-                "state anchors do not support INT8 KV yet".into(),
+                "state anchors do not support quantized KV yet".into(),
             ));
         }
         if tokens.len() != token_idx + 1 {
@@ -5069,9 +5247,9 @@ impl BatchedModel {
                 self.batch
             )));
         }
-        if self.int8_kv {
+        if self.int8_kv || self.q4_kv {
             return Err(Error::InvalidArgument(
-                "state anchors do not support INT8 KV yet".into(),
+                "state anchors do not support quantized KV yet".into(),
             ));
         }
         let c = self.cfg;
@@ -5170,6 +5348,11 @@ impl BatchedModel {
     /// Moves a sequence's KV rows from `from` to `to` (compaction). Only the
     /// first `len` positions are copied.
     pub fn copy_seq_kv(&self, from: usize, to: usize, len: usize) -> Result<(), Error> {
+        if self.q4_kv {
+            return Err(Error::InvalidArgument(
+                "paged Q4 KV compaction moves the block table, not contiguous rows".into(),
+            ));
+        }
         if self.int8_kv {
             let c = self.cfg;
             if len == 0 {
@@ -5420,6 +5603,23 @@ mod paged_support_tests {
         assert!(BatchedModel::check_int8_kv_support(&cfg).is_err());
         cfg.head_dim = 0;
         assert!(BatchedModel::check_int8_kv_support(&cfg).is_err());
+    }
+
+    #[test]
+    fn check_q4_kv_support_allows_non_power_of_two_head_dim() {
+        let mut cfg = Config::tiny();
+        cfg.head_dim = 255;
+        assert!(BatchedModel::check_q4_kv_support(&cfg).is_ok());
+        cfg.head_dim = 256;
+        assert!(BatchedModel::check_q4_kv_support(&cfg).is_ok());
+        cfg.head_dim = 257;
+        assert!(BatchedModel::check_q4_kv_support(&cfg).is_err());
+        cfg.head_dim = 0;
+        assert!(BatchedModel::check_q4_kv_support(&cfg).is_err());
+        cfg.head_dim = 128;
+        cfg.n_heads = 3;
+        cfg.n_kv_heads = 2;
+        assert!(BatchedModel::check_q4_kv_support(&cfg).is_err());
     }
 }
 
