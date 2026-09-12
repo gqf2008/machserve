@@ -47,8 +47,10 @@ python tools/paged_prefix_ab_real.py --arm contiguous
 - 分页 arm 会自动带 `MACH_PAGED_DEBUG=1`，服务日志里每个请求一行
   `paged: admit id=… prompt_tokens=… full_pages=… reused_pages=…`，预填物化时一行
   `paged: register slot=… full_pages=…`。**该复用而 `reused_pages=0` 就是缓存未命中的直接证据。**
-- arm 若因为模型/形状不受支持而静默退化成 contiguous，harness 会检查日志里的
-  `MACH_PAGED is unsupported` 并直接失败，不会输出误导性数字。
+- **自检（肯定不变量）**：分页 arm 要求日志里出现 `paged: admit` 行，且至少一个请求
+  `reused_pages>0`；任一不满足即直接失败、不写 JSON。这样无论服务端以后用哪种文案静默
+  退化成 contiguous，都不会产出看起来正常的数字。harness 还会拒绝：非 200 状态、
+  `error` SSE 帧、无数据帧、缺 `finish_reason`、模型目录不存在、端口已被占用、子进程提前退出。
 - **安全约束**：两个 arm 必须拆到不同时间窗口，中间留 ≥10 分钟观察窗口。本机曾两次
   在重 GPU arm 结束的同一秒级窗口内出现显示驱动 TDR（Event 4101），随后 7900 XTX
   掉出 HIP 设备枚举（`doctor` 只剩核显），必须重启才能复位。每 arm 结束都查一次
