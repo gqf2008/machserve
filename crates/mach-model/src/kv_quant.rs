@@ -1,10 +1,11 @@
 //! KV-cache quantization primitives.
 //!
-//! Stage 1 implements only the full-attention INT8 layout and its CPU oracle.
-//! Quantization is symmetric per `(token, kv_head, head_dim block)`: the
-//! payload is one `i8` per K/V element and one `f32` scale per head row. This
-//! keeps the layout identical for the future contiguous and paged GPU stores;
-//! it is intentionally not wired into the f16/f32 runtime yet.
+//! Stage 1 implements the full-attention INT8 and packed Q4 KV layouts and
+//! their CPU oracles. INT8 is symmetric per `(token, kv_head, head_dim block)`:
+//! one `i8` per K/V element and one `f32` scale per head row. Q4 packs two
+//! signed nibbles per byte with the same per-token/head scale geometry. Both
+//! layouts are page-major compatible; GPU kernels and runtime wiring are
+//! tracked separately.
 
 use crate::Error;
 
@@ -29,6 +30,16 @@ impl KvQuantFormat {
 /// extremes. The f64 product is saturated back to the finite f32 range.
 fn dequant_value(q: i8, scale: f32) -> f32 {
     let v = q as f64 * scale as f64;
+    if v > f32::MAX as f64 {
+        f32::MAX
+    } else if v < f32::MIN as f64 {
+        f32::MIN
+    } else {
+        v as f32
+    }
+}
+
+fn sat_f64_to_f32(v: f64) -> f32 {
     if v > f32::MAX as f64 {
         f32::MAX
     } else if v < f32::MIN as f64 {
@@ -750,19 +761,615 @@ pub fn gather_paged_int8(
     })
 }
 
+/// One packed signed int4 KV payload plus one f32 scale per token/head row.
+///
+/// Two signed nibbles are packed per byte, low nibble first. Values are
+/// symmetric in `[-7, 7]`; code 8 is zero, codes 9..15 are +1..+7 and codes
+/// 1..7 are -7..-1. Code 0 is unused by quantization (it would decode as -8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q4Kv {
+    q: Vec<u8>,
+    scales: Vec<f32>,
+    heads: usize,
+    head_dim: usize,
+}
+
+impl Q4Kv {
+    pub fn empty(heads: usize, head_dim: usize) -> Result<Self, Error> {
+        if heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "Q4 KV requires non-zero heads and head_dim".into(),
+            ));
+        }
+        heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV head block overflow".into()))?;
+        Ok(Self {
+            q: Vec::new(),
+            scales: Vec::new(),
+            heads,
+            head_dim,
+        })
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    pub fn packed_dim(&self) -> usize {
+        self.head_dim.div_ceil(2)
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.scales.len() / self.heads
+    }
+
+    pub fn quantized(&self) -> &[u8] {
+        &self.q
+    }
+
+    pub fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+
+    pub fn quantize(values: &[f32], heads: usize, head_dim: usize) -> Result<Self, Error> {
+        if heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "Q4 KV requires non-zero heads and head_dim".into(),
+            ));
+        }
+        let block = heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV head block overflow".into()))?;
+        if !values.len().is_multiple_of(block) {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV values length {} is not a multiple of heads*head_dim {block}",
+                values.len()
+            )));
+        }
+        if let Some((i, v)) = values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite())
+        {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV input has non-finite value at index {i}: {v}"
+            )));
+        }
+
+        let rows = values.len() / block;
+        let packed_dim = head_dim.div_ceil(2);
+        let mut q = Vec::with_capacity(rows * heads * packed_dim);
+        let mut scales = Vec::with_capacity(rows * heads);
+        for row in 0..rows {
+            for head in 0..heads {
+                let start = row * block + head * head_dim;
+                let end = start + head_dim;
+                let max_abs = values[start..end]
+                    .iter()
+                    .fold(0.0f32, |m, &v| m.max(v.abs()));
+                let scaled = max_abs / 7.0;
+                let scale = if max_abs == 0.0 {
+                    1.0
+                } else if scaled == 0.0 {
+                    max_abs
+                } else {
+                    scaled
+                };
+                scales.push(scale);
+                for d in (0..head_dim).step_by(2) {
+                    let code0 = quantize_q4_nibble(values[start + d], scale);
+                    let code1 = if d + 1 < head_dim {
+                        quantize_q4_nibble(values[start + d + 1], scale)
+                    } else {
+                        0
+                    };
+                    q.push(code0 | (code1 << 4));
+                }
+            }
+        }
+        Ok(Self {
+            q,
+            scales,
+            heads,
+            head_dim,
+        })
+    }
+
+    pub fn scale(&self, token: usize, head: usize) -> Option<f32> {
+        if token >= self.tokens() || head >= self.heads {
+            return None;
+        }
+        Some(self.scales[token * self.heads + head])
+    }
+
+    pub fn head_row(&self, token: usize, head: usize) -> Option<&[u8]> {
+        if token >= self.tokens() || head >= self.heads {
+            return None;
+        }
+        let start = (token * self.heads + head) * self.packed_dim();
+        Some(&self.q[start..start + self.packed_dim()])
+    }
+
+    pub fn dot_q(&self, q: &[f32], token: usize, head: usize) -> Result<f32, Error> {
+        if q.len() != self.head_dim {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV dot q length {} != head_dim {}",
+                q.len(),
+                self.head_dim
+            )));
+        }
+        let row = self
+            .head_row(token, head)
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV dot row out of range".into()))?;
+        let scale = self
+            .scale(token, head)
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV dot scale out of range".into()))?;
+        if !scale.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV dot scale non-finite for token {token} head {head}: {scale}"
+            )));
+        }
+        if let Some((i, v)) = q
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV dot q has non-finite value at index {i}: {v}"
+            )));
+        }
+        let mut out = 0.0f64;
+        for (d, &value) in q.iter().enumerate() {
+            let code = if d.is_multiple_of(2) {
+                row[d / 2] & 0x0f
+            } else {
+                row[d / 2] >> 4
+            };
+            let deq = ((code as i16 - 8) as f64) * scale as f64;
+            out += value as f64 * deq;
+        }
+        if !out.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV dot produced a non-finite value: token={token} head={head} value={out}"
+            )));
+        }
+        Ok(sat_f64_to_f32(out))
+    }
+
+    pub fn dequantize(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.tokens() * self.heads * self.head_dim);
+        for token in 0..self.tokens() {
+            for head in 0..self.heads {
+                let scale = self.scale(token, head).unwrap();
+                let row = self.head_row(token, head).unwrap();
+                for d in 0..self.head_dim {
+                    let code = if d.is_multiple_of(2) {
+                        row[d / 2] & 0x0f
+                    } else {
+                        row[d / 2] >> 4
+                    };
+                    out.push(dequant_q4_code(code, scale));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn dequantize_into(&self, out: &mut [f32]) -> Result<(), Error> {
+        if out.len() != self.tokens() * self.heads * self.head_dim {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV dequantize output length {} != {}",
+                out.len(),
+                self.tokens() * self.heads * self.head_dim
+            )));
+        }
+        let mut at = 0usize;
+        for token in 0..self.tokens() {
+            for head in 0..self.heads {
+                let scale = self.scale(token, head).unwrap();
+                let row = self.head_row(token, head).unwrap();
+                for d in 0..self.head_dim {
+                    let code = if d.is_multiple_of(2) {
+                        row[d / 2] & 0x0f
+                    } else {
+                        row[d / 2] >> 4
+                    };
+                    out[at] = dequant_q4_code(code, scale);
+                    at += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn quantize_q4_nibble(value: f32, scale: f32) -> u8 {
+    let q = (value / scale).round().clamp(-7.0, 7.0) as i16;
+    (q + 8) as u8
+}
+
+fn dequant_q4_code(code: u8, scale: f32) -> f32 {
+    let q = (code as i16 - 8) as f64;
+    let v = q * scale as f64;
+    if v > f32::MAX as f64 {
+        f32::MAX
+    } else if v < f32::MIN as f64 {
+        f32::MIN
+    } else {
+        v as f32
+    }
+}
+
+/// Paged Q4 KV layout: payload `[pages, tokens_per_page, kv_heads, packed_dim]`
+/// (bytes) and scales `[pages, tokens_per_page, kv_heads]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedQ4KvLayout {
+    pages: usize,
+    tokens_per_page: usize,
+    heads: usize,
+    head_dim: usize,
+    packed_dim: usize,
+    payload_len: usize,
+    scale_len: usize,
+    scale_bytes: usize,
+    total_bytes: usize,
+}
+
+impl PagedQ4KvLayout {
+    pub fn new(
+        pages: usize,
+        tokens_per_page: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, Error> {
+        if pages == 0 || tokens_per_page == 0 || heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "Q4 paged KV layout requires non-zero pages/tokens_per_page/heads/head_dim".into(),
+            ));
+        }
+        let packed_dim = head_dim.div_ceil(2);
+        let per_page = tokens_per_page
+            .checked_mul(heads)
+            .and_then(|v| v.checked_mul(packed_dim))
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV per-page payload overflow".into()))?;
+        let payload_len = pages
+            .checked_mul(per_page)
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV paged payload overflow".into()))?;
+        let scale_len = pages
+            .checked_mul(tokens_per_page)
+            .and_then(|v| v.checked_mul(heads))
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV paged scale overflow".into()))?;
+        let scale_bytes = scale_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV paged scale bytes overflow".into()))?;
+        let total_bytes = payload_len
+            .checked_add(scale_bytes)
+            .ok_or_else(|| Error::InvalidArgument("Q4 KV paged total bytes overflow".into()))?;
+        Ok(Self {
+            pages,
+            tokens_per_page,
+            heads,
+            head_dim,
+            packed_dim,
+            payload_len,
+            scale_len,
+            scale_bytes,
+            total_bytes,
+        })
+    }
+
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
+    pub fn tokens_per_page(&self) -> usize {
+        self.tokens_per_page
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn packed_dim(&self) -> usize {
+        self.packed_dim
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn scale_len(&self) -> usize {
+        self.scale_len
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_len
+    }
+
+    pub fn scale_bytes(&self) -> usize {
+        self.scale_bytes
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn packed_index(
+        &self,
+        page: usize,
+        offset: usize,
+        head: usize,
+        byte: usize,
+    ) -> Option<usize> {
+        if page >= self.pages
+            || offset >= self.tokens_per_page
+            || head >= self.heads
+            || byte >= self.packed_dim
+        {
+            return None;
+        }
+        ((page * self.tokens_per_page + offset) * self.heads + head)
+            .checked_mul(self.packed_dim)
+            .and_then(|v| v.checked_add(byte))
+    }
+
+    pub fn payload_index(
+        &self,
+        page: usize,
+        offset: usize,
+        head: usize,
+        dim: usize,
+    ) -> Option<usize> {
+        if dim >= self.head_dim {
+            return None;
+        }
+        self.packed_index(page, offset, head, dim / 2)
+    }
+
+    pub fn scale_index(&self, page: usize, offset: usize, head: usize) -> Option<usize> {
+        if page >= self.pages || offset >= self.tokens_per_page || head >= self.heads {
+            return None;
+        }
+        (page * self.tokens_per_page + offset)
+            .checked_mul(self.heads)
+            .and_then(|v| v.checked_add(head))
+    }
+}
+
+fn checked_q4_layout_len(values: usize, expected: usize, what: &str) -> Result<(), Error> {
+    if values != expected {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 KV {what} length {values} != expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_q4_min_len(values: usize, needed: usize, what: &str) -> Result<(), Error> {
+    if values < needed {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 KV {what} length {values} < needed {needed}"
+        )));
+    }
+    Ok(())
+}
+
+/// Scatter one contiguous `Q4Kv` into a page-major Q4 pool.
+pub fn scatter_paged_q4(
+    src: &Q4Kv,
+    layout: &PagedQ4KvLayout,
+    page_table: &[usize],
+    payload: &mut [u8],
+    scales: &mut [f32],
+) -> Result<(), Error> {
+    if src.heads != layout.heads || src.head_dim != layout.head_dim {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 KV scatter shape mismatch: src heads/head_dim={}/{} layout={}/{}",
+            src.heads, src.head_dim, layout.heads, layout.head_dim
+        )));
+    }
+    checked_q4_layout_len(payload.len(), layout.payload_len, "payload")?;
+    checked_q4_layout_len(scales.len(), layout.scale_len, "scale")?;
+    let tokens = src.tokens();
+    let logical_pages = tokens.div_ceil(layout.tokens_per_page);
+    if logical_pages > layout.pages {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 KV tokens {tokens} need {logical_pages} pages but layout has {}",
+            layout.pages
+        )));
+    }
+    checked_q4_min_len(page_table.len(), logical_pages, "page table")?;
+    for &page in &page_table[..logical_pages] {
+        if page >= layout.pages {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV page table entry {page} >= pages {}",
+                layout.pages
+            )));
+        }
+    }
+
+    for token in 0..tokens {
+        let logical = token / layout.tokens_per_page;
+        let off = token % layout.tokens_per_page;
+        let page = page_table[logical];
+        for head in 0..layout.heads {
+            let idx = layout.packed_index(page, off, head, 0).unwrap();
+            payload[idx..idx + layout.packed_dim]
+                .copy_from_slice(src.head_row(token, head).unwrap());
+            scales[layout.scale_index(page, off, head).unwrap()] = src.scale(token, head).unwrap();
+        }
+    }
+    Ok(())
+}
+
+/// Gather `tokens` from a page-major Q4 pool into a contiguous oracle.
+pub fn gather_paged_q4(
+    layout: &PagedQ4KvLayout,
+    page_table: &[usize],
+    payload: &[u8],
+    scales: &[f32],
+    tokens: usize,
+) -> Result<Q4Kv, Error> {
+    checked_q4_layout_len(payload.len(), layout.payload_len, "payload")?;
+    checked_q4_layout_len(scales.len(), layout.scale_len, "scale")?;
+    let logical_pages = tokens.div_ceil(layout.tokens_per_page);
+    if logical_pages > layout.pages {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 KV tokens {tokens} need {logical_pages} pages but layout has {}",
+            layout.pages
+        )));
+    }
+    checked_q4_min_len(page_table.len(), logical_pages, "page table")?;
+    for &page in &page_table[..logical_pages] {
+        if page >= layout.pages {
+            return Err(Error::InvalidArgument(format!(
+                "Q4 KV page table entry {page} >= pages {}",
+                layout.pages
+            )));
+        }
+    }
+
+    let mut q = Vec::with_capacity(tokens * layout.heads * layout.packed_dim);
+    let mut out_scales = Vec::with_capacity(tokens * layout.heads);
+    for token in 0..tokens {
+        let logical = token / layout.tokens_per_page;
+        let off = token % layout.tokens_per_page;
+        let page = page_table[logical];
+        for head in 0..layout.heads {
+            let idx = layout.packed_index(page, off, head, 0).unwrap();
+            q.extend_from_slice(&payload[idx..idx + layout.packed_dim]);
+            let scale = scales[layout.scale_index(page, off, head).unwrap()];
+            if !scale.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "Q4 paged KV has non-finite scale at token {token} head {head}: {scale}"
+                )));
+            }
+            out_scales.push(scale);
+        }
+    }
+    Ok(Q4Kv {
+        q,
+        scales: out_scales,
+        heads: layout.heads,
+        head_dim: layout.head_dim,
+    })
+}
+
+/// Single-token full-attention decode oracle for Q4 K/V.
+pub fn attention_decode_q4(
+    q: &[f32],
+    n_heads: usize,
+    k: &Q4Kv,
+    v: &Q4Kv,
+    softmax_scale: f32,
+) -> Result<Vec<f32>, Error> {
+    if n_heads == 0 || k.heads == 0 || k.head_dim == 0 {
+        return Err(Error::InvalidArgument(
+            "Q4 attention requires non-zero n_heads/kv_heads/head_dim".into(),
+        ));
+    }
+    if k.heads != v.heads || k.head_dim != v.head_dim || k.tokens() != v.tokens() {
+        return Err(Error::InvalidArgument(
+            "Q4 attention K/V shape mismatch".into(),
+        ));
+    }
+    if k.tokens() == 0 {
+        return Err(Error::InvalidArgument(
+            "Q4 attention requires at least one token".into(),
+        ));
+    }
+    if !n_heads.is_multiple_of(k.heads) {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 attention n_heads={n_heads} is not a multiple of kv_heads={}",
+            k.heads
+        )));
+    }
+    let q_len = n_heads
+        .checked_mul(k.head_dim)
+        .ok_or_else(|| Error::InvalidArgument("Q4 attention q size overflow".into()))?;
+    if q.len() != q_len {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 attention q length {} != n_heads*head_dim {q_len}",
+            q.len()
+        )));
+    }
+    if let Some((i, value)) = q
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 attention q has non-finite value at index {i}: {value}"
+        )));
+    }
+    if !softmax_scale.is_finite() || softmax_scale <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "Q4 attention softmax_scale must be finite and positive, got {softmax_scale}"
+        )));
+    }
+
+    let groups = n_heads / k.heads;
+    let mut out = vec![0.0f32; q_len];
+    for h in 0..n_heads {
+        let kv = h / groups;
+        let qh = &q[h * k.head_dim..(h + 1) * k.head_dim];
+        let mut scores = Vec::with_capacity(k.tokens());
+        for token in 0..k.tokens() {
+            scores.push(k.dot_q(qh, token, kv)? * softmax_scale);
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs = Vec::with_capacity(scores.len());
+        let mut denom = 0.0f32;
+        for &score in &scores {
+            let p = (score - max_score).exp();
+            if !p.is_finite() {
+                return Err(Error::InvalidArgument(
+                    "Q4 attention softmax produced non-finite probability".into(),
+                ));
+            }
+            probs.push(p);
+            denom += p;
+        }
+        if !denom.is_finite() || denom <= 0.0 {
+            return Err(Error::InvalidArgument(
+                "Q4 attention softmax denominator invalid".into(),
+            ));
+        }
+        let inv = 1.0f64 / denom as f64;
+        for dim in 0..k.head_dim {
+            let mut acc = 0.0f64;
+            for (token, &p) in probs.iter().enumerate() {
+                let vs = v.scale(token, kv).unwrap();
+                let row = v.head_row(token, kv).unwrap();
+                let code = if dim.is_multiple_of(2) {
+                    row[dim / 2] & 0x0f
+                } else {
+                    row[dim / 2] >> 4
+                };
+                let value = dequant_q4_code(code, vs) as f64;
+                acc += p as f64 * inv * value;
+            }
+            out[h * k.head_dim + dim] = sat_f64_to_f32(acc);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sat_f64_to_f32(v: f64) -> f32 {
-        if v > f32::MAX as f64 {
-            f32::MAX
-        } else if v < f32::MIN as f64 {
-            f32::MIN
-        } else {
-            v as f32
-        }
-    }
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
@@ -1383,5 +1990,206 @@ mod tests {
             max_prob_diff < 0.02,
             "max softmax prob diff {max_prob_diff}"
         );
+    }
+
+    fn attention_decode_f32_ref(
+        q: &[f32],
+        n_heads: usize,
+        k: &[f32],
+        v: &[f32],
+        kv_heads: usize,
+        dim: usize,
+        softmax_scale: f32,
+    ) -> Vec<f32> {
+        let tokens = k.len() / (kv_heads * dim);
+        let groups = n_heads / kv_heads;
+        let mut out = vec![0.0f32; n_heads * dim];
+        for h in 0..n_heads {
+            let kv = h / groups;
+            let qh = &q[h * dim..(h + 1) * dim];
+            let mut scores = Vec::with_capacity(tokens);
+            for t in 0..tokens {
+                let krow = &k[(t * kv_heads + kv) * dim..(t * kv_heads + kv + 1) * dim];
+                scores.push(qh.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * softmax_scale);
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let probs: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+            let denom: f32 = probs.iter().sum();
+            for d in 0..dim {
+                let mut acc = 0.0f32;
+                for t in 0..tokens {
+                    let vrow = &v[(t * kv_heads + kv) * dim..(t * kv_heads + kv + 1) * dim];
+                    acc += probs[t] / denom * vrow[d];
+                }
+                out[h * dim + d] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn q4_roundtrip_error_is_bounded_by_half_scale() {
+        let mut seed = 0x4b56u64;
+        let heads = 3usize;
+        let dim = 16usize;
+        let values: Vec<f32> = (0..heads * dim).map(|_| lcg(&mut seed) * 2.0).collect();
+        let q = Q4Kv::quantize(&values, heads, dim).unwrap();
+        let got = q.dequantize();
+        for head in 0..heads {
+            let scale = q.scale(0, head).unwrap();
+            for d in 0..dim {
+                let i = head * dim + d;
+                assert!((got[i] - values[i]).abs() <= scale * 0.5 + 1e-6);
+            }
+        }
+        assert_eq!(q.packed_dim(), dim / 2);
+    }
+
+    #[test]
+    fn q4_odd_head_dim_packs_tail() {
+        let dim = 5usize;
+        let values = [-1.0, -0.25, 0.0, 0.5, 2.0];
+        let q = Q4Kv::quantize(&values, 1, dim).unwrap();
+        assert_eq!(q.packed_dim(), 3);
+        assert_eq!(q.quantized().len(), 3);
+        assert_eq!(q.quantized()[2] >> 4, 0, "tail padding nibble must be zero");
+        let got = q.dequantize();
+        let scale = q.scale(0, 0).unwrap();
+        assert_eq!(got.len(), dim);
+        for (a, b) in got.iter().zip(&values) {
+            assert!((a - b).abs() <= scale * 0.5 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn q4_layout_counts_and_indices() {
+        let layout = PagedQ4KvLayout::new(3, 4, 2, 5).unwrap();
+        assert_eq!(layout.packed_dim(), 3);
+        assert_eq!(layout.payload_len(), 3 * 4 * 2 * 3);
+        assert_eq!(layout.scale_len(), 3 * 4 * 2);
+        assert_eq!(layout.scale_bytes(), layout.scale_len() * 4);
+        assert_eq!(
+            layout.total_bytes(),
+            layout.payload_len() + layout.scale_bytes()
+        );
+        assert_eq!(
+            layout.packed_index(1, 2, 1, 2),
+            Some(((4 + 2) * 2 + 1) * 3 + 2)
+        );
+        assert_eq!(
+            layout.payload_index(1, 2, 1, 4),
+            layout.packed_index(1, 2, 1, 2)
+        );
+        assert_eq!(layout.scale_index(1, 2, 1), Some((4 + 2) * 2 + 1));
+        assert_eq!(layout.packed_index(3, 0, 0, 0), None);
+        assert_eq!(layout.packed_index(0, 4, 0, 0), None);
+        assert_eq!(layout.packed_index(0, 0, 2, 0), None);
+        assert_eq!(layout.packed_index(0, 0, 0, 3), None);
+        assert_eq!(layout.payload_index(0, 0, 0, 5), None);
+        assert_eq!(layout.scale_index(0, 4, 0), None);
+    }
+
+    #[test]
+    fn q4_paged_rejects_over_capacity_and_bad_gather_table() {
+        let src = Q4Kv::quantize(&[1.0, -1.0, 0.5, -0.5, 0.25, -0.25], 1, 2).unwrap();
+        let layout = PagedQ4KvLayout::new(1, 2, 1, 2).unwrap();
+        let mut payload = vec![0u8; layout.payload_len()];
+        let mut scales = vec![0.0f32; layout.scale_len()];
+        assert!(scatter_paged_q4(&src, &layout, &[0, 0], &mut payload, &mut scales).is_err());
+        assert!(gather_paged_q4(&layout, &[0, 0], &payload, &scales, 3).is_err());
+
+        let layout2 = PagedQ4KvLayout::new(2, 2, 1, 2).unwrap();
+        let payload2 = vec![0u8; layout2.payload_len()];
+        let scales2 = vec![0.0f32; layout2.scale_len()];
+        assert!(gather_paged_q4(&layout2, &[2], &payload2, &scales2, 1).is_err());
+        assert!(gather_paged_q4(&layout2, &[], &payload2, &scales2, 1).is_err());
+    }
+
+    #[test]
+    fn q4_subnormal_scale_does_not_underflow_to_zero() {
+        let tiny = f32::from_bits(1);
+        let values = [tiny, -tiny, 0.0, 0.0];
+        let q = Q4Kv::quantize(&values, 1, 4).unwrap();
+        let scale = q.scale(0, 0).unwrap();
+        assert!(scale > 0.0, "subnormal input produced a zero scale");
+        let deq = q.dequantize();
+        assert_eq!(deq, values);
+        assert_eq!(q.dot_q(&[1.0, 2.0, 0.0, 0.0], 0, 0).unwrap(), -tiny);
+    }
+
+    #[test]
+    fn q4_extreme_dot_saturates_like_dequantize() {
+        let max = f32::MAX;
+        let q = Q4Kv::quantize(&[max, max], 1, 2).unwrap();
+        let dot = q.dot_q(&[max, max], 0, 0).unwrap();
+        assert_eq!(
+            dot,
+            f32::MAX,
+            "finite f64 dot above f32 range must saturate"
+        );
+    }
+
+    #[test]
+    fn q4_layout_rejects_byte_overflow() {
+        assert!(PagedQ4KvLayout::new(usize::MAX, 2, 1, 2).is_err());
+    }
+
+    #[test]
+    fn q4_paged_scatter_gather_roundtrips() {
+        let mut seed = 0x7134u64;
+        let heads = 2usize;
+        let dim = 8usize;
+        let tokens = 6usize;
+        let values: Vec<f32> = (0..tokens * heads * dim)
+            .map(|_| lcg(&mut seed) * 2.0)
+            .collect();
+        let src = Q4Kv::quantize(&values, heads, dim).unwrap();
+        let layout = PagedQ4KvLayout::new(4, 4, heads, dim).unwrap();
+        let page_table = [2usize, 0, 3, 1];
+        let mut payload = vec![0u8; layout.payload_len()];
+        let mut scales = vec![0.0f32; layout.scale_len()];
+        scatter_paged_q4(&src, &layout, &page_table, &mut payload, &mut scales).unwrap();
+        let got = gather_paged_q4(&layout, &page_table, &payload, &scales, tokens).unwrap();
+        assert_eq!(got, src);
+    }
+
+    #[test]
+    fn q4_paged_rejects_bad_page_table() {
+        let values: Vec<f32> = (0..4 * 2 * 2).map(|i| i as f32 - 8.0).collect();
+        let src = Q4Kv::quantize(&values, 2, 2).unwrap();
+        let layout = PagedQ4KvLayout::new(2, 2, 2, 2).unwrap();
+        let bad = [0usize, 2];
+        let mut payload = vec![0u8; layout.payload_len()];
+        let mut scales = vec![0.0f32; layout.scale_len()];
+        assert!(scatter_paged_q4(&src, &layout, &bad, &mut payload, &mut scales).is_err());
+    }
+
+    #[test]
+    fn q4_attention_matches_f32_with_bounded_error() {
+        let mut seed = 0xa44u64;
+        let n_heads = 4usize;
+        let kv_heads = 2usize;
+        let dim = 8usize;
+        let tokens = 6usize;
+        let q: Vec<f32> = (0..n_heads * dim).map(|_| lcg(&mut seed)).collect();
+        let k: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed))
+            .collect();
+        let v: Vec<f32> = (0..tokens * kv_heads * dim)
+            .map(|_| lcg(&mut seed))
+            .collect();
+        let kq = Q4Kv::quantize(&k, kv_heads, dim).unwrap();
+        let vq = Q4Kv::quantize(&v, kv_heads, dim).unwrap();
+        let scale = 1.0 / (dim as f32).sqrt();
+        let want = attention_decode_f32_ref(&q, n_heads, &k, &v, kv_heads, dim, scale);
+        let got = attention_decode_q4(&q, n_heads, &kq, &vq, scale).unwrap();
+        let diff = max_abs_diff(&got, &want);
+        assert!(diff < 0.25, "Q4 attention vs f32 diff {diff}");
+    }
+
+    #[test]
+    fn q4_rejects_non_finite_input() {
+        assert!(Q4Kv::quantize(&[0.0, f32::NAN], 1, 2).is_err());
+        assert!(Q4Kv::quantize(&[0.0, f32::INFINITY], 1, 2).is_err());
     }
 }
