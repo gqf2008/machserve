@@ -1929,7 +1929,14 @@ impl BatchedModel {
         self.rms_final_dev = self.dalloc(w.rms_final.len() * 4)?;
         self.upload(self.rms_final_dev, &w.rms_final)?;
 
-        for lw in &w.layers {
+        // Crash breadcrumb (MACH_LOAD_TRACE=1): the Q4-on-device upload is a
+        // phase a hard power-off has been observed in; per-layer progress on
+        // stderr is unbuffered, so the last line survives a power cut.
+        let load_trace = std::env::var("MACH_LOAD_TRACE").is_ok_and(|v| v != "0");
+        for (li, lw) in w.layers.iter().enumerate() {
+            if load_trace {
+                eprintln!("load: upload layer {}/{} ...", li, w.layers.len());
+            }
             let l = LayerDev {
                 wq: std::ptr::null_mut(),
                 wk: std::ptr::null_mut(),

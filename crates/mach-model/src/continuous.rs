@@ -976,6 +976,27 @@ impl ContinuousModel {
         // (hipErrorInvalidConfiguration) and would panic the serving engine.
         // The outputs loop below skips count==0 rows and the hard-stop loop
         // finishes the over-limit sequences.
+        // Crash breadcrumbs: the batched forward is where a long paged prefill has
+        // been observed to die, so log each chunk boundary. stderr is unbuffered, so
+        // the last line survives a hard power-off.
+        let did_prefill = rows.iter().any(|&(_, count, wp)| wp && count > 0);
+        if did_prefill
+            && let Some(pg) = &self.paged
+            && pg.debug
+        {
+            for (i, &(_, count, wp)) in rows.iter().enumerate() {
+                if wp && count > 0 {
+                    let s = self.seqs[i].as_ref().expect("active slot");
+                    eprintln!(
+                        "paged: prefill id={} rows={} at_pos={} remaining={}",
+                        s.id,
+                        count,
+                        s.len,
+                        s.prompt.len()
+                    );
+                }
+            }
+        }
         let (sampled, logprobs, topk) = if tokens.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else {
@@ -1036,6 +1057,12 @@ impl ContinuousModel {
             out
         };
 
+        if did_prefill
+            && let Some(pg) = &self.paged
+            && pg.debug
+        {
+            eprintln!("paged: forward done rows={}", tokens.len());
+        }
         let mut done_slots = Vec::new();
         let mut outputs = Vec::new();
         for (i, &(start, count, was_prefill)) in rows.iter().enumerate() {
