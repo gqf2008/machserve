@@ -101,10 +101,12 @@ fn qwen3_moe_tiny_cfg() -> Config {
 }
 
 #[test]
-#[ignore = "real-model GPU parity; set MACH_TEST_MODEL and run with --ignored"]
+#[ignore = "real-MoE GPU parity; needs .models/model.safetensors; run with --ignored"]
 fn qwen3_moe_tiny_decodes_finite_and_deterministic() {
     let Some(path) = model_path() else {
-        panic!("MACH_TEST_MODEL must point at a .safetensors checkpoint to run this MoE test");
+        panic!(
+            ".models/model.safetensors is required to run this MoE test (see the module doc for the download)"
+        );
     };
     let Some(hip) = hip_ctx() else { return };
 
