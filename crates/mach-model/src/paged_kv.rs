@@ -1796,4 +1796,134 @@ mod tests {
         let mut a = PageAllocator::new(2);
         a.free(99);
     }
+
+    /// Mirrors `ContinuousModel::finish`'s paged retire loop and pins the
+    /// invariant the whole cross-request reuse story rests on: retiring a
+    /// request must return **only its own** pages to the free list, so a later
+    /// request's fresh allocation can never land on a page that is still
+    /// mapped as cached prefix content.
+    ///
+    /// The assertion is deliberately about *page ownership*, not about the
+    /// next request's hit count: `free_page` only touches the allocator and
+    /// never the cache, so a retire that wrongly frees a registered page still
+    /// aliases the (now dangling) id and would pass a hit-count check. The
+    /// unrelated probe plan is what makes that defect visible.
+    ///
+    /// Keep this in lockstep with `continuous.rs`'s retire branch: content
+    /// pages under `chain.len()` are kept unless they lost the first-writer
+    /// race; the never-registered partial page and the pad region are freed.
+    #[test]
+    fn retire_keeps_registered_pages_reusable() {
+        let mut b = GpuPagedTableBuilder::new(16, 4);
+        // 2 full pages (8 tokens) + a 1-token partial page.
+        let tokens: Vec<i32> = (1..=9).collect();
+        let chain = b.compute_chain(&tokens);
+        let full = tokens.len() / 4;
+        assert_eq!(full, 2);
+
+        let mut first = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
+        // The engine pads every admitted table up to `max_pages` before it
+        // installs it, so the retire loop's `!is_content` (pad) arm runs too.
+        b.pad_table(&mut first.table, 4).unwrap();
+        b.register_chain(&chain[..full], &first.table); // prefill materialized
+        let owned: Vec<u32> = (0..full)
+            .map(|i| first.table.get(i).expect("planned page"))
+            .collect();
+
+        // --- engine retire (continuous.rs::finish) ---
+        for (i, &page) in first.table.pages().iter().enumerate() {
+            let is_content = i < chain.len();
+            let lost_race = is_content && chain.get(i).and_then(|h| b.page_of(h)) != Some(page);
+            if !is_content || lost_race {
+                b.free_page(page);
+            }
+        }
+
+        // --- ownership probe ---
+        // Only the partial page and the pads may be back in the free list.
+        // The probe must span >= 3 pages: the allocator pops LIFO, so a
+        // one-page probe would land on the freed partial page under both the
+        // correct and the buggy retire.
+        let other: Vec<i32> = (100..=112).collect(); // 3 full pages + partial
+        let probe = b
+            .plan_with_chain(&other, b.compute_chain(&other), true)
+            .unwrap();
+        for &page in probe.table.pages() {
+            assert!(
+                !owned.contains(&page),
+                "registered page {page} was returned to the free list by retire"
+            );
+        }
+
+        // --- next request with the same prefix ---
+        let second = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
+        assert_eq!(
+            second.reused_pages, full,
+            "every registered full page must still alias after retire"
+        );
+        for (i, &page) in owned.iter().enumerate() {
+            assert_eq!(
+                second.table.get(i),
+                Some(page),
+                "page {i} aliased to its owner"
+            );
+        }
+        // The partial last page is never *aliased*: it is not registered, so
+        // the cache cannot resolve its hash (the allocator may hand the freed
+        // id back to this request, which is not aliasing).
+        assert_eq!(b.page_of(&chain[full]), None, "partial page is not cached");
+    }
+
+    /// Pool pressure is recoverable: once a retired entry's content is
+    /// evicted, the freed pages satisfy a fresh (non-reusing) plan. This is
+    /// the "plan fails -> evict_one_retired -> retry" loop's builder half.
+    #[test]
+    fn evicted_content_frees_pages_for_a_new_plan() {
+        // Pool of exactly 1 page (4 tokens per page): one live plan fills it.
+        let mut b = GpuPagedTableBuilder::new(1, 4);
+        let a_tokens = [1i32, 2, 3, 4];
+        let a_chain = b.compute_chain(&a_tokens);
+        let pa = b.plan_with_chain(&a_tokens, a_chain.clone(), true).unwrap();
+        b.register_chain(&a_chain, &pa.table);
+
+        // A second, unrelated prompt cannot be planned: the registered page
+        // is still pinning the pool (full_pages reuse does not apply here).
+        let b_tokens = [9i32, 8, 7, 6];
+        let b_chain = b.compute_chain(&b_tokens);
+        assert!(
+            b.plan_with_chain(&b_tokens, b_chain.clone(), true).is_err(),
+            "pool is exhausted while the retired page stays registered"
+        );
+
+        // Evicting the cold retired content returns its page to the pool.
+        assert!(b.evict_page(&a_chain[0]), "registered hash must evict");
+        assert_eq!(b.cached_pages(), 0);
+        // Replaying the *evicted* content must not alias it again (the check
+        // has to use `a_tokens`, not the unrelated prompt, or it is vacuous).
+        let replay = b.plan_with_chain(&a_tokens, a_chain.clone(), true).unwrap();
+        assert_eq!(replay.reused_pages, 0, "evicted content must not alias");
+        b.free_plan_pages(&replay, &replay.table);
+        // ...and the same freed page serves the unrelated prompt.
+        let pb = b.plan_with_chain(&b_tokens, b_chain.clone(), true).unwrap();
+        assert_eq!(pb.table.get(0), pa.table.get(0), "the freed page is reused");
+    }
+
+    /// A prompt shorter than one page registers nothing. The load-bearing
+    /// assertion is `cached_pages() == 0`: a `register_chain(&chain, ..)`
+    /// regression (registering the partial page's hash) turns it red. The
+    /// trailing `reused_pages == 0` is vacuous on its own — with
+    /// `full_pages == 0` the plan can never alias — and only guards the
+    /// boundary the plan reports.
+    #[test]
+    fn sub_page_prompt_registers_nothing() {
+        let mut b = GpuPagedTableBuilder::new(8, 4);
+        let tokens = [5i32, 4, 3];
+        let chain = b.compute_chain(&tokens);
+        let p = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
+        assert_eq!(p.full_pages, 0);
+        b.register_chain(&chain[..p.full_pages], &p.table);
+        assert_eq!(b.cached_pages(), 0, "nothing registered");
+        let again = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
+        assert_eq!(again.reused_pages, 0);
+    }
 }
