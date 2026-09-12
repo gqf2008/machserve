@@ -61,7 +61,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: engine HIP memory-pool parity
         run: cargo test -p mach-engine --features hip --lib -- --ignored --test-threads=1
-      - name: model GPU parity (ignored opt-in)
+      # NOTE: this step runs only the *non*-`#[ignore]`d model tests. The opt-in
+      # GPU parity suites (`mrope_gpu`, and the real-model tests) are `#[ignore]`d
+      # and each needs its own env opt-in (e.g. MACH_TEST_MROPE_GPU=1) plus a
+      # device, so they are NOT covered here (nor by the CPU job) and must be
+      # run explicitly; the step name used to claim otherwise.
+      - name: model tests (hip, non-ignored only)
         run: cargo test -p mach-model --features hip -- --test-threads=1
       - name: server tests
         run: cargo test -p mach-server --features hip

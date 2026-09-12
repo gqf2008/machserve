@@ -55,7 +55,9 @@ use mach_model::vision::VisionConfig;
 #[cfg(feature = "hip")]
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
-use mach_server::startup::{config_from_json, estimate_vram, model_file_bytes};
+use mach_server::startup::{
+    config_from_json, estimate_vram, model_file_bytes, resolve_preprocessor_path,
+};
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ChatFormat, ImageRuntimeConfig, ServerEngine, VisionSetup, router};
 #[cfg(any(feature = "hip", test))]
@@ -144,19 +146,6 @@ fn resolve_config_path(root: &Path, model: &str, explicit: Option<&OsStr>) -> Pa
     } else {
         root.join("qwen-config.json")
     }
-}
-
-/// Resolve `preprocessor_config.json` beside a checkpoint directory or shard.
-#[cfg(feature = "hip")]
-fn resolve_preprocessor_path(checkpoint: &Path) -> Option<PathBuf> {
-    let direct = checkpoint.join("preprocessor_config.json");
-    if direct.exists() {
-        return Some(direct);
-    }
-    checkpoint
-        .parent()
-        .map(|p| p.join("preprocessor_config.json"))
-        .filter(|p| p.exists())
 }
 
 /// Resolve the tokenizer beside a checkpoint directory/shard parent, with an
@@ -978,24 +967,5 @@ mod paged_tpp_tests {
         assert!(validate_paged_tpp(&cfg, Some("48")).is_err());
         // Valid custom value.
         assert_eq!(validate_paged_tpp(&cfg, Some("128")).unwrap(), 128);
-    }
-}
-
-#[cfg(all(test, feature = "hip"))]
-mod vision_path_tests {
-    use super::*;
-
-    #[test]
-    fn resolves_preprocessor_config_for_dir_and_shard() {
-        let dir = std::env::temp_dir().join(format!("mach-pre-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("preprocessor_config.json"), b"{}").unwrap();
-        let want = dir.join("preprocessor_config.json");
-        assert_eq!(resolve_preprocessor_path(&dir), Some(want.clone()));
-        let shard = dir.join("model-00001-of-00002.safetensors");
-        std::fs::write(&shard, b"x").unwrap();
-        assert_eq!(resolve_preprocessor_path(&shard), Some(want));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
