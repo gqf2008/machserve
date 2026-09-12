@@ -1,5 +1,8 @@
 //! Env-gated GPU parity harness for the Qwen3.5/Qwen3.8 vision tower.
 //!
+//! Selecting the tests explicitly (`--ignored`) without `MACH_TEST_VISION_GPU=1`
+//! fails loudly (panic) before any device is touched, rather than reporting "ok"
+//! — libtest drops the output of passing tests (see RULE_可达性 / #163).
 //! Run only in a dedicated GPU window:
 //! `$env:MACH_TEST_VISION_GPU='1'; cargo test -p mach-model --features hip --test vision_gpu -- --ignored --test-threads 1`
 #![cfg(feature = "hip")]
@@ -72,8 +75,9 @@ fn tiny_weights() -> VisionWeights {
 #[ignore = "GPU vision parity; set MACH_TEST_VISION_GPU=1 and run explicitly"]
 fn gpu_vision_forward_matches_cpu() {
     if std::env::var("MACH_TEST_VISION_GPU").as_deref() != Ok("1") {
-        eprintln!("skipping GPU vision parity: MACH_TEST_VISION_GPU is not 1");
-        return;
+        // `#[ignore]`d + explicitly selected => a missing opt-in must fail
+        // loudly (libtest drops the output of passing tests).
+        panic!("MACH_TEST_VISION_GPU=1 is required to run this GPU vision parity test");
     }
     let hip = hip::hip().expect("HIP runtime");
     let cfg = tiny_cfg();

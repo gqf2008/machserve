@@ -1,4 +1,8 @@
 //! Env-gated GPU parity for multimodal row-embedding injection.
+//!
+//! The tests are `#[ignore]`d and need `MACH_TEST_EMBED_GPU=1`; selecting them
+//! explicitly without that opt-in fails loudly (panic) before any device is
+//! touched, rather than reporting "ok" (libtest drops passing tests' output).
 #![cfg(feature = "hip")]
 
 use mach_kernel_sys::hip;
@@ -56,8 +60,9 @@ impl Drop for DevBuf {
 
 fn gpu_enabled() -> bool {
     if std::env::var("MACH_TEST_EMBED_GPU").as_deref() != Ok("1") {
-        eprintln!("skipping GPU embedding parity: MACH_TEST_EMBED_GPU is not 1");
-        return false;
+        // `#[ignore]`d + explicitly selected => a missing opt-in must fail
+        // loudly (libtest drops the output of passing tests).
+        panic!("MACH_TEST_EMBED_GPU=1 is required to run this GPU embedding parity test");
     }
     true
 }
