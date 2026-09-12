@@ -1393,26 +1393,40 @@ mod paged_quantized_cpu_parity {
     }
 }
 
-/// **Known-failing repro (issue #168) — `#[ignore]` until the fix lands.**
+/// **Known-bad shape repro (issue #168) — the shape seen to fail on the real
+/// machine, not yet observed red in a GPU test run.**
 ///
-/// Server-shaped chunked paged prefill: chunk 1 is a full 512-row step that
-/// spans eight 64-token pages, chunk 2 continues past page 8. Every other
-/// chunked-prefill test covers <= 2 pages (or stays inside page 0), and this
-/// shape is the one observed on the real model (`MACH_PAGED=1` +
-/// `MACH_PREFILL_ROWS=512`) to produce degenerate output and to hard-power-off
-/// the machine — so it must NOT run in an unattended GPU job until fixed.
+/// 2026-09-12 real-machine scan: `MACH_PAGED=1` + `MACH_PREFILL_ROWS=512` on
+/// Qwen3-8B produced degenerate output once a paged prefill needed a **second**
+/// chunk (`~630 token = 10 pages / 2 chunks`), and hard-powered-off the box at
+/// 30 pages / 4 chunks. Every existing chunked-prefill test covers <= 2 pages
+/// or stays inside page 0, so this shape is the uncovered one.
+///
+/// This case uses the same 10-page / 2-chunk shape with sequential decode as
+/// the independent reference. Weights here are F16 hipBLAS (the real failures
+/// used `MACH_Q4_DEVICE=2`, i.e. dense `gemv_q4`) — if the defect lives in the
+/// Q4 dense path instead, this case can still pass; a `with_paged_kv_rows_q4_all`
+/// variant is the follow-up that closes that gap.
+///
+/// **Opt-in on purpose**: this shape has hard-powered-off the machine, so a
+/// bare `--ignored` batch run must NOT execute it.
 #[test]
-#[ignore = "known failing repro (#168): paged multi-chunk prefill across 8+ pages; run only with an operator watching"]
+#[ignore = "known-bad shape (#168): needs MACH_TEST_PAGED_MANY_PAGE=1 and an operator watching"]
 fn batched_paged_f16_chunked_prefill_across_many_pages_repro() {
-    let Some(hip) = hip_ctx() else { return };
+    if std::env::var("MACH_TEST_PAGED_MANY_PAGE").as_deref() != Ok("1") {
+        panic!("MACH_TEST_PAGED_MANY_PAGE=1 is required to run this known-bad paged repro");
+    }
+    let hip = hip_ctx().unwrap_or_else(|| {
+        panic!("no HIP device is present; this repro is opt-in and must not silently skip")
+    });
     let mut cfg = Config::llama(128, 2, 4, 2, 1024, 4096);
     cfg.dtype = ModelDType::F16;
     let tpp = 64usize;
     let w = Weights::random(&cfg, 91).unwrap();
     let vocab = cfg.vocab_size;
-    // 576 tokens = 9 pages of 64. Chunk 1 = 512 rows (pages 0..7);
-    // chunk 2 = 64 rows (page 8).
-    let total = 576usize;
+    // 640 tokens = 10 pages of 64. Chunk 1 = 512 rows (pages 0..7);
+    // chunk 2 = 128 rows (pages 8..9) — the confirmed-failing real shape.
+    let total = 640usize;
     let seq: Vec<u32> = (0..total as u32)
         .map(|i| (i * 37 + 11) % 1024 + 1)
         .collect();
@@ -1424,11 +1438,24 @@ fn batched_paged_f16_chunked_prefill_across_many_pages_repro() {
         ref_logits.push(r.decode_step(t).unwrap());
     }
 
+    // Same cross-path bound as the sibling f16 chunked test: batched (packed)
+    // vs single-sequence GEMMs accumulate in different orders and hipBLAS may
+    // pick a different tile, so f16 logits agree to ~1e-3 (bound 0.1).
+    let check = |row: usize, got: &[f32], want: &[f32], ctx: &str| {
+        let max = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 0.1, "{ctx}: f16 logits max diff {max}");
+    };
+
     let lens1: Vec<u32> = (0..512u32).collect();
     let slots1: Vec<u32> = vec![0; 512];
     let (s1, lm1) = fwd_rows(&mut paged, &seq[0..512], &lens1, &slots1, vocab);
     for &row in &[0usize, 63, 64, 511] {
-        assert_close(
+        check(
+            row,
             &lm1[row * vocab..(row + 1) * vocab],
             &ref_logits[row],
             &format!("many-page chunk1 row {row}"),
@@ -1445,7 +1472,8 @@ fn batched_paged_f16_chunked_prefill_across_many_pages_repro() {
     let (s2, lm2) = fwd_rows(&mut paged, &seq[512..], &lens2, &slots2, vocab);
     for &row in &[0usize, total - 512 - 1] {
         let pos = 512 + row;
-        assert_close(
+        check(
+            row,
             &lm2[row * vocab..(row + 1) * vocab],
             &ref_logits[pos],
             &format!("many-page chunk2 row {row} (pos {pos})"),
