@@ -21,7 +21,8 @@
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
 //! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
 //! engage paged KV — plain, Q4 and FP8 non-MLA). The paged-path safety cap is
-//! MACH_PREFILL_ROWS<=64 / MACH_CAPACITY<=64 until the attention rewrite lands.
+//! MACH_PREFILL_ROWS<=64 / MACH_CAPACITY<=64 until controlled 512-row GPU
+//! validation of the tiled attention path lands.
 //! Limitations: paged KV serves
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).

@@ -1983,6 +1983,17 @@ HF↔MachServe 4-token greedy 序列对拍都已有记录；剩余 P3 增强是�
   `device_map_has_cuda=false`）；4-token greedy 序列与 MachServe 逐位一致。完整 Q4-vs-BF16
   logits 数值 parity 不作为验收门禁，top-5 仅保留诊断。
 
+## Paged attention：tiled GQA + online softmax 重写（#168/#187，2026-09-12）
+
+- Dense F16/F32 paged attention 改为 vLLM/FlashInfer 风格：每 block 一个
+  `(row, kv_head)`，同一 GQA group 复用 K/V tile；KV 按 bounded tile 加载
+  shared memory；使用 `m/l/acc` online softmax，不再按 `max_seq_len` 分配
+  整段 scores。
+- 新 kernel 进入 hiprtc offline 门禁（内核计数 74→77，含 F16 Q-block）；CPU tiled online-softmax
+  对拍覆盖跨页/非整除 tile；512-row GPU parity 作为受控真机回归入口保留。
+- server 的 `MACH_PREFILL_ROWS<=64` / `MACH_CAPACITY<=64` 安全 cap 暂不提前解除，
+  等 512-row 真机验证通过后再单独放开。
+
 ## Qwen3.8-27B Stage C4：Q4-on-device prefill 行复用（#146，2026-09-11）
 
 - `gemv_q4` 是 decode 形状：一个 warp 只算"一行权重 × 一行输入"，batch 维在

@@ -428,7 +428,7 @@ pub struct BatchedModel {
     /// ping-pong expert buffers). `Some` only in buffered-prefill mode.
     prefetch: Option<crate::prefill_buffered::PrefetchEngine>,
     /// Paged-KV mode: the KV caches are addressed as a page pool via per-slot
-    /// block tables (`kv_store_paged` / `attn_decode_paged`) instead of the
+    /// block tables (`kv_store_paged` + tiled GQA attention kernels) instead of the
     /// contiguous `[slot, max_seq, kv, dim]` layout. Enabled by
     /// [`Self::with_paged_kv`]; the KV allocation itself is unchanged (the
     /// default identity block-table mapping gives the same physical layout and
@@ -579,12 +579,12 @@ impl BatchedModel {
 
     /// Builds a batched model in **paged-KV** mode (dense F32): the KV caches
     /// are addressed via per-slot block tables (page pool) using
-    /// `kv_store_paged` / `attn_decode_paged`. The default mapping is the
+    /// `kv_store_paged` + tiled dense GQA attention. The default mapping is the
     /// static identity (same physical layout as the contiguous path); call
     /// [`Self::set_block_table`] to install reuse-planner tables so sequences
-    /// share prefix physical pages. Dense F16 and MLA (F32) paged kernels are
-    /// wired too (`with_paged_kv_rows` dtype variants; fused
-    /// `kv_store_paged_mla`).
+    /// share prefix physical pages. Dense F16/F32 use the tiled GQA kernels
+    /// (`attn_paged_tiled_*`); MLA keeps its legacy full-score kernel and page
+    /// store (`kv_store_paged_mla`).
     pub fn with_paged_kv(
         hip: Arc<Hip>,
         cfg: Config,
@@ -614,7 +614,7 @@ impl BatchedModel {
     }
 
     /// [`Self::with_paged_kv_rows`] for storage-Q4 weights: each tensor is
-    /// dequantized to f16 on upload, so the wired f16 paged kernels serve the
+    /// dequantized to f16 on upload, so the tiled f16 paged kernels serve the
     /// device path directly.
     pub fn with_paged_kv_rows_q4(
         hip: Arc<Hip>,
@@ -669,7 +669,7 @@ impl BatchedModel {
     }
 
     /// [`Self::with_paged_kv_rows`] for storage-FP8 weights: E4M3 tensors are
-    /// dequantized to f16 on upload; the f16 paged kernels serve the device.
+    /// dequantized to f16 on upload; the tiled f16 paged kernels serve the device.
     pub fn with_paged_kv_rows_fp8(
         hip: Arc<Hip>,
         cfg: Config,
@@ -690,26 +690,53 @@ impl BatchedModel {
     /// than falling through to contiguous kernels while owning block tables,
     /// or failing mid-request.
     fn paged_guards(cfg: &Config, tokens_per_page: usize) -> Result<(), Error> {
+        if cfg.n_heads == 0 || cfg.n_kv_heads == 0 || cfg.head_dim == 0 {
+            return Err(Error::InvalidArgument(
+                "paged attention requires positive n_heads/n_kv_heads/head_dim".into(),
+            ));
+        }
         if tokens_per_page == 0 || !cfg.max_seq_len.is_multiple_of(tokens_per_page) {
             return Err(Error::InvalidArgument(format!(
                 "tokens_per_page {tokens_per_page} must be a non-zero divisor of max_seq_len {}",
                 cfg.max_seq_len
             )));
         }
-        // The paged attention kernels stage the full per-row score array in
+        // The legacy MLA paged kernel stages the full per-row score array in
         // dynamic shared memory: `(max_pages * tokens_per_page + 256) * 4` ==
         // `(max_seq_len + 256) * 4` bytes. Enforce the 64 KiB device limit
-        // here so an unsupported context size fails at construction with a
-        // clear error, not with a cryptic launch failure mid-request. (The
-        // contiguous attention kernels share the same smem bound.)
-        let smem = (cfg.max_seq_len + 256) * 4;
-        if smem > 64 * 1024 {
-            return Err(Error::InvalidArgument(format!(
-                "max_seq_len {} needs {smem} bytes of attention smem (64 KiB device limit); \
-                 paged-KV mode supports contexts up to {} tokens",
-                cfg.max_seq_len,
-                (64 * 1024) / 4 - 256
-            )));
+        // for that path. Dense F16/F32 now uses the tiled GQA/online-softmax
+        // kernels, whose shared-memory footprint is independent of max_seq_len
+        // (bounded by the K/V tile budget), so they must not inherit this bound.
+        let tiled_dense = cfg.kv_lora_rank == 0;
+        if tiled_dense {
+            if !cfg.n_heads.is_multiple_of(cfg.n_kv_heads) {
+                return Err(Error::InvalidArgument(format!(
+                    "paged tiled attention requires n_heads divisible by n_kv_heads ({}/{})",
+                    cfg.n_heads, cfg.n_kv_heads
+                )));
+            }
+            let groups = cfg.n_heads / cfg.n_kv_heads;
+            if groups > 16 {
+                return Err(Error::InvalidArgument(format!(
+                    "paged tiled attention supports at most 16 query heads per KV head (got {groups})"
+                )));
+            }
+            if cfg.head_dim > 256 {
+                return Err(Error::InvalidArgument(format!(
+                    "paged tiled attention supports head_dim <= 256 (got {})",
+                    cfg.head_dim
+                )));
+            }
+        } else {
+            let smem = (cfg.max_seq_len + 256) * 4;
+            if smem > 64 * 1024 {
+                return Err(Error::InvalidArgument(format!(
+                    "max_seq_len {} needs {smem} bytes of attention smem (64 KiB device limit); \
+                     this paged-KV mode supports contexts up to {} tokens",
+                    cfg.max_seq_len,
+                    (64 * 1024) / 4 - 256
+                )));
+            }
         }
         // The paged decode branch dispatches dense F32/F16 and MLA (F32); any
         // other dtype would silently fall through to the contiguous kernels
@@ -988,6 +1015,16 @@ impl BatchedModel {
     /// static and need no per-step refresh.
     fn init_paged(&mut self, tokens_per_page: usize) -> Result<(), Error> {
         let max_pages = self.cfg.max_seq_len / tokens_per_page;
+        let pool_pages = self
+            .batch
+            .checked_mul(max_pages)
+            .ok_or_else(|| Error::InvalidArgument("paged pool page count overflow".into()))?;
+        if pool_pages > i32::MAX as usize {
+            return Err(Error::InvalidArgument(format!(
+                "paged pool has {pool_pages} pages; i32 block tables support at most {}",
+                i32::MAX
+            )));
+        }
         self.paged = true;
         self.tokens_per_page = tokens_per_page;
         self.max_pages_per_seq = max_pages;
@@ -2749,6 +2786,7 @@ impl BatchedModel {
             true,
             0,
             0,
+            false,
         )?;
         let next = self.sample(self.batch)?;
         // Step profiler: the sampling sync above drained the stream, so all
@@ -3015,6 +3053,7 @@ impl BatchedModel {
                 true,
                 0,
                 0,
+                false,
             )?;
             self.sample_device(self.batch)
         })();
@@ -3060,7 +3099,7 @@ impl BatchedModel {
         }
         let record = (|| {
             self.upload_decode_inputs(n as usize)?;
-            self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0, 0)?;
+            self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0, 0, false)?;
             self.sampler.sample_batched_upload(n as usize)?;
             self.sampler
                 .sample_batched_kernel(self.logits, n, self.cfg.vocab_size)
@@ -3086,6 +3125,7 @@ impl BatchedModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_kernels(
         &self,
         count: i32,
@@ -3094,6 +3134,7 @@ impl BatchedModel {
         decode_only: bool,
         num_runs: i32,
         gdn_runs: i32,
+        paged_same_slot: bool,
     ) -> Result<(), Error> {
         let c = self.cfg;
         let b = count;
@@ -3720,7 +3761,6 @@ impl BatchedModel {
                     // Paged decode (F16 KV): store + attention through the
                     // block tables; same addressing as the F32 paged branch.
                     let tpp = self.tokens_per_page as i32;
-                    let max_pages = self.max_pages_per_seq as i32;
                     k.launch_kv_store_paged_f16(
                         self.k_buf,
                         kc as *mut u16,
@@ -3743,22 +3783,42 @@ impl BatchedModel {
                         c.head_dim as i32,
                         tpp,
                     )?;
-                    k.launch_attn_decode_paged_f16_gqa(
-                        self.q,
-                        kc as *const u16,
-                        vc as *const u16,
-                        self.block_tables,
-                        self.attn,
-                        self.pos_dev,
-                        self.table_offsets,
-                        b,
-                        c.n_heads as i32,
-                        c.n_kv_heads as i32,
-                        c.head_dim as i32,
-                        scale,
-                        tpp,
-                        max_pages,
-                    )?;
+                    if paged_same_slot {
+                        let groups = (c.n_heads / c.n_kv_heads) as i32;
+                        let q_block = (16 / groups).clamp(1, 4);
+                        k.launch_attn_paged_tiled_f16_gqa_qblock(
+                            self.q,
+                            kc as *const u16,
+                            vc as *const u16,
+                            self.block_tables,
+                            self.attn,
+                            self.pos_dev,
+                            self.table_offsets,
+                            b,
+                            c.n_heads as i32,
+                            c.n_kv_heads as i32,
+                            c.head_dim as i32,
+                            scale,
+                            tpp,
+                            q_block,
+                        )?;
+                    } else {
+                        k.launch_attn_paged_tiled_f16_gqa(
+                            self.q,
+                            kc as *const u16,
+                            vc as *const u16,
+                            self.block_tables,
+                            self.attn,
+                            self.pos_dev,
+                            self.table_offsets,
+                            b,
+                            c.n_heads as i32,
+                            c.n_kv_heads as i32,
+                            c.head_dim as i32,
+                            scale,
+                            tpp,
+                        )?;
+                    }
                 } else if f16 {
                     k.launch_kv_store_batched_f16(
                         self.k_buf,
@@ -3827,7 +3887,6 @@ impl BatchedModel {
                     // works alongside plain decode. `set_block_table` may
                     // alias prefix physical pages across slots between steps.
                     let tpp = self.tokens_per_page as i32;
-                    let max_pages = self.max_pages_per_seq as i32;
                     k.launch_kv_store_paged(
                         self.k_buf,
                         kc as *mut f32,
@@ -3850,7 +3909,7 @@ impl BatchedModel {
                         c.head_dim as i32,
                         tpp,
                     )?;
-                    k.launch_attn_decode_paged(
+                    k.launch_attn_paged_tiled_f32_gqa(
                         self.q,
                         kc as *const f32,
                         vc as *const f32,
@@ -3864,7 +3923,6 @@ impl BatchedModel {
                         c.head_dim as i32,
                         scale,
                         tpp,
-                        max_pages,
                     )?;
                 } else {
                     k.launch_kv_store_batched(
@@ -4724,6 +4782,10 @@ impl BatchedModel {
                 .sample_batched_readback(self.logits, params, vocab);
         }
         self.upload_decode_inputs(n)?;
+        let paged_same_slot = self.paged
+            && !slots.is_empty()
+            && slots.iter().all(|&s| s == slots[0])
+            && lens.windows(2).all(|w| w[1] == w[0].saturating_add(1));
         self.run_kernels(
             n as i32,
             self.slots_dev,
@@ -4731,6 +4793,7 @@ impl BatchedModel {
             decode_only,
             num_runs,
             num_gdn_runs,
+            paged_same_slot,
         )?;
         self.sampler
             .sample_batched_after_stage(self.logits, params, vocab)
@@ -5185,11 +5248,20 @@ mod paged_support_tests {
         // Page geometry: zero and non-divisor tpp are rejected.
         assert!(BatchedModel::check_paged_support(&cfg, 0).is_err());
         assert!(BatchedModel::check_paged_support(&cfg, 48).is_err());
+        let mut malformed = Config::tiny();
+        malformed.n_kv_heads = 0;
+        assert!(BatchedModel::check_paged_support(&malformed, 64).is_err());
 
-        // Attention-smem bound: max_seq_len beyond 16128 tokens.
+        // Full-score smem bound applies to legacy MLA, but not to dense
+        // F16/F32, which use the tiled GQA/online-softmax kernels.
         let mut big = Config::tiny();
         big.max_seq_len = 32768;
-        assert!(BatchedModel::check_paged_support(&big, 64).is_err());
+        assert!(BatchedModel::check_paged_support(&big, 64).is_ok());
+        big.dtype = ModelDType::F16;
+        assert!(BatchedModel::check_paged_support(&big, 64).is_ok());
+        let mut big_mla = Config::mla(128, 2, 4, 1024, 32768, 32, 16, 16, 8, 16);
+        big_mla.dtype = ModelDType::F32;
+        assert!(BatchedModel::check_paged_support(&big_mla, 64).is_err());
 
         // MLA is F32-only: F16 MLA rejected, F32 MLA accepted.
         let mut mla = Config::mla(128, 2, 4, 1024, 256, 32, 16, 16, 8, 16);

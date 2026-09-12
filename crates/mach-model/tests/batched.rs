@@ -794,8 +794,8 @@ fn shared_prefix_paged_reuse_matches_full_compute() {
     }
 }
 
-/// Paged decode in F16 mode (#78 C3): the newly wired
-/// `kv_store_paged_f16` / `attn_decode_paged_f16_gqa` must track the static
+/// Paged decode in F16 mode (#78 C3): the tiled
+/// `kv_store_paged_f16` / `attn_paged_tiled_f16_gqa` path must track the static
 /// F16 path bit-tight across a page boundary, mirroring the F32 paged test.
 #[test]
 fn batched_paged_f16_decode_matches_static_gpu() {
@@ -1508,10 +1508,68 @@ mod paged_quantized_cpu_parity {
     }
 }
 
-/// **Known-bad shape repro (issue #168) — the shape seen to fail on the real
-/// machine, not yet observed red in a GPU test run.**
+/// Post-rewrite regression for the tiled paged GQA + online-softmax kernel.
 ///
-/// 2026-09-12 real-machine scan: `MACH_PAGED=1` + `MACH_PREFILL_ROWS=512` on
+/// Geometry: 8 query heads / 2 KV heads (groups=4), head_dim=128, 512-row
+/// first prefill chunk + 128-row second chunk over 10 pages. This is the
+/// controlled-power acceptance gate for the old 512-row hard-reset shape.
+#[test]
+#[ignore = "controlled-power paged tiled-attention regression; set MACH_TEST_PAGED_TILED_ATTN=1"]
+fn batched_paged_tiled_f16_gqa_matches_reference_for_long_prefill() {
+    if std::env::var("MACH_TEST_PAGED_TILED_ATTN").as_deref() != Ok("1") {
+        panic!(
+            "MACH_TEST_PAGED_TILED_ATTN=1 is required for this controlled paged tiled-attention test"
+        );
+    }
+    let hip = hip_ctx().unwrap_or_else(|| {
+        panic!("no HIP device is present; this test is opt-in and must not silently skip")
+    });
+    // Realistic-enough GQA geometry: 8 query heads / 2 KV heads = groups 4,
+    // head_dim 128. The old paged kernel used a (row, query-head) grid and a
+    // whole-prefix score buffer; this shape is the 512-row gate for the rewrite.
+    let mut cfg = Config::llama(1024, 2, 8, 2, 1024, 4096);
+    cfg.dtype = ModelDType::F16;
+    let tpp = 64usize;
+    let w = Weights::random(&cfg, 0x7a11ed).unwrap();
+    let vocab = cfg.vocab_size;
+    let total = 640usize;
+    let seq: Vec<u32> = (0..total as u32)
+        .map(|i| (i * 37 + 11) % 1024 + 1)
+        .collect();
+    let mut paged = BatchedModel::with_paged_kv_rows(hip.clone(), cfg, &w, 1, 512, tpp).unwrap();
+    let mut r = GpuModel::new(hip, cfg, &w).unwrap();
+    let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(total);
+    for &t in &seq {
+        ref_logits.push(r.decode_step(t).unwrap());
+    }
+    let check = |pos: usize, got: &[f32]| {
+        let want = &ref_logits[pos];
+        let max = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 0.1, "tiled paged f16 pos {pos}: max diff {max}");
+        assert_eq!(
+            greedy_argmax(got),
+            greedy_argmax(want),
+            "tiled paged greedy {pos}"
+        );
+    };
+    let lens1: Vec<u32> = (0..512u32).collect();
+    let slots1: Vec<u32> = vec![0; 512];
+    let (_, lm1) = fwd_rows(&mut paged, &seq[0..512], &lens1, &slots1, vocab);
+    for &row in &[0usize, 63, 64, 127, 128, 255, 256, 511] {
+        check(row, &lm1[row * vocab..(row + 1) * vocab]);
+    }
+    let lens2: Vec<u32> = (512..total as u32).collect();
+    let slots2: Vec<u32> = vec![0; total - 512];
+    let (_, lm2) = fwd_rows(&mut paged, &seq[512..], &lens2, &slots2, vocab);
+    for &row in &[0usize, 1, 127] {
+        check(512 + row, &lm2[row * vocab..(row + 1) * vocab]);
+    }
+}
+
 /// Qwen3-8B produced degenerate output once a paged prefill needed a **second**
 /// chunk (`~630 token = 10 pages / 2 chunks`), and hard-powered-off the box at
 /// 30 pages / 4 chunks. Every existing chunked-prefill test covers <= 2 pages

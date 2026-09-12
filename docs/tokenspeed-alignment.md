@@ -89,8 +89,8 @@
 - [x] CPU 连续批处理引擎：队列/槽位复用/交错 prefill+decode + 前缀复用（GPU 接线参考）
 - [x] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（#78 C1-C6，7900 XTX 真机 A/B）
   - 地基：`paged_kv.rs`（块表 + 页分配器 + 分页 attention + **分页参考变压器
-    `PagedRef`** == RefModel 逐位一致）、`kv_store_paged`/`attn_decode_paged`
-    内核 + 真机对拍逐位一致；
+    `PagedRef`** == RefModel 逐位一致）、`kv_store_paged` + dense tiled GQA
+    attention（F16/F32；MLA 仍走 legacy full-score）内核 + 对拍/离线门禁；
   - **batched.rs 已接入**：`BatchedModel::with_paged_kv`（F32）→ C1 per-slot
     块表（`set_block_table`，共享前缀混叠页，复用 logits == 全算）→ C2
     chunked prefill（per-row 偏移刷新，行打包逐位对拍）→ C3 f16 分页内核
