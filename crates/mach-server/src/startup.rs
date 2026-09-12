@@ -10,6 +10,33 @@
 use mach_model::config::{Config, ModelDType};
 use std::path::{Path, PathBuf};
 
+/// Largest paged prefill batch currently treated as safe on the project's
+/// 7900 XTX / Windows+ROCm test environment. This is a conservative policy
+/// cap, not a claim that every value below it is issue-free: 16 and 64 rows
+/// passed a 601-token Qwen3-8B/Q4-on-device test, while 128 rows produced a
+/// corrupted greedy continuation and 512 rows has caused hard resets.
+pub const PAGED_PREFILL_ROWS_MAX: usize = 64;
+
+/// Caps the effective paged prefill batch before any weight load. `capacity`
+/// is included because the model constructors take
+/// `prefill_rows.max(capacity)`, so allowing more slots would bypass the cap.
+pub fn cap_paged_prefill_rows(
+    prefill_rows: usize,
+    capacity: usize,
+    paged: bool,
+) -> Result<usize, String> {
+    if !paged {
+        return Ok(prefill_rows);
+    }
+    if capacity > PAGED_PREFILL_ROWS_MAX {
+        return Err(format!(
+            "MACH_PAGED requires MACH_CAPACITY <= {PAGED_PREFILL_ROWS_MAX} \
+             (got {capacity}); larger paged prefill batches are currently disabled"
+        ));
+    }
+    Ok(prefill_rows.min(PAGED_PREFILL_ROWS_MAX).max(capacity))
+}
+
 /// Collapse a model-family name to a lowercase alphanumeric key so the two
 /// places it can come from agree: `model_type` is snake_case (`deepseek_v2`)
 /// while the `architectures[0]` fallback is a PascalCase class name
@@ -833,6 +860,14 @@ mod tests {
             int8, want_int8,
             "INT8 KV accounting must cover only full-attention layers"
         );
+    }
+
+    #[test]
+    fn paged_prefill_rows_are_capped_and_capacity_is_checked() {
+        assert_eq!(cap_paged_prefill_rows(512, 64, true).unwrap(), 64);
+        assert_eq!(cap_paged_prefill_rows(16, 1, true).unwrap(), 16);
+        assert_eq!(cap_paged_prefill_rows(512, 64, false).unwrap(), 512);
+        assert!(cap_paged_prefill_rows(64, 128, true).is_err());
     }
 
     #[test]
