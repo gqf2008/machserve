@@ -64,9 +64,12 @@ jobs:
       # NOTE: this step runs only the *non*-`#[ignore]`d model tests, and the two
       # ways that leaves GPU parity uncovered are different:
       #  - truly `#[ignore]`d suites (`mrope_gpu`, `embed_gpu`, `int8_kv`,
-      #    `vision_gpu`, ...) are simply not selected here (libtest reports them
-      #    as ignored); most also require a `MACH_TEST_*` opt-in and now fail
-      #    loudly if selected without it, so they must be requested explicitly;
+      #    `vision_gpu`, `load_safetensors`, ...) are simply not selected here
+      #    (libtest reports them as ignored). Most need a `MACH_TEST_*` opt-in,
+      #    but today only `mrope_gpu` fails loudly when selected without it;
+      #    `embed_gpu` / `int8_kv` / `vision_gpu` / `load_safetensors` still
+      #    `eprintln! + return` on the unset-opt-in path, so selecting them
+      #    without the env still reports "ok" silently (same #163 remaining work);
       #  - the real-model suites (`real_model`, `qwen3_real`, `qwen15_real`,
       #    `qwen3_q4_real`, `moe_real`) are NOT ignored: they run here, but
       #    self-skip via `eprintln! + return` when `MACH_TEST_MODEL` is unset,
