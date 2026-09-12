@@ -137,6 +137,8 @@ cargo run -p mach-server --release --features hip
 #   MACH_KV=int8(实验:Q4_DEVICE=2 的连续 full-attention K/V 用 INT8,预检按 payload+scales)、
 #   MACH_PAGED_DEBUG=1(分页复用 trace:每个请求一行 `paged: admit`/`paged: register`,
 #     含 reused_pages —— 该复用而缺失就是缓存未命中的直接证据)
+#   MACH_LOAD_TRACE=1(Q4 权重上传逐层 trace(含 Q4-on-device):`load: upload layer i/n ...`,
+#     用于定位加载/上传阶段卡在哪一层；与 MACH_PAGED_DEBUG 一样默认关闭)
 
 # 调用示例
 curl -s http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/json" \
