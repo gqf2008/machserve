@@ -1799,9 +1799,15 @@ mod tests {
 
     /// Mirrors `ContinuousModel::finish`'s paged retire loop and pins the
     /// invariant the whole cross-request reuse story rests on: retiring a
-    /// request must leave its *registered* full pages mapped, so the next
-    /// request with the same prefix still aliases the very same physical
-    /// pages (not "reuse one request later").
+    /// request must return **only its own** pages to the free list, so a later
+    /// request's fresh allocation can never land on a page that is still
+    /// mapped as cached prefix content.
+    ///
+    /// The assertion is deliberately about *page ownership*, not about the
+    /// next request's hit count: `free_page` only touches the allocator and
+    /// never the cache, so a retire that wrongly frees a registered page still
+    /// aliases the (now dangling) id and would pass a hit-count check. The
+    /// unrelated probe plan is what makes that defect visible.
     ///
     /// Keep this in lockstep with `continuous.rs`'s retire branch: content
     /// pages under `chain.len()` are kept unless they lost the first-writer
@@ -1815,9 +1821,12 @@ mod tests {
         let full = tokens.len() / 4;
         assert_eq!(full, 2);
 
-        let first = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
+        let mut first = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
+        // The engine pads every admitted table up to `max_pages` before it
+        // installs it, so the retire loop's `!is_content` (pad) arm runs too.
+        b.pad_table(&mut first.table, 4).unwrap();
         b.register_chain(&chain[..full], &first.table); // prefill materialized
-        let aliased_pages: Vec<u32> = (0..full)
+        let owned: Vec<u32> = (0..full)
             .map(|i| first.table.get(i).expect("planned page"))
             .collect();
 
@@ -1830,13 +1839,29 @@ mod tests {
             }
         }
 
+        // --- ownership probe ---
+        // Only the partial page and the pads may be back in the free list.
+        // The probe must span >= 3 pages: the allocator pops LIFO, so a
+        // one-page probe would land on the freed partial page under both the
+        // correct and the buggy retire.
+        let other: Vec<i32> = (100..=112).collect(); // 3 full pages + partial
+        let probe = b
+            .plan_with_chain(&other, b.compute_chain(&other), true)
+            .unwrap();
+        for &page in probe.table.pages() {
+            assert!(
+                !owned.contains(&page),
+                "registered page {page} was returned to the free list by retire"
+            );
+        }
+
         // --- next request with the same prefix ---
         let second = b.plan_with_chain(&tokens, chain.clone(), true).unwrap();
         assert_eq!(
             second.reused_pages, full,
             "every registered full page must still alias after retire"
         );
-        for (i, &page) in aliased_pages.iter().enumerate() {
+        for (i, &page) in owned.iter().enumerate() {
             assert_eq!(
                 second.table.get(i),
                 Some(page),
@@ -1873,14 +1898,22 @@ mod tests {
         // Evicting the cold retired content returns its page to the pool.
         assert!(b.evict_page(&a_chain[0]), "registered hash must evict");
         assert_eq!(b.cached_pages(), 0);
+        // Replaying the *evicted* content must not alias it again (the check
+        // has to use `a_tokens`, not the unrelated prompt, or it is vacuous).
+        let replay = b.plan_with_chain(&a_tokens, a_chain.clone(), true).unwrap();
+        assert_eq!(replay.reused_pages, 0, "evicted content must not alias");
+        b.free_plan_pages(&replay, &replay.table);
+        // ...and the same freed page serves the unrelated prompt.
         let pb = b.plan_with_chain(&b_tokens, b_chain.clone(), true).unwrap();
-        assert_eq!(pb.reused_pages, 0, "evicted content must not alias again");
         assert_eq!(pb.table.get(0), pa.table.get(0), "the freed page is reused");
     }
 
-    /// A prompt shorter than one page registers nothing: there is no full
-    /// page to alias, so a later identical prompt must not reuse anything
-    /// (and must not leak the hash into the cache).
+    /// A prompt shorter than one page registers nothing. The load-bearing
+    /// assertion is `cached_pages() == 0`: a `register_chain(&chain, ..)`
+    /// regression (registering the partial page's hash) turns it red. The
+    /// trailing `reused_pages == 0` is vacuous on its own — with
+    /// `full_pages == 0` the plan can never alias — and only guards the
+    /// boundary the plan reports.
     #[test]
     fn sub_page_prompt_registers_nothing() {
         let mut b = GpuPagedTableBuilder::new(8, 4);
