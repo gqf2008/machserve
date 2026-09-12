@@ -66,7 +66,10 @@ thirdparty/        第三方参考代码(占位)
 - **分页 KV + 跨请求前缀共享(实验)**:SHA-256 前缀哈希链 + LCM 块池 + 复用规划 +
   前缀 KV 缓存(CPU 参考路径已打通):共享系统提示/工具定义的请求只算 delta,
   复用 logits 与全算逐位一致;5 请求共享 8-token 前缀实测 prompt token 复用 71%
-  (对标 FreeToken 多轮 TTFT -65..-80%)。GPU(batched.rs)接线为后续批次。
+  (对标 FreeToken 多轮 TTFT -65..-80%)。GPU dense F16/F32 已切换到 tiled
+  GQA + online-softmax；F16 run-based query tile 支持不同 slot 的混合
+  prefill/decode，MLA paged 仍保留 legacy full-score 路径，且 server 的
+  prefill-row 安全 cap 待受控 512-row 真机验证后再解除。
 - **存储级 Q4(int4)**:权重打包 int4 + 每 32 元素 f32 scale 存主机(8B 模型
   ~5GB vs f32 32GB),`MACH_Q4=1` 加载/上传时反量化 f16 进显存;已在 7900 XTX
   实跑 Qwen3-8B(16GB F16 显存,主机峰值 ~8GB)。

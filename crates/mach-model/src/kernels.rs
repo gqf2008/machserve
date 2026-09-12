@@ -1167,6 +1167,8 @@ extern "C" __global__ void kv_store_paged(const float* kv, float* pool,
 }
 "#;
 
+/// Legacy dense F32 paged decode kernel (per query head, full-prefix scores).
+/// Kept for low-level parity/A-B; production dense F32 uses the tiled GQA path.
 /// Paged decode attention: reads the KV prefix `0..=pos` through per-request
 /// block tables from a page pool (`[num_pages, tokens_per_page, kv_heads,
 /// head_dim]`), enabling cross-request prefix sharing. Mirrors the CPU
@@ -1273,6 +1275,8 @@ extern "C" __global__ void kv_store_paged_f16(const float* kv,
 }
 "#;
 
+/// Legacy dense F16 paged decode kernel (per query head, full-prefix scores).
+/// Kept for A/B and low-level parity; production uses the tiled GQA kernels.
 /// Paged decode attention (f16 KV): same signature/addressing as
 /// `attn_decode_paged`, but k_pool/v_pool hold f16 bit patterns
 /// (`unsigned short`, `[num_pages, tokens_per_page, kv_heads, head_dim]`) that
@@ -1348,6 +1352,671 @@ extern "C" __global__ void attn_decode_paged_f16_gqa(
             acc += __expf(scores[p] - m) * f16_bits_to_f32(*vp);
         }
         out[((long long)s * n_heads + h) * head_dim + dd] = acc / ssum;
+    }
+}
+"#;
+
+/// Paged causal attention for f16 KV, tiled GQA + online softmax.
+///
+/// Unlike `attn_decode_paged_f16_gqa` (one block per query head with the whole
+/// prefix's scores in dynamic shared memory), this kernel assigns one block to
+/// `(row, kv_head)`, reuses each K/V tile across the GQA query-head group, and
+/// keeps only `tile` scores plus the online-softmax state live. Shared K/V
+/// tiles are converted back to f32 on use. The causal prefix is processed in
+/// bounded tiles, so shared-memory usage is independent of `max_seq_len`.
+const ATTN_PAGED_TILED_F16_GQA: &str = r#"
+__device__ __forceinline__ float paged_tiled_f16_to_f32(unsigned short u) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = u;
+    return (float)c.h;
+}
+
+extern "C" __global__ void attn_paged_tiled_f16_gqa(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_pool,
+    const unsigned short* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page, int tile) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    float* red = (float*)smem_raw;                 // [blockDim.x]
+    float* scores = red + blockDim.x;              // [tile]
+    unsigned short* k_tile = (unsigned short*)(scores + tile); // [tile][head_dim]
+    unsigned short* v_tile = k_tile + (long long)tile * head_dim;
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x / n_kv_heads;
+    const int kv = blockIdx.x % n_kv_heads;
+    if (row >= batch || tid >= blockDim.x) {
+        return;
+    }
+
+    const int groups = n_heads / n_kv_heads;
+    const int pos = pos_buf[row];
+    const int len = pos + 1;
+    const int* table = block_tables + table_offsets[row];
+    const int own_d = tid < head_dim;
+
+    float m[16];
+    float l[16];
+    float acc[16];
+    for (int g = 0; g < groups; ++g) {
+        m[g] = -3.402823466e38f;
+        l[g] = 0.0f;
+        acc[g] = 0.0f;
+    }
+
+    for (int tile0 = 0; tile0 < len; tile0 += tile) {
+        int n_t = len - tile0;
+        if (n_t > tile) n_t = tile;
+
+        for (int i = tid; i < n_t; i += blockDim.x) {
+            int p = tile0 + i;
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = table[logical];
+            long long base = ((long long)page * tokens_per_page + off)
+                             * n_kv_heads * head_dim + kv * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                k_tile[(long long)i * head_dim + d] = k_pool[base + d];
+                v_tile[(long long)i * head_dim + d] = v_pool[base + d];
+            }
+        }
+        __syncthreads();
+
+        for (int g = 0; g < groups; ++g) {
+            const float* qg = q + (((long long)row * n_heads + kv * groups + g) * head_dim);
+            for (int i = tid; i < n_t; i += blockDim.x) {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += qg[d] * paged_tiled_f16_to_f32(k_tile[(long long)i * head_dim + d]);
+                }
+                scores[i] = dot * scale;
+            }
+            __syncthreads();
+
+            float tmax = -3.402823466e38f;
+            for (int i = tid; i < n_t; i += blockDim.x) {
+                tmax = fmaxf(tmax, scores[i]);
+            }
+            red[tid] = tmax;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+                __syncthreads();
+            }
+            const float tile_max = red[0];
+            __syncthreads();
+
+            float tsum = 0.0f;
+            for (int i = tid; i < n_t; i += blockDim.x) {
+                scores[i] = __expf(scores[i] - tile_max);
+                tsum += scores[i];
+            }
+            red[tid] = tsum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) red[tid] += red[tid + s];
+                __syncthreads();
+            }
+            const float tile_sum = red[0];
+            __syncthreads();
+
+            const float m_new = fmaxf(m[g], tile_max);
+            const float alpha = __expf(m[g] - m_new);
+            const float beta = __expf(tile_max - m_new);
+            m[g] = m_new;
+            l[g] = l[g] * alpha + tile_sum * beta;
+
+            if (own_d) {
+                const int d = tid;
+                float a = 0.0f;
+                for (int i = 0; i < n_t; ++i) {
+                    a += beta * scores[i]
+                         * paged_tiled_f16_to_f32(v_tile[(long long)i * head_dim + d]);
+                }
+                acc[g] = acc[g] * alpha + a;
+            }
+            __syncthreads(); // scores/red may be reused by the next query head
+        }
+        __syncthreads(); // K/V tile may be overwritten by the next tile
+    }
+
+    if (own_d) {
+        const int d = tid;
+        for (int g = 0; g < groups; ++g) {
+            const long long out_idx = ((long long)row * n_heads + kv * groups + g) * head_dim + d;
+            out[out_idx] = l[g] > 0.0f ? acc[g] / l[g] : 0.0f;
+        }
+    }
+}
+"#;
+
+/// Paged causal attention for f16 KV with a same-slot query-row block.
+///
+/// This is the prefill fast path: one block handles `(query_row_block,
+/// kv_head)` and reuses each K/V tile across the block's GQA groups and query
+/// rows. Callers must only select it when all rows in the block share one
+/// slot/block-table (the continuous prefill packing guarantee); mixed-slot
+/// batches use the per-row kernel.
+const ATTN_PAGED_TILED_F16_GQA_QBLOCK: &str = r#"
+__device__ __forceinline__ float paged_qblock_f16_to_f32(unsigned short u) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = u;
+    return (float)c.h;
+}
+
+extern "C" __global__ void attn_paged_tiled_f16_gqa_qblock(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_pool,
+    const unsigned short* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page, int tile, int q_block) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    float* red = (float*)smem_raw;
+    float* scores = red + blockDim.x;
+    unsigned short* k_tile = (unsigned short*)(scores + tile);
+    unsigned short* v_tile = k_tile + (long long)tile * head_dim;
+
+    const int tid = threadIdx.x;
+    const int kv = blockIdx.x % n_kv_heads;
+    const int row0 = (blockIdx.x / n_kv_heads) * q_block;
+    if (row0 >= batch) return;
+    int rows = batch - row0;
+    if (rows > q_block) rows = q_block;
+    const int groups = n_heads / n_kv_heads;
+    const int* table = block_tables + table_offsets[row0];
+    const int max_pos = pos_buf[row0 + rows - 1] + 1;
+    const int have_d = tid < head_dim;
+
+    float m[16];
+    float l[16];
+    float acc[16];
+    for (int idx = 0; idx < rows * groups; ++idx) {
+        m[idx] = -3.402823466e38f;
+        l[idx] = 0.0f;
+        acc[idx] = 0.0f;
+    }
+
+    for (int tile0 = 0; tile0 < max_pos; tile0 += tile) {
+        int tile_len = max_pos - tile0;
+        if (tile_len > tile) tile_len = tile;
+
+        for (int i = tid; i < tile_len; i += blockDim.x) {
+            int p = tile0 + i;
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = table[logical];
+            long long base = ((long long)page * tokens_per_page + off)
+                             * n_kv_heads * head_dim + kv * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                k_tile[(long long)i * head_dim + d] = k_pool[base + d];
+                v_tile[(long long)i * head_dim + d] = v_pool[base + d];
+            }
+        }
+        __syncthreads();
+
+        for (int r = 0; r < rows; ++r) {
+            const int pos = pos_buf[row0 + r];
+            if (tile0 > pos) continue;
+            int n_t = pos + 1 - tile0;
+            if (n_t > tile_len) n_t = tile_len;
+            const int row = row0 + r;
+            for (int g = 0; g < groups; ++g) {
+                const int idx = r * groups + g;
+                const float* qg = q + (((long long)row * n_heads + kv * groups + g) * head_dim);
+                for (int i = tid; i < n_t; i += blockDim.x) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += qg[d] * paged_qblock_f16_to_f32(k_tile[(long long)i * head_dim + d]);
+                    }
+                    scores[i] = dot * scale;
+                }
+                __syncthreads();
+
+                float tmax = -3.402823466e38f;
+                for (int i = tid; i < n_t; i += blockDim.x) tmax = fmaxf(tmax, scores[i]);
+                red[tid] = tmax;
+                __syncthreads();
+                for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+                    __syncthreads();
+                }
+                const float tile_max = red[0];
+                __syncthreads();
+
+                float tsum = 0.0f;
+                for (int i = tid; i < n_t; i += blockDim.x) {
+                    scores[i] = __expf(scores[i] - tile_max);
+                    tsum += scores[i];
+                }
+                red[tid] = tsum;
+                __syncthreads();
+                for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                    if (tid < s) red[tid] += red[tid + s];
+                    __syncthreads();
+                }
+                const float tile_sum = red[0];
+                __syncthreads();
+
+                const float m_new = fmaxf(m[idx], tile_max);
+                const float alpha = __expf(m[idx] - m_new);
+                const float beta = __expf(tile_max - m_new);
+                m[idx] = m_new;
+                l[idx] = l[idx] * alpha + tile_sum * beta;
+                if (have_d) {
+                    const int d = tid;
+                    float a = 0.0f;
+                    for (int i = 0; i < n_t; ++i) {
+                        a += beta * scores[i]
+                             * paged_qblock_f16_to_f32(v_tile[(long long)i * head_dim + d]);
+                    }
+                    acc[idx] = acc[idx] * alpha + a;
+                }
+                __syncthreads();
+            }
+        }
+        __syncthreads();
+    }
+
+    if (have_d) {
+        const int d = tid;
+        for (int r = 0; r < rows; ++r) {
+            const int row = row0 + r;
+            for (int g = 0; g < groups; ++g) {
+                const int idx = r * groups + g;
+                const long long out_idx = ((long long)row * n_heads + kv * groups + g) * head_dim + d;
+                out[out_idx] = l[idx] > 0.0f ? acc[idx] / l[idx] : 0.0f;
+            }
+        }
+    }
+}
+"#;
+
+/// Paged causal attention for f16 KV, run-based tiled GQA + online softmax.
+///
+/// One block consumes one `[row0, q_start, q_take]` descriptor and one KV
+/// head. The M dimension packs all query rows in the tile with that head's GQA
+/// group, so one K/V tile load is reused by up to `q_take * groups` query
+/// heads. The descriptor lets a mixed batch contain multiple runs from
+/// different slots without requiring the whole batch to share a block table.
+const ATTN_PAGED_TILED_F16_GQA_RUNS: &str = r#"
+__device__ __forceinline__ float paged_runs_f16_to_f32(unsigned short u) {
+    union { _Float16 h; unsigned short u; } c;
+    c.u = u;
+    return (float)c.h;
+}
+
+__device__ __forceinline__ float paged_runs_warp_max(float v) {
+    for (int off = warpSize >> 1; off > 0; off >>= 1) {
+        v = fmaxf(v, __shfl_down(v, off, warpSize));
+    }
+    return v;
+}
+
+__device__ __forceinline__ float paged_runs_warp_sum(float v) {
+    for (int off = warpSize >> 1; off > 0; off >>= 1) {
+        v += __shfl_down(v, off, warpSize);
+    }
+    return v;
+}
+
+__device__ __forceinline__ void paged_runs_load_f16_tile(
+    const unsigned short* __restrict__ pool,
+    unsigned short* __restrict__ dst,
+    const int* __restrict__ table,
+    int tile0, int tile_len, int tokens_per_page,
+    int n_kv_heads, int head_dim, int kv, int tid, int nthreads) {
+    const int logical0 = tile0 / tokens_per_page;
+    const int off0 = tile0 - logical0 * tokens_per_page;
+    const int page0 = table[logical0];
+
+    // vLLM-style tile/page fast path: when the tile is contained in one page,
+    // resolve the physical page once and reuse it for every lane in the tile.
+    if (off0 + tile_len <= tokens_per_page) {
+        const long long page_row0 = (long long)page0 * tokens_per_page + off0;
+        if ((head_dim & 7) == 0) {
+            const int vecs_per_row = head_dim >> 3;
+            const int total_vecs = tile_len * vecs_per_row;
+            for (int e = tid; e < total_vecs; e += nthreads) {
+                const int i = e / vecs_per_row;
+                const int d = (e - i * vecs_per_row) << 3;
+                const long long base = (page_row0 + i)
+                    * n_kv_heads * head_dim + kv * head_dim + d;
+                const uint4 v = *reinterpret_cast<const uint4*>(pool + base);
+                *reinterpret_cast<uint4*>(dst + (long long)i * head_dim + d) = v;
+            }
+        } else {
+            for (int i = tid; i < tile_len; i += nthreads) {
+                const long long base = (page_row0 + i)
+                    * n_kv_heads * head_dim + kv * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    dst[(long long)i * head_dim + d] = pool[base + d];
+                }
+            }
+        }
+        return;
+    }
+
+    // General path for tiles crossing a page boundary.
+    if ((head_dim & 7) == 0) {
+        const int vecs_per_row = head_dim >> 3;
+        const int total_vecs = tile_len * vecs_per_row;
+        for (int e = tid; e < total_vecs; e += nthreads) {
+            const int i = e / vecs_per_row;
+            const int d = (e - i * vecs_per_row) << 3;
+            const int p = tile0 + i;
+            const int logical = p / tokens_per_page;
+            const int off = p - logical * tokens_per_page;
+            const int page = table[logical];
+            const long long base = ((long long)page * tokens_per_page + off)
+                * n_kv_heads * head_dim + kv * head_dim + d;
+            const uint4 v = *reinterpret_cast<const uint4*>(pool + base);
+            *reinterpret_cast<uint4*>(dst + (long long)i * head_dim + d) = v;
+        }
+    } else {
+        for (int i = tid; i < tile_len; i += nthreads) {
+            const int p = tile0 + i;
+            const int logical = p / tokens_per_page;
+            const int off = p - logical * tokens_per_page;
+            const int page = table[logical];
+            const long long base = ((long long)page * tokens_per_page + off)
+                * n_kv_heads * head_dim + kv * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                dst[(long long)i * head_dim + d] = pool[base + d];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void attn_paged_tiled_f16_gqa_runs(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_pool,
+    const unsigned short* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ run_descs,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int n_runs, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page, int tile, int q_block) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    float* red = (float*)smem_raw;                  // [blockDim.x]
+    float* scores = red + blockDim.x;               // [tile]
+    const int score_cap = (tile + 3) & ~3;
+    unsigned short* k_tile = (unsigned short*)(scores + score_cap);
+    unsigned short* v_tile = k_tile + (long long)tile * head_dim;
+
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int kv = blockIdx.x % n_kv_heads;
+    const int work = blockIdx.x / n_kv_heads;
+    if (work >= n_runs) return;
+
+    const int* desc = run_descs + work * 3;
+    const int row0 = desc[0];
+    const int q_start = desc[1];
+    int rows = desc[2];
+    if (rows <= 0 || rows > q_block) return;
+
+    const int groups = n_heads / n_kv_heads;
+    const int first_row = row0 + q_start;
+    const int* table = block_tables + table_offsets[first_row];
+    const int max_pos = pos_buf[first_row + rows - 1] + 1;
+    const int active = rows * groups;
+    if (active > 16) return;
+
+    const int lane = tid % warpSize;
+    const int warp = tid / warpSize;
+    const int nwarps = nthreads / warpSize;
+    const int have_d = tid < head_dim;
+
+    float m[16];
+    float l[16];
+    float acc[16];
+    for (int idx = 0; idx < active; ++idx) {
+        m[idx] = -3.402823466e38f;
+        l[idx] = 0.0f;
+        acc[idx] = 0.0f;
+    }
+
+    for (int tile0 = 0; tile0 < max_pos; tile0 += tile) {
+        int tile_len = max_pos - tile0;
+        if (tile_len > tile) tile_len = tile;
+
+        paged_runs_load_f16_tile(
+            k_pool, k_tile, table, tile0, tile_len, tokens_per_page,
+            n_kv_heads, head_dim, kv, tid, nthreads);
+        paged_runs_load_f16_tile(
+            v_pool, v_tile, table, tile0, tile_len, tokens_per_page,
+            n_kv_heads, head_dim, kv, tid, nthreads);
+        __syncthreads();
+
+        for (int r = 0; r < rows; ++r) {
+            const int row = first_row + r;
+            const int pos = pos_buf[row];
+            if (tile0 > pos) continue;
+            int n_t = pos + 1 - tile0;
+            if (n_t > tile_len) n_t = tile_len;
+
+            for (int g = 0; g < groups; ++g) {
+                const int idx = r * groups + g;
+                const float* qg = q
+                    + (((long long)row * n_heads + kv * groups + g) * head_dim);
+
+                for (int i = tid; i < n_t; i += nthreads) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += qg[d]
+                            * paged_runs_f16_to_f32(k_tile[(long long)i * head_dim + d]);
+                    }
+                    scores[i] = dot * scale;
+                }
+                __syncthreads();
+
+                float tmax = (tid < n_t) ? scores[tid] : -3.402823466e38f;
+                tmax = paged_runs_warp_max(tmax);
+                if (lane == 0) red[warp] = tmax;
+                __syncthreads();
+                if (warp == 0) {
+                    float v = (lane < nwarps) ? red[lane] : -3.402823466e38f;
+                    v = paged_runs_warp_max(v);
+                    if (lane == 0) red[0] = v;
+                }
+                __syncthreads();
+                const float tile_max = red[0];
+
+                float tsum = 0.0f;
+                if (tid < n_t) {
+                    tsum = __expf(scores[tid] - tile_max);
+                    scores[tid] = tsum;
+                }
+                tsum = paged_runs_warp_sum(tsum);
+                if (lane == 0) red[warp] = tsum;
+                __syncthreads();
+                if (warp == 0) {
+                    float v = (lane < nwarps) ? red[lane] : 0.0f;
+                    v = paged_runs_warp_sum(v);
+                    if (lane == 0) red[0] = v;
+                }
+                __syncthreads();
+                const float tile_sum = red[0];
+
+                const float m_new = fmaxf(m[idx], tile_max);
+                const float alpha = __expf(m[idx] - m_new);
+                const float beta = __expf(tile_max - m_new);
+                m[idx] = m_new;
+                l[idx] = l[idx] * alpha + tile_sum * beta;
+                if (have_d) {
+                    const int d = tid;
+                    float a = 0.0f;
+                    for (int i = 0; i < n_t; ++i) {
+                        a += beta * scores[i]
+                            * paged_runs_f16_to_f32(v_tile[(long long)i * head_dim + d]);
+                    }
+                    acc[idx] = acc[idx] * alpha + a;
+                }
+                __syncthreads(); // scores/red are reused by the next GQA head
+            }
+        }
+        __syncthreads(); // K/V tile is overwritten by the next tile
+    }
+
+    if (have_d) {
+        const int d = tid;
+        for (int r = 0; r < rows; ++r) {
+            const int row = first_row + r;
+            for (int g = 0; g < groups; ++g) {
+                const int idx = r * groups + g;
+                const long long out_idx =
+                    ((long long)row * n_heads + kv * groups + g) * head_dim + d;
+                out[out_idx] = l[idx] > 0.0f ? acc[idx] / l[idx] : 0.0f;
+            }
+        }
+    }
+}
+"#;
+
+/// Paged causal attention for f32 KV, tiled GQA + online softmax.
+///
+/// Unlike `attn_decode_paged_f16_gqa` (one block per query head with the whole
+/// prefix's scores in dynamic shared memory), this kernel assigns one block to
+/// `(row, kv_head)`, reuses each K/V tile across the GQA query-head group, and
+/// keeps only `tile` scores plus the online-softmax state live. Shared K/V
+/// tiles are loaded as float and reused directly. The causal prefix is processed in
+/// bounded tiles, so shared-memory usage is independent of `max_seq_len`.
+const ATTN_PAGED_TILED_F32_GQA: &str = r#"
+__device__ __forceinline__ float paged_tiled_f32_identity(float u) {
+    return u;
+}
+
+extern "C" __global__ void attn_paged_tiled_f32_gqa(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int* __restrict__ block_tables,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    const int* __restrict__ table_offsets,
+    int batch, int n_heads, int n_kv_heads, int head_dim,
+    float scale, int tokens_per_page, int tile) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    float* red = (float*)smem_raw;                 // [blockDim.x]
+    float* scores = red + blockDim.x;              // [tile]
+    float* k_tile = (float*)(scores + tile); // [tile][head_dim]
+    float* v_tile = k_tile + (long long)tile * head_dim;
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x / n_kv_heads;
+    const int kv = blockIdx.x % n_kv_heads;
+    if (row >= batch || tid >= blockDim.x) {
+        return;
+    }
+
+    const int groups = n_heads / n_kv_heads;
+    const int pos = pos_buf[row];
+    const int len = pos + 1;
+    const int* table = block_tables + table_offsets[row];
+    const int own_d = tid < head_dim;
+
+    float m[16];
+    float l[16];
+    float acc[16];
+    for (int g = 0; g < groups; ++g) {
+        m[g] = -3.402823466e38f;
+        l[g] = 0.0f;
+        acc[g] = 0.0f;
+    }
+
+    for (int tile0 = 0; tile0 < len; tile0 += tile) {
+        int n_t = len - tile0;
+        if (n_t > tile) n_t = tile;
+
+        for (int i = tid; i < n_t; i += blockDim.x) {
+            int p = tile0 + i;
+            int logical = p / tokens_per_page;
+            int off = p % tokens_per_page;
+            int page = table[logical];
+            long long base = ((long long)page * tokens_per_page + off)
+                             * n_kv_heads * head_dim + kv * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                k_tile[(long long)i * head_dim + d] = k_pool[base + d];
+                v_tile[(long long)i * head_dim + d] = v_pool[base + d];
+            }
+        }
+        __syncthreads();
+
+        for (int g = 0; g < groups; ++g) {
+            const float* qg = q + (((long long)row * n_heads + kv * groups + g) * head_dim);
+            for (int i = tid; i < n_t; i += blockDim.x) {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += qg[d] * paged_tiled_f32_identity(k_tile[(long long)i * head_dim + d]);
+                }
+                scores[i] = dot * scale;
+            }
+            __syncthreads();
+
+            float tmax = -3.402823466e38f;
+            for (int i = tid; i < n_t; i += blockDim.x) {
+                tmax = fmaxf(tmax, scores[i]);
+            }
+            red[tid] = tmax;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+                __syncthreads();
+            }
+            const float tile_max = red[0];
+            __syncthreads();
+
+            float tsum = 0.0f;
+            for (int i = tid; i < n_t; i += blockDim.x) {
+                scores[i] = __expf(scores[i] - tile_max);
+                tsum += scores[i];
+            }
+            red[tid] = tsum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) red[tid] += red[tid + s];
+                __syncthreads();
+            }
+            const float tile_sum = red[0];
+            __syncthreads();
+
+            const float m_new = fmaxf(m[g], tile_max);
+            const float alpha = __expf(m[g] - m_new);
+            const float beta = __expf(tile_max - m_new);
+            m[g] = m_new;
+            l[g] = l[g] * alpha + tile_sum * beta;
+
+            if (own_d) {
+                const int d = tid;
+                float a = 0.0f;
+                for (int i = 0; i < n_t; ++i) {
+                    a += beta * scores[i]
+                         * (v_tile[(long long)i * head_dim + d]);
+                }
+                acc[g] = acc[g] * alpha + a;
+            }
+            __syncthreads(); // scores/red may be reused by the next query head
+        }
+        __syncthreads(); // K/V tile may be overwritten by the next tile
+    }
+
+    if (own_d) {
+        const int d = tid;
+        for (int g = 0; g < groups; ++g) {
+            const long long out_idx = ((long long)row * n_heads + kv * groups + g) * head_dim + d;
+            out[out_idx] = l[g] > 0.0f ? acc[g] / l[g] : 0.0f;
+        }
     }
 }
 "#;
@@ -3429,8 +4098,12 @@ pub struct HipKernels {
     attn_decode_batched: HipKernelModule,
     kv_store_paged: HipKernelModule,
     attn_decode_paged: HipKernelModule,
+    attn_paged_tiled_f32_gqa: HipKernelModule,
     kv_store_paged_f16: HipKernelModule,
     attn_decode_paged_f16_gqa: HipKernelModule,
+    attn_paged_tiled_f16_gqa: HipKernelModule,
+    attn_paged_tiled_f16_gqa_qblock: HipKernelModule,
+    attn_paged_tiled_f16_gqa_runs: HipKernelModule,
     kv_store_paged_mla: HipKernelModule,
     attn_decode_paged_mla_batched: HipKernelModule,
     argmax_batched: HipKernelModule,
@@ -3589,11 +4262,31 @@ impl HipKernels {
             attn_decode_batched: compile_cached(&arch, ATTN_DECODE_BATCHED, "attn_decode_batched")?,
             kv_store_paged: compile_cached(&arch, KV_STORE_PAGED, "kv_store_paged")?,
             attn_decode_paged: compile_cached(&arch, ATTN_DECODE_PAGED, "attn_decode_paged")?,
+            attn_paged_tiled_f32_gqa: compile_cached(
+                &arch,
+                ATTN_PAGED_TILED_F32_GQA,
+                "attn_paged_tiled_f32_gqa",
+            )?,
             kv_store_paged_f16: compile_cached(&arch, KV_STORE_PAGED_F16, "kv_store_paged_f16")?,
             attn_decode_paged_f16_gqa: compile_cached(
                 &arch,
                 ATTN_DECODE_PAGED_F16_GQA,
                 "attn_decode_paged_f16_gqa",
+            )?,
+            attn_paged_tiled_f16_gqa: compile_cached(
+                &arch,
+                ATTN_PAGED_TILED_F16_GQA,
+                "attn_paged_tiled_f16_gqa",
+            )?,
+            attn_paged_tiled_f16_gqa_qblock: compile_cached(
+                &arch,
+                ATTN_PAGED_TILED_F16_GQA_QBLOCK,
+                "attn_paged_tiled_f16_gqa_qblock",
+            )?,
+            attn_paged_tiled_f16_gqa_runs: compile_cached(
+                &arch,
+                ATTN_PAGED_TILED_F16_GQA_RUNS,
+                "attn_paged_tiled_f16_gqa_runs",
             )?,
             kv_store_paged_mla: compile_cached(&arch, KV_STORE_PAGED_MLA, "kv_store_paged_mla")?,
             attn_decode_paged_mla_batched: compile_cached(
@@ -5521,6 +6214,8 @@ impl HipKernels {
             .launch([blocks, 1, 1], [256, 1, 1], &mut p, self.stream)?)
     }
 
+    /// Legacy per-row F16 paged decode kernel; production dense paths use the
+    /// tiled GQA kernels.
     /// Paged decode attention (f16 KV): reads f16-bit-pattern pages back to
     /// f32 for the softmax; same addressing/launch shape as
     /// `launch_attn_decode_paged`.
@@ -5568,6 +6263,365 @@ impl HipKernels {
         let shared = ((max_pages * tokens_per_page + 256) * 4) as u32;
         Ok(self.attn_decode_paged_f16_gqa.launch_shmem(
             [(batch * n_heads) as u32, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+
+    /// Paged causal F16 GQA attention with bounded KV tiles and online softmax.
+    ///
+    /// One block handles `(row, kv_head)` and reuses each K/V tile across the
+    /// GQA query-head group. `tile` is chosen from a fixed shared-memory budget
+    /// so this path never allocates scores proportional to the sequence length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_paged_tiled_f16_gqa(
+        &self,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        if batch <= 0
+            || n_heads <= 0
+            || n_kv_heads <= 0
+            || head_dim <= 0
+            || head_dim > 256
+            || tokens_per_page <= 0
+            || n_heads % n_kv_heads != 0
+            || !scale.is_finite()
+            || scale <= 0.0
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f16_gqa invalid dims: batch={batch} n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} tpp={tokens_per_page} scale={scale}"
+            )));
+        }
+        let groups = n_heads / n_kv_heads;
+        if groups > 16 {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f16_gqa groups={groups} exceeds 16"
+            )));
+        }
+        // Keep 2 * tile * head_dim f16 elements under 16 KiB so two CTAs
+        // can coexist per gfx1100 CU without a pipeline.
+        let mut tile = (4096usize / head_dim as usize).clamp(1, 128);
+        while tile > 1 && (tile & (tile - 1)) != 0 {
+            tile >>= 1;
+        }
+        let grid = (batch as u64)
+            .checked_mul(n_kv_heads as u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| {
+                Error::InvalidArgument("attn_paged_tiled_f16_gqa grid overflow".into())
+            })?;
+        let shared = ((256usize + tile) * 4 + 2 * tile * head_dim as usize * 2) as u32;
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let btp = block_tables;
+        let op = out;
+        let posp = pos;
+        let top = table_offsets;
+        let tile_i = tile as i32;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &btp as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &top as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &tile_i as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.attn_paged_tiled_f16_gqa.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+    /// Paged causal F32 GQA attention with bounded KV tiles and online softmax.
+    ///
+    /// One block handles `(row, kv_head)` and reuses each K/V tile across the
+    /// GQA query-head group. `tile` is chosen from a fixed shared-memory budget
+    /// so this path never allocates scores proportional to the sequence length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_paged_tiled_f32_gqa(
+        &self,
+        q: *const f32,
+        k_pool: *const f32,
+        v_pool: *const f32,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+    ) -> Result<(), Error> {
+        if batch <= 0
+            || n_heads <= 0
+            || n_kv_heads <= 0
+            || head_dim <= 0
+            || head_dim > 256
+            || tokens_per_page <= 0
+            || n_heads % n_kv_heads != 0
+            || !scale.is_finite()
+            || scale <= 0.0
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f32_gqa invalid dims: batch={batch} n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} tpp={tokens_per_page} scale={scale}"
+            )));
+        }
+        let groups = n_heads / n_kv_heads;
+        if groups > 16 {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f32_gqa groups={groups} exceeds 16"
+            )));
+        }
+        // Keep 2 * tile * head_dim f32 elements under 16 KiB so two CTAs
+        // can coexist per gfx1100 CU without a pipeline.
+        let mut tile = (2048usize / head_dim as usize).clamp(1, 128);
+        while tile > 1 && (tile & (tile - 1)) != 0 {
+            tile >>= 1;
+        }
+        let grid = (batch as u64)
+            .checked_mul(n_kv_heads as u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| {
+                Error::InvalidArgument("attn_paged_tiled_f32_gqa grid overflow".into())
+            })?;
+        let shared = ((256usize + tile) * 4 + 2 * tile * head_dim as usize * 4) as u32;
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let btp = block_tables;
+        let op = out;
+        let posp = pos;
+        let top = table_offsets;
+        let tile_i = tile as i32;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const f32 as *mut core::ffi::c_void,
+            &vp as *const *const f32 as *mut core::ffi::c_void,
+            &btp as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &top as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &tile_i as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.attn_paged_tiled_f32_gqa.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+    /// Same-slot prefill fast path for the F16 tiled paged kernel.
+    ///
+    /// One block handles `q_block` consecutive query rows sharing a block table
+    /// and reuses each K/V tile across all rows and GQA heads. `q_block` is
+    /// capped so `q_block * groups <= 16` (the register-array bound).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_paged_tiled_f16_gqa_qblock(
+        &self,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        block_tables: *const i32,
+        out: *mut f32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        batch: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+        q_block: i32,
+    ) -> Result<(), Error> {
+        if batch <= 0
+            || n_heads <= 0
+            || n_kv_heads <= 0
+            || head_dim <= 0
+            || head_dim > 256
+            || tokens_per_page <= 0
+            || n_heads % n_kv_heads != 0
+            || !scale.is_finite()
+            || scale <= 0.0
+            || q_block <= 0
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f16_gqa_qblock invalid dims: batch={batch} n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} tpp={tokens_per_page} scale={scale} q_block={q_block}"
+            )));
+        }
+        let groups = n_heads / n_kv_heads;
+        if groups > 16 || q_block.checked_mul(groups).is_none_or(|v| v > 16) {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f16_gqa_qblock q_block={q_block} groups={groups} exceeds 16 register slots"
+            )));
+        }
+        let q_block = q_block.min(batch);
+        let mut tile = (4096usize / head_dim as usize).clamp(1, 128);
+        while tile > 1 && (tile & (tile - 1)) != 0 {
+            tile >>= 1;
+        }
+        let row_blocks = (batch as u64).div_ceil(q_block as u64);
+        let grid = row_blocks
+            .checked_mul(n_kv_heads as u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| {
+                Error::InvalidArgument("attn_paged_tiled_f16_gqa_qblock grid overflow".into())
+            })?;
+        let shared = ((256usize + tile) * 4 + 2 * tile * head_dim as usize * 2) as u32;
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let btp = block_tables;
+        let op = out;
+        let posp = pos;
+        let top = table_offsets;
+        let tile_i = tile as i32;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &btp as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &top as *const *const i32 as *mut core::ffi::c_void,
+            &batch as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &tile_i as *const i32 as *mut core::ffi::c_void,
+            &q_block as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.attn_paged_tiled_f16_gqa_qblock.launch_shmem(
+            [grid, 1, 1],
+            [256, 1, 1],
+            &mut p,
+            self.stream,
+            shared,
+        )?)
+    }
+    /// Run-based F16 tiled paged attention for mixed prefill/decode batches.
+    ///
+    /// Each `run_descs[i]` is `[row0, q_start, q_take]`; one block processes
+    /// that query tile for one KV head. This removes the old "whole batch must
+    /// share one slot" restriction and packs the M dimension as query rows ×
+    /// GQA group, matching the vLLM/FlashInfer tiled layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_attn_paged_tiled_f16_gqa_runs(
+        &self,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        block_tables: *const i32,
+        out: *mut f32,
+        run_descs: *const i32,
+        pos: *const i32,
+        table_offsets: *const i32,
+        n_runs: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        tokens_per_page: i32,
+        q_block: i32,
+    ) -> Result<(), Error> {
+        if n_runs <= 0
+            || n_heads <= 0
+            || n_kv_heads <= 0
+            || head_dim <= 0
+            || head_dim > 256
+            || tokens_per_page <= 0
+            || n_heads % n_kv_heads != 0
+            || !scale.is_finite()
+            || scale <= 0.0
+            || q_block <= 0
+            || run_descs.is_null()
+        {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f16_gqa_runs invalid dims: n_runs={n_runs} n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} tpp={tokens_per_page} scale={scale} q_block={q_block}"
+            )));
+        }
+        let groups = n_heads / n_kv_heads;
+        if groups > 16 || q_block.checked_mul(groups).is_none_or(|v| v > 16) {
+            return Err(Error::InvalidArgument(format!(
+                "attn_paged_tiled_f16_gqa_runs q_block={q_block} groups={groups} exceeds 16 register slots"
+            )));
+        }
+        let mut tile = (4096usize / head_dim as usize).clamp(1, 128);
+        while tile > 1 && (tile & (tile - 1)) != 0 {
+            tile >>= 1;
+        }
+        let grid = (n_runs as u64)
+            .checked_mul(n_kv_heads as u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| {
+                Error::InvalidArgument("attn_paged_tiled_f16_gqa_runs grid overflow".into())
+            })?;
+        let score_cap = (tile + 3) & !3;
+        let shared = ((256usize + score_cap) * 4 + 2 * tile * head_dim as usize * 2) as u32;
+        let qp = q;
+        let kp = k_pool;
+        let vp = v_pool;
+        let btp = block_tables;
+        let op = out;
+        let rp = run_descs;
+        let posp = pos;
+        let top = table_offsets;
+        let tile_i = tile as i32;
+        let mut p = vec![
+            &qp as *const *const f32 as *mut core::ffi::c_void,
+            &kp as *const *const u16 as *mut core::ffi::c_void,
+            &vp as *const *const u16 as *mut core::ffi::c_void,
+            &btp as *const *const i32 as *mut core::ffi::c_void,
+            &op as *const *mut f32 as *mut core::ffi::c_void,
+            &rp as *const *const i32 as *mut core::ffi::c_void,
+            &posp as *const *const i32 as *mut core::ffi::c_void,
+            &top as *const *const i32 as *mut core::ffi::c_void,
+            &n_runs as *const i32 as *mut core::ffi::c_void,
+            &n_heads as *const i32 as *mut core::ffi::c_void,
+            &n_kv_heads as *const i32 as *mut core::ffi::c_void,
+            &head_dim as *const i32 as *mut core::ffi::c_void,
+            &scale as *const f32 as *mut core::ffi::c_void,
+            &tokens_per_page as *const i32 as *mut core::ffi::c_void,
+            &tile_i as *const i32 as *mut core::ffi::c_void,
+            &q_block as *const i32 as *mut core::ffi::c_void,
+        ];
+        Ok(self.attn_paged_tiled_f16_gqa_runs.launch_shmem(
+            [grid, 1, 1],
             [256, 1, 1],
             &mut p,
             self.stream,
@@ -5680,6 +6734,8 @@ impl HipKernels {
         )?)
     }
 
+    /// Legacy per-row dense F32 paged decode kernel; production dense paths
+    /// use the tiled GQA kernels.
     /// Paged decode attention (batched): reads the KV prefix through per-row
     /// block tables from the page pool.
     #[allow(clippy::too_many_arguments)]
@@ -6633,7 +7689,7 @@ impl Drop for HipKernels {
 
 /// Offline hiprtc compile gate: every kernel source must compile for the
 /// target arch **without a device** (hiprtc is a device-independent compiler).
-/// Needs only the ROCm DLLs present; skips when they are absent (plain CI).
+/// Needs the ROCm DLLs present; explicit runs fail loudly when absent (plain CI does not compile this hip-gated test).
 #[cfg(all(test, feature = "hip"))]
 mod offline_tests {
     use super::*;
@@ -6716,6 +7772,10 @@ mod offline_tests {
         KV_STORE_PAGED_F16,
         KV_STORE_PAGED_INT8,
         ATTN_DECODE_PAGED_F16_GQA,
+        ATTN_PAGED_TILED_F16_GQA,
+        ATTN_PAGED_TILED_F16_GQA_QBLOCK,
+        ATTN_PAGED_TILED_F16_GQA_RUNS,
+        ATTN_PAGED_TILED_F32_GQA,
         ATTN_DECODE_PAGED_INT8_GQA,
         KV_STORE_PAGED_MLA,
         ATTN_DECODE_PAGED_MLA,
@@ -6731,18 +7791,18 @@ mod offline_tests {
     fn kernel_count_matches_documented_gate() {
         assert_eq!(
             ALL_KERNELS.len(),
-            74,
+            78,
             "kernel count changed — update the count in CLAUDE.md (离线内核编译门禁) and docs/roadmap.md"
         );
     }
 
     #[test]
     fn all_kernel_sources_compile_offline() {
-        if mach_kernel_sys::hip::hip().is_err() {
-            eprintln!("skipping: ROCm runtime not available");
-            return;
+        if let Err(e) = mach_kernel_sys::hip::hip() {
+            panic!("offline hiprtc gate requires a loadable ROCm runtime: {e}");
         }
         for (name, src) in ALL_KERNELS {
+            eprintln!("[hiprtc offline] compiling {name}");
             let size = HipKernelModule::compile_only("gfx1100", src)
                 .unwrap_or_else(|e| panic!("kernel {name} failed offline hiprtc compile: {e}"));
             assert!(size > 0, "kernel {name} produced an empty code object");

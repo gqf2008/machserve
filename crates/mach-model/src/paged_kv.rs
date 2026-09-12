@@ -75,6 +75,52 @@ pub fn page_offsets(
     Some((physical, pos % tokens_per_page))
 }
 
+/// Build per-(run, query-tile) descriptors for the run-based paged attention
+/// kernel.
+///
+/// A run is a maximal block of adjacent rows with the same KV slot and
+/// consecutive ascending positions. Each output descriptor is
+/// `[row0, q_start, q_take]`: the first query row is `row0 + q_start`, and
+/// `q_take` is the number of adjacent query rows in this tile. The second
+/// return value is true when at least one tile contains multiple query rows.
+#[must_use]
+#[allow(dead_code)] // consumed by the HIP batched path and covered by CPU tests
+pub(crate) fn build_tiled_attn_runs(
+    lens: &[u32],
+    slots: &[u32],
+    q_block: usize,
+) -> (Vec<[i32; 3]>, bool) {
+    assert_eq!(
+        lens.len(),
+        slots.len(),
+        "lens and slots must be equal length"
+    );
+    assert!(q_block > 0, "q_block must be positive");
+
+    let mut runs = Vec::new();
+    let mut any_multi = false;
+    let mut i = 0usize;
+    while i < lens.len() {
+        let slot = slots[i];
+        let mut j = i + 1;
+        while j < lens.len() && slots[j] == slot && lens[j] == lens[j - 1].saturating_add(1) {
+            j += 1;
+        }
+
+        let q_len = j - i;
+        let mut q_start = 0usize;
+        while q_start < q_len {
+            let q_take = q_block.min(q_len - q_start);
+            runs.push([i as i32, q_start as i32, q_take as i32]);
+            any_multi |= q_take > 1;
+            q_start += q_take;
+        }
+        i = j;
+    }
+
+    (runs, any_multi)
+}
+
 /// Paged decode attention (CPU reference).
 ///
 /// `q` is `[n_heads, head_dim]`; the KV page pool is
@@ -971,6 +1017,257 @@ mod tests {
         assert_eq!(page_offsets(&t, 4, 4), Some((20, 0)));
         assert_eq!(page_offsets(&t, 7, 4), Some((20, 3)));
         assert_eq!(page_offsets(&t, 8, 4), None);
+    }
+
+    #[test]
+    fn tiled_attn_runs_split_mixed_slots_and_query_tiles() {
+        let lens = [5u32, 6, 7, 10, 11, 20, 21, 22];
+        let slots = [0u32, 0, 0, 1, 1, 2, 2, 2];
+        let (runs, any_multi) = build_tiled_attn_runs(&lens, &slots, 2);
+        assert!(any_multi);
+        assert_eq!(
+            runs,
+            vec![[0, 0, 2], [0, 2, 1], [3, 0, 2], [5, 0, 2], [5, 2, 1],]
+        );
+    }
+
+    #[test]
+    fn tiled_attn_runs_keep_non_contiguous_slot_blocks_separate() {
+        let lens = [1u32, 2, 4, 5];
+        let slots = [0u32, 0, 0, 0];
+        let (runs, any_multi) = build_tiled_attn_runs(&lens, &slots, 8);
+        assert!(any_multi);
+        assert_eq!(runs, vec![[0, 0, 2], [2, 0, 2]]);
+
+        let (single_runs, any_multi) = build_tiled_attn_runs(&[3, 9], &[0, 1], 4);
+        assert!(!any_multi);
+        assert_eq!(single_runs, vec![[0, 0, 1], [1, 0, 1]]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tiled_attention_runs_cpu(
+        q: &[f32],
+        k_pool: &[f32],
+        v_pool: &[f32],
+        tables: &[PagedTable],
+        slots: &[u32],
+        lens: &[u32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        tokens_per_page: usize,
+        scale: f32,
+        tile: usize,
+        q_block: usize,
+    ) -> Vec<f32> {
+        let row_stride = n_heads * head_dim;
+        let (runs, _) = build_tiled_attn_runs(lens, slots, q_block);
+        let mut out = vec![0.0f32; q.len()];
+        for desc in runs {
+            let row0 = desc[0] as usize;
+            let q_start = desc[1] as usize;
+            let q_take = desc[2] as usize;
+            for r in 0..q_take {
+                let row = row0 + q_start + r;
+                let table = &tables[slots[row] as usize];
+                let got = tiled_attention_decode_cpu(
+                    &q[row * row_stride..(row + 1) * row_stride],
+                    k_pool,
+                    v_pool,
+                    table,
+                    lens[row] as usize,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    tokens_per_page,
+                    scale,
+                    tile,
+                );
+                out[row * row_stride..(row + 1) * row_stride].copy_from_slice(&got);
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn tiled_attention_decode_cpu(
+        q: &[f32],
+        k_pool: &[f32],
+        v_pool: &[f32],
+        table: &PagedTable,
+        pos: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        tokens_per_page: usize,
+        scale: f32,
+        tile: usize,
+    ) -> Vec<f32> {
+        assert_eq!(q.len(), n_heads * head_dim);
+        let groups = n_heads / n_kv_heads;
+        let n = pos + 1;
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let kv = h / groups;
+            let mut m = f32::NEG_INFINITY;
+            let mut l = 0.0f32;
+            let mut acc = vec![0.0f32; head_dim];
+            let mut start = 0usize;
+            while start < n {
+                let nt = tile.min(n - start);
+                let mut scores = vec![0.0f32; nt];
+                for i in 0..nt {
+                    let p = start + i;
+                    let (page, off) = page_offsets(table, p, tokens_per_page).unwrap();
+                    let koff =
+                        ((page as usize * tokens_per_page + off) * n_kv_heads + kv) * head_dim;
+                    let mut sc = 0.0f32;
+                    for dd in 0..head_dim {
+                        sc += q[h * head_dim + dd] * k_pool[koff + dd];
+                    }
+                    scores[i] = sc * scale;
+                }
+                let tile_max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let tile_sum: f32 = scores.iter().map(|s| (s - tile_max).exp()).sum();
+                let m_new = m.max(tile_max);
+                let alpha = (m - m_new).exp();
+                let beta = (tile_max - m_new).exp();
+                for dd in 0..head_dim {
+                    let mut a = 0.0f32;
+                    for i in 0..nt {
+                        let p = start + i;
+                        let (page, off) = page_offsets(table, p, tokens_per_page).unwrap();
+                        let voff = ((page as usize * tokens_per_page + off) * n_kv_heads + kv)
+                            * head_dim
+                            + dd;
+                        a += (scores[i] - m_new).exp() * v_pool[voff];
+                    }
+                    acc[dd] = acc[dd] * alpha + a;
+                }
+                l = l * alpha + tile_sum * beta;
+                m = m_new;
+                start += nt;
+            }
+            for dd in 0..head_dim {
+                out[h * head_dim + dd] = acc[dd] / l;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tiled_attn_runs_cpu_matches_full_for_mixed_slots() {
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 8usize;
+        let tokens_per_page = 4usize;
+        let lens = [0u32, 1, 2, 4, 5];
+        let slots = [0u32, 0, 0, 1, 1];
+        let q_block = 2usize;
+        let tile = 3usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let row_stride = n_heads * head_dim;
+        let mut rng = lcg(123);
+        let q: Vec<f32> = (0..lens.len() * row_stride).map(|_| rng()).collect();
+
+        let num_pages = 2usize;
+        let pool_len = num_pages * tokens_per_page * n_kv_heads * head_dim;
+        let k_pool: Vec<f32> = (0..pool_len).map(|_| rng()).collect();
+        let v_pool: Vec<f32> = (0..pool_len).map(|_| rng()).collect();
+
+        let mut table0 = PagedTable::new();
+        table0.append(0);
+        table0.append(1);
+        let mut table1 = PagedTable::new();
+        table1.append(1);
+        table1.append(0);
+        let tables = [table0, table1];
+
+        let got = tiled_attention_runs_cpu(
+            &q,
+            &k_pool,
+            &v_pool,
+            &tables,
+            &slots,
+            &lens,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            tokens_per_page,
+            scale,
+            tile,
+            q_block,
+        );
+        for row in 0..lens.len() {
+            let want = paged_attention_decode(
+                &q[row * row_stride..(row + 1) * row_stride],
+                &k_pool,
+                &v_pool,
+                &tables[slots[row] as usize],
+                lens[row] as usize,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                tokens_per_page,
+                scale,
+            );
+            let diff = max_abs_diff(&got[row * row_stride..(row + 1) * row_stride], &want);
+            assert!(diff < 1e-6, "row={row} run-tiled vs full max diff {diff}");
+        }
+    }
+
+    #[test]
+    fn tiled_online_softmax_matches_full_attention() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let head_dim = 8;
+        let tokens_per_page = 4;
+        let max_pos = 11usize;
+        let mut rng = lcg(77);
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| rng()).collect();
+        let num_pages = (max_pos + 1).div_ceil(tokens_per_page);
+        let mut table = PagedTable::new();
+        for page in 0..num_pages as u32 {
+            table.append(page);
+        }
+        let pool_len = num_pages * tokens_per_page * n_kv_heads * head_dim;
+        let k_pool: Vec<f32> = (0..pool_len).map(|_| rng()).collect();
+        let v_pool: Vec<f32> = (0..pool_len).map(|_| rng()).collect();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        for pos in [0usize, 3, 4, 7, 10, 11] {
+            let want = paged_attention_decode(
+                &q,
+                &k_pool,
+                &v_pool,
+                &table,
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                tokens_per_page,
+                scale,
+            );
+            for tile in [1usize, 2, 3, 5, 16] {
+                let got = tiled_attention_decode_cpu(
+                    &q,
+                    &k_pool,
+                    &v_pool,
+                    &table,
+                    pos,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    tokens_per_page,
+                    scale,
+                    tile,
+                );
+                let diff = max_abs_diff(&got, &want);
+                assert!(
+                    diff < 1e-6,
+                    "pos={pos} tile={tile} tiled vs full max diff {diff}"
+                );
+            }
+        }
     }
 
     #[test]

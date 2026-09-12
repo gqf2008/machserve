@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 /// 7900 XTX / Windows+ROCm test environment. This is a conservative policy
 /// cap, not a claim that every value below it is issue-free: 16 and 64 rows
 /// passed a 601-token Qwen3-8B/Q4-on-device test, while 128 rows produced a
-/// corrupted greedy continuation and 512 rows has caused hard resets.
+/// corrupted greedy continuation and 512 rows has caused hard resets. The
+/// tiled GQA kernel is wired, but this server cap stays until a controlled
+/// 512-row GPU validation passes and is recorded.
 pub const PAGED_PREFILL_ROWS_MAX: usize = 64;
 
 /// Caps the effective paged prefill batch before any weight load. `capacity`
