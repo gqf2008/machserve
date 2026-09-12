@@ -977,8 +977,10 @@ impl ContinuousModel {
         // The outputs loop below skips count==0 rows and the hard-stop loop
         // finishes the over-limit sequences.
         // Crash breadcrumbs: the batched forward is where a long paged prefill has
-        // been observed to die, so log each chunk boundary. stderr is unbuffered, so
-        // the last line survives a hard power-off.
+        // been observed to die, so log each chunk boundary. stderr is written
+        // synchronously per call, so the last line's write is issued before a power
+        // cut (what the consumer had flushed may still be lost; tracing also
+        // perturbs timing, so "no crash with trace on" is not evidence).
         let did_prefill = rows.iter().any(|&(_, count, wp)| wp && count > 0);
         if did_prefill
             && let Some(pg) = &self.paged
