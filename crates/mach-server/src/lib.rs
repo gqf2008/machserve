@@ -5,6 +5,7 @@ pub mod engine;
 pub mod multimodal;
 #[cfg(feature = "hip")]
 pub mod routes;
+pub mod startup;
 
 #[cfg(feature = "hip")]
 pub use engine::{ImageRuntimeConfig, ServerEngine, VisionSetup};
