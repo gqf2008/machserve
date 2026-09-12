@@ -1441,7 +1441,7 @@ fn batched_paged_f16_chunked_prefill_across_many_pages_repro() {
     // Same cross-path bound as the sibling f16 chunked test: batched (packed)
     // vs single-sequence GEMMs accumulate in different orders and hipBLAS may
     // pick a different tile, so f16 logits agree to ~1e-3 (bound 0.1).
-    let check = |row: usize, got: &[f32], want: &[f32], ctx: &str| {
+    let check = |_row: usize, got: &[f32], want: &[f32], ctx: &str| {
         let max = got
             .iter()
             .zip(want)
