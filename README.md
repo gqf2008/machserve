@@ -133,7 +133,10 @@ cargo run -p mach-server --release --features hip
 #   环境变量:MACH_MODELS(默认 .models)、MACH_MODEL、MACH_CONFIG、
 #   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)、
 #   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)、
-#   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64)、
+#   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64；
+#     当前项目实测环境的保守上限 MACH_PREFILL_ROWS<=64、MACH_CAPACITY<=64，
+#     超过会告警截断/拒绝。已验证 Qwen3-8B/Q4-on-device/TPP=64/约 600 token；
+#     128+ 行已观测到错误输出/整机异常，其他模型与上下文仍需单独验证)、
 #   MACH_KV=int8(实验:Q4_DEVICE=2 的连续 full-attention K/V 用 INT8,预检按 payload+scales)、
 #   MACH_PAGED_DEBUG=1(分页复用 trace:每个请求一行 `paged: admit`/`paged: register`,
 #     含 reused_pages —— 该复用而缺失就是缓存未命中的直接证据)

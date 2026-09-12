@@ -20,7 +20,9 @@
 //! ~54GB would not fit in VRAM; all-Q4 ~13.5GB does),
 //! MACH_PAGED=1 (paged-KV engine with cross-request prefix reuse) with
 //! MACH_TPP (KV page size in tokens, default 64; only read by the modes that
-//! engage paged KV — plain, Q4 and FP8 non-MLA). Limitations: paged KV serves
+//! engage paged KV — plain, Q4 and FP8 non-MLA). The paged-path safety cap is
+//! MACH_PREFILL_ROWS<=64 / MACH_CAPACITY<=64 until the attention rewrite lands.
+//! Limitations: paged KV serves
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
 //! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
 //! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
@@ -56,7 +58,8 @@ use mach_model::vision::VisionConfig;
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
 #[cfg(feature = "hip")]
 use mach_server::startup::{
-    config_from_json, estimate_vram, model_file_bytes, resolve_preprocessor_path,
+    PAGED_PREFILL_ROWS_MAX, cap_paged_prefill_rows, config_from_json, estimate_vram,
+    model_file_bytes, resolve_preprocessor_path,
 };
 #[cfg(feature = "hip")]
 use mach_server::{AppState, ChatFormat, ImageRuntimeConfig, ServerEngine, VisionSetup, router};
@@ -646,6 +649,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Safety cap: paged prefill batches above the empirically safe limit have
+    // caused corrupted outputs and whole-machine resets on the project's 7900
+    // XTX. Apply this before any weight load and make an overridden non-default
+    // value visible in the server log.
+    let prefill_rows = match cap_paged_prefill_rows(prefill_rows, capacity, paged_tpp.is_some()) {
+        Ok(capped) => {
+            if paged_tpp.is_some() && capped != prefill_rows {
+                eprintln!(
+                    "warning: paged prefill rows capped from {prefill_rows} to {capped} \
+                     ({PAGED_PREFILL_ROWS_MAX} is the current conservative policy cap; \
+                     128+ observed unsafe)"
+                );
+            }
+            capped
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+
     // Optional multimodal (Qwen3.5 vision) support: MACH_VISION=1 loads the
     // vision tower weights and image preprocessor config, and serves
     // image_url requests through the OpenAI chat endpoint.
