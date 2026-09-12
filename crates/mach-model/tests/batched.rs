@@ -1406,8 +1406,11 @@ mod paged_quantized_cpu_parity {
     /// `MACH_Q4_DEVICE=2`, 1958 tokens, prefill rows 512) left no Kernel-Power
     /// 41, which weakly excludes the rowbatch axis but this case cannot.
     ///
-    /// Run with a clean env (`MACH_GRAPH` / `MACH_LAYER_DUMP` unset): the
-    /// 1-row CPU reference side is graph-capturable, the 512-row side is not.
+    /// Run with `MACH_GRAPH` unset (and `MACH_LAYER_DUMP` too, so the run matches
+    /// the real failing config): with `MACH_GRAPH=1` the new 1-row decode step below
+    /// is graph-capturable (`n=1 <= GEMV_MAX_M`, dtype F16) while the 512/128-row
+    /// packed chunks are not (`graph_capture_ok`), so that step would run on a
+    /// different execution path than the chunks.
     #[test]
     #[ignore = "known-bad shape (#168): needs MACH_TEST_PAGED_MANY_PAGE=1 and an operator watching"]
     fn batched_paged_q4_all_chunked_prefill_across_many_pages_repro() {
