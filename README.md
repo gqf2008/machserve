@@ -134,7 +134,9 @@ cargo run -p mach-server --release --features hip
 #   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)、
 #   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)、
 #   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64)、
-#   MACH_KV=int8(实验:Q4_DEVICE=2 的连续 full-attention K/V 用 INT8,预检按 payload+scales)
+#   MACH_KV=int8(实验:Q4_DEVICE=2 的连续 full-attention K/V 用 INT8,预检按 payload+scales)、
+#   MACH_PAGED_DEBUG=1(分页复用 trace:每个请求一行 `paged: admit`/`paged: register`,
+#     含 reused_pages —— 该复用而缺失就是缓存未命中的直接证据)
 
 # 调用示例
 curl -s http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/json" \
