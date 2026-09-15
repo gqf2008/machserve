@@ -1743,8 +1743,18 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
   覆盖 `dim=65` + 乱序 page table 与 `dim=128` 跨页路径。
 - 跑后 Display 无新增 4101、Kernel-Power 无新增 41，doctor 仍枚举
   `device_count=2` 且 gpu[0] 为 RX 7900 XTX。
-- 结论：direct kernel GPU parity 已实机通过；端到端 runtime 回归与性能矩阵仍未执行，
-  不宣称性能。
+- 同批真机窗口第二 arm（运行 revision `a3144c1`，当时使用旧测试名
+  `batched_model_q4_q4_kv_matches_f16_paged_decode` / `batched_model_q4_q4_kv_prefill_matches_f16`；
+  整理后的运行记录见 issue #192 评论 `5677451720`。测试文件自 `da84614` 起重命名/注释并新增
+  精确层数断言；该断言不包含在这次真机 run 中，GPU 执行逻辑不变）：
+  tiny Q4 dense + paged KV runtime smoke，
+  `batched_model_q4_q4_kv_runtime_smoke_decode` 与 `batched_model_q4_q4_kv_runtime_smoke_prefill`
+  2 passed / 0 failed，libtest 19.4s / 命令 wall 21.1s；
+  Q4 为有损 KV，runtime smoke 按有限 logit 差 `<1.0` 做粗粒度鲁棒性门禁，逐位数值正确性由上面的
+  kernel CPU-oracle parity 负责。
+- 两条 arm 跑后均无新增 4101/41，doctor 持续枚举 `device_count=2`。
+- 结论：direct kernel GPU parity 已实机通过，tiny runtime smoke 也通过；性能矩阵仍未执行，
+  不宣称 runtime wiring parity 或性能已经完整验证。
 
 ## INT8 KV：paged runtime 接线（#190，2026-09-12）
 

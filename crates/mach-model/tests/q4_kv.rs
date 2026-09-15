@@ -9,8 +9,12 @@
 #![cfg(feature = "hip")]
 
 use mach_kernel_sys::hip;
+use mach_model::batched::BatchedModel;
+use mach_model::config::ModelDType;
 use mach_model::kernels::HipKernels;
 use mach_model::kv_quant::{PagedQ4KvLayout, Q4Kv, attention_decode_q4, scatter_paged_q4};
+use mach_model::sampling::SamplingParams;
+use mach_model::{Config, Weights, WeightsQ4};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -257,4 +261,105 @@ fn paged_q4_attention_matches_cpu_oracle() {
     run_paged_q4_attention_parity(&h, &k, 65, true);
     // 128 is the production head_dim for the current Qwen checkpoints.
     run_paged_q4_attention_parity(&h, &k, 128, false);
+}
+
+#[test]
+#[ignore = "GPU runtime smoke; run explicitly with MACH_TEST_Q4_KV=1"]
+fn batched_model_q4_q4_kv_runtime_smoke_decode() {
+    let (h, _) = gpu_ctx();
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let tpp = 32usize;
+    let w = Weights::random(&cfg, 456).unwrap();
+    let wq = WeightsQ4::from_weights(&w, &cfg);
+    let mut f16 =
+        BatchedModel::with_paged_kv_rows_q4_all(Arc::clone(&h), cfg, &wq, 1, 1, tpp).unwrap();
+    let mut q4 =
+        BatchedModel::with_paged_kv_rows_q4_all_q4_kv(Arc::clone(&h), cfg, &wq, 1, 1, tpp).unwrap();
+    assert!(q4.q4_kv_enabled());
+    assert_eq!(q4.q4_kv_layer_count(), cfg.n_layers);
+
+    // Smoke test only: Q4 KV is lossy, so f16-vs-Q4 argmax may legitimately
+    // diverge. Exact numerical parity is pinned by the kernel-level
+    // CPU-oracle tests above; the absolute bound below only catches gross
+    // runtime/dispatch regressions.
+    for step in 0..8u32 {
+        let token = (step * 37 + 11) % 1024 + 1;
+        f16.decode_step(&[token]).unwrap();
+        q4.decode_step(&[token]).unwrap();
+        let a = f16.read_logits_rows(1).unwrap();
+        let b = q4.read_logits_rows(1).unwrap();
+        let diff = max_abs_diff(&a, &b);
+        assert!(
+            diff < 1.0,
+            "paged Q4 KV runtime logit diff {diff} at decode step {step}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "GPU runtime prefill smoke; run explicitly with MACH_TEST_Q4_KV=1"]
+fn batched_model_q4_q4_kv_runtime_smoke_prefill() {
+    let (h, _) = gpu_ctx();
+    let mut cfg = Config::tiny();
+    cfg.dtype = ModelDType::F16;
+    let tpp = 32usize;
+    let w = Weights::random(&cfg, 654).unwrap();
+    let wq = WeightsQ4::from_weights(&w, &cfg);
+    let mut f16 =
+        BatchedModel::with_paged_kv_rows_q4_all(Arc::clone(&h), cfg, &wq, 2, 4, tpp).unwrap();
+    let mut q4 =
+        BatchedModel::with_paged_kv_rows_q4_all_q4_kv(Arc::clone(&h), cfg, &wq, 2, 4, tpp).unwrap();
+    let table0: Vec<u32> = (0..8).collect();
+    let table1: Vec<u32> = (8..16).rev().collect();
+    f16.set_block_table(0, &table0).unwrap();
+    f16.set_block_table(1, &table1).unwrap();
+    q4.set_block_table(0, &table0).unwrap();
+    q4.set_block_table(1, &table1).unwrap();
+
+    let tokens = [3u32, 17, 42, 5];
+    let lens = [0u32, 1, 0, 1];
+    let slots = [0u32, 0, 1, 1];
+    let mut params_a: Vec<SamplingParams> = (0..tokens.len())
+        .map(|_| SamplingParams::default())
+        .collect();
+    let mut params_b = params_a.clone();
+    let counts_a: Vec<Vec<(u32, u32)>> = vec![Vec::new(); tokens.len()];
+    let counts_b = counts_a.clone();
+    let bias_a: Vec<Vec<(u32, f32)>> = vec![Vec::new(); tokens.len()];
+    let bias_b = bias_a.clone();
+    f16.decode_step_explicit(
+        &tokens,
+        &lens,
+        &slots,
+        &mut params_a,
+        &counts_a,
+        &bias_a,
+        false,
+    )
+    .unwrap();
+    q4.decode_step_explicit(
+        &tokens,
+        &lens,
+        &slots,
+        &mut params_b,
+        &counts_b,
+        &bias_b,
+        false,
+    )
+    .unwrap();
+
+    let a = f16.read_logits_rows(tokens.len()).unwrap();
+    let b = q4.read_logits_rows(tokens.len()).unwrap();
+    let vocab = cfg.vocab_size;
+    for row in 0..tokens.len() {
+        let ar = &a[row * vocab..(row + 1) * vocab];
+        let br = &b[row * vocab..(row + 1) * vocab];
+        let diff = max_abs_diff(ar, br);
+        // Smoke/robustness bound only; exact parity is covered above.
+        assert!(
+            diff < 1.0,
+            "paged Q4 KV prefill row {row} logit diff {diff}"
+        );
+    }
 }
