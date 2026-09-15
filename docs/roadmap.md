@@ -1732,6 +1732,20 @@ GDN 家族第四只状态真 bug:compaction 只搬 KV 不搬 GDN 递归状态。
   无效组合 fail-fast，不静默回退到 f16 KV；
 - 真机 GPU parity / 性能矩阵仍未执行，当前只完成编译与 CPU 预检接线。
 
+## Q4 KV 真机 parity（#192，2026-09-15）
+
+- 硬件：AMD Radeon RX 7900 XTX（gfx1100），`device_count=2`，23.84 GiB free；
+  commit `53fead9`。
+- `MACH_TEST_Q4_KV=1 cargo test -p mach-model --features hip --test q4_kv -- --ignored --test-threads 1 --nocapture`：
+  `paged_q4_store_matches_cpu_oracle`、`paged_q4_attention_matches_cpu_oracle`
+  两项均通过，2 passed / 0 failed，耗时 28.2s。
+- store 逐位对拍 CPU `Q4Kv::quantize`；attention 对拍 CPU oracle；
+  覆盖 `dim=65` + 乱序 page table 与 `dim=128` 跨页路径。
+- 跑后 Display 无新增 4101、Kernel-Power 无新增 41，doctor 仍枚举
+  `device_count=2` 且 gpu[0] 为 RX 7900 XTX。
+- 结论：direct kernel GPU parity 已实机通过；端到端 runtime 回归与性能矩阵仍未执行，
+  不宣称性能。
+
 ## INT8 KV：paged runtime 接线（#190，2026-09-12）
 
 Stage 5 的 `kv_store_paged_int8` / `attn_decode_paged_int8_gqa` 已从
