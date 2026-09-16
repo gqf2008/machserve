@@ -22,6 +22,12 @@ cargo test --workspace --features hip -- --test-threads 1
 cargo test -p mach-engine --features hip --lib -- --ignored --test-threads 1   # #[ignore] 的 GPU 测试
 cargo test -p mach-server --features hip
 
+# GPU 安全门禁(必跑;本机 30 天内 30 次整机硬断电,已定性为硬件层供电问题,不是代码 bug;
+# 复盘与假设矩阵见 docs/rocm-windows-hard-poweroff-investigation.md §8/§12)
+# 规则:单负载串行 —— GPU 负载期间禁止并发 cargo build/clippy/第二个推理/大文件拷贝
+pwsh -File tools/gpu_guard.ps1 pre     # 跑前:device_count/gpu[0] 校验 + 距上次硬断电 ≥60 分钟
+pwsh -File tools/gpu_guard.ps1 post    # 跑后:窗口内 4101/41/6008/WHEA + 二次 device_count 比对
+
 # 单个测试示例
 cargo test -p mach-model --features hip --test batched batched_paged_decode_matches_static_gpu -- --test-threads 1
 
