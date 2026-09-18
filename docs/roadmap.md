@@ -13,7 +13,7 @@
 
 | 阶段 | 交付物 | 验收(exit criteria) |
 |---|---|---|
-| P0 地基 | 工作区骨架 + mach-engine(device/内存/stream/graph 生命周期)+ mach-kernel 边界 + mach-kernel-sys FFI 骨架 + 基准框架 | 全绿构建;软件 graph 捕获/重放测试;注册表调度基准 |
+| P0 地基 | 工作区骨架 + ~~mach-engine~~(批次 3 已删)+ ~~mach-kernel~~(批次 1 已删)+ mach-kernel-sys FFI 骨架 + 基准框架 | 全绿构建;~~软件 graph 捕获/重放测试;注册表调度基准~~(批次 1/3 移除) |
 | P1 单模型 decode 链路 | 小模型:静态 KV + CUDA graph 化 decode + eager prefill + safetensors 权重加载 | 输出与参考实现逐 token 一致;TPOT 对标 TokenSpeed 同 kernel 场景 |
 | P2 引擎化 | mach-scheduler(复用 ts-scheduler-core)+ 连续批处理 + 采样 + axum OpenAI server | 多请求延迟/吞吐基线 vs TokenSpeed/vLLM |
 | P3 性能主力 | MoE + FP8 + MLA(flashinfer)+ AMD(gluon)(spec-decode 已证伪并移除,批次 2/#200) | 吞吐追上/局部超越;GPU util 达标 |
@@ -22,7 +22,7 @@
 
 ## 关键决策(已确认)
 
-- **不用 burn 运行时**:burn 是训练/通用框架,serving 用不上 autodiff/dispatch;其 graph capture 设计作为参考抄入 `mach-engine`。
+- **不用 burn 运行时**:burn 是训练/通用框架,serving 用不上 autodiff/dispatch;其 graph capture 设计曾作为参考(2026-09 批次 3 随 mach-engine 一并移除)。
 - **不用 libtorch / tch-rs**:框架非内核,会把 C++ 运行时拉回。
 - **内核 = 第三方优秀实现**(flashinfer/cutlass/trtllm/gluon),通过 `mach-kernel-sys` FFI 接入。
 - ~~**CUDA 控制用 cudarc**(stream/graph/内存),`cuda` feature 默认关闭~~(2026-09 批次 1 删除占位;CUDA 内核路线改按 NVIDIA CUDA Rust 双轨 cutile-rs/cuda-oxide 重评,见 cuda-port.md)。
@@ -45,12 +45,25 @@
 
 - **目标 GPU = AMD Radeon RX 7900 XTX(gfx1100,24G,Windows 原生 ROCm 6.2)**。
 - 路线改为 **AMD/HIP 优先**:`mach-kernel-sys` 提供 HIP FFI(动态加载 amdhip64_6.dll + hiprtc0602.dll),
-  `mach-engine` 提供 `HipGraphCapture`(2026-09 批次 1 后:`HipMemoryPool` 已删;graph 面批次 3 移除)。
+  `mach-engine` 曾提供 `HipGraphCapture`(2026-09 批次 3 整 crate 移除,hip_arch() 归入 mach-kernel-sys)。
 - tokenspeed-kernel-amd 目前只有 gfx950/gfx1250;7900 XTX 的 kernel 走自有 HIP/hiprtc 路径,
   后续可参考 Gluon(gfx1100 支持)补充。
 - P1 验收改为:小模型 decode 链路在 7900 XTX 上跑通,TPOT 对标 TokenSpeed(同 kernel 场景)。
 
 ## 进度日志
+
+- **后端重构批次 3 完成(2026-09-18,issue #202)**:移除 #103 HIP graph 捕获实验面并删除
+  mach-engine 整 crate —— batched.rs 的 decode_graphs/greedy_graph 字段、graph_capture_ok
+  门控、capture_greedy_decode_graph/capture_decode_graph 捕获实现、set_decode_graph_enabled
+  开关、MACH_GRAPH 环境读取全删;model.rs 的 capture_decode/decode_step_graph/step_graph
+  同步移除;continuous.rs 转发器、lib.rs 的 Error::Engine/Error::Graph 变体清除。
+  hip_arch()/DEFAULT_HIP_ARCH/MACH_HIP_ARCH 搬入 mach-kernel-sys::hip(唯一 FFI 边界)。
+  删 examples/qwen3_30b_graph_churn.rs,decode_bench/qwen_bench 改为纯 eager 基准;
+  tests 的 4 个 graph 对拍测试(decode_graph_matches_eager_f16 /
+  decode_graph_buckets_follow_active_rows / decode_graph_engine_repeated_requests_match_eager /
+  graph_replay_matches_eager)随功能一并删除。workspace 4 crates → 3。
+  验证:fmt / clippy -D warnings / check×2 / workspace lib 测试 / 3 个 CPU 集成套件全绿,
+  offline 81 内核门禁 2/2(graph 无专用内核);GPU 回归待显卡恢复后随批次 2-5 统一补跑。
 
 - **后端重构批次 2 完成(2026-09-18,PR #201 / issue #200)**:移除 spec-decode 实验面,
   纯删除零行为变化 —— 删 `speculative.rs`(442 行)+ `tests/spec_decode.rs` +

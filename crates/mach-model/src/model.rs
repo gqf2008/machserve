@@ -4,12 +4,11 @@
 //! - `update_inputs`: copies the token + position into pinned host buffers and
 //!   issues async H2D copies on the stream;
 //! - `run_kernels`: the whole kernel sequence (GEMMs, norms, attention, KV
-//!   store) — this is exactly what gets captured into a HIP graph;
+//!   store) — this is the fixed per-token kernel sequence;
 //! - `read_logits`: stream sync + D2H copy.
 //!
-//! Because `pos` and `token` are read by kernels from device buffers, one
-//! captured graph can serve every position: update the buffers between
-//! replays, then replay.
+//! Because `pos` and `token` are read by kernels from device buffers, the
+//! same buffers serve every position: update them between steps.
 
 use crate::adaptive::{AdaptiveProfile, BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
@@ -20,8 +19,6 @@ use crate::moe_backend::LruExpertCache;
 use crate::moe_offload;
 use crate::sampling::HipSampler;
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
-use mach_engine::graph::{GraphCapture, GraphHandle};
-use mach_engine::hip::HipGraphCapture;
 use mach_kernel_sys::hip::{self, Hip, HipEvent, HipStream};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -121,7 +118,7 @@ pub struct GpuModel {
     // pinned host input buffers
     host_tok: *mut i32,
     host_pos: *mut i32,
-    // device input buffers (read by kernels; updated between replays)
+    // device input buffers (read by kernels; updated between steps)
     dev_tok: *mut i32,
     dev_pos: *mut i32,
     // activations
@@ -1744,19 +1741,6 @@ impl GpuModel {
         Ok(())
     }
 
-    /// Graph-driven step without logits readback (see [`step_eager`]).
-    pub fn step_graph(&mut self, graph: &dyn GraphHandle, token: u32) -> Result<(), Error> {
-        if self.pos >= self.cfg.max_seq_len {
-            return Err(Error::Model("sequence length exceeded".into()));
-        }
-        self.update_inputs(token)?;
-        // SAFETY: inputs updated on the capture stream before the replay; the
-        // caller syncs before any readback.
-        unsafe { graph.replay()? };
-        self.pos += 1;
-        Ok(())
-    }
-
     /// One eager decode step for `token` at position `self.pos`.
     /// Builds a GPU model with a MoE offload budget: at most `gpu_budget` of the
     /// top-k routed experts are computed on the GPU per step; the rest fall back
@@ -2320,7 +2304,7 @@ impl GpuModel {
         Ok(logits)
     }
 
-    /// Zeroes the KV cache and resets the position (before graph capture).
+    /// Zeroes the KV cache and resets the position (between runs).
     pub fn reset_state(&mut self) -> Result<(), Error> {
         let bytes = self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
         for (kc, vc) in &self.kv_cache {
@@ -2391,45 +2375,6 @@ impl GpuModel {
         self.k.sync()?;
         self.pos = 0;
         Ok(())
-    }
-
-    /// Warms up, resets state, then captures the decode kernel sequence into a
-    /// HIP graph. Replays are driven with
-    /// [`decode_step_graph`](Self::decode_step_graph).
-    pub fn capture_decode(&mut self) -> Result<Box<dyn GraphHandle>, Error> {
-        // Warmup: compile everything and let hipBLAS allocate workspace.
-        for _ in 0..3 {
-            self.update_inputs(0)?;
-            self.run_kernels()?;
-            self.k.sync()?;
-        }
-        self.reset_state()?;
-
-        let cap = HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)?;
-        cap.prepare()?;
-        self.k.sync()?;
-        cap.begin()?;
-        self.run_kernels()?;
-        let graph = cap.end()?;
-        Ok(graph)
-    }
-
-    /// One graph-driven decode step: update inputs, replay, read logits.
-    pub fn decode_step_graph(
-        &mut self,
-        graph: &dyn GraphHandle,
-        token: u32,
-    ) -> Result<Vec<f32>, Error> {
-        if self.pos >= self.cfg.max_seq_len {
-            return Err(Error::Model("sequence length exceeded".into()));
-        }
-        self.update_inputs(token)?;
-        // SAFETY: input buffers are updated on the capture stream before the
-        // replay, and the read syncs the stream before touching the output.
-        unsafe { graph.replay()? };
-        let out = self.read_logits()?;
-        self.pos += 1;
-        Ok(out)
     }
 }
 

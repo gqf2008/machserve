@@ -61,10 +61,7 @@ fn main() {
     let cfg_path = model_dir.join("config.json");
     assert!(cfg_path.exists(), "missing {cfg_path:?}");
     let mut cfg = config_from_json(&cfg_path);
-    // The diagnostic example profiles by default; MACH_GRAPH=1 (#103 decode
-    // graphs) turns it off — event records and graph capture are mutually
-    // exclusive by design.
-    cfg.step_profile = !std::env::var("MACH_GRAPH").is_ok_and(|v| v == "1");
+    cfg.step_profile = true;
     println!(
         "config: d={} layers={} experts={} topk={} moe_inter={} vocab={}",
         cfg.d_model,
@@ -102,7 +99,7 @@ fn main() {
     // Two full passes over the same sequence (the first pass doubles as
     // warmup): logits finite on every step, greedy tokens run-to-run stable
     // (deterministic Q4 path), and per-step timing. MACH_CHECK_STEPS overrides
-    // the default 16 (long runs exercise graph replay stability, #103).
+    // the default 16 (long runs exercise decode stability).
     let n_steps = std::env::var("MACH_CHECK_STEPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -139,8 +136,8 @@ fn main() {
     for (i, &g) in a.iter().enumerate() {
         println!("step {i}: greedy token {g}");
     }
-    // The first pass includes the one-time graph capture when MACH_GRAPH=1;
-    // the second is pure replay steady-state.
+    // The first pass includes any one-time kernel-warmup effects; the
+    // second is steady-state.
     println!(
         "decode: {:.2} ms/step pass1 ({:.0} tok/s, {} steps)",
         el.as_secs_f64() * 1000.0 / n_steps as f64,

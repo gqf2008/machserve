@@ -1,5 +1,5 @@
 //! Loads a real Qwen2.5-0.5B-Instruct checkpoint (BF16 safetensors) and
-//! benchmarks decode TPOT on the GPU, eager vs HIP graph.
+//! benchmarks decode TPOT on the GPU (eager path).
 //!
 //! Also dumps the first tokens' logits to `.models/qwen_rust_logits.json` for
 //! numeric validation against `tools/ref_llama.py` (fp64 reference).
@@ -92,13 +92,6 @@ fn main() {
     }
     let eager_full_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64;
 
-    let graph = model.capture_decode().expect("capture");
-    let t1 = Instant::now();
-    for &t in &seq {
-        model.decode_step_graph(&*graph, t).expect("graph");
-    }
-    let graph_full_ms = t1.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64;
-
     // --- launch-only path ---
     model.reset_state().expect("reset");
     let t2 = Instant::now();
@@ -107,22 +100,9 @@ fn main() {
     }
     let eager_launch_ms = t2.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64;
 
-    let graph2 = model.capture_decode().expect("capture2");
-    let t3 = Instant::now();
-    for &t in &seq {
-        model.step_graph(&*graph2, t).expect("graph launch");
-    }
-    let graph_launch_ms = t3.elapsed().as_secs_f64() * 1000.0 / n_tokens as f64;
-
     println!("\n=== decode TPOT (Qwen2.5-0.5B, 7900 XTX) ===");
-    println!(
-        "full step (incl. logits readback): eager {eager_full_ms:.2} ms/tok | graph {graph_full_ms:.2} ms/tok | {:.2}x",
-        eager_full_ms / graph_full_ms
-    );
-    println!(
-        "launch-only: eager {eager_launch_ms:.2} ms/tok | graph {graph_launch_ms:.2} ms/tok | {:.2}x",
-        eager_launch_ms / graph_launch_ms
-    );
+    println!("full step (incl. logits readback): eager {eager_full_ms:.2} ms/tok");
+    println!("launch-only: eager {eager_launch_ms:.2} ms/tok");
 
     // --- real generation demo: 8 tokens, host argmax (full logits readback) ---
     model.reset_state().expect("reset");

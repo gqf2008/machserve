@@ -14,10 +14,18 @@ use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Default HIP offload architecture for the P1 target (RX 7900 XTX, RDNA3).
+/// Override with the `MACH_HIP_ARCH` environment variable.
+pub const DEFAULT_HIP_ARCH: &str = "gfx1100";
+
+/// Returns the HIP offload arch to compile kernels for.
+#[must_use]
+pub fn hip_arch() -> String {
+    std::env::var("MACH_HIP_ARCH").unwrap_or_else(|_| DEFAULT_HIP_ARCH.to_string())
+}
+
 /// HIP success code.
 pub const HIP_SUCCESS: c_int = 0;
-/// Capture mode: global (the only mode usable from multiple threads).
-pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_int = 0;
 /// Memcpy kinds (driver_types.h).
 pub const HIP_MEMCPY_HOST_TO_HOST: c_int = 0;
 pub const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
@@ -28,8 +36,6 @@ pub const HIP_MEMCPY_DEFAULT: c_int = 4;
 /// Opaque HIP handles.
 pub type HipStream = *mut c_void;
 pub type HipEvent = *mut c_void;
-pub type HipGraph = *mut c_void;
-pub type HipGraphExec = *mut c_void;
 pub type HipModule = *mut c_void;
 pub type HipFunction = *mut c_void;
 pub type HipRtcProgram = *mut c_void;
@@ -76,14 +82,6 @@ pub struct HipApi {
     pub hip_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> c_int,
     pub hip_event_synchronize: unsafe extern "C" fn(HipEvent) -> c_int,
     pub hip_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> c_int,
-    pub hip_stream_begin_capture: unsafe extern "C" fn(HipStream, c_int) -> c_int,
-    pub hip_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> c_int,
-    pub hip_graph_instantiate:
-        unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut c_void, *mut c_char, usize) -> c_int,
-    pub hip_graph_launch: unsafe extern "C" fn(HipGraphExec, HipStream) -> c_int,
-    pub hip_graph_upload: unsafe extern "C" fn(HipGraphExec, HipStream) -> c_int,
-    pub hip_graph_exec_destroy: unsafe extern "C" fn(HipGraphExec) -> c_int,
-    pub hip_graph_destroy: unsafe extern "C" fn(HipGraph) -> c_int,
     pub hip_module_load_data: unsafe extern "C" fn(*mut HipModule, *const c_void) -> c_int,
     pub hip_module_get_function:
         unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> c_int,
@@ -248,13 +246,6 @@ fn load() -> Result<Arc<Hip>, HipError> {
         hip_event_record: sym(&hip_lib, "hipEventRecord")?,
         hip_event_synchronize: sym(&hip_lib, "hipEventSynchronize")?,
         hip_event_elapsed_time: sym(&hip_lib, "hipEventElapsedTime")?,
-        hip_stream_begin_capture: sym(&hip_lib, "hipStreamBeginCapture")?,
-        hip_stream_end_capture: sym(&hip_lib, "hipStreamEndCapture")?,
-        hip_graph_instantiate: sym(&hip_lib, "hipGraphInstantiate")?,
-        hip_graph_launch: sym(&hip_lib, "hipGraphLaunch")?,
-        hip_graph_upload: sym(&hip_lib, "hipGraphUpload")?,
-        hip_graph_exec_destroy: sym(&hip_lib, "hipGraphExecDestroy")?,
-        hip_graph_destroy: sym(&hip_lib, "hipGraphDestroy")?,
         hip_module_load_data: sym(&hip_lib, "hipModuleLoadData")?,
         hip_module_get_function: sym(&hip_lib, "hipModuleGetFunction")?,
         hip_module_unload: sym(&hip_lib, "hipModuleUnload")?,
