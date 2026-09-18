@@ -4,8 +4,11 @@
 
 ## 1. 现状（已有，可复用）
 
-- **后端无关抽象**（`mach-engine`）：`MemoryPool` / `Allocation`、`GraphCapture` / `GraphHandle`、`Device` / `DType` / `Shape` —— CUDA 直接实现这些 trait 即可接入 host 侧。
-- **占位**（`crates/mach-engine/src/cuda.rs`，`cuda` feature 编译）：`CudaMemoryPool` / `CudaGraphCapture` 已定义，`supported() = false`。
+> 2026-09 后端重构批次 1 后：原 `mach-engine` 的 `MemoryPool` / `Device` / `DType` / `Shape`
+> 与 `cuda.rs` 占位已删除（零用户）；服务级后端边界（`mach-model::backend::ServingModel`）
+> 在批次 6-8 落地，CUDA 占位后端随批次 8 接入。本文 P1-P5 的"镜像 hiprtc/NVRTC"思路
+> 届时按 NVIDIA CUDA Rust 双轨（cutile-rs Tile JIT / cuda-oxide SIMT）重新评估。
+
 - **唯一 FFI 边界**（`mach-kernel-sys`）：HIP 侧是动态加载 amdhip64_6.dll / hiprtc0602.dll / hipblas.dll；CUDA 侧镜像为 cuBLAS / NVRTC（cuBLAS 动态库 + nvrtc64_*.dll）。
 
 ## 2. 要做的（按依赖顺序）

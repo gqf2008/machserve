@@ -9,7 +9,6 @@
 #[cfg(feature = "hip")]
 pub mod adaptive;
 pub mod adaptive_policy;
-pub mod adaptive_q;
 #[cfg(feature = "hip")]
 pub mod batched;
 pub mod config;
@@ -28,7 +27,6 @@ pub mod moe_offload;
 pub mod mrope;
 pub mod multimodal;
 pub mod paged_kv;
-pub mod paged_scheduler;
 pub mod prefill_buffered;
 pub mod prefix_cache;
 pub mod prefix_kv;

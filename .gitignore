@@ -1,8 +1,5 @@
 /target
 Cargo.lock
-# third-party kernel build artifacts
-/thirdparty/**/build
-/thirdparty/**/cmake-build*
 *.o
 *.a
 *.so
@@ -16,6 +13,10 @@ __pycache__/
 
 # local scratch: A/B scripts, server logs, one-off inspection tools
 /.scratch
+
+# junk guards: shell that fails to expand %SystemDrive%, throwaway probes
+/%SystemDrive%/
+crates/mach-model/examples/ab_probe_tmp.rs
 
 # C4 vision runbook outputs (golden/e2e dumps, never committed)
 /artifacts

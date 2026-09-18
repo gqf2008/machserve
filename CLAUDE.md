@@ -48,13 +48,10 @@ cargo run -p mach-model --release --features hip --example chat_check    # 真�
 ```
 mach-kernel-sys    唯一的 ROCm/BLAS FFI 边界(基准 example 的 psapi 显存计数除外):运行时动态加载
                    amdhip64_6.dll(回退 amdhip64.dll)/ hiprtc0602.dll / hipblas.dll(libloading,无链接期
-                   依赖;ROCm bin 目录可用 MACH_HIP_PATH 覆盖;flashinfer/cutlass feature 需 MACH_THIRDPARTY 指向预编译库)
-mach-engine        后端无关核心:Device/DType/Shape、内存池(CPU + HipMemoryPool)、
-                   stream/event、图捕获(SoftwareGraphCapture + HipGraphCapture)
-mach-kernel        Kernel trait / op registry 内核边界抽象(主要为设计骨架 + mach-bench 面)
+                   依赖;ROCm bin 目录可用 MACH_HIP_PATH 覆盖)
+mach-engine        HIP 图捕获生命周期(HipGraphCapture + hip_arch;后端重构批次 3 移除整个 crate)
 mach-model         模型层(见下)
 mach-server        axum OpenAI 兼容 API(completions/chat/SSE)+ doctor 子命令
-mach-bench         host 侧派发开销微基准
 ```
 
 ### mach-model 内部分层(理解本仓库的关键)

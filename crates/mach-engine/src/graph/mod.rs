@@ -6,14 +6,8 @@
 //! allocate nothing (an allocation mid-capture becomes a memory node and the
 //! resulting graph cannot be relaunched).
 //!
-//! [`SoftwareGraphCapture`] is the reference implementation used on CPU and in
-//! tests: it records operation descriptors instead of launching kernels and
-//! replays them by name. The CUDA implementation (behind the `cuda` feature)
-//! drives the real driver API through cudarc.
-
-mod software;
-
-pub use software::SoftwareGraphCapture;
+//! The only remaining implementation is the HIP one (`crate::hip`), kept
+//! until refactor batch 3 removes the graph experiment surface.
 
 use core::fmt;
 

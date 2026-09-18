@@ -5,15 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "MachServe FFI boundary: bindings to thirdparty/ C/CUDA kernel libraries."
-build = "build.rs"
+description = "MachServe FFI boundary: ROCm/HIP dynamic loading (amdhip64_6 / hiprtc / hipblas)."
 
 [features]
 default = []
-# Compile the flashinfer FFI declarations (requires thirdparty/flashinfer built).
-flashinfer = []
-# Compile the cutlass FFI declarations (requires thirdparty/cutlass built).
-cutlass = []
 # HIP runtime FFI (ROCm). Loads amdhip64_6.dll / hiprtc0602.dll dynamically.
 hip = ["dep:libloading"]
 
