@@ -15,7 +15,7 @@
 //! included), then a single uniform draw walks the allowed set.
 
 use crate::Error;
-use mach_engine::hip::hip_arch;
+use mach_kernel_sys::hip::hip_arch;
 use mach_kernel_sys::hip::{self, Hip, HipKernelModule, HipStream};
 use std::sync::Arc;
 

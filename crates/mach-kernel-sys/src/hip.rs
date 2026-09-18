@@ -15,6 +15,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// HIP success code.
+/// Default HIP offload architecture for the P1 target (RX 7900 XTX, RDNA3).
+/// Override with the `MACH_HIP_ARCH` environment variable.
+pub const DEFAULT_HIP_ARCH: &str = "gfx1100";
+
+/// Returns the HIP offload arch to compile kernels for.
+#[must_use]
+pub fn hip_arch() -> String {
+    std::env::var("MACH_HIP_ARCH").unwrap_or_else(|_| DEFAULT_HIP_ARCH.to_string())
+}
+
 pub const HIP_SUCCESS: c_int = 0;
 /// Capture mode: global (the only mode usable from multiple threads).
 pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_int = 0;

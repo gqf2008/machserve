@@ -111,34 +111,6 @@ fn gpu_matches_cpu_reference_large_dmodel() {
 
 #[cfg(feature = "hip")]
 #[test]
-fn graph_replay_matches_eager() {
-    let Some(hip) = hip_ctx() else { return };
-    let cfg = Config::tiny();
-    let w = Weights::random(&cfg, 11).unwrap();
-    let tokens = [17u32, 3, 255];
-
-    // Eager path on a fresh model.
-    let mut eager = GpuModel::new(hip.clone(), cfg, &w).unwrap();
-    let mut eager_logits = Vec::new();
-    for &t in &tokens {
-        eager_logits.push(eager.decode_step(t).unwrap());
-    }
-
-    // Graph path: warmup + reset + capture, then replay the same tokens.
-    let mut graph_model = GpuModel::new(hip, cfg, &w).unwrap();
-    let graph = graph_model.capture_decode().unwrap();
-    let mut graph_logits = Vec::new();
-    for &t in &tokens {
-        graph_logits.push(graph_model.decode_step_graph(&*graph, t).unwrap());
-    }
-
-    for (i, (g, e)) in graph_logits.iter().zip(&eager_logits).enumerate() {
-        assert_close(g, e, 5e-3, 5e-3, &format!("graph vs eager step {i}"));
-    }
-}
-
-#[cfg(feature = "hip")]
-#[test]
 fn kv_cache_is_positional() {
     let Some(hip) = hip_ctx() else { return };
     let cfg = Config::tiny();

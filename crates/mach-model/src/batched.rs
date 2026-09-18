@@ -13,7 +13,6 @@ use crate::kernels::RopeParams;
 use crate::moe_offload;
 use crate::sampling::{BatchedSampler, SampleOutput, SamplingParams};
 use crate::{Config, Error, Weights, WeightsFp8, WeightsQ4};
-use mach_engine::graph::GraphCapture;
 use mach_kernel_sys::hip::{self, Hip, HipEvent};
 use std::sync::Arc;
 
@@ -499,26 +498,6 @@ pub struct BatchedModel {
     /// Device per-row table offsets: `[rows]` ints, `offset[row] = slots[row] *
     /// max_pages_per_seq`, refreshed per step.
     table_offsets: *mut i32,
-    /// #103: lazily captured HIP graphs for pure-decode steps, keyed by the
-    /// active row count `n` (`1..=GEMV_MAX_M`). Capture folds the whole decode
-    /// step (~700 module launches + the input-upload memcpys on this
-    /// host-launch-bound platform) into one `hipGraphLaunch`; replay re-reads
-    /// the pinned staging buffers, so only the sampler readback (sync + D2H)
-    /// stays outside the graph.
-    decode_graphs: std::collections::HashMap<i32, Box<dyn mach_engine::graph::GraphHandle>>,
-    /// The greedy [`Self::decode_step`] graph (its row count is always
-    /// `self.batch`, so a single graph suffices — kept separate from
-    /// `decode_graphs`, whose captures embed the full sampler instead of the
-    /// argmax readback kernel).
-    greedy_graph: Option<Box<dyn mach_engine::graph::GraphHandle>>,
-    /// MACH_GRAPH=1 gate for service-chain decode-graph capture (also
-    /// switchable via [`Self::set_decode_graph_enabled`]). Experimental: on
-    /// ROCm 6.2 / Windows the 30B service chain degenerates after ~1-4k graph
-    /// replays (hipGraphLaunch/sync report success while the GPU work silently
-    /// vanishes — see the churn repro `qwen3_30b_graph_churn`); pure single-
-    /// stream replay survived 12k steps, so the knob stays opt-in until the
-    /// driver-side behavior is re-verified on a newer ROCm.
-    graph_enabled: bool,
     /// Debug (issue #107 layer-divergence localization): when set, every
     /// forward snapshots the LAST active row's residual (`self.x`) to
     /// `<dir>/hs_L{li:02}.npy` after each layer body — the same per-layer
@@ -1369,9 +1348,6 @@ impl BatchedModel {
             offsets_host: std::ptr::null_mut(),
             offsets_dirty: false,
             table_offsets: std::ptr::null_mut(),
-            decode_graphs: std::collections::HashMap::new(),
-            greedy_graph: None,
-            graph_enabled: std::env::var("MACH_GRAPH").is_ok_and(|v| v == "1"),
             layer_dump: None,
         };
         m.alloc_buffers()?;
@@ -2538,8 +2514,6 @@ impl BatchedModel {
         self.rope_delta = 0;
         self.row_embed_active = false;
         self.row_embed_rows = 0;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
         if !self.int8_kv_cache.is_empty() {
             let payload_bytes =
                 self.batch * self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim;
@@ -2739,8 +2713,6 @@ impl BatchedModel {
     pub fn set_mrope_tables(&mut self, cos: &[f32], sin: &[f32], rows: usize) -> Result<(), Error> {
         self.mrope_active = false;
         self.mrope_rows = 0;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
         let rot = self.cfg.attn_rotary_dim();
         if rows == 0 || rows > self.rows {
             return Err(Error::InvalidArgument(format!(
@@ -2776,8 +2748,6 @@ impl BatchedModel {
         )?;
         self.mrope_rows = rows;
         self.mrope_active = true;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
         Ok(())
     }
 
@@ -2785,8 +2755,6 @@ impl BatchedModel {
     pub fn clear_mrope_tables(&mut self) {
         self.mrope_active = false;
         self.mrope_rows = 0;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
     }
 
     /// HF `rope_deltas` used for token-by-token text continuation after a
@@ -2794,8 +2762,6 @@ impl BatchedModel {
     /// the RoPE angle is shifted by this delta.
     pub fn set_rope_delta(&mut self, delta: i32) {
         self.rope_delta = delta;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
     }
     /// Upload row-level embedding overrides for the next step. `features` is
     /// `[rows, d_model]`; row `r` overrides the normal token embedding when
@@ -2808,8 +2774,6 @@ impl BatchedModel {
     ) -> Result<(), Error> {
         self.row_embed_active = false;
         self.row_embed_rows = 0;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
         if rows == 0 || rows > self.rows || mask.len() != rows {
             return Err(Error::InvalidArgument(format!(
                 "row embedding rows/mask mismatch: rows={rows} mask={} capacity={}",
@@ -2857,8 +2821,6 @@ impl BatchedModel {
     pub fn clear_row_embeddings(&mut self) {
         self.row_embed_active = false;
         self.row_embed_rows = 0;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
     }
 
     /// Runs a batched decode step for `tokens` (one per sequence), returning the
@@ -2869,44 +2831,6 @@ impl BatchedModel {
             if *l as usize >= self.cfg.max_seq_len {
                 return Err(Error::Model(format!("seq {i} exceeds max_seq_len")));
             }
-        }
-        let b = self.batch;
-        if self.graph_capture_ok(b, true) {
-            // Greedy graph path (#103): stage every pinned mirror, then one
-            // replay covers uploads + run_kernels + argmax; only the D2H
-            // readback stays outside.
-            unsafe {
-                for (i, (&t, &l)) in tokens.iter().zip(&self.lens).enumerate() {
-                    *self.tokens_host.add(i) = t as i32;
-                    *self.pos_host.add(i) = l as i32;
-                    *self.slots_host.add(i) = i as i32; // row == slot for decode
-                    *self.run_mask_host.add(i) = 0;
-                    self.last_row_by_slot[i] = i;
-                }
-            }
-            if self.paged {
-                // The graph always re-uploads the offsets: keep the staging at
-                // the identity mapping this entry point guarantees.
-                let identity: Vec<u32> = (0..b as u32).collect();
-                self.stage_table_offsets(&identity);
-            }
-            if self.greedy_graph.is_none() {
-                self.capture_greedy_decode_graph()?;
-            }
-            // SAFETY: every captured buffer is owned by `self` and alive; the
-            // pinned staging mirrors were refreshed above on this thread.
-            unsafe { self.greedy_graph.as_deref().unwrap().replay()? }
-            let next = self.sample_readback(b)?;
-            // Only now is the device offsets buffer known to hold the identity
-            // mapping (the graph's recorded memcpy uploaded it): clearing the
-            // dirty flag earlier would let a failed capture/replay leave a
-            // stale non-identity table in place while the eager fallback
-            // skips its refresh.
-            self.offsets_dirty = false;
-            for l in self.lens.iter_mut() {
-                *l += 1;
-            }
-            return Ok(next);
         }
         unsafe {
             for (i, (&t, &l)) in tokens.iter().zip(&self.lens).enumerate() {
@@ -3117,73 +3041,6 @@ impl BatchedModel {
     }
 
     /// #103: a step is graph-capturable only when it is a pure decode step on
-    /// the custom-GEMV path with a fully device-driven MoE and no outside
-    /// stream/sync involvement:
-    /// - `decode_only` (prefill/mixed steps keep the hipBLAS/host-loop paths,
-    ///   which sync and read counts back to the host);
-    /// - `n <= GEMV_MAX_M` so every projection's grid is fixed at capture
-    ///   time, and every projection's reduction width `<= GEMV_MAX_D` so
-    ///   every projection takes the custom GEMV kernels — the hipBLAS
-    ///   `GemmEx` fallback may lazily allocate workspace, which aborts
-    ///   capture. The widths are the input side of each projection: dense
-    ///   models use d / nq / inter, MLA adds q_lora_rank / kv_lora_rank;
-    /// - f16 (f32 routes even small GEMMs through hipBLAS);
-    /// - no step profiler (event records would be baked into the graph) and no
-    ///   prefetch engine (its cross-stream H2D pipeline cannot be captured);
-    /// - MoE models must take the device-driven grouped path with all experts
-    ///   resident (no CPU-expert host loop).
-    fn graph_capture_ok(&self, n: usize, decode_only: bool) -> bool {
-        if !(self.graph_enabled && decode_only)
-            || self.prof.is_some()
-            || self.prefetch.is_some()
-            || self.layer_dump.is_some()
-            || self.cfg.dtype != ModelDType::F16
-            || (self.int8_kv && self.paged)
-            || self.q4_kv
-            || n == 0
-            || n > GEMV_MAX_M as usize
-        {
-            return false;
-        }
-        let c = &self.cfg;
-        let max_kk = if c.kv_lora_rank > 0 {
-            // MLA: q_a(d) / kv_a(d) / q_b(q_lora_rank) / kv_b(kv_lora_rank)
-            // / o(n_heads * v_head_dim).
-            c.d_model
-                .max(c.q_lora_rank)
-                .max(c.kv_lora_rank)
-                .max(c.n_heads * c.v_head_dim)
-        } else {
-            // Dense/MoE: q/k/v + router + lm_head(d), o(nq), dense-MLP
-            // down(inter); MoE experts ride the device-driven grouped kernels
-            // (required below), not the gemm closure. Qwen3.5 adds the GDN
-            // projections (all contract over d, except out_proj over
-            // gdn_value_dim) and the doubled q_proj row count (n, not kk —
-            // the GEMV grid scales with it, n is unbounded by GEMV_MAX_D).
-            c.d_model
-                .max(c.n_heads * c.head_dim)
-                .max(c.intermediate_size)
-                .max(c.gdn_value_dim())
-        };
-        if max_kk > GEMV_MAX_D as usize {
-            return false;
-        }
-        if c.num_experts > 0 {
-            let grouped = self.moe_grouped || !self.q4_experts.is_empty();
-            if !grouped || self.expert_slots < c.num_experts {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Enables/disables decode-graph capture (MACH_GRAPH=1 sets the initial
-    /// value at construction; tests use this setter instead of the process-wide
-    /// env). Existing captured graphs stay cached.
-    pub fn set_decode_graph_enabled(&mut self, on: bool) {
-        self.graph_enabled = on;
-    }
-
     /// Debug (issue #107): after every forward, write the LAST active row's
     /// per-layer residual (post full layer — attention + MLP/MoE residual, the
     /// same point `.scratch/np_ref.py` records) to `<dir>/hs_L{li:02}.npy`
@@ -3200,18 +3057,12 @@ impl BatchedModel {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::Model(format!("layer dump dir {}: {e}", dir.display())))?;
-        self.graph_enabled = false;
-        self.decode_graphs.clear();
-        self.greedy_graph = None;
         self.layer_dump = Some(dir);
         Ok(())
     }
 
     /// Turns the layer dump off (files stay on disk). The dump example uses
     /// this before generating, so the prompt's final-step files survive.
-    /// Graph capture stays disabled — re-enabling is the caller's call
-    /// ([`Self::set_decode_graph_enabled`]); the prior setting is not
-    /// remembered.
     pub fn clear_layer_dump(&mut self) {
         self.layer_dump = None;
     }
@@ -3239,112 +3090,6 @@ impl BatchedModel {
             hip::HIP_MEMCPY_DEVICE_TO_HOST,
         )?;
         write_npy_f32(&dir.join(name), &hs)
-    }
-
-    /// Number of captured decode graphs (one per active-row-count bucket seen
-    /// so far). Diagnostics/tests for the #103 graph path.
-    #[must_use]
-    pub fn decode_graph_count(&self) -> usize {
-        self.decode_graphs.len()
-    }
-
-    /// Captures the greedy [`Self::decode_step`] sequence (input uploads +
-    /// `run_kernels` + argmax) into a single HIP graph. Same capture-then-
-    /// immediately-replay contract as [`Self::capture_decode_graph`].
-    fn capture_greedy_decode_graph(&mut self) -> Result<(), Error> {
-        let cap =
-            mach_engine::hip::HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)
-                .inspect_err(|_| self.graph_enabled = false)?;
-        // Any capture failure permanently disables the graph path: a caller
-        // must fall back to eager rather than re-failing every step.
-        if let Err(e) = cap.prepare() {
-            self.graph_enabled = false;
-            return Err(e.into());
-        }
-        self.k.sync()?;
-        if let Err(e) = cap.begin() {
-            self.graph_enabled = false;
-            return Err(e.into());
-        }
-        let record = (|| {
-            self.upload_decode_inputs(self.batch)?;
-            self.run_kernels(
-                self.batch as i32,
-                self.slots_dev,
-                self.run_mask_dev,
-                true,
-                0,
-                0,
-                false,
-            )?;
-            self.sample_device(self.batch)
-        })();
-        // `end` must run even when recording failed, to leave capture mode.
-        match (record, cap.end()) {
-            (Ok(()), Ok(g)) => {
-                self.greedy_graph = Some(g);
-                eprintln!("greedy decode graph captured (batch={})", self.batch);
-                Ok(())
-            }
-            (Err(e), _) => {
-                self.graph_enabled = false;
-                Err(e)
-            }
-            (Ok(()), Err(e)) => {
-                self.graph_enabled = false;
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Captures one pure-decode step (input uploads + `run_kernels` + sampler
-    /// upload/kernel) into a HIP graph keyed by the active row count `n`.
-    /// Stream capture records without executing, so the first replay right
-    /// after capture performs exactly the step that was just recorded — no
-    /// separate warmup is needed (all kernels were compiled at
-    /// [`HipKernels::new`] and all device buffers were allocated at
-    /// construction, so the capture window allocates and compiles nothing).
-    fn capture_decode_graph(&mut self, n: i32) -> Result<(), Error> {
-        let cap =
-            mach_engine::hip::HipGraphCapture::with_stream(Arc::clone(self.k.hip()), self.k.stream)
-                .inspect_err(|_| self.graph_enabled = false)?;
-        // Any capture failure permanently disables the graph path: a caller
-        // must fall back to eager rather than re-failing every step.
-        if let Err(e) = cap.prepare() {
-            self.graph_enabled = false;
-            return Err(e.into());
-        }
-        self.k.sync()?;
-        if let Err(e) = cap.begin() {
-            self.graph_enabled = false;
-            return Err(e.into());
-        }
-        let record = (|| {
-            self.upload_decode_inputs(n as usize)?;
-            self.run_kernels(n, self.slots_dev, self.run_mask_dev, true, 0, 0, false)?;
-            self.sampler.sample_batched_upload(n as usize)?;
-            self.sampler
-                .sample_batched_kernel(self.logits, n, self.cfg.vocab_size)
-        })();
-        // `end` must run even when recording failed, to leave capture mode.
-        match (record, cap.end()) {
-            (Ok(()), Ok(g)) => {
-                self.decode_graphs.insert(n, g);
-                eprintln!(
-                    "decode graph captured: n={n} ({} total)",
-                    self.decode_graphs.len()
-                );
-                Ok(())
-            }
-            (Err(e), _) => {
-                self.graph_enabled = false; // don't retry a failing shape
-                Err(e)
-            }
-            (Ok(()), Err(e)) => {
-                self.graph_enabled = false;
-                Err(e.into())
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5073,29 +4818,13 @@ impl BatchedModel {
         }
         self.stage_table_offsets(slots);
         self.offsets_dirty = true;
-        // Sampler parameter staging is host-only; the upload + kernel either
-        // run eagerly below or are recorded inside the decode graph.
+        // Sampler parameter staging is host-only; the upload + kernel run
+        // eagerly below.
         self.sampler.sample_batched_stage(params, counts, bias)?;
         let vocab = self.cfg.vocab_size;
         let groups = (self.cfg.n_heads / self.cfg.n_kv_heads).max(1);
         let q_block = (16 / groups).clamp(1, 4);
         let (paged_runs, paged_runs_multi) = self.stage_paged_attn_runs(lens, slots, q_block)?;
-        // Graphs record the legacy one-row-per-slot GDN kernels; a chunked
-        // step (mixed prefill rows) or a multi-row paged run must stay on the
-        // eager per-run path.
-        if num_gdn_runs == 0 && !paged_runs_multi && self.graph_capture_ok(n, decode_only) {
-            let key = n as i32;
-            if !self.decode_graphs.contains_key(&key) {
-                self.capture_decode_graph(key)?;
-            }
-            // SAFETY: every buffer the graph touches is owned by `self` and
-            // alive; the pinned staging mirrors (inputs + sampler params) were
-            // refreshed above on this thread, and no other stream uses them.
-            unsafe { self.decode_graphs[&key].replay()? }
-            return self
-                .sampler
-                .sample_batched_readback(self.logits, params, vocab);
-        }
         self.upload_decode_inputs(n)?;
         self.run_kernels(
             n as i32,

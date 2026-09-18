@@ -5,7 +5,7 @@
 
 use crate::Config;
 use crate::Error;
-use mach_engine::hip::hip_arch;
+use mach_kernel_sys::hip::hip_arch;
 use mach_kernel_sys::hip::{self, Hip, HipKernelModule, HipStream};
 
 /// Rotary embedding parameters, bundled so the RoPE launches keep a stable

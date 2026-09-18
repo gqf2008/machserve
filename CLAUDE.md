@@ -42,13 +42,12 @@ cargo run -p mach-model --release --features hip --example chat_check    # 真�
 
 运行时环境变量(MACH_MODELS / MACH_MODEL / MACH_CONFIG / MACH_TOKENIZER / MACH_CAPACITY / MACH_PREFILL_ROWS / MACH_MOE_SLOTS / MACH_ADDR / MACH_DTYPE / MACH_Q4 / MACH_FP8 / MACH_HIP_PATH 等)以 `crates/mach-server/src/main.rs` 中 `env::var` 的读取点为准(顶部文档注释只列了其中一部分)。
 
-## 架构(crates,自底向上)
+## 架构(3 crates,自底向上)
 
 ```
 mach-kernel-sys    唯一的 ROCm/BLAS FFI 边界(基准 example 的 psapi 显存计数除外):运行时动态加载
                    amdhip64_6.dll(回退 amdhip64.dll)/ hiprtc0602.dll / hipblas.dll(libloading,无链接期
-                   依赖;ROCm bin 目录可用 MACH_HIP_PATH 覆盖)
-mach-engine        HIP 图捕获生命周期(HipGraphCapture + hip_arch;后端重构批次 3 移除整个 crate)
+                   依赖;ROCm bin 目录可用 MACH_HIP_PATH 覆盖;MACH_HIP_ARCH 覆盖编译目标架构)
 mach-model         模型层(见下)
 mach-server        axum OpenAI 兼容 API(completions/chat/SSE)+ doctor 子命令
 ```
@@ -63,7 +62,7 @@ mach-server        axum OpenAI 兼容 API(completions/chat/SSE)+ doctor 子命�
 
 ### 请求流与线程模型
 
-HTTP handler(axum)→ channel → **唯一后台引擎线程**(模型/GPU 状态只在该线程,`mach-server/src/engine.rs`)→ ContinuousModel → BatchedModel → hipBLAS GEMM + hiprtc 内核。HIP graph 捕获重放在 GpuModel 单序列路径(`model.rs` 的 `capture_decode`)与服务链(#103,MACH_GRAPH 实验开关)均已接入;#103 实测服务链 host-bound、graph 零收益,30B 图捕获在 ROCm 6.2/Windows 驱动上有腐化缺陷,该方向暂停。
+HTTP handler(axum)→ channel → **唯一后台引擎线程**(模型/GPU 状态只在该线程,`mach-server/src/engine.rs`)→ ContinuousModel → BatchedModel → hipBLAS GEMM + hiprtc 内核。HIP graph 捕获(#103)已随后端重构批次 3 移除:实测服务链 host-bound 零收益,30B 图捕获在 ROCm 6.2/Windows 驱动上有腐化缺陷;mach-engine crate 一并删除,hip_arch() 归入 mach-kernel-sys。
 
 ## 关键约定
 

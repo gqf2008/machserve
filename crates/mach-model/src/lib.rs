@@ -68,12 +68,6 @@ pub enum Error {
     #[error("hip error: {0}")]
     #[cfg(feature = "hip")]
     Hip(#[from] mach_kernel_sys::hip::HipError),
-    #[error("engine error: {0}")]
-    #[cfg(feature = "hip")]
-    Engine(#[from] mach_engine::Error),
-    #[error("graph error: {0}")]
-    #[cfg(feature = "hip")]
-    Graph(#[from] mach_engine::graph::GraphError),
 }
 
 #[cfg(feature = "hip")]
