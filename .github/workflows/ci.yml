@@ -63,8 +63,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: engine HIP memory-pool parity
-        run: cargo test -p mach-engine --features hip --lib -- --ignored --test-threads=1
       # NOTE: this step runs only the *non*-`#[ignore]`d model tests, and the two
       # ways that leaves GPU parity uncovered are different:
       #  - truly `#[ignore]`d suites (`mrope_gpu`, `embed_gpu`, `int8_kv`,

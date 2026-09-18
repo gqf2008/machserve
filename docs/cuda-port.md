@@ -16,7 +16,7 @@
 | 步 | 内容 | 依赖 |
 |---|---|---|
 | P1 | `mach-kernel-sys` 加 `cuda` 后端：动态加载 cudart / cuBLAS / NVRTC，镜像现有 hip.rs 的 `Hip` 结构（`Cuda` + `api` 表） | 有 CUDA 工具链的构建机 |
-| P2 | `CudaMemoryPool` 真实现（cudaMallocAsync + 持久池 + graph pin，复用 MemoryPool 契约）；`CudaGraphCapture`（cuStreamBegin/EndCapture + Instantiate + Launch，严格 NoCapture→Prepare→Capture 生命周期） | P1 |
+| P2 | ~~`CudaMemoryPool` 真实现（复用 MemoryPool 契约）；`CudaGraphCapture`~~（MemoryPool trait 与 graph 面已随批次 1/3 退役——本行随批次 8 按 ServingModel 边界重定义） | P1 |
 | P3 | GEMM 走 cuBLAS（GemmEx，fp16/fp32 累加路径已定义）；注意力/采样/MoE 内核走 NVRTC 编译（镜像 hiprtc 的 `HipKernelModule` → `CudaKernelModule` + KERNEL_CACHE） | P1 |
 | P4 | `mach-model` / `mach-server` 按 `feature` 选后端（`hip` / `cuda` 互斥）；Q4/FP8 存储、offload、prefill 缓冲、状态复用全部后端无关，直接复用 | P2/P3 |
 | P5 | FP8 **计算**路径（cuBLAS fp8 GEMM 在 NVIDIA 上可用，正是 FreeToken 的论文路径）——这是 AMD（gfx1100 hipBLAS 拒 fp8）做不到的差异化 | P3 |
@@ -28,4 +28,4 @@
 
 ## 4. 验收
 
-- P1 后 `cargo check --features cuda` 编译过；P2 后 MemoryPool/GraphCapture 契约测试（CpuMemoryPool 参考）在 CUDA 后端复跑全绿；P4 后 qwen3-moe-tiny Q4/FP8 在 NVIDIA 卡上与 HIP 对拍一致。
+- P1 后 `cargo check --features cuda` 编译过；~~P2 后 MemoryPool/GraphCapture 契约测试（CpuMemoryPool 参考）在 CUDA 后端复跑全绿~~（契约面已退役，批次 8 重定义为 ServingModel 占位后端编译 + `hip,cuda` 互斥 `compile_error!`）；P4 后 qwen3-moe-tiny Q4/FP8 在 NVIDIA 卡上与 HIP 对拍一致。

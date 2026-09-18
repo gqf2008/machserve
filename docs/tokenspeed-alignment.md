@@ -54,10 +54,10 @@
    复用前缀的 KV、只算 delta 并逐页快照缓存。✅ 已实现（6 单测：
    `shared_prefix_reuses_and_matches_full_recompute` 等；10-token 请求共享 8-token
    前缀时只算 2 个 token，复用 logits 与全算逐位一致）。
-6. **`paged_scheduler.rs`**：CPU 侧分页调度器——FSM（Submitted→PrefillDone→
-   Decoding→Finished）+ 复用规划 + 前缀 KV 驱动参考模型的多请求调度。✅ 已实现
-   （2 单测：5 个共享 8-token 系统提示的请求，45 个 prompt token 复用 32 个、
-   只算 13 个——**节省 71%**，贪心解码与全算逐位一致；对标 FreeToken 多轮
+6. ~~**`paged_scheduler.rs`**：CPU 侧分页调度器~~ **已退役**（2026-09 后端重构
+   批次 1：零接线死代码删除，其 FSM + 复用规划能力由 `cpu_engine.rs` 承载，
+   删除前验证记录：5 个共享 8-token 系统提示的请求 71% prompt token 复用、
+   贪心与全算逐位一致；对标 FreeToken 多轮
    TTFT -65..-80% 目标）。
 7. **`cpu_engine.rs`**：CPU 连续批处理引擎——队列 + 槽位复用 + 交错 prefill/decode
    + 跨请求前缀复用 + FSM 生命周期（镜像 `continuous.rs` 的 serving 语义，
@@ -85,7 +85,7 @@
 - [ ] 三模块 CPU-only：`cargo test -p mach-model --lib` 全绿 + `clippy -D warnings`
       干净（不依赖 GPU）
 - [x] CPU 参考路径：跨请求前缀共享（复用 logits == 全算，逐位一致；delta-only 计算）
-- [x] CPU 分页调度器：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
+- [x] ~~CPU 分页调度器~~（`paged_scheduler.rs` 已随批次 1 删除，能力并入 `cpu_engine.rs`）：FSM 生命周期 + 前缀共享多请求调度（5 请求共享系统提示 → 71% prompt token 复用）
 - [x] CPU 连续批处理引擎：队列/槽位复用/交错 prefill+decode + 前缀复用（GPU 接线参考）
 - [x] GPU（batched.rs）接线：静态 KV 槽位 → 分页表 + 前缀共享（#78 C1-C6，7900 XTX 真机 A/B）
   - 地基：`paged_kv.rs`（块表 + 页分配器 + 分页 attention + **分页参考变压器

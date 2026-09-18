@@ -16,10 +16,6 @@ pub use graph::{CaptureState, GraphCapture, GraphError, GraphHandle};
 /// Error type used across the core crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid argument: {0}")]
-    InvalidArgument(String),
-    #[error("backend unavailable: {0}")]
-    BackendUnavailable(String),
     #[error("graph error: {0}")]
     Graph(#[from] graph::GraphError),
 

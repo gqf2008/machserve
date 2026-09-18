@@ -2,9 +2,9 @@
 //!
 //! The lifecycle mirrors the design proven in burn/cubecl: a strict
 //! `NoCapture → Prepare → Capture → NoCapture` progression, a mandatory warmup
-//! run that primes the persistent memory pool, and a capture window that must
-//! allocate nothing (an allocation mid-capture becomes a memory node and the
-//! resulting graph cannot be relaunched).
+//! run, and a capture window that must allocate nothing (an allocation
+//! mid-capture becomes a memory node and the resulting graph cannot be
+//! relaunched).
 //!
 //! The only remaining implementation is the HIP one (`crate::hip`), kept
 //! until refactor batch 3 removes the graph experiment surface.
@@ -20,8 +20,6 @@ pub enum GraphError {
     AlreadyActive,
     #[error("no capture is recording on this stream")]
     NotRecording,
-    #[error("capture allocated inside the recording window (memory node): {0}")]
-    AllocatedDuringCapture(String),
     #[error("backend does not support hardware graph capture")]
     Unsupported,
     #[error("driver error during graph capture/replay: {0}")]
@@ -38,7 +36,7 @@ pub enum CaptureState {
     /// No capture is prepared or recording.
     #[default]
     NoCapture,
-    /// `prepare` has armed the persistent pools for the warmup run.
+    /// `prepare` has armed the backend for the warmup run.
     Prepare,
     /// Launches are being recorded into a graph instead of executing.
     Capture,
@@ -108,7 +106,7 @@ pub trait GraphCapture: Send + Sync {
     /// Whether this backend supports hardware graph capture.
     fn supported(&self) -> bool;
 
-    /// Arms the persistent pool for an upcoming capture. Call before warmup.
+    /// Arms the backend for an upcoming capture. Call before warmup.
     fn prepare(&self) -> Result<(), GraphError>;
 
     /// Opens the recording window. Must follow [`prepare`](Self::prepare).
@@ -132,5 +130,46 @@ impl fmt::Display for CaptureState {
             Self::Capture => "capture",
         };
         f.write_str(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CaptureState;
+
+    /// 状态机严格性是 HipGraphCapture 唯一生命周期约束的 CPU 参考
+    /// (移植自被删的 SoftwareGraphCapture 测试,约定:GPU 路径需 CPU 参考对拍)。
+    #[test]
+    fn lifecycle_transitions_are_strict() {
+        let mut s = CaptureState::NoCapture;
+        assert!(s.begin().is_err());
+        assert!(s.end().is_err());
+
+        s = s.prepare().unwrap();
+        assert_eq!(s, CaptureState::Prepare);
+        assert!(s.prepare().is_err());
+        assert!(s.end().is_err());
+
+        s = s.begin().unwrap();
+        assert_eq!(s, CaptureState::Capture);
+        assert!(s.begin().is_err());
+        assert!(s.prepare().is_err());
+
+        s = s.end().unwrap();
+        assert_eq!(s, CaptureState::NoCapture);
+    }
+
+    #[test]
+    fn abort_resets_from_prepare_and_capture() {
+        let s = CaptureState::NoCapture.prepare().unwrap();
+        assert_eq!(s.abort(), CaptureState::NoCapture);
+
+        let s = CaptureState::NoCapture.prepare().unwrap().begin().unwrap();
+        assert_eq!(s.abort(), CaptureState::NoCapture);
+
+        // abort 后可重新 prepare(覆盖 hip_graph_lifecycle_is_strict 的 CPU 面)
+        let s = CaptureState::NoCapture.prepare().unwrap().begin().unwrap();
+        let s = s.abort();
+        assert!(s.prepare().is_ok());
     }
 }

@@ -263,32 +263,34 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         Some(h)
     }
 
-    struct DevBuf(*mut core::ffi::c_void);
+    struct DevBuf {
+        hip: Arc<Hip>,
+        ptr: *mut core::ffi::c_void,
+    }
 
     impl DevBuf {
-        fn alloc(h: &Hip, bytes: usize) -> Self {
-            let mut ptr = std::ptr::null_mut();
-            unsafe { hip::check(h, (h.api.hip_malloc)(&mut ptr, bytes)).unwrap() };
-            Self(ptr)
+        fn alloc(h: &Arc<Hip>, bytes: usize) -> Self {
+            let ptr = hip::malloc(h, bytes).unwrap();
+            Self {
+                hip: Arc::clone(h),
+                ptr,
+            }
         }
     }
 
     impl Drop for DevBuf {
         fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    let _ = (hip::hip().unwrap().api.hip_free)(self.0);
-                }
+            if !self.ptr.is_null() {
+                let _ = hip::free(&self.hip, self.ptr);
             }
         }
     }
 
     #[test]
     fn hip_device_is_visible() {
-        let Some(h) = dev() else { return };
+        let Some(_h) = dev() else { return };
         let name = hip::device_name(0).unwrap();
         assert!(!name.is_empty());
-        let _ = h;
         eprintln!("HIP device 0: {name}");
     }
 
@@ -304,7 +306,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let mut hy = vec![1.0f32; n as usize];
         hip::memcpy(
             h,
-            x.0,
+            x.ptr,
             hx.as_mut_ptr() as *const _,
             (n * 4) as usize,
             HIP_MEMCPY_HOST_TO_DEVICE,
@@ -312,7 +314,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         .unwrap();
         hip::memcpy(
             h,
-            y.0,
+            y.ptr,
             hy.as_mut_ptr() as *const _,
             (n * 4) as usize,
             HIP_MEMCPY_HOST_TO_DEVICE,
@@ -322,8 +324,8 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let module =
             hip::HipKernelModule::compile(&hip_arch(), SAXPY_SRC, "saxpy").expect("hiprtc compile");
         let a: f32 = 2.0;
-        let xp = x.0;
-        let yp = y.0;
+        let xp = x.ptr;
+        let yp = y.ptr;
         let mut params: Vec<*mut core::ffi::c_void> = vec![
             &a as *const f32 as *mut core::ffi::c_void,
             &xp as *const *mut core::ffi::c_void as *mut core::ffi::c_void,
@@ -344,7 +346,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         hip::memcpy(
             h,
             hy.as_mut_ptr() as *mut _,
-            y.0 as *const _,
+            y.ptr as *const _,
             (n * 4) as usize,
             HIP_MEMCPY_DEVICE_TO_HOST,
         )
@@ -368,7 +370,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let mut hy = vec![0.0f32; n as usize];
         hip::memcpy(
             h,
-            x.0,
+            x.ptr,
             hx.as_mut_ptr() as *const _,
             (n * 4) as usize,
             HIP_MEMCPY_HOST_TO_DEVICE,
@@ -376,7 +378,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         .unwrap();
         hip::memcpy(
             h,
-            y.0,
+            y.ptr,
             hy.as_mut_ptr() as *const _,
             (n * 4) as usize,
             HIP_MEMCPY_HOST_TO_DEVICE,
@@ -386,8 +388,8 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         let module =
             hip::HipKernelModule::compile(&hip_arch(), SAXPY_SRC, "saxpy").expect("hiprtc compile");
         let a: f32 = 2.0;
-        let xp = x.0;
-        let yp = y.0;
+        let xp = x.ptr;
+        let yp = y.ptr;
 
         let cap = HipGraphCapture::new(Arc::clone(h)).unwrap();
         cap.prepare().unwrap();
@@ -421,7 +423,7 @@ extern "C" __global__ void saxpy(float a, const float* x, float* y, int n) {
         hip::memcpy(
             h,
             hy.as_mut_ptr() as *mut _,
-            y.0 as *const _,
+            y.ptr as *const _,
             (n * 4) as usize,
             HIP_MEMCPY_DEVICE_TO_HOST,
         )
