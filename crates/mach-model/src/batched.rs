@@ -4988,7 +4988,7 @@ impl BatchedModel {
         // Positions and slots must stay inside the device buffers: an out-of-
         // range length would make the KV store write past the cache (silent
         // corruption). Guarded here for the explicit-entry API, which the
-        // continuous/speculative engines use directly.
+        // the continuous engine uses directly.
         if let Some(&l) = lens.iter().find(|&&l| l as usize >= self.cfg.max_seq_len) {
             return Err(Error::Model(format!(
                 "row at position {l} exceeds max_seq_len {}",

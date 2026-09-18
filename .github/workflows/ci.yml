@@ -52,7 +52,7 @@ jobs:
       # `vision_real_weights` contributes its 2 fast tests (path/tolerance); the 11-minute
       # real-checkpoint parity is `#[ignore]`d and is not run by this job.
       - name: integration tests (CPU-reachable only)
-        run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode --test vision_real_weights
+        run: cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test vision_real_weights
       - name: vision first-step comparator selftest
         run: python tools/vision_c4_compare_first_step.py --selftest
 

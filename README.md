@@ -54,10 +54,9 @@ mach-server        axum OpenAI 兼容 API(completions / chat / SSE 流式)
 - **真实 tokenizer**:字节级 BPE(Qwen2.5/Llama),与 HF tokenizers 逐 token 对拍一致。
 - **SSE 流式**:`stream: true` → 逐 token delta + `[DONE]`,增量 UTF-8 跨 token 不分裂。
 - **对话模板**:Qwen chat template,`<|im_end|>` 停止。
-- **speculative decoding(实验)**:0.5B 草稿 + 1.5B 目标,argmax 验收,输出与纯贪心
-  逐 token 一致(单序列/批量/生命周期已多层验证);**实测吞吐 0.29x(慢 ~3.5x,
-  2026-08-24,0.5B 草稿→1.5B 目标 K=4),净负收益,暂停投入**
-  (`spec_check` 示例,0.5B 对 1.5B)。
+- ~~**speculative decoding**~~:**已退役**(2026-09 批次 2 移除代码):0.5B 草稿 + 1.5B 目标
+  argmax 验收曾与纯贪心逐 token 一致,但实测吞吐 0.29x(慢 ~3.5x,2026-08-24,
+  0.5B→1.5B K=4),净负收益。证伪记录保留于性能地图。
 - **MLA(DeepSeek-V2 风格,实验)**:低秩 Q + 压缩 KV,expanded per-head KV decode;
   单序列/批量/连续批处理(含槽位压缩 KV 搬移)与 CPU 参考逐 token 对拍一致
   (f32;真实 MLA checkpoint 验证待做)。
@@ -85,7 +84,7 @@ mach-server        axum OpenAI 兼容 API(completions / chat / SSE 流式)
 | 内存布局 [slot][kv][pos][dim] | 证伪(0x) | 新布局计时 |
 | V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
 | QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
-| **spec-decode**(P3al-P3ap) | 正确性已多层验证(单/批量/生命周期);**实测 0.29x(净负,暂停)** | GPU 测试全绿 |
+| ~~**spec-decode**~~(P3al-P3ap,2026-09 批次 2 移除) | 正确性曾多层验证(单/批量/生命周期);**实测 0.29x(净负)** | 证伪,代码已删(历史可恢复) |
 | **MoE**(P3at-P3az, #70) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP;批量解码 grouped GEMV 设备路径(每层 4 发射,免 counts D2H/sync/host 循环)+ router 并行 top-k + sampler 单块上传;**Q4-on-device 专家池(30B 类检查点内存可行路径,#85)+ m=1 GEMV 内核与 grouped 小批量并行重构(#87)** | 全回归绿;**A/B(7900 XTX,2 层/64 专家/topk8/batch32/F16):4.87→0.098 ms/step(50x)**;**真机验证(#85,#87,2026-08-30):Qwen3-30B-A3B Q4-on-device 加载 201.6s→解码 17.4 ms/step(#87 前为 190,#87 后 10.9x;16 步全有限 logits、两遍 greedy 逐位稳定)** |
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
 | **存储级 Q4**(#16/#20/#24/#25/#27/#30) | 8B 主机内存 48GB→~5GB,`MACH_Q4=1` 服务,加载 13x 加速 | Qwen3-8B 真机验证 + GPU 对拍 |
@@ -133,7 +132,6 @@ cargo run -p mach-model --release --features hip --example chat_check
 cargo run -p mach-server --release --features hip
 #   环境变量:MACH_MODELS(默认 .models)、MACH_MODEL、MACH_CONFIG、
 #   MACH_CAPACITY(默认 64)、MACH_ADDR(默认 127.0.0.1:8080)、MACH_DTYPE(f16/f32)、
-#   MACH_SPEC=1(实验 spec-decode,greedy-only,配 MACH_DRAFT)、
 #   MACH_PAGED=1(分页 KV + 跨请求前缀共享,配 MACH_TPP 页大小默认 64；
 #     当前项目实测环境的保守上限 MACH_PREFILL_ROWS<=64、MACH_CAPACITY<=64，
 #     超过会告警截断/拒绝。已验证 Qwen3-8B/Q4-on-device/TPP=64/约 600 token；
