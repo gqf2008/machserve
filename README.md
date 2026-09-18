@@ -35,12 +35,10 @@ GPU 侧直接调用 AMD hipBLAS/hiprtc 运行时编译的内核。
 ## 架构(crates)
 
 ```
-mach-engine        Device / DType / 内存 / Stream / HIP graph 捕获
+mach-engine        HIP graph 捕获(重构批次 3 移除)
 mach-kernel-sys    唯一 FFI 边界:amdhip64_6.dll / hiprtc0602.dll / hipblas.dll 动态加载
 mach-model         模型:config / safetensors 加载 / fp16 / 连续批处理 / 采样 / tokenizer
 mach-server        axum OpenAI 兼容 API(completions / chat / SSE 流式)
-mach-bench         基准框架
-thirdparty/        第三方参考代码(占位)
 ```
 
 ## 能力清单

@@ -4,7 +4,7 @@
 > 验收:同模型、同权重、同请求分布,对比 TTFT / TPOT / 吞吐 / GPU 利用率。
 > 平台(2026-09-04 修订):**芯片平台全都要支持** —— 当前已实现 AMD
 > (ROCm/HIP,gfx1100);macOS / Windows / Linux 皆为终态,`mach-kernel-sys`
-> 唯一 FFI 边界与预留的 `cuda` feature 即为此服务。本机现阶段可复跑的对标
+> 唯一 FFI 边界即为此服务(2026-09 批次 1 后:`cuda` 占位 feature 已删,CUDA 按批次 8 重评)。本机现阶段可复跑的对标
 > 是 llama.cpp(Vulkan);TokenSpeed/FreeToken 为跨平台归一的目标对手。
 > 节奏:**模型覆盖渐进添加,底子优先** —— 新模型族(如 Qwen3.8 混合线性
 > 注意力)以层类型抽象进入,不做单检查点补丁。
@@ -25,7 +25,7 @@
 - **不用 burn 运行时**:burn 是训练/通用框架,serving 用不上 autodiff/dispatch;其 graph capture 设计作为参考抄入 `mach-engine`。
 - **不用 libtorch / tch-rs**:框架非内核,会把 C++ 运行时拉回。
 - **内核 = 第三方优秀实现**(flashinfer/cutlass/trtllm/gluon),通过 `mach-kernel-sys` FFI 接入。
-- **CUDA 控制用 cudarc**(stream/graph/内存),`cuda` feature 默认关闭。
+- ~~**CUDA 控制用 cudarc**(stream/graph/内存),`cuda` feature 默认关闭~~(2026-09 批次 1 删除占位;CUDA 内核路线改按 NVIDIA CUDA Rust 双轨 cutile-rs/cuda-oxide 重评,见 cuda-port.md)。
 - **P1 是 go/no-go 闸门**:TPOT 追不平立即复盘,不盲目继续。
 
 ## "超越"的抓手
@@ -45,13 +45,24 @@
 
 - **目标 GPU = AMD Radeon RX 7900 XTX(gfx1100,24G,Windows 原生 ROCm 6.2)**。
 - 路线改为 **AMD/HIP 优先**:`mach-kernel-sys` 提供 HIP FFI(动态加载 amdhip64_6.dll + hiprtc0602.dll),
-  `mach-engine` 提供 `HipMemoryPool` / `HipGraphCapture`(HIP graph 捕获 = AMD 版 CUDA Graph)。
+  `mach-engine` 提供 `HipGraphCapture`(2026-09 批次 1 后:`HipMemoryPool` 已删;graph 面批次 3 移除)。
 - tokenspeed-kernel-amd 目前只有 gfx950/gfx1250;7900 XTX 的 kernel 走自有 HIP/hiprtc 路径,
   后续可参考 Gluon(gfx1100 支持)补充。
 - P1 验收改为:小模型 decode 链路在 7900 XTX 上跑通,TPOT 对标 TokenSpeed(同 kernel 场景)。
 
 ## 进度日志
 
+- **后端重构批次 1 完成(2026-09-18,PR #199 / issue #198)**:零引用死代码清理,
+  纯删除零行为变化 —— 删 mach-kernel + mach-bench 两 crate(op 注册表骨架,唯一
+  消费者是 mach-bench 微基准)、mach-model 死模块 paged_scheduler/adaptive_q、
+  mach-engine 死子系统(device/dtype/shape/stream/memory 含 HipMemoryPool/
+  cuda.rs 占位/graph software.rs)、mach-kernel-sys 的 ffi.rs 占位 +
+  MACH_THIRDPARTY 钩子 + thirdparty/;净 -3236/+101 行。CaptureState 状态机
+  CPU 测试移植进 graph/mod.rs(审查发现)。验证:fmt / clippy --features hip
+  -D warnings / check×2(cpu+hip)/ test --workspace --lib(306 绿)/
+  decode_slice+fp16+load_safetensors 全绿。后续批次基线:批次 2 移除
+  spec-decode(#200)、批次 3 移除 #103 graph 面并删 mach-engine、批次 6 引入
+  backend::ServingModel 边界、批次 8 CUDA 占位(cutile-rs 方向)。
 - **P0 完成(2026-08-22)**:workspace 骨架、mach-engine 核心抽象、mach-kernel 内核边界、
   mach-kernel-sys FFI 骨架、mach-bench 基准(host 派发 ~86-90 ns/op)。
 - **P0.5 AMD/HIP 地基完成(2026-08-22,真机验证)**:

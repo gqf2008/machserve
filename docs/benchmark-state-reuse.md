@@ -96,6 +96,9 @@ bound `1 − delta/context`.
 - Anchor save/restore correctness is pinned by `tests/state_reuse.rs`
   (CPU exact-equal pair + GPU `#[ignore]` parity test); run with
   `cargo test -p mach-model --features hip --test state_reuse -- --ignored --test-threads=1`.
-- The elastic-memory pressure simulation (`region_shrink_to_under_pressure_no_oom`,
-  CPU + HIP `#[ignore]`) verifies the pool never OOMs when VRAM is squeezed.
+- ~~The elastic-memory pressure simulation (`region_shrink_to_under_pressure_no_oom`,
+  CPU + HIP `#[ignore]`) verifies the pool never OOMs when VRAM is squeezed.~~
+  **Retired 2026-09 (backend refactor batch 1)**: the TaggedPool/HipMemoryPool
+  elastic-memory feature and its tests were deleted as zero-user subsystems;
+  the shrink-to-under-pressure property is no longer implemented or verified.
 
