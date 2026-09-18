@@ -114,7 +114,7 @@ pub enum FsmEvent {
     /// Capacity eviction that releases the request's KV resources and puts it
     /// back on the submission queue ([`RequestState::Submitted`]).
     Retract,
-    /// Adjust the decode reserve (e.g. speculative window).
+    /// Adjust the decode reserve.
     UpdateReserveNumTokens(i32),
     /// A batch produced `tokens`; append to the request's token stream.
     ExtendResult(Vec<i32>),

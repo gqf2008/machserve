@@ -34,7 +34,7 @@
 | **全局前缀缓存（SHA-256 前缀哈希链 + matcher）** | `prefix_cache.rs` + `reuse_planner.rs` + `prefix_kv.rs` CPU 参考已实现（复用 logits == 全算逐位一致）；GPU 侧 `GpuPagedTableBuilder` 内容哈希页复用 + `ContinuousModel` 物化水位门控（C5a） | ✅ **GPU 服务链已闭环 + 真机 A/B**（78.8% 提示词节省、后续请求 TTFT 13.4x，见 `docs/benchmark-results-paged-prefix.md`）；剩余：真实模型同口径 A/B |
 | **调度器 FSM（7 状态 + 事件 + Retracted/WriteBack/LoadBack）** | `scheduler_fsm.rs` 已移植（7 状态 + 12 事件，非法迁移 panic） | 🟡 已实现，未接入 `continuous.rs` |
 | KV 缓存事件（PD 跨节点） | 无（单节点） | ⏸ 单卡目标暂不需要 |
-| spec-decode | 已实现；实测 0.29x 净负，暂停 | ⏸ 需更便宜草稿/批量形态 |
+| ~~spec-decode~~ | 2026-09 批次 2 移除(#200)：实测 0.29x 净负收益 | ❌ 证伪，代码已删(历史可恢复) |
 | 存储量化 | Q4 int4 真机验证；FP8 E4M3 存储路径已合入 | ✅ 已对齐（存储级） |
 | 内核栈 | hipBLAS + hiprtc（gfx1100 / 7900 XTX） | 🟡 目标硬件不同（上游 gfx950/gfx1250），内核无法直接对齐 |
 

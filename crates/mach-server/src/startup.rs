@@ -320,35 +320,31 @@ pub fn model_file_bytes(path: &Path) -> u64 {
     }
 }
 
-/// Rough device-memory estimate for the preflight: weight file + KV cache +
-/// 256MiB scratch margin (+ draft model in spec mode). MLA uses the expanded
-/// per-head KV cache (always f32); dense uses the GQA formula with the dtype's
-/// element size. Sharded weight files are counted via [`model_file_bytes`];
-/// hipBLAS workspace and compiled kernels are not counted; the margin covers
-/// today's scenarios.
+/// Test shorthand for [`estimate_vram_kv`] with unpacked KV (`kv_q4 =
+/// false`); runtime callers use `estimate_vram_kv` directly so the KV mode is
+/// explicit.
+#[cfg(test)]
 pub fn estimate_vram(
     cfg: &Config,
     capacity: usize,
     file_bytes: u64,
-    draft: Option<(&Config, u64)>,
     fp8: bool,
     q4_device: bool,
     kv_int8: bool,
 ) -> u64 {
-    estimate_vram_kv(
-        cfg, capacity, file_bytes, draft, fp8, q4_device, kv_int8, false,
-    )
+    estimate_vram_kv(cfg, capacity, file_bytes, fp8, q4_device, kv_int8, false)
 }
 
-/// [`estimate_vram`] extended with packed-Q4 KV. Keeping the original
-/// signature preserves the large existing test surface; runtime callers use
-/// this entry point so the KV mode is explicit.
-#[allow(clippy::too_many_arguments)]
+/// Rough device-memory estimate for the preflight: weight file + KV cache +
+/// 256MiB scratch margin, with the KV mode explicit (unpacked / INT8 / packed
+/// Q4). MLA uses the expanded per-head KV cache (always f32); dense uses the
+/// GQA formula with the dtype's element size. Sharded weight files are counted
+/// via [`model_file_bytes`]; hipBLAS workspace and compiled kernels are not
+/// counted; the margin covers today's scenarios.
 pub fn estimate_vram_kv(
     cfg: &Config,
     capacity: usize,
     file_bytes: u64,
-    draft: Option<(&Config, u64)>,
     fp8: bool,
     q4_device: bool,
     kv_int8: bool,
@@ -419,21 +415,7 @@ pub fn estimate_vram_kv(
     } else {
         0
     };
-    let mut est = weight + (kv * kv_layers) as u64 + gdn_state + (256 << 20);
-    if let Some((dcfg, dfb)) = draft {
-        let dkv_elem = if dcfg.dtype == ModelDType::F16 { 2 } else { 4 };
-        let dkv = if dcfg.kv_lora_rank > 0 {
-            capacity
-                * dcfg.max_seq_len
-                * dcfg.n_heads
-                * (dcfg.qk_nope_head_dim + dcfg.qk_rope_head_dim + dcfg.v_head_dim)
-                * 4
-        } else {
-            capacity * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * dkv_elem * 2
-        };
-        est += dfb + (dkv * dcfg.n_layers) as u64;
-    }
-    est
+    weight + (kv * kv_layers) as u64 + gdn_state + (256 << 20)
 }
 
 #[cfg(test)]
@@ -451,7 +433,7 @@ mod tests {
     #[test]
     fn dense_estimate_includes_weights_kv_and_margin() {
         let cfg = dense_cfg();
-        let est = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
+        let est = estimate_vram(&cfg, 8, 1_000_000, false, false, false);
         // KV (f32) = capacity*max_seq*kv_heads*head_dim*4 per layer.
         let kv =
             (8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 4 * 2 * cfg.n_layers) as u64;
@@ -462,9 +444,9 @@ mod tests {
     fn f16_dense_uses_two_byte_kv() {
         let mut cfg = dense_cfg();
         cfg.dtype = ModelDType::F16;
-        let f16 = estimate_vram(&cfg, 8, 0, None, false, false, false);
+        let f16 = estimate_vram(&cfg, 8, 0, false, false, false);
         cfg.dtype = ModelDType::F32;
-        let f32 = estimate_vram(&cfg, 8, 0, None, false, false, false);
+        let f32 = estimate_vram(&cfg, 8, 0, false, false, false);
         // KV diff = layers * capacity*max_seq*kv_heads*head_dim*(4-2).
         let kv_diff =
             (cfg.n_layers * 8 * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
@@ -482,8 +464,8 @@ mod tests {
         for cap in [1usize, 8] {
             for max_seq in [64usize, 128] {
                 cfg.max_seq_len = max_seq;
-                let f16 = estimate_vram(&cfg, cap, 0, None, false, false, false);
-                let int8 = estimate_vram(&cfg, cap, 0, None, false, false, true);
+                let f16 = estimate_vram(&cfg, cap, 0, false, false, false);
+                let int8 = estimate_vram(&cfg, cap, 0, false, false, true);
                 let f16_kv =
                     (cfg.n_layers * cap * max_seq * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
                 let int8_kv =
@@ -501,8 +483,8 @@ mod tests {
         for cap in [1usize, 8] {
             for max_seq in [64usize, 128] {
                 cfg.max_seq_len = max_seq;
-                let f16 = estimate_vram(&cfg, cap, 0, None, false, false, false);
-                let q4 = estimate_vram_kv(&cfg, cap, 0, None, false, false, false, true);
+                let f16 = estimate_vram(&cfg, cap, 0, false, false, false);
+                let q4 = estimate_vram_kv(&cfg, cap, 0, false, false, false, true);
                 let f16_kv =
                     (cfg.n_layers * cap * max_seq * cfg.n_kv_heads * cfg.head_dim * 2 * 2) as u64;
                 let q4_kv = (cfg.n_layers
@@ -519,7 +501,7 @@ mod tests {
     #[should_panic(expected = "mutually exclusive")]
     fn estimate_vram_kv_rejects_mixed_quantized_modes() {
         let cfg = dense_cfg();
-        let _ = estimate_vram_kv(&cfg, 1, 0, None, false, false, true, true);
+        let _ = estimate_vram_kv(&cfg, 1, 0, false, false, true, true);
     }
     #[test]
     fn mla_estimate_uses_expanded_per_head_kv() {
@@ -532,20 +514,9 @@ mod tests {
             * 4
             * cfg.n_layers) as u64;
         assert_eq!(
-            estimate_vram(&cfg, 8, 0, None, false, false, false),
+            estimate_vram(&cfg, 8, 0, false, false, false),
             kv + (256 << 20)
         );
-    }
-
-    #[test]
-    fn spec_adds_draft_weights_and_kv() {
-        let tcfg = dense_cfg();
-        let dcfg = dense_cfg();
-        let base = estimate_vram(&tcfg, 8, 1_000, None, false, false, false);
-        let spec = estimate_vram(&tcfg, 8, 1_000, Some((&dcfg, 500)), false, false, false);
-        let dkv =
-            (dcfg.n_layers * 8 * dcfg.max_seq_len * dcfg.n_kv_heads * dcfg.head_dim * 4 * 2) as u64;
-        assert_eq!(spec - base, 500 + dkv);
     }
 
     /// Removes the temp file on drop (also on test panic).
@@ -873,15 +844,15 @@ mod tests {
     #[test]
     fn q4_and_q4_device_weight_terms() {
         let cfg = dense_cfg();
-        let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
+        let base = estimate_vram(&cfg, 8, 1_000_000, false, false, false);
         // MACH_Q4 loads standard BF16/F16 files and quantizes at load: the
         // device holds f16 = the same bytes as the file, so the weight term
         // is unchanged vs dense.
-        let q4 = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
+        let q4 = estimate_vram(&cfg, 8, 1_000_000, false, false, false);
         assert_eq!(q4, base);
         // MACH_Q4_DEVICE keeps the expert pool packed on the device: the
         // weight term is 0.3x the file bytes.
-        let q4d = estimate_vram(&cfg, 8, 1_000_000, None, false, true, false);
+        let q4d = estimate_vram(&cfg, 8, 1_000_000, false, true, false);
         assert_eq!(q4d, base - 700_000);
     }
 
@@ -894,7 +865,7 @@ mod tests {
         let mut cfg = mach_model::Config::qwen3_5(64, 5, 4, 2, 16, 176, 97, 4096, 2, 4, 8, 4);
         cfg.dtype = ModelDType::F32;
         let cap = 8usize;
-        let got = estimate_vram(&cfg, cap, 0, None, false, false, false);
+        let got = estimate_vram(&cfg, cap, 0, false, false, false);
         // qwen35_small shape: interval 4 over 5 layers -> full-attn ONLY
         // layer 3 (li where (li+1)%4==0); layers 0,1,2,4 are GDN.
         let full_layers = (0..cfg.n_layers)
@@ -909,7 +880,7 @@ mod tests {
             + (256 << 20)) as u64;
         assert_eq!(got, want);
 
-        let int8 = estimate_vram(&cfg, cap, 0, None, false, false, true);
+        let int8 = estimate_vram(&cfg, cap, 0, false, false, true);
         let int8_kv_per_layer = cap * cfg.max_seq_len * cfg.n_kv_heads * (cfg.head_dim * 2 + 8);
         let want_int8 = (int8_kv_per_layer * full_layers
             + cap * (cfg.n_layers - full_layers) * per_gdn_layer * 4
@@ -931,8 +902,8 @@ mod tests {
     #[test]
     fn fp8_scales_weight_term_by_two() {
         let cfg = dense_cfg();
-        let base = estimate_vram(&cfg, 8, 1_000_000, None, false, false, false);
-        let fp8 = estimate_vram(&cfg, 8, 1_000_000, None, true, false, false);
+        let base = estimate_vram(&cfg, 8, 1_000_000, false, false, false);
+        let fp8 = estimate_vram(&cfg, 8, 1_000_000, true, false, false);
         // FP8 stores E4M3 (1 byte/weight) but the device holds dequantized f16
         // (2 bytes/weight): the weight term must be x2, or the preflight can
         // pass while the upload OOMs (regression).

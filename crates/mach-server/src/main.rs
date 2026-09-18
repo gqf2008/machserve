@@ -28,7 +28,7 @@
 //! validation of the tiled attention path lands.
 //! Limitations: paged KV serves
 //! MLA models in F32 only (quantized MLA warns and falls back to continuous),
-//! and MACH_SPEC / MoE-offload modes ignore MACH_PAGED (warned).
+//! and MoE-offload mode ignores MACH_PAGED (warned).
 //! MACH_MOE_GROUPED=0 (default on; disable the batched-MoE decode grouped
 //! GEMV device path — A/B switch and ops lever). NOTE: Q4-on-device models
 //! (MACH_Q4_DEVICE>=1) have no f16/f32 expert copy, so they ALWAYS run the
@@ -231,8 +231,8 @@ fn parse_kv_mode() -> Result<KvMode, String> {
 /// Parses and validates `MACH_TPP` for a branch that actually engages paged
 /// KV (`MACH_PAGED` already checked by the caller). Runs BEFORE any weight
 /// load: a bad value fails fast instead of aborting after the multi-minute
-/// load. The MACH_SPEC / MoE-offload branches ignore MACH_PAGED (warned)
-/// and never call this, so a stale value must not abort them. Returns
+/// load. The MoE-offload branch ignores MACH_PAGED (warned) and never
+/// calls this, so a stale value must not abort it. Returns
 /// `None` (after reporting) for a fatal configuration — the caller degrades.
 #[cfg(feature = "hip")]
 fn parse_paged_tpp(cfg: &Config) -> Option<usize> {
@@ -378,7 +378,7 @@ fn run_doctor() {
             && cfg.kv_lora_rank == 0
             && cfg.dtype == ModelDType::F16
             && BatchedModel::check_q4_kv_support(&cfg).is_ok();
-        let need = estimate_vram_kv(&cfg, cap, fb, None, fp8, q4_device, kv_int8, kv_q4);
+        let need = estimate_vram_kv(&cfg, cap, fb, fp8, q4_device, kv_int8, kv_q4);
         let gib = need as f64 / (1024.0 * 1024.0 * 1024.0);
         println!(
             "estimate: d_model={} layers={} experts={} need ~{:.2} GiB (capacity {cap})",
@@ -457,15 +457,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Compute dtype: default fp16 (2x+ GEMM, verified vs fp32), MACH_DTYPE=f32
     // opts out. bf16 is not wired yet.
     let dtype = std::env::var("MACH_DTYPE").unwrap_or_else(|_| "f16".into());
-    let spec = std::env::var("MACH_SPEC").is_ok();
-    let spec_k = std::env::var("MACH_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
-    let draft_name = std::env::var("MACH_DRAFT").unwrap_or_else(|_| "qwen-0.5b.safetensors".into());
-    let draft_config =
-        std::env::var("MACH_DRAFT_CONFIG").unwrap_or_else(|_| "qwen-config.json".into());
-
     let root = PathBuf::from(root);
     let checkpoint_path = resolve_checkpoint_path(&root, &model_name);
     let config_path = resolve_config_path(&root, &model_name, explicit_config.as_deref());
@@ -502,12 +493,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
-        if spec {
-            eprintln!(
-                "MACH_Q4=1 and MACH_SPEC are mutually exclusive (spec mode loads a second model)"
-            );
-            std::process::exit(1);
-        }
         if moe_slots.is_some() {
             eprintln!(
                 "MACH_Q4=1 and MACH_MOE_SLOTS are mutually exclusive (cpu-backend offload needs f32 Weights)"
@@ -521,6 +506,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             q4_device
         );
     }
+    // spec-decode was removed (measured 0.29x net-negative); warn on leftover
+    // env vars instead of silently ignoring them (repo convention).
+    for var in [
+        "MACH_SPEC",
+        "MACH_SPEC_K",
+        "MACH_DRAFT",
+        "MACH_DRAFT_CONFIG",
+    ] {
+        if std::env::var_os(var).is_some() {
+            eprintln!("warning: {var} is no longer supported (spec-decode removed); ignoring");
+        }
+    }
 
     if fp8 {
         if q4 {
@@ -530,12 +527,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cfg.dtype != ModelDType::F16 {
             eprintln!(
                 "MACH_FP8=1 requires dtype f16 (FP8 dequantizes to f16 on device); set MACH_DTYPE=f16 or drop MACH_FP8"
-            );
-            std::process::exit(1);
-        }
-        if spec {
-            eprintln!(
-                "MACH_FP8=1 and MACH_SPEC are mutually exclusive (spec mode loads a second model)"
             );
             std::process::exit(1);
         }
@@ -594,17 +585,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // NOTE: hipBLAS workspace and compiled kernels are not counted; the 256MiB
     // margin covers today's tiny/1.5B scenarios.
     let file_bytes = model_file_bytes(&checkpoint_path);
-    let draft_est = if spec {
-        let dfb = model_file_bytes(&root.join(&draft_name));
-        let mut dcfg = config_from_json(&root.join(&draft_config));
-        match dtype.as_str() {
-            "f32" => dcfg.dtype = ModelDType::F32,
-            _ => dcfg.dtype = ModelDType::F16,
-        }
-        Some((dcfg, dfb))
-    } else {
-        None
-    };
     // In Q4 mode the device holds dequantized f16 weights (~4x the packed int4
     // file size), so the preflight weight term must account for that or it can
     // pass while the upload OOMs.
@@ -612,7 +592,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg,
         capacity,
         file_bytes,
-        draft_est.as_ref().map(|(c, b)| (c, *b)),
         fp8,
         q4_device != 0,
         kv_int8,
@@ -672,18 +651,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Q4 mode loads packed int4 weights directly (host RAM stays small) and
-    // spawns the Q4 engine; f16/f32 and spec modes keep the f32 host load.
+    // spawns the Q4 engine; f16/f32 modes keep the f32 host load.
     // Paged mode is wired for the plain-Weights and storage-quantized paths
-    // (device f16 served by the f16 paged kernels); MACH_SPEC remains
-    // contiguous-only (warned).
+    // (device f16 served by the f16 paged kernels).
     // Resolve paged engagement BEFORE any weight load: a stale/invalid
     // MACH_TPP or a paged-incompatible checkpoint must fail fast (or degrade
     // with a warning) up front, not abort after the multi-minute load.
     // Paged KV serves MLA in F32 only; the quantized branches always serve
-    // KV in device f16, so quantized MLA never qualifies. MACH_SPEC and
-    // MoE-offload ignore MACH_PAGED (warned in-branch) and skip this. The
+    // KV in device f16, so quantized MLA never qualifies. MoE-offload
+    // ignores MACH_PAGED (warned in-branch) and skips this. The
     // model-side paged_guards stay the authoritative last-resort checks.
-    let paged_tpp = if paged_requested && !spec && moe_slots.is_none() {
+    let paged_tpp = if paged_requested && moe_slots.is_none() {
         if cfg.kv_lora_rank > 0 && (q4 || fp8) {
             // Quantized builds force device dtype F16 (build_q4/build_fp8),
             // so a quantized MLA checkpoint can never qualify for paged KV
@@ -756,7 +734,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // image_url requests through the OpenAI chat endpoint.
     let mut vision_setup = None;
     let mut image_runtime = None;
-    if std::env::var("MACH_VISION").is_ok_and(|v| v != "0") && !spec {
+    if std::env::var("MACH_VISION").is_ok_and(|v| v != "0") {
         let raw: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&config_path).expect("read config for vision"),
         )
@@ -797,8 +775,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             weights,
             max_tokens,
         });
-    } else if std::env::var("MACH_VISION").is_ok_and(|v| v != "0") {
-        eprintln!("warning: MACH_VISION is not supported with MACH_SPEC; disabling vision");
     }
     if vision_setup.is_some() && paged_tpp.is_some() {
         eprintln!("warning: MACH_VISION is not supported with paged KV; disabling vision");
@@ -842,38 +818,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let handle = eng.clone().spawn_fp8(hip, cfg, wfp8)?;
         (eng, handle)
-    } else if spec {
-        if paged_requested {
-            eprintln!(
-                "warning: MACH_PAGED is ignored in MACH_SPEC mode (paged spec wiring is a follow-up)"
-            );
-        }
-        let w: Weights =
-            load_safetensors(&checkpoint_path, &cfg, true).expect("load target weights");
-        println!(
-            "model {model_name}: d_model={} layers={} heads={} kv={} vocab={} dtype={:?}",
-            cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, cfg.dtype
-        );
-        // Speculative-decoding mode: MACH_SPEC=1 serves greedy requests through
-        // a draft + target engine (greedy-only; other params rejected).
-        let mut dcfg = config_from_json(&root.join(&draft_config));
-        // Two [prof] streams (draft + target) would interleave without any
-        // role tag — disable the profiler on the draft.
-        dcfg.step_profile = false;
-        match dtype.as_str() {
-            "f32" => dcfg.dtype = ModelDType::F32,
-            "f16" => dcfg.dtype = ModelDType::F16,
-            _ => {}
-        }
-        let dw: Weights =
-            load_safetensors(&root.join(&draft_name), &dcfg, true).expect("load draft weights");
-        println!(
-            "draft {draft_name}: d_model={} layers={} dtype={:?} K={spec_k}",
-            dcfg.d_model, dcfg.n_layers, dcfg.dtype
-        );
-        let eng = ServerEngine::with_spec(capacity, spec_k);
-        let handle = eng.clone().spawn_spec(hip, cfg, w, dcfg, dw)?;
-        (eng, handle)
     } else {
         let w: Weights = load_safetensors(&checkpoint_path, &cfg, true).expect("load weights");
         println!(
@@ -909,7 +853,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = router(state);
     println!(
-        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{}{})",
+        "mach-server listening on http://{addr} (capacity {capacity}, prefill rows {prefill_rows}{}{})",
         if q4 {
             ", storage Q4"
         } else if fp8 {
@@ -917,7 +861,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             ""
         },
-        if spec { ", spec-decode" } else { "" },
         if let Some(slots) = moe_slots {
             format!(", moe-offload slots={slots}")
         } else {

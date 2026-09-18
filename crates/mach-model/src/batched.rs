@@ -4937,15 +4937,6 @@ impl BatchedModel {
         Ok(out)
     }
 
-    /// Batched decode with explicit per-sequence lengths and a variable active
-    /// count (`tokens.len()` may be <= capacity). The engine owns `lens`; this
-    /// method does not touch the internal lens used by [`decode_step`](Self::decode_step).
-    /// Row capacity of the model (max rows per step).
-    #[must_use]
-    pub const fn row_capacity(&self) -> usize {
-        self.rows
-    }
-
     /// Maximum KV positions per sequence (hard context limit).
     #[must_use]
     pub const fn max_seq_len(&self) -> usize {
@@ -4967,6 +4958,9 @@ impl BatchedModel {
         self.cfg.gdn_enabled()
     }
 
+    /// Batched decode with explicit per-sequence lengths and a variable active
+    /// count (`tokens.len()` may be <= capacity). The engine owns `lens`; this
+    /// method does not touch the internal lens used by [`decode_step`](Self::decode_step).
     #[allow(clippy::too_many_arguments)]
     pub fn decode_step_explicit(
         &mut self,
@@ -4988,7 +4982,7 @@ impl BatchedModel {
         // Positions and slots must stay inside the device buffers: an out-of-
         // range length would make the KV store write past the cache (silent
         // corruption). Guarded here for the explicit-entry API, which the
-        // continuous/speculative engines use directly.
+        // continuous engine uses directly.
         if let Some(&l) = lens.iter().find(|&&l| l as usize >= self.cfg.max_seq_len) {
             return Err(Error::Model(format!(
                 "row at position {l} exceeds max_seq_len {}",

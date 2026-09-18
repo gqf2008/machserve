@@ -4556,7 +4556,7 @@ unsafe impl Send for CachedModule {}
 unsafe impl Sync for CachedModule {}
 
 /// In-process hiprtc compile cache, keyed by `(arch, source)`. Loading several
-/// models in one process (spec-decode draft+target, server, tests) previously
+/// models in one process (test suites, multi-model setups) previously
 /// recompiled every kernel per model (~36 serial hiprtc compiles each time);
 /// the cache makes the second and later model loads reuse the compiled modules.
 static KERNEL_CACHE: std::sync::OnceLock<

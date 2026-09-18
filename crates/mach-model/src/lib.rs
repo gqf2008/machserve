@@ -36,8 +36,6 @@ pub mod reuse_planner;
 #[cfg(feature = "hip")]
 pub mod sampling;
 pub mod scheduler_fsm;
-#[cfg(feature = "hip")]
-pub mod speculative;
 pub mod state_reuse;
 pub mod tokenizer;
 

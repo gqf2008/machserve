@@ -3,12 +3,10 @@
 //! channels, so no GPU state crosses thread boundaries.
 
 use mach_kernel_sys::hip::Hip;
-use mach_model::batched::BatchedModel;
 use mach_model::continuous::{ContinuousModel, SeqId};
 use mach_model::image_processor::ProcessedImage;
 use mach_model::multimodal::{MultimodalPrompt, VisionImage};
 use mach_model::sampling::SamplingParams;
-use mach_model::speculative::SpeculativeEngine;
 use mach_model::vision::{VisionConfig, VisionGrid, VisionWeights};
 use mach_model::vision_gpu::VisionGpu;
 use mach_model::{Config, Weights, WeightsFp8, WeightsQ4};
@@ -189,10 +187,6 @@ pub struct ServerEngine {
     capacity: usize,
     /// Rows per prefill step (>= capacity; larger = faster long-prompt TTFT).
     prefill_rows: usize,
-    /// Speculative-decoding mode (greedy-only; draft + target models).
-    spec: bool,
-    /// Draft tokens per verify round in spec mode.
-    spec_k: usize,
     /// MoE offload (cpu backend): GPU-resident expert slots per layer; None = full.
     offload_slots: Option<usize>,
     /// Paged-KV mode: KV in a page pool with cross-request prefix reuse;
@@ -221,7 +215,7 @@ pub enum EngineError {
     Busy,
     #[error("engine is shutting down")]
     ShuttingDown,
-    #[error("invalid request for spec mode: {0}")]
+    #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("model error: {0}")]
     Model(#[from] mach_model::Error),
@@ -240,14 +234,7 @@ impl ServerEngine {
     /// per prefill step.
     #[must_use]
     pub fn with_prefill_rows(capacity: usize, prefill_rows: usize) -> Arc<Self> {
-        Self::with_mode(capacity, prefill_rows.max(capacity), false, 0)
-    }
-
-    /// Creates a speculative-decoding engine (greedy-only) with `k` draft
-    /// tokens per verify round.
-    #[must_use]
-    pub fn with_spec(capacity: usize, k: usize) -> Arc<Self> {
-        Self::with_mode(capacity, capacity, true, k.max(1))
+        Self::with_mode_offload(capacity, prefill_rows.max(capacity), None, None)
     }
 
     /// Creates a continuous-batching engine in MoE offload mode (cpu backend) with
@@ -257,15 +244,9 @@ impl ServerEngine {
         Self::with_mode_offload(
             capacity,
             prefill_rows.max(capacity),
-            false,
-            0,
             Some(expert_slots),
             None,
         )
-    }
-
-    fn with_mode(capacity: usize, prefill_rows: usize, spec: bool, spec_k: usize) -> Arc<Self> {
-        Self::with_mode_offload(capacity, prefill_rows, spec, spec_k, None, None)
     }
 
     /// Creates a paged-KV engine (`tokens_per_page` page size): requests whose
@@ -276,8 +257,6 @@ impl ServerEngine {
         Self::with_mode_offload(
             capacity,
             prefill_rows.max(capacity),
-            false,
-            0,
             None,
             Some(tokens_per_page),
         )
@@ -309,16 +288,12 @@ impl ServerEngine {
     fn with_mode_offload(
         capacity: usize,
         prefill_rows: usize,
-        spec: bool,
-        spec_k: usize,
         offload_slots: Option<usize>,
         paged_tpp: Option<usize>,
     ) -> Arc<Self> {
         Arc::new(Self {
             capacity,
             prefill_rows,
-            spec,
-            spec_k,
             offload_slots,
             paged_tpp,
             pending: Mutex::new(VecDeque::new()),
@@ -330,34 +305,6 @@ impl ServerEngine {
             image: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         })
-    }
-
-    /// Rejects requests the (greedy-only) spec engine cannot serve.
-    fn check_spec_request(
-        &self,
-        stop_seqs: &[Vec<u32>],
-        logit_bias: &[(u32, f32)],
-        params: &SamplingParams,
-    ) -> Result<(), EngineError> {
-        if !self.spec {
-            return Ok(());
-        }
-        if !stop_seqs.is_empty() || !logit_bias.is_empty() {
-            return Err(EngineError::InvalidRequest(
-                "stop/logit_bias unsupported in spec mode".into(),
-            ));
-        }
-        if params.temperature != 0.0
-            || params.top_k != 0
-            || params.top_p != 1.0
-            || params.presence_penalty != 0.0
-            || params.frequency_penalty != 0.0
-        {
-            return Err(EngineError::InvalidRequest(
-                "spec mode is greedy-only".into(),
-            ));
-        }
-        Ok(())
     }
 
     /// Submits a text-only generation request; resolves when the sequence finishes.
@@ -397,7 +344,6 @@ impl ServerEngine {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::ShuttingDown);
         }
-        self.check_spec_request(&stop_seqs, &logit_bias, &params)?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
@@ -465,7 +411,6 @@ impl ServerEngine {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::ShuttingDown);
         }
-        self.check_spec_request(&stop_seqs, &logit_bias, &params)?;
         let (tx, rx) = oneshot::channel();
         let (tokens_tx, tokens_rx) = tokio::sync::mpsc::channel(256);
         {
@@ -701,31 +646,6 @@ impl ServerEngine {
         self.spawn_engine_thread(model)
     }
 
-    /// Spawns a speculative-decoding engine thread (greedy-only).
-    pub fn spawn_spec(
-        self: Arc<Self>,
-        hip: Arc<Hip>,
-        cfg: Config,
-        w: Weights,
-        dcfg: Config,
-        dw: Weights,
-    ) -> Result<std::thread::JoinHandle<()>, EngineError> {
-        if self.paged_tpp.is_some() {
-            return Err(EngineError::InvalidRequest(
-                "Speculative mode does not support MACH_PAGED (paged spec wiring is a follow-up)"
-                    .into(),
-            ));
-        }
-        let k = self.spec_k;
-        let draft = BatchedModel::with_rows(hip.clone(), dcfg, &dw, self.capacity, self.capacity)?;
-        let target = BatchedModel::with_rows(hip, cfg, &w, self.capacity, self.capacity * (k + 1))?;
-        let mut engine = SpeculativeEngine::new(draft, target, k, self.capacity);
-        Ok(std::thread::Builder::new()
-            .name("mach-engine".into())
-            .spawn(move || self.run_spec(&mut engine))
-            .expect("spawn engine thread"))
-    }
-
     /// Spawns the engine thread; builds the GPU vision runtime inside it when
     /// a setup was installed via [`Self::set_vision`].
     fn spawn_engine_thread(
@@ -907,76 +827,6 @@ impl ServerEngine {
         self.streams.lock().unwrap().clear();
         self.cond.notify_all();
     }
-
-    /// Speculative-decoding engine loop (greedy-only; draft + target models).
-    fn run_spec(self: &Arc<Self>, engine: &mut SpeculativeEngine) {
-        loop {
-            // Admit pending requests while capacity allows.
-            {
-                let mut pending = self.pending.lock().unwrap();
-                let mut txs = self.txs.lock().unwrap();
-                let mut streams = self.streams.lock().unwrap();
-                while !pending.is_empty() && engine.active() < self.capacity {
-                    let r = pending.pop_front().expect("checked non-empty");
-                    let id = engine
-                        .add(&r.prompt, r.max_new, r.eos)
-                        .expect("capacity guaranteed") as SeqId;
-                    txs.insert(id, r.done);
-                    if let Some(stx) = r.tokens_tx {
-                        streams.insert(id, stx);
-                    }
-                }
-                drop(streams);
-            }
-            if engine.active() > 0 {
-                let outputs = match engine.step() {
-                    Ok(outputs) => outputs,
-                    Err(e) => {
-                        let msg = format!("spec step failed: {e}");
-                        eprintln!("{msg}; stopping engine");
-                        self.fail_all(&msg);
-                        self.shutdown.store(true, Ordering::Release);
-                        break;
-                    }
-                };
-                let mut txs = self.txs.lock().unwrap();
-                let mut streams = self.streams.lock().unwrap();
-                // A speculative round can emit several tokens for one
-                // sequence and mark it finished in the same call, so the
-                // completion must wait until the whole group is queued.
-                let outputs: Vec<(SeqId, u32)> = outputs
-                    .into_iter()
-                    .map(|(id, t)| (id as SeqId, t))
-                    .collect();
-                let (complete, cancel) =
-                    deliver_step_tokens(outputs, &mut streams, &mut txs, |id| {
-                        engine.is_done(id as usize)
-                    });
-                for id in cancel {
-                    engine.cancel(id as usize);
-                }
-                for id in complete {
-                    let output = engine.generated(id as usize);
-                    let reason = engine.finish_reason(id as usize);
-                    if let Some(tx) = txs.remove(&id) {
-                        // Spec mode is greedy-only: no logprobs tracked.
-                        let _ = tx.send(Ok((output, Vec::new(), Vec::new(), reason)));
-                    }
-                    streams.remove(&id);
-                }
-            } else {
-                let mut pending = self.pending.lock().unwrap();
-                if pending.is_empty() {
-                    if self.shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    while pending.is_empty() && !self.shutdown.load(Ordering::Acquire) {
-                        pending = self.cond.wait(pending).unwrap();
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Outcome of handing one step's token to a streaming client.
@@ -1023,8 +873,8 @@ type StepDelivery = (Vec<SeqId>, Vec<SeqId>);
 /// Delivers one step's outputs to the streaming clients, grouped per
 /// sequence.
 ///
-/// A speculative round can emit several tokens for one sequence and mark it
-/// finished in the same call, so the completion must not be sent until every
+/// A step can emit several tokens for one sequence and mark it finished in
+/// the same call, so the completion must not be sent until every
 /// token of that round has been queued — otherwise the trailing tokens are
 /// silently dropped while the client is told the response finished cleanly.
 ///
@@ -1213,12 +1063,13 @@ mod tests {
         assert_eq!(push_token(&mut streams, &mut txs, id, 9), TokenDelivery::Ok);
     }
 
-    /// Regression for the speculative path: one round can emit several
-    /// tokens for a sequence *and* be the round that finishes it. All of the
-    /// tokens must be queued before the caller is told to complete, otherwise
-    /// the trailing ones vanish while the client sees a clean finish.
+    /// One step can emit several tokens for a sequence *and* be the step
+    /// that finishes it (the original regression came from the retired
+    /// speculative path). All of the tokens must be queued before the caller
+    /// is told to complete, otherwise the trailing ones vanish while the
+    /// client sees a clean finish.
     #[test]
-    fn spec_round_queues_every_token_before_completing() {
+    fn multi_token_step_queues_every_token_before_completing() {
         let id: SeqId = 7;
         let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel(8);
         let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
@@ -1246,11 +1097,11 @@ mod tests {
         );
     }
 
-    /// A stalled consumer on any token of the round fails the whole request
+    /// A stalled consumer on any token of the step fails the whole request
     /// and asks the caller to cancel the sequence — the completion is never
     /// sent.
     #[test]
-    fn spec_round_stall_reports_cancel_and_fails_completion() {
+    fn multi_token_step_stall_reports_cancel_and_fails_completion() {
         let id: SeqId = 8;
         let (tok_tx, _tok_rx) = tokio::sync::mpsc::channel(2);
         tok_tx.try_send(0).unwrap();

@@ -15,7 +15,7 @@ cargo clippy --workspace --all-targets --features hip -- -D warnings
 cargo check --workspace --all-targets                    # CPU-only 面(必须始终可编译)
 cargo check --workspace --all-targets --features hip     # HIP 面 type-check(CI 是 check×2,两面都要过)
 cargo test --workspace --lib                             # CPU 单元测试
-cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors --test spec_decode  # CPU 集成测试
+cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors  # CPU 集成测试
 
 # GPU 回归(需本机 ROCm + GPU;必须单线程 —— ROCm Windows 并发 GPU setup 会死锁)
 cargo test --workspace --features hip -- --test-threads 1
@@ -40,7 +40,7 @@ cargo run -p mach-model --release --features hip --example qwen_bench    # decod
 cargo run -p mach-model --release --features hip --example chat_check    # 真实对话验证
 ```
 
-运行时环境变量(MACH_MODELS / MACH_MODEL / MACH_CONFIG / MACH_TOKENIZER / MACH_CAPACITY / MACH_PREFILL_ROWS / MACH_MOE_SLOTS / MACH_ADDR / MACH_DTYPE / MACH_Q4 / MACH_FP8 / MACH_SPEC / MACH_SPEC_K / MACH_DRAFT / MACH_DRAFT_CONFIG / MACH_HIP_PATH 等)以 `crates/mach-server/src/main.rs` 中 `env::var` 的读取点为准(顶部文档注释只列了其中一部分)。
+运行时环境变量(MACH_MODELS / MACH_MODEL / MACH_CONFIG / MACH_TOKENIZER / MACH_CAPACITY / MACH_PREFILL_ROWS / MACH_MOE_SLOTS / MACH_ADDR / MACH_DTYPE / MACH_Q4 / MACH_FP8 / MACH_HIP_PATH 等)以 `crates/mach-server/src/main.rs` 中 `env::var` 的读取点为准(顶部文档注释只列了其中一部分)。
 
 ## 架构(crates,自底向上)
 
@@ -58,7 +58,7 @@ mach-server        axum OpenAI 兼容 API(completions/chat/SSE)+ doctor 子命�
 - **CPU 参考栈(无需 GPU,CI 可跑)**:`ref_model` / `cpu_engine` / `fp64_ref` / PagedRef(`paged_kv` 的 CPU 全变压器)。它们既是行为规范也是 GPU 接线的蓝图。
 - **GPU 路径**:`kernels.rs` 集中放所有 HIP 内核源码(hiprtc 运行时编译,进程内有编译缓存);`model.rs`(GpuModel 单序列)→ `batched.rs`(BatchedModel 批量 decode,分页 KV 经 `with_paged_kv` 接入)→ `continuous.rs`(ContinuousModel 连续批处理:prefill/decode 混合、EOS、槽位压缩);另有 `prefill_buffered.rs`(双缓冲 prefill,下一层权重预取与当前层计算重叠)与 `sampling.rs`(GPU 批量采样:温度/top-k/top-p/惩罚,crate 内最大模块)。
 - **调度/复用(TokenSpeed 对齐线)**:`scheduler_fsm`(7 状态 FSM)、`kv_block_pool`(LCM 块池+RAII)、`prefix_cache`(SHA-256 前缀哈希链)、`reuse_planner` / `prefix_kv` / `state_reuse`(跨请求前缀共享与多轮状态复用)。
-- **量化/特化**:`q4`(存储级 int4)/ `fp8`(E4M3 存储,计算级已证伪)/ `moe_backend` + `moe_offload`(LRU 专家缓存 + host RAM offload)/ `adaptive*`(带宽自适应 offload 决策;q* 分数模型 adaptive_q 已随批次 1 退役,可从历史版本恢复)/ `speculative`(spec-decode,实测净负收益,**暂停投入**)。
+- **量化/特化**:`q4`(存储级 int4)/ `fp8`(E4M3 存储,计算级已证伪)/ `moe_backend` + `moe_offload`(LRU 专家缓存 + host RAM offload)/ `adaptive*`(带宽自适应 offload 决策;q* 分数模型 adaptive_q 已随批次 1 退役,可从历史版本恢复)。spec-decode 已随批次 2 移除(实测 0.29x 净负收益,README 性能地图保留证伪记录)。
 - `loader.rs`:纯 Rust safetensors(F32/F16/BF16、多 shard、Llama/Qwen/DeepSeek-MLA/Qwen-MoE/Qwen3.5-GDN 键名映射);`tokenizer.rs`:字节级 BPE。
 
 ### 请求流与线程模型
