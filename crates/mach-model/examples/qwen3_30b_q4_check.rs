@@ -99,7 +99,7 @@ fn main() {
     // Two full passes over the same sequence (the first pass doubles as
     // warmup): logits finite on every step, greedy tokens run-to-run stable
     // (deterministic Q4 path), and per-step timing. MACH_CHECK_STEPS overrides
-    // the default 16 (long runs exercise graph replay stability, #103).
+    // the default 16 (long runs exercise decode stability).
     let n_steps = std::env::var("MACH_CHECK_STEPS")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -3,7 +3,7 @@
 //! While layer `l` is being computed, layer `l + 1`'s weights are prefetched.
 //! On the GPU path that is an async host→device copy of the next MoE layer's
 //! expert weights on a **separate stream**, so the copy overlaps the GEMMs of
-//! the current layer and never enters a graph capture of the compute stream.
+//! the current layer and runs on its own stream to overlap with the compute stream.
 //!
 //! The scheduling core is [`run_double_buffered`]: a generic layer pipeline
 //! whose ordering contract makes the output **bitwise identical** to a

@@ -503,8 +503,7 @@ pub struct BatchedModel {
     /// `<dir>/hs_L{li:02}.npy` after each layer body — the same per-layer
     /// hidden-state trace `.scratch/np_ref.py` records at `REC_POS` — so the
     /// first layer where the device forward diverges from the host reference
-    /// can be read straight off the files. Syncs per layer and is mutually
-    /// exclusive with graph capture (see [`Self::graph_capture_ok`]).
+    /// can be read straight off the files. Syncs per layer.
     layer_dump: Option<std::path::PathBuf>,
 }
 
@@ -2909,10 +2908,9 @@ impl BatchedModel {
     }
 
     /// Host half of [`Self::refresh_table_offsets`]: refills the pinned
-    /// offsets staging only. Split from the upload so decode-graph capture can
-    /// record the memcpy (the graph then re-reads this staging on replay)
-    /// while the per-step host write stays outside the graph. No-op outside
-    /// paged mode.
+    /// offsets staging only. Split from the upload so the per-step host
+    /// write stays separate from the device traffic. No-op outside paged
+    /// mode.
     fn stage_table_offsets(&mut self, slots: &[u32]) {
         if !self.paged {
             return;
@@ -3000,9 +2998,8 @@ impl BatchedModel {
     }
 
     /// Device half of the decode-step input staging: tokens/pos/slots/run_mask
-    /// (+ paged table offsets) H2D from the pinned mirrors. When captured into
-    /// a decode graph these become memcpy nodes that re-copy the current
-    /// staging contents on every replay, so the host only rewrites the pinned
+    /// (+ paged table offsets) H2D from the pinned mirrors. These are async
+    /// memcpy nodes on the engine stream; the host only rewrites the pinned
     /// buffers between steps.
     fn upload_decode_inputs(&self, n: usize) -> Result<(), Error> {
         hip::memcpy_async(
@@ -3040,12 +3037,10 @@ impl BatchedModel {
         self.upload_table_offsets(n)
     }
 
-    /// #103: a step is graph-capturable only when it is a pure decode step on
     /// Debug (issue #107): after every forward, write the LAST active row's
     /// per-layer residual (post full layer — attention + MLP/MoE residual, the
     /// same point `.scratch/np_ref.py` records) to `<dir>/hs_L{li:02}.npy`
-    /// (f32, C-order). Files always carry the most recent step. Forces graph
-    /// capture off — the per-layer D2H read cannot be captured. Library-code
+    /// (f32, C-order). Files always carry the most recent step. Library-code
     /// debug hook: the server/examples choose the directory; no env is read
     /// here.
     ///
@@ -3412,8 +3407,8 @@ impl BatchedModel {
                 // Weights-driven dispatch (`has_gdn`, dtype-independent). The
                 // kernels index the persistent state by SLOT via `slots`.
                 // Pure decode steps (gdn_runs == 0: one row per slot) take
-                // the legacy per-row kernels — the same launches the decode
-                // graphs record. Steps carrying chunk runs (#112 Stage B:
+                // the legacy per-row kernels. Steps carrying chunk runs
+                // (#112 Stage B:
                 // contiguous consecutive-position rows of one slot = one WY
                 // chunk) instead walk the per-run chunked kernels; runs are
                 // host-side descriptors partitioning ALL rows.
@@ -4646,8 +4641,8 @@ impl BatchedModel {
         self.sample_readback(n)
     }
 
-    /// Device half of [`Self::sample`]: the argmax kernel only (graph-
-    /// capturable, #103).
+    /// Device half of [`Self::sample`]: the argmax kernel only (async on
+    /// the engine stream).
     fn sample_device(&self, n: usize) -> Result<(), Error> {
         self.k.launch_argmax_batched(
             self.logits,
@@ -4657,8 +4652,8 @@ impl BatchedModel {
         )
     }
 
-    /// Host half of [`Self::sample`]: sync + D2H of the sampled tokens. This
-    /// is the graph boundary — it cannot be captured.
+    /// Host half of [`Self::sample`]: sync + D2H of the sampled tokens.
+    /// This is the readback boundary — the only blocking device traffic.
     fn sample_readback(&self, n: usize) -> Result<Vec<u32>, Error> {
         unsafe {
             hip::check(
@@ -4721,7 +4716,7 @@ impl BatchedModel {
         assert_eq!(n, lens.len(), "tokens and lens must be equal length");
         assert_eq!(n, slots.len(), "tokens and slots must be equal length");
         // The sampler stages/reads per row; a mismatch would silently sample
-        // stale staging rows in the graph path (its grid uses `n`).
+        // stale staging rows (the sampler grid uses `n`).
         assert_eq!(n, params.len(), "tokens and params must be equal length");
         assert!(n <= self.rows, "active count exceeds row capacity");
         // Positions and slots must stay inside the device buffers: an out-of-
@@ -4802,9 +4797,8 @@ impl BatchedModel {
         // run descriptors above; all non-paged rows use decode attention
         // (run_mask = 0).
         let run_mask = vec![0i32; n];
-        // Host staging: refresh every pinned input mirror. Replayable graphs
-        // re-read these buffers on every launch, so this write is the ONLY
-        // per-step input work in the graph path.
+        // Host staging: refresh every pinned input mirror — this write is
+        // the ONLY per-step input work.
         unsafe {
             for i in 0..n {
                 *self.tokens_host.add(i) = tokens[i] as i32;

@@ -4447,7 +4447,7 @@ extern "C" __global__ void moe_prefix_sum(const int* counts, int* offsets, int n
 /// Compiled kernels plus the hipBLAS handle, bound to one stream.
 pub struct HipKernels {
     hip: std::sync::Arc<Hip>,
-    /// Shared execution stream (also the capture stream).
+    /// Shared execution stream.
     pub stream: HipStream,
     /// hipBLAS handle bound to `stream`.
     pub blas: mach_kernel_sys::hipblas::HipBlas,
@@ -5126,7 +5126,7 @@ impl HipKernels {
             &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
         // Dynamic shared memory: scores[max_seq] + red[256] floats; sized by
-        // max_seq so a graph captured at pos 0 replays safely at later positions.
+        // max_seq sized for the worst-case position up front.
         const MAX_SMEM_FLOATS: u32 = 16384; // gfx1100 64 KiB dynamic smem limit
         let floats = max_seq as u32 + 256;
         if floats > MAX_SMEM_FLOATS {
@@ -5241,7 +5241,7 @@ impl HipKernels {
             &max_seq as *const i32 as *mut core::ffi::c_void,
         ];
         // Dynamic shared memory: scores[max_seq] + red[256] floats; sized by
-        // max_seq so a graph captured at pos 0 replays safely at later positions.
+        // max_seq sized for the worst-case position up front.
         const MAX_SMEM_FLOATS: u32 = 16384; // gfx1100 64 KiB dynamic smem limit
         let floats = max_seq as u32 + 256;
         if floats > MAX_SMEM_FLOATS {

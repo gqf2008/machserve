@@ -778,8 +778,7 @@ impl BatchedSampler {
 
     /// Host half of [`Self::sample_batched`]: validates the per-row inputs and
     /// refills the pinned parameter staging (no device traffic). Split out so
-    /// decode-graph replay (#103) can redo just this host write per step while
-    /// the upload + kernel are folded into the graph.
+    /// the caller can redo just this host write per step.
     pub(crate) fn sample_batched_stage(
         &self,
         params: &[SamplingParams],
@@ -820,7 +819,7 @@ impl BatchedSampler {
     }
 
     /// Eager device half following [`Self::sample_batched_stage`]: parameter
-    /// upload + sampling kernel + readback. Used by the non-graph decode path.
+    /// upload + sampling kernel + readback. Used by the decode path.
     pub(crate) fn sample_batched_after_stage(
         &self,
         logits: *const f32,
@@ -837,8 +836,8 @@ impl BatchedSampler {
     /// at fixed offsets, so this is 12 small memcpys — a whole-block copy
     /// would transfer `capacity` rows per step (~34MB at prefill-rows
     /// capacity) and dominate n≪capacity decode steps, which is exactly the
-    /// hot case this sampler serves. Graph-capturable (memcpy nodes re-copy
-    /// the current staging contents at replay).
+    /// hot case this sampler serves. Async on the engine stream (memcpy
+    /// nodes re-copy the current staging contents).
     pub(crate) fn sample_batched_upload(&self, n: usize) -> Result<(), Error> {
         hip::memcpy_async(
             &self.hip,
@@ -940,7 +939,7 @@ impl BatchedSampler {
     }
 
     /// The sampling kernel itself (penalties/bias in place on `logits`, then
-    /// per-row top-k/top-p/temperature draw). Graph-capturable.
+    /// per-row top-k/top-p/temperature draw). Async on the engine stream.
     pub(crate) fn sample_batched_kernel(
         &self,
         logits: *const f32,
@@ -994,9 +993,9 @@ impl BatchedSampler {
 
     /// Host-side readback half: sync, D2H the sampled tokens + logprobs,
     /// advance the authoritative seeds, then the optional per-row
-    /// `top_logprobs` pass. This is the graph boundary (#103): the sync and
-    /// D2H cannot be captured, so the graph ends right after the sampling
-    /// kernel and every caller (graph or eager) funnels through here.
+    /// `top_logprobs` pass. This is the readback boundary: the sync and
+    /// D2H are the only blocking device traffic in the sampling path, and
+    /// every caller funnels through here.
     pub(crate) fn sample_batched_readback(
         &self,
         logits: *const f32,

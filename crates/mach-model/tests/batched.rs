@@ -1327,9 +1327,8 @@ mod paged_quantized_cpu_parity {
     /// `MACH_Q4_DEVICE=2`, 1958 tokens, prefill rows 512) left no Kernel-Power
     /// 41, which weakly excludes the rowbatch axis but this case cannot.
     ///
-    /// Run with `MACH_LAYER_DUMP` unset so the run matches the real failing
-    /// config (the #103 decode-graph path this note used to mention was removed
-    /// in backend refactor batch 3).
+    /// The #103 decode-graph path this note used to mention was removed in
+    /// backend refactor batch 3; no env vars affect this test binary.
     #[test]
     #[ignore = "known-bad shape (#168): needs MACH_TEST_PAGED_MANY_PAGE=1 and an operator watching"]
     fn batched_paged_q4_all_chunked_prefill_across_many_pages_repro() {

@@ -2,9 +2,8 @@
 //!
 //! P1 decode slice: a small transformer (attention + MLP, GQA) with a static
 //! KV cache, runnable on CPU (reference) and on AMD GPUs via the HIP path.
-//! The GPU decode step is structured so the kernel sequence can be captured
-//! once into a HIP graph and replayed for every token — the serving pattern
-//! used by TokenSpeed on CUDA.
+//! The GPU decode step runs as a fixed kernel sequence per token with zero
+//! per-step allocation.
 
 #[cfg(feature = "hip")]
 pub mod adaptive;

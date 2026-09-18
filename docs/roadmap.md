@@ -13,7 +13,7 @@
 
 | 阶段 | 交付物 | 验收(exit criteria) |
 |---|---|---|
-| P0 地基 | 工作区骨架 + ~~mach-engine~~(批次 3 已删)+ ~~mach-kernel~~(批次 1 已删)+ mach-kernel-sys FFI 骨架 + 基准框架 | 全绿构建 |
+| P0 地基 | 工作区骨架 + ~~mach-engine~~(批次 3 已删)+ ~~mach-kernel~~(批次 1 已删)+ mach-kernel-sys FFI 骨架 + 基准框架 | 全绿构建;~~软件 graph 捕获/重放测试;注册表调度基准~~(批次 1/3 移除) |
 | P1 单模型 decode 链路 | 小模型:静态 KV + CUDA graph 化 decode + eager prefill + safetensors 权重加载 | 输出与参考实现逐 token 一致;TPOT 对标 TokenSpeed 同 kernel 场景 |
 | P2 引擎化 | mach-scheduler(复用 ts-scheduler-core)+ 连续批处理 + 采样 + axum OpenAI server | 多请求延迟/吞吐基线 vs TokenSpeed/vLLM |
 | P3 性能主力 | MoE + FP8 + MLA(flashinfer)+ AMD(gluon)(spec-decode 已证伪并移除,批次 2/#200) | 吞吐追上/局部超越;GPU util 达标 |
@@ -59,7 +59,7 @@
   同步移除;continuous.rs 转发器、lib.rs 的 Error::Engine/Error::Graph 变体清除。
   hip_arch()/DEFAULT_HIP_ARCH/MACH_HIP_ARCH 搬入 mach-kernel-sys::hip(唯一 FFI 边界)。
   删 examples/qwen3_30b_graph_churn.rs,decode_bench/qwen_bench 改为纯 eager 基准;
-  tests 的 3 个 graph 对拍测试(decode_graph_matches_eager_f16 /
+  tests 的 4 个 graph 对拍测试(decode_graph_matches_eager_f16 /
   decode_graph_buckets_follow_active_rows / decode_graph_engine_repeated_requests_match_eager /
   graph_replay_matches_eager)随功能一并删除。workspace 4 crates → 3。
   验证:fmt / clippy -D warnings / check×2 / workspace lib 测试 / 3 个 CPU 集成套件全绿,

@@ -4,12 +4,11 @@
 //! - `update_inputs`: copies the token + position into pinned host buffers and
 //!   issues async H2D copies on the stream;
 //! - `run_kernels`: the whole kernel sequence (GEMMs, norms, attention, KV
-//!   store) — this is exactly what gets captured into a HIP graph;
+//!   store) — this is the fixed per-token kernel sequence;
 //! - `read_logits`: stream sync + D2H copy.
 //!
-//! Because `pos` and `token` are read by kernels from device buffers, one
-//! captured graph can serve every position: update the buffers between
-//! replays, then replay.
+//! Because `pos` and `token` are read by kernels from device buffers, the
+//! same buffers serve every position: update them between steps.
 
 use crate::adaptive::{AdaptiveProfile, BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
@@ -119,7 +118,7 @@ pub struct GpuModel {
     // pinned host input buffers
     host_tok: *mut i32,
     host_pos: *mut i32,
-    // device input buffers (read by kernels; updated between replays)
+    // device input buffers (read by kernels; updated between steps)
     dev_tok: *mut i32,
     dev_pos: *mut i32,
     // activations
@@ -2305,7 +2304,7 @@ impl GpuModel {
         Ok(logits)
     }
 
-    /// Zeroes the KV cache and resets the position (before graph capture).
+    /// Zeroes the KV cache and resets the position (between runs).
     pub fn reset_state(&mut self) -> Result<(), Error> {
         let bytes = self.cfg.max_seq_len * self.cfg.n_kv_heads * self.cfg.head_dim * 4;
         for (kc, vc) in &self.kv_cache {

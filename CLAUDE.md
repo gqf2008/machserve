@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-MachServe 是**除内核外全部 Rust** 的 LLM 推理引擎,目标硬件为 **AMD GPU(ROCm/HIP,当前 RX 7900 XTX / gfx1100,Windows 原生 ROCm 6.2)**。host 侧(调度/采样/内存/图捕获/HTTP)零 Python;GPU 侧走 hipBLAS GEMM + hiprtc 运行时编译的自有内核。CUDA 不在当前路线(旧 `cuda` 占位已删,后端重构批次 8 按 cutile-rs/cuda-oxide 双轨重评)。主分支是 `master`。文档与提交描述用中文。
+MachServe 是**除内核外全部 Rust** 的 LLM 推理引擎,目标硬件为 **AMD GPU(ROCm/HIP,当前 RX 7900 XTX / gfx1100,Windows 原生 ROCm 6.2)**。host 侧(调度/采样/内存/HTTP)零 Python;GPU 侧走 hipBLAS GEMM + hiprtc 运行时编译的自有内核。CUDA 不在当前路线(旧 `cuda` 占位已删,后端重构批次 8 按 cutile-rs/cuda-oxide 双轨重评)。主分支是 `master`。文档与提交描述用中文。
 
 ## 常用命令
 
