@@ -320,12 +320,10 @@ pub fn model_file_bytes(path: &Path) -> u64 {
     }
 }
 
-/// Rough device-memory estimate for the preflight: weight file + KV cache +
-/// 256MiB scratch margin. MLA uses the expanded
-/// per-head KV cache (always f32); dense uses the GQA formula with the dtype's
-/// element size. Sharded weight files are counted via [`model_file_bytes`];
-/// hipBLAS workspace and compiled kernels are not counted; the margin covers
-/// today's scenarios.
+/// Test shorthand for [`estimate_vram_kv`] with unpacked KV (`kv_q4 =
+/// false`); runtime callers use `estimate_vram_kv` directly so the KV mode is
+/// explicit.
+#[cfg(test)]
 pub fn estimate_vram(
     cfg: &Config,
     capacity: usize,
@@ -337,10 +335,12 @@ pub fn estimate_vram(
     estimate_vram_kv(cfg, capacity, file_bytes, fp8, q4_device, kv_int8, false)
 }
 
-/// [`estimate_vram`] extended with packed-Q4 KV. Keeping the original
-/// signature preserves the large existing test surface; runtime callers use
-/// this entry point so the KV mode is explicit.
-#[allow(clippy::too_many_arguments)]
+/// Rough device-memory estimate for the preflight: weight file + KV cache +
+/// 256MiB scratch margin, with the KV mode explicit (unpacked / INT8 / packed
+/// Q4). MLA uses the expanded per-head KV cache (always f32); dense uses the
+/// GQA formula with the dtype's element size. Sharded weight files are counted
+/// via [`model_file_bytes`]; hipBLAS workspace and compiled kernels are not
+/// counted; the margin covers today's scenarios.
 pub fn estimate_vram_kv(
     cfg: &Config,
     capacity: usize,

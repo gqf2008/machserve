@@ -84,7 +84,7 @@ mach-server        axum OpenAI 兼容 API(completions / chat / SSE 流式)
 | 内存布局 [slot][kv][pos][dim] | 证伪(0x) | 新布局计时 |
 | V 加载向量化 | 证伪(0x,acc2 开销抵消) | 2-dim 变体计时 |
 | QKV/gateup GEMM 融合 | 关闭(非 launch 主导) | 层数扫描次线性 |
-| ~~**spec-decode**~~(P3al-P3ap,2026-09 批次 2 移除) | 正确性曾多层验证(单/批量/生命周期);**实测 0.29x(净负)** | 证伪,代码已删(历史可恢复) |
+| **spec-decode**(P3al-P3ap,2026-09 批次 2 移除) | 正确性曾多层验证(单/批量/生命周期);**实测 0.29x(净负)** | 证伪,代码已删(历史可恢复) |
 | **MoE**(P3at-P3az, #70) | 端到端闭环:权重→GPU(单序列+批量分组 GEMM)→连续批处理→HTTP;批量解码 grouped GEMV 设备路径(每层 4 发射,免 counts D2H/sync/host 循环)+ router 并行 top-k + sampler 单块上传;**Q4-on-device 专家池(30B 类检查点内存可行路径,#85)+ m=1 GEMV 内核与 grouped 小批量并行重构(#87)** | 全回归绿;**A/B(7900 XTX,2 层/64 专家/topk8/batch32/F16):4.87→0.098 ms/step(50x)**;**真机验证(#85,#87,2026-08-30):Qwen3-30B-A3B Q4-on-device 加载 201.6s→解码 17.4 ms/step(#87 前为 190,#87 后 10.9x;16 步全有限 logits、两遍 greedy 逐位稳定)** |
 | **MLA**(P3ca-P3ce) | 单序列/批量/连续批处理/F16 decode 已落地,槽位压缩 KV 搬移修复 | 与 CPU 参考对拍;HIP 回归全绿 |
 | **存储级 Q4**(#16/#20/#24/#25/#27/#30) | 8B 主机内存 48GB→~5GB,`MACH_Q4=1` 服务,加载 13x 加速 | Qwen3-8B 真机验证 + GPU 对拍 |

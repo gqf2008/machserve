@@ -16,7 +16,7 @@
 | P0 地基 | 工作区骨架 + mach-engine(device/内存/stream/graph 生命周期)+ mach-kernel 边界 + mach-kernel-sys FFI 骨架 + 基准框架 | 全绿构建;软件 graph 捕获/重放测试;注册表调度基准 |
 | P1 单模型 decode 链路 | 小模型:静态 KV + CUDA graph 化 decode + eager prefill + safetensors 权重加载 | 输出与参考实现逐 token 一致;TPOT 对标 TokenSpeed 同 kernel 场景 |
 | P2 引擎化 | mach-scheduler(复用 ts-scheduler-core)+ 连续批处理 + 采样 + axum OpenAI server | 多请求延迟/吞吐基线 vs TokenSpeed/vLLM |
-| P3 性能主力 | MoE + FP8 + MLA(flashinfer)+ spec-decode + AMD(gluon) | 吞吐追上/局部超越;GPU util 达标 |
+| P3 性能主力 | MoE + FP8 + MLA(flashinfer)+ AMD(gluon)(spec-decode 已证伪并移除,批次 2/#200) | 吞吐追上/局部超越;GPU util 达标 |
 | P4 分布式 | NCCL + TP/PP/EP,通信与计算重叠 | 多卡扩展效率曲线对比 |
 | P5 打磨 | 正确性契约全绿 + 性能矩阵 + 稳定化 | "超越"指标表逐项确认 |
 
@@ -51,6 +51,15 @@
 - P1 验收改为:小模型 decode 链路在 7900 XTX 上跑通,TPOT 对标 TokenSpeed(同 kernel 场景)。
 
 ## 进度日志
+
+- **后端重构批次 2 完成(2026-09-18,PR #201 / issue #200)**:移除 spec-decode 实验面,
+  纯删除零行为变化 —— 删 `speculative.rs`(442 行)+ `tests/spec_decode.rs` +
+  `examples/spec_check.rs`,摘除 MACH_SPEC/MACH_SPEC_K/MACH_DRAFT/MACH_DRAFT_CONFIG
+  全链路(spawn_spec/run_spec/with_spec/check_spec_request、estimate_vram* 的 draft
+  参数);engine.rs 两个投递辅助回归测试改名保留(测通用多 token 投递,非 spec 行为);
+  遗留 MACH_SPEC* 环境变量改为启动告警而非静默忽略。净 -1366/+51 行。验证:fmt /
+  clippy -D warnings / check×2 / workspace lib 测试 / 3 个 CPU 集成套件全绿,offline
+  81 内核门禁 2/2(spec 无专用内核);GPU 回归待显卡恢复后随批次 2-5 统一补跑。
 
 - **后端重构批次 1 完成(2026-09-18,PR #199 / issue #198)**:零引用死代码清理,
   纯删除零行为变化 —— 删 mach-kernel + mach-bench 两 crate(op 注册表骨架,唯一

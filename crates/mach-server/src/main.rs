@@ -506,6 +506,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             q4_device
         );
     }
+    // spec-decode was removed (measured 0.29x net-negative); warn on leftover
+    // env vars instead of silently ignoring them (repo convention).
+    for var in [
+        "MACH_SPEC",
+        "MACH_SPEC_K",
+        "MACH_DRAFT",
+        "MACH_DRAFT_CONFIG",
+    ] {
+        if std::env::var_os(var).is_some() {
+            eprintln!("warning: {var} is no longer supported (spec-decode removed); ignoring");
+        }
+    }
 
     if fp8 {
         if q4 {
@@ -639,10 +651,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Q4 mode loads packed int4 weights directly (host RAM stays small) and
-    // spawns the Q4 engine; f16/f32 and spec modes keep the f32 host load.
+    // spawns the Q4 engine; f16/f32 modes keep the f32 host load.
     // Paged mode is wired for the plain-Weights and storage-quantized paths
-    // (device f16 served by the f16 paged kernels); MoE-offload remains
-    // contiguous-only (warned).
+    // (device f16 served by the f16 paged kernels).
     // Resolve paged engagement BEFORE any weight load: a stale/invalid
     // MACH_TPP or a paged-incompatible checkpoint must fail fast (or degrade
     // with a warning) up front, not abort after the multi-minute load.

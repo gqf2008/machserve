@@ -97,4 +97,4 @@ MACH_MODELS=.models MACH_MODEL=model.safetensors MACH_CONFIG=config.json \
 
 服务端等价入口：`MACH_FP8=1 cargo run -p mach-server --release --features hip`
 （`MACH_FP8` 走 `load_safetensors_fp8` → FP8 批量引擎；preflight 会标注 storage FP8；
-与 `MACH_Q4` / `MACH_SPEC` / `MACH_MOE_SLOTS` 互斥，要求 `MACH_DTYPE=f16`）。
+与 `MACH_Q4` / `MACH_MOE_SLOTS` 互斥，要求 `MACH_DTYPE=f16`）。

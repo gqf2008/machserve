@@ -45,7 +45,7 @@ jobs:
       - name: workspace lib tests
         run: cargo test --workspace --lib
       # `decode_slice` runs its CPU case here (the GPU cases are compiled out
-      # without the feature); `fp16` and `spec_decode` are `--features hip`-only
+      # without the feature); `fp16` is a `--features hip`-only
       # suites, so without the feature they report "0 tests" rather than being
       # skipped — they are NOT covered by this job. `load_safetensors` runs its
       # CPU cases (15 passed + 1 ignored) and compiles out its 9 hip-gated GPU cases (25 with hip, 8 ignored).
