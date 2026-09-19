@@ -1,0 +1,47 @@
+# MachServe 看板定义(.walgit/board.toml)——主仓在 walgit,issue/PR/评审/看板都在 refs/collab/*
+# 看板是线程集合在声明式列定义下的确定性投影:卡片进入【第一个】满足谓词的列;字段留空 = 匹配任意。
+# 移动卡片 = 追加一条签名 `status` 条目,不是改这个文件。
+#
+# 逐字段继承:status 取最新一条带字符串 status 的 status 条目(merge_result {"merged":true} 也置 merged);
+# owner/worktree/branch 各取最新一条写了该字段的 status 条目(缺字段继承,显式空串清除),work 缺省回退到该条 note。
+# 建单即认领:建完 issue 立刻补带 owner 的 status —— 只写 owner 在 comment 里不算数。
+# 线程 id 沿用迁入时的 `gh-<原 GitHub issue 号>`,新线程用描述性短 id。
+
+version = 1
+
+[sort]
+by = "ts"          # ts(默认,按最后活动) | id(按线程 id)
+direction = "desc" # desc(默认,新在前) | asc
+
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "blocked"
+status = "blocked"
+
+[[column]]
+name = "needs-human"
+status = "needs-human"
+
+# 终态三种 card_status 都要有列,否则卡片在合并/结项后从看板消失。
+[[column]]
+name = "merged"
+status = "merged"
+
+[[column]]
+name = "done"
+status = "done"
+
+[[column]]
+name = "closed"
+status = "closed"

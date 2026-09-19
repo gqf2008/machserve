@@ -1,9 +1,13 @@
 name: CI
 
+# GitHub 是镜像/发版仓(2026-09-19 起:主仓=自建 walgit)。日常开发与评审在 walgit,
+# GitHub 上没有 PR 流程,所以这里只在镜像推 master / v* tag(发版门禁)时跑跨平台验证,
+# GPU job 仍是手动 workflow_dispatch。
 on:
   push:
     branches: [master]
-  pull_request:
+    tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

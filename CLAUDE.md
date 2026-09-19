@@ -38,6 +38,12 @@ cargo run -p mach-server --release --features hip          # OpenAI 兼容 API,�
 cargo run -p mach-server --release --features hip -- doctor  # 一键排障:GPU/显存/环境/模型检查
 cargo run -p mach-model --release --features hip --example qwen_bench    # decode 吞吐/批量/prefill 基准
 cargo run -p mach-model --release --features hip --example chat_check    # 真实对话验证
+
+# walgit 主仓:issue/PR/评审/看板都在 refs/collab/*(GitHub 只做镜像与发版)
+walgit --config ~/.walgit/walgit.toml collab board        # 看板(线程按 .walgit/board.toml 投影)
+walgit --config ~/.walgit/walgit.toml collab ls           # 全部线程 id
+walgit --config ~/.walgit/walgit.toml collab thread <id>  # 单线程(逐条验签)
+pwsh -File tools/mirror_to_github.ps1 -Once               # 把 heads/tags 镜像到 GitHub(发版走这里)
 ```
 
 运行时环境变量(MACH_MODELS / MACH_MODEL / MACH_CONFIG / MACH_TOKENIZER / MACH_CAPACITY / MACH_PREFILL_ROWS / MACH_MOE_SLOTS / MACH_ADDR / MACH_DTYPE / MACH_Q4 / MACH_FP8 / MACH_HIP_PATH 等)以 `crates/mach-server/src/main.rs` 中 `env::var` 的读取点为准(顶部文档注释只列了其中一部分)。
@@ -73,8 +79,27 @@ HTTP handler(axum)→ channel → **唯一后台引擎线程**(模型/GPU 状态
 5. **文档同步**:里程碑完成后在 `docs/roadmap.md` 追加进度日志条目(含验证命令与结果),README 性能地图与 `docs/tokenspeed-alignment.md` 状态表按需同步;基准方法论在 `docs/benchmark-protocol.md`。
 6. **性能声称必须有实测**:每个优化方向记录真 A/B 数据;已证伪方向(split-K、FP8 计算级、spec-decode 等)记入 README 性能地图,不再重复投入。
 
-## 开发流程(issue 驱动)
+## 仓库托管(2026-09-19 起:walgit 主仓,GitHub 镜像发版)
 
-- 每个工作单元一个 GitHub issue(同类 ≥3 条合并为批次 issue + checklist);基于 `master` 开 worktree 开发,**不直接在 master 上改**;PR 关联 issue。
-- 提交信息用 conventional commits(`feat(model):` / `fix:` / `chore:` / `test:` / `docs:` + 中文描述 + issue 号;标题末尾的 `(#N)` 是 squash merge 自动附带的 PR 号,不是手写;更早历史提交为英文,近期起统一中文);PR 审查通过 + CI 绿(fmt / clippy -D warnings / check×2 / CPU 测试)后 squash merge,合并后清理分支与 worktree。
-- 开始处理 issue 前在 issue 上标记"处理中"并注明 worktree,避免多 agent 撞车。
+- **主仓 = 自建 walgit**:`origin = http://127.0.0.1:8081/gqf2008/machserve.git`。代码、issue、PR/评审、看板都在这里
+  —— issue/PR/评审/状态是 `refs/collab/*` 里的签名条目(`walgit collab ...`),不走 GitHub 的 label/PR 流程。
+- **GitHub 只做镜像与发版**:`github = https://github.com/gqf2008/machserve.git`(旧 `origin`)。它的
+  Issues / Wiki / Projects / Discussions 已于 2026-09-19 关闭;存量未结 issue 已迁到 walgit 线程(见看板)。
+  镜像由 `tools/mirror_to_github.ps1` 把 `refs/heads/*` + `refs/tags/*` 推过去,`refs/collab/*` 永不同步。
+  **不要手工往 `github` remote 推分支**:发版在 walgit 侧打 `v*` tag,由镜像带到 GitHub。
+- 本机 walgit 服务:`walgit service status`(默认 `http://127.0.0.1:8081`);CLI 用安装版
+  `%LOCALAPPDATA%\Programs\walgit\walgit.exe`(PATH 里那份可能是旧版,`healthz` 的 version 可核对)。
+  本机签名身份 `mach-win`,私钥 `~/.walgit/keys/mach-win.ed25519`。
+
+## 开发流程(walgit 线程驱动)
+
+- 每个工作单元一个 walgit 线程(同类 ≥3 条合并为批次线程 + checklist):`walgit collab entry --kind issue` 建线程,
+  紧接着补一条带 `owner` 的 `status` 条目(建单即认领;纯待办也要 owner,用 `blocked` / `needs-human` 表达)。
+- 基于 `origin/master` 开 worktree 开发,**不直接在 master 上改**;开工与状态流转都写 `status` 条目
+  (owner/worktree/branch/work),避免多 agent 撞车。
+- 提交信息用 conventional commits(`feat(model):` / `fix:` / `chore:` / `test:` / `docs:` + 中文描述 + 线程号;
+  更早历史提交为英文,近期起统一中文)。
+- 实现完成挂 `patch` 条目(base/head);重大改动必须有独立审查者,审查结论写 `review` 条目;本地合并进 `master`
+  并 `git push origin`,随后记 `merge_result {"merged": true}`,再补 `status closed` 归档,清理分支与 worktree。
+- 本地门禁(fmt / clippy -D warnings / check×2 / CPU 测试)在合并前跑绿;GitHub Actions 只在镜像发版
+  (推 `master` 或 `v*` tag)时作为跨平台验证,不作为日常合并前置。

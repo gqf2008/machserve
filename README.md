@@ -162,6 +162,13 @@ curl -sN http://127.0.0.1:8080/v1/chat/completions -H "content-type: application
 - **不用 burn / libtorch / tch-rs 运行时**;hipBLAS `GemmEx_v2` 提供 fp16 GEMM。
 - 详细路线与踩坑见 [`docs/roadmap.md`](docs/roadmap.md)。
 
+## 仓库托管与协作
+
+- **主仓在自建 walgit**(`origin = http://127.0.0.1:8081/gqf2008/machserve.git`):代码、issue、PR/评审、看板都在那里
+  —— issue/PR/评审/状态是 `refs/collab/*` 里的签名条目(`walgit collab ...`),开发流程见 [CLAUDE.md](CLAUDE.md)。
+- **GitHub 只是镜像与发版入口**(`https://github.com/gqf2008/machserve`):Issues / Wiki / Projects / Discussions
+  已关闭;`refs/heads/*` + `refs/tags/*` 由 `tools/mirror_to_github.ps1` 镜像过去,发版在 walgit 侧打 `v*` tag。
+
 ## License
 
 MIT
