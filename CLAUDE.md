@@ -87,6 +87,9 @@ HTTP handler(axum)→ channel → **唯一后台引擎线程**(模型/GPU 状态
   Issues / Wiki / Projects / Discussions 已于 2026-09-19 关闭;存量未结 issue 已迁到 walgit 线程(见看板)。
   镜像由 `tools/mirror_to_github.ps1` 把 `refs/heads/*` + `refs/tags/*` 推过去,`refs/collab/*` 永不同步。
   **不要手工往 `github` remote 推分支**:发版在 walgit 侧打 `v*` tag,由镜像带到 GitHub。
+- **从 walgit 克隆要带 `-b master`**:walgit 服务端的 HEAD 模板是 `refs/heads/main`,而本仓主分支是
+  `master`,直接 `git clone <walgit-url>` 会落到未出生分支(工作区空,不是仓库空):
+  `git clone -b master http://127.0.0.1:8081/gqf2008/machserve.git`。
 - 本机 walgit 服务:`walgit service status`(默认 `http://127.0.0.1:8081`);CLI 用安装版
   `%LOCALAPPDATA%\Programs\walgit\walgit.exe`(PATH 里那份可能是旧版,`healthz` 的 version 可核对)。
   本机签名身份 `mach-win`,私钥 `~/.walgit/keys/mach-win.ed25519`。

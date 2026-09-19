@@ -166,6 +166,8 @@ curl -sN http://127.0.0.1:8080/v1/chat/completions -H "content-type: application
 
 - **主仓在自建 walgit**(`origin = http://127.0.0.1:8081/gqf2008/machserve.git`):代码、issue、PR/评审、看板都在那里
   —— issue/PR/评审/状态是 `refs/collab/*` 里的签名条目(`walgit collab ...`),开发流程见 [CLAUDE.md](CLAUDE.md)。
+  从 walgit 克隆请带分支:walgit 的 HEAD 模板是 `main`、本仓主分支是 `master`,
+  `git clone -b master http://127.0.0.1:8081/gqf2008/machserve.git`。
 - **GitHub 只是镜像与发版入口**(`https://github.com/gqf2008/machserve`):Issues / Wiki / Projects / Discussions
   已关闭;`refs/heads/*` + `refs/tags/*` 由 `tools/mirror_to_github.ps1` 镜像过去,发版在 walgit 侧打 `v*` tag。
 
