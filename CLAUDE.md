@@ -21,7 +21,8 @@ cargo test -p mach-model --test decode_slice --test fp16 --test load_safetensors
 cargo test --workspace --features hip -- --test-threads 1
 cargo test -p mach-server --features hip
 
-# GPU 安全门禁(必跑;本机 30 天内 30 次整机硬断电,已定性为硬件层供电问题,不是代码 bug;
+# GPU 安全门禁(必跑;2026-09 期间本机 40+ 次整机硬断电,已定性为硬件层供电问题,不是代码 bug;
+#   2026-10-01 换 1250W 电源后同一杀手配方 5/5 全绿(杀手配方见 docs 同文件 §17),但限功耗遗留变量与多日观察未收口;
 # 复盘与假设矩阵见 docs/rocm-windows-hard-poweroff-investigation.md §8/§12)
 # 规则:单负载串行 —— GPU 负载期间禁止并发 cargo build/clippy/第二个推理/大文件拷贝
 pwsh -File tools/gpu_guard.ps1 pre     # 跑前:device_count/gpu[0] 校验 + 距上次硬断电 ≥60 分钟
