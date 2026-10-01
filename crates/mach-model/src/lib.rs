@@ -6,8 +6,6 @@
 //! per-step allocation.
 
 #[cfg(feature = "hip")]
-pub mod adaptive;
-pub mod adaptive_policy;
 #[cfg(feature = "hip")]
 pub mod batched;
 pub mod config;

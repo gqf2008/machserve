@@ -124,7 +124,7 @@ impl LruExpertCache {
     ///
     /// `gpu_fetch_budget` caps how many new experts may be uploaded to GPU this
     /// step; routed experts beyond the budget are placed on the CPU. This is the
-    /// policy hook that the bandwidth-adaptive q* (P2) will tune.
+    /// policy hook for bounded-slot placement.
     pub fn plan(&mut self, routed: &[u32], gpu_fetch_budget: usize) -> StepPlan {
         let mut placements = Vec::with_capacity(routed.len());
         let mut fetches = Vec::new();

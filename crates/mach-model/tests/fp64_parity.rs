@@ -4,7 +4,7 @@
 //! f64 with the same f32 weights (exact f32 → f64 conversion), so the
 //! difference against the f32 CPU/GPU paths is exactly the f32 rounding error
 //! of those paths. These opt-in GPU tests verify, per MoE offload mode
-//! (full / slots / adaptive, and the batched cpu-backend), that all three
+//! (full / slots, and the batched cpu-backend), that all
 //! agree within an accumulated f32 rounding bound and that the argmax is
 //! identical across all three.
 //!
@@ -153,7 +153,7 @@ fn check_three_way(label: &str, cfg: &Config, gpu: &[f32], cpu: &[f32], fp64: &[
 #[cfg(feature = "hip")]
 #[ignore]
 #[test]
-fn gpu_full_slots_adaptive_three_way_fp64_parity() {
+fn gpu_full_slots_three_way_fp64_parity() {
     use mach_model::model::GpuModel;
     use std::sync::Arc;
 
@@ -179,17 +179,6 @@ fn gpu_full_slots_adaptive_three_way_fp64_parity() {
         "gpu slots=1",
         &cfg,
         &slots_logits,
-        &cpu_logits,
-        &fp64_logits,
-    );
-
-    // adaptive q*: per-miss GPU-vs-CPU choice from measured bandwidth.
-    let mut adaptive = GpuModel::with_adaptive(Arc::clone(&hip), cfg, &w, 2).unwrap();
-    let adaptive_logits = adaptive.forward(&tokens).unwrap();
-    check_three_way(
-        "gpu adaptive",
-        &cfg,
-        &adaptive_logits,
         &cpu_logits,
         &fp64_logits,
     );
@@ -259,7 +248,7 @@ fn batched_cpu_backend_three_way_fp64_parity() {
     }
 }
 
-/// Real qwen3-moe-tiny three-way parity on the 7900 XTX: full + slots + adaptive
+/// Real qwen3-moe-tiny three-way parity on the 7900 XTX: full + slots
 /// vs the f32 CPU reference and the fp64 reference. Skipped when the checkpoint
 /// is not present. Opt-in (`#[ignore]`); run with `--test-threads=1`.
 #[cfg(feature = "hip")]
@@ -353,16 +342,6 @@ fn moe_real_three_way_fp64_parity() {
         "qwen3-moe-tiny slots=4",
         &cfg,
         &slots_logits,
-        &cpu_logits,
-        &fp64_logits,
-    );
-
-    let mut adaptive = GpuModel::with_adaptive(Arc::clone(&hip), cfg, &w, 4).unwrap();
-    let adaptive_logits = adaptive.forward(&tokens).unwrap();
-    check_three_way(
-        "qwen3-moe-tiny adaptive",
-        &cfg,
-        &adaptive_logits,
         &cpu_logits,
         &fp64_logits,
     );

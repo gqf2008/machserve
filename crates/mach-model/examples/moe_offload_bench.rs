@@ -1,5 +1,5 @@
 //! Reproducible benchmark for the MoE offload engine: compares full-resident,
-//! bounded-slot, and bandwidth-adaptive (q*) placement on the SAME model + input.
+//! bounded-slot placement on the SAME model + input.
 //!
 //! Run on a GPU box (needs a MoE checkpoint; opt-in, no model is loaded here):
 //!   MACH_MODEL=<model.safetensors> MACH_CONFIG=<config.json> MACH_MOE_SLOTS=2 \
@@ -54,7 +54,6 @@ fn main() {
 
     let (full, full_logits) = run_mode(&hip, cfg, &w, Mode::Full, &seq);
     let (slot, slot_logits) = run_mode(&hip, cfg, &w, Mode::Slots(slots), &seq);
-    let (adapt, adapt_logits) = run_mode(&hip, cfg, &w, Mode::Adaptive(slots), &seq);
 
     // Placement-invariance on the real checkpoint: offloaded modes must match
     // the full-resident logits exactly (scheduling is a numeric no-op).
@@ -95,12 +94,6 @@ fn main() {
         slot.tpot_ms,
         1000.0 / slot.tpot_ms
     );
-    println!(
-        "adaptive      | {:8.2} | {:10.2} | {:8.1}",
-        adapt.ttft_ms,
-        adapt.tpot_ms,
-        1000.0 / adapt.tpot_ms
-    );
     println!("note: TTFT/TPOT include the offload path syncs/D2H; placement is");
     println!("      invariance-agnostic, so any diff vs full is scheduling, not accuracy.");
     println!();
@@ -110,18 +103,12 @@ fn main() {
         max_diff(&full_logits, &slot_logits),
         argmax(&full_logits) == argmax(&slot_logits)
     );
-    println!(
-        "adaptive                         {:>14.6} | {}",
-        max_diff(&full_logits, &adapt_logits),
-        argmax(&full_logits) == argmax(&adapt_logits)
-    );
 }
 
 #[cfg(feature = "hip")]
 enum Mode {
     Full,
     Slots(usize),
-    Adaptive(usize),
 }
 
 #[cfg(feature = "hip")]
@@ -142,7 +129,6 @@ fn run_mode(
     let mut model = match mode {
         Mode::Full => GpuModel::new(Arc::clone(hip), cfg, w).unwrap(),
         Mode::Slots(s) => GpuModel::with_expert_slots(Arc::clone(hip), cfg, w, s).unwrap(),
-        Mode::Adaptive(s) => GpuModel::with_adaptive(Arc::clone(hip), cfg, w, s).unwrap(),
     };
     model.reset_state().unwrap();
     for _ in 0..3 {

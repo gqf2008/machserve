@@ -10,7 +10,6 @@
 //! Because `pos` and `token` are read by kernels from device buffers, the
 //! same buffers serve every position: update them between steps.
 
-use crate::adaptive::{AdaptiveProfile, BandwidthProbe, BandwidthProfile};
 use crate::config::ModelDType;
 use crate::fp16::f32_to_f16;
 use crate::kernels::HipKernels;
@@ -207,13 +206,6 @@ pub struct GpuModel {
     /// Small device scratch for slot indices + reordered expert weights.
     slot_ids_dev: *mut i32,
     slot_w_dev: *mut f32,
-    /// Bandwidth profile for adaptive (q*) placement; None = static placement.
-    adaptive: Option<AdaptiveProfile>,
-    /// Auto re-probe cadence: every N decode steps, re-measure PCIe bandwidth and
-    /// fold it into the adaptive profile (0 = disabled). Enables real-time q*.
-    reprobe_every: usize,
-    /// Decode-step counter for the re-probe cadence.
-    step_counter: usize,
     /// Dedicated copy stream (owned) for the offload paths' async D2H/H2D:
     /// the host-side MoE work overlaps the GPU-resident part instead of
     /// draining the compute stream every layer.
@@ -314,9 +306,6 @@ impl GpuModel {
             slot_ctx: Vec::new(),
             slot_ids_dev: std::ptr::null_mut(),
             slot_w_dev: std::ptr::null_mut(),
-            adaptive: None,
-            reprobe_every: 0,
-            step_counter: 0,
             // Copy stream + events for the offload paths' async transfers.
             xfer_stream: {
                 let mut s = std::ptr::null_mut();
@@ -429,9 +418,6 @@ impl GpuModel {
             slot_ctx: Vec::new(),
             slot_ids_dev: std::ptr::null_mut(),
             slot_w_dev: std::ptr::null_mut(),
-            adaptive: None,
-            reprobe_every: 0,
-            step_counter: 0,
             xfer_stream: {
                 let mut s = std::ptr::null_mut();
                 unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut s))? };
@@ -543,9 +529,6 @@ impl GpuModel {
             slot_ctx: Vec::new(),
             slot_ids_dev: std::ptr::null_mut(),
             slot_w_dev: std::ptr::null_mut(),
-            adaptive: None,
-            reprobe_every: 0,
-            step_counter: 0,
             xfer_stream: {
                 let mut s = std::ptr::null_mut();
                 unsafe { hip::check(&hip, (hip.api.hip_stream_create)(&mut s))? };
@@ -1963,70 +1946,16 @@ impl GpuModel {
         }
         Ok(())
     }
-    /// Builds a GPU model in adaptive (q*) mode: measures the machine PCIe
-    /// bandwidth and CPU expert cost at init, and per miss decides whether to
-    /// fetch an expert to a GPU slot or compute it on the CPU (the BandwidthProbe).
-    pub fn with_adaptive(
-        hip: Arc<Hip>,
-        cfg: Config,
-        w: &Weights,
-        expert_slots: usize,
-    ) -> Result<Self, Error> {
-        let mut m = Self::build(Arc::clone(&hip), cfg, w, expert_slots)?;
-        m.host_w = Some(Arc::new(w.clone()));
-        let a = BandwidthProbe::measure(&hip, &cfg)?.profile;
-        m.adaptive = Some(AdaptiveProfile::new(
-            a.pcie_bytes_per_sec,
-            a.cpu_expert_sec,
-            0.9,
-        ));
-        m.alloc_offload_pins()?;
-        Ok(m)
-    }
-
-    /// Re-measures PCIe bandwidth + CPU expert cost and folds the sample into the
-    /// adaptive (q*) profile, so a contended bus shifts the per-miss decision to
-    /// CPU. Call periodically from the serving loop or via `set_reprobe_every`.
-    pub fn reprobe_bandwidth(&mut self) -> Result<(), Error> {
-        if let Some(prof) = &mut self.adaptive {
-            let a = BandwidthProbe::measure(self.k.hip(), &self.cfg)?.profile;
-            prof.observe(a.pcie_bytes_per_sec);
-        }
-        Ok(())
-    }
-    /// Sets the auto re-probe cadence: every `n` decode steps, re-measure PCIe
-    /// bandwidth and fold it into the adaptive profile. `0` disables.
-    pub fn set_reprobe_every(&mut self, n: usize) {
-        self.reprobe_every = n;
-    }
-
-    #[must_use]
-    fn should_reprobe(counter: usize, every: usize) -> bool {
-        every > 0 && counter > 0 && counter.is_multiple_of(every)
-    }
-
-    /// Advances the step counter and re-probes bandwidth on the cadence (if the
-    /// adaptive profile is present). Real-time q*: a contended bus shifts the
-    /// per-miss decision to CPU on the following steps.
-    fn maybe_reprobe(&mut self) -> Result<(), Error> {
-        self.step_counter += 1;
-        if Self::should_reprobe(self.step_counter, self.reprobe_every) {
-            self.reprobe_bandwidth()?;
-        }
-        Ok(())
-    }
-    /// Places a step routed experts into GPU slots (bounded by `cap`), applying
-    /// the adaptive q* choice when `adaptive` is provided. Returns (to_upload,
-    /// slot_list, gpu_w, cpu): experts to copy into slots, slot indices for the GPU
-    /// gather (in routed order), their weights, and the CPU fallback.
+    /// Places a step routed experts into GPU slots (bounded by `cap`).
+    /// Returns (to_upload, slot_list, gpu_w, cpu): experts to copy into slots,
+    /// slot indices for the GPU gather (in routed order), their weights, and
+    /// the CPU fallback.
     #[allow(clippy::type_complexity)]
     fn moe_slot_place(
         &self,
         li: usize,
         ids: &[i32],
         weights: &[f32],
-        adaptive: Option<BandwidthProfile>,
-        expert_bytes: usize,
     ) -> (Vec<(usize, usize)>, Vec<i32>, Vec<f32>, Vec<(usize, f32)>) {
         let mut to_upload: Vec<(usize, usize)> = Vec::new();
         let mut slot_list: Vec<i32> = Vec::new();
@@ -2042,10 +1971,6 @@ impl GpuModel {
             if let Some(slot) = ctx.lru.get(id) {
                 slot_list.push(slot as i32);
                 gpu_w.push(w);
-            } else if adaptive
-                .is_some_and(|p| p.choose(expert_bytes) == crate::adaptive::FetchChoice::ComputeCpu)
-            {
-                cpu.push((e, w));
             } else if ctx.lru.len() < cap || ctx.lru.evict_lru_not_in(&routed_set).is_some() {
                 let put = ctx.lru.put(id);
                 if ctx.slot_expert[put.slot] != e as i32 {
@@ -2124,17 +2049,9 @@ impl GpuModel {
             (ctx.wg, ctx.wu, ctx.wd, ctx.cap)
         };
 
-        // Decide placement: fill free slots, overflow to CPU, no intra-step eviction;
-        // in adaptive mode a miss is computed on the CPU when it is cheaper than the
-        // PCIe fetch pull for this machine (q*).
-        let expert_bytes = 3 * inter as usize * d as usize * 4;
-        let (to_upload, slot_list, gpu_w, cpu) = self.moe_slot_place(
-            li,
-            ids,
-            weights,
-            self.adaptive.as_ref().map(|p| p.profile()),
-            expert_bytes,
-        );
+        // Decide placement: fill free slots, overflow to CPU, no intra-step
+        // eviction.
+        let (to_upload, slot_list, gpu_w, cpu) = self.moe_slot_place(li, ids, weights);
 
         // Upload experts that changed slots (on-demand fetch from host RAM).
         if !to_upload.is_empty() {
@@ -2272,7 +2189,6 @@ impl GpuModel {
         self.update_inputs(token)?;
         self.run_kernels()?;
         let out = self.read_logits()?;
-        self.maybe_reprobe()?;
         self.pos += 1;
         Ok(out)
     }
@@ -2394,22 +2310,5 @@ impl Drop for GpuModel {
         for &p in &self.host_pins {
             let _ = hip::host_free(hip, p);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reprobe_cadence() {
-        // Disabled (every == 0) never reprobes.
-        assert!(!GpuModel::should_reprobe(0, 0));
-        assert!(!GpuModel::should_reprobe(5, 0));
-        // Enabled: triggers exactly on multiples of `every`.
-        assert!(!GpuModel::should_reprobe(0, 10));
-        assert!(!GpuModel::should_reprobe(9, 10));
-        assert!(GpuModel::should_reprobe(10, 10));
-        assert!(GpuModel::should_reprobe(20, 10));
     }
 }
